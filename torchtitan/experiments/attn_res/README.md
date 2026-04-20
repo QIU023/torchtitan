@@ -23,8 +23,8 @@ baseline × 1.25 compute at matched size, with PP-friendly `N ≈ 8`.
 | --- | --- |
 | [`attn_res.py`](./attn_res.py) | `block_attn_res()` primitive, `AttnResConfig`, `AttnResProjection` (pseudo-query, zero-initialized), `stack_blocks` / `unstack_blocks` |
 | [`model.py`](./model.py) | `AttnResLlama3TransformerBlock` (subclass of `Llama3TransformerBlock`) and `AttnResLlama3Model` (subclass of `Llama3Model`) |
-| [`__init__.py`](./__init__.py) | Model flavors: `debugmodel_attn_res`, `150M_attn_res`; `model_registry(flavor)` |
-| [`config_registry.py`](./config_registry.py) | Trainer configs: `llama3_150m_baseline`, `llama3_150m_attn_res` (shared hyperparameters, only model flavor differs) |
+| [`__init__.py`](./__init__.py) | Model flavors: `debugmodel_attn_res`, `175M_attn_res`; `model_registry(flavor)` |
+| [`config_registry.py`](./config_registry.py) | Trainer configs: `llama3_175m_baseline`, `llama3_175m_attn_res` (shared hyperparameters, only model flavor differs) |
 | [`tests/`](./tests/) | CPU unit tests for the primitive, projection, stack/unstack, and end-to-end debug model |
 
 Core torchtitan files are not modified: subclasses extend
@@ -38,10 +38,10 @@ Core torchtitan files are not modified: subclasses extend
 pytest torchtitan/experiments/attn_res/tests/ -v
 
 # Single-GPU debug forward
-bash run_train.sh --module attn_res --config llama3_150m_baseline \
+bash run_train.sh --module attn_res --config llama3_175m_baseline \
     --training.steps 100
 
-bash run_train.sh --module attn_res --config llama3_150m_attn_res \
+bash run_train.sh --module attn_res --config llama3_175m_attn_res \
     --training.steps 100
 ```
 

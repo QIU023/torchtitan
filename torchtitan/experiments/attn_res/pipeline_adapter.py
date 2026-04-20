@@ -600,7 +600,7 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         # backward so the graph survives the second traversal.
         #
         # Cost: each in-flight mb retains its stage graph until the rank
-        # cache evicts at step end. For our 150M smoke on 8x RTX 5090
+        # cache evicts at step end. For our 175M smoke on 8x RTX 5090
         # (1 layer / virtual stage, M=4 mbs in flight) that shows up as
         # +5 GiB on rank 7 (11.9 GiB vs 6.9 GiB for naive PP). Still
         # under 32 GiB so training completes, and 1000-step loss curves

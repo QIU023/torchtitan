@@ -21,9 +21,12 @@ from functools import partial
 
 import torch.nn as nn
 
-# Total number of transformer layers for the 150M config. Fixed by the
-# Llama3 shape; all num_blocks values must divide it (see _150m_attn_res).
-_150M_N_LAYERS = 12
+# Total number of transformer layers for the 175M Llama3 dense config.
+# Fixed by the Llama3 shape; all num_blocks values must divide it (see
+# _175m_attn_res). Name reflects total parameter count (~174M with tied
+# embedding counted once); torchtitan's size-log convention reports this
+# as 75.5M non-embedding.
+_175M_N_LAYERS = 12
 
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.experiments.attn_res.attn_res import AttnResConfig, AttnResProjection
@@ -177,19 +180,23 @@ def _debugmodel_attn_res() -> AttnResLlama3Model.Config:
     )
 
 
-def _150m_attn_res(
+def _175m_attn_res(
     num_blocks: int = 6,
-    n_layers: int = _150M_N_LAYERS,
+    n_layers: int = _175M_N_LAYERS,
     enable_weight_tying: bool = True,
 ) -> AttnResLlama3Model.Config:
-    """~150M dense Llama3 with Block AttnRes enabled.
+    """~175M dense Llama3 with Block AttnRes enabled.
+
+    Parameter count: 174,017,280 total (tied embedding counted once) /
+    75,555,072 as reported by torchtitan's size-log under the tied-
+    embedding convention (excludes the 98.5M shared embed/output).
 
     Args:
         num_blocks: Number of attention-residual blocks. Must divide
             ``n_layers``. Paper sweet spot is ``N=8``; default is 6
             (closest divisor below 8 for n_layers=12). N=1 is equivalent
             to standard residuals and is disallowed.
-        n_layers: Total transformer layers. Default 12 (original 150M
+        n_layers: Total transformer layers. Default 12 (original 175M
             shape). Pass 16 to align with the Phase-3 8-GPU PP layout
             (PP=8, layers_per_stage=1 -> 16 virtual stages, 2 chunks
             per rank under Interleaved1F1B).
@@ -255,13 +262,13 @@ def _150m_attn_res(
 
 attn_res_configs = {
     "debugmodel_attn_res": _debugmodel_attn_res,
-    "150M_attn_res": _150m_attn_res,  # default N=6
+    "175M_attn_res": _175m_attn_res,  # default N=6
     # Ablation flavors over num_blocks. n_layers=12, so divisors are
     # {2, 3, 4, 6, 12}. N=1 is degenerate (= standard residuals).
-    "150M_attn_res_n2": partial(_150m_attn_res, num_blocks=2),
-    "150M_attn_res_n3": partial(_150m_attn_res, num_blocks=3),
-    "150M_attn_res_n4": partial(_150m_attn_res, num_blocks=4),
-    "150M_attn_res_n12": partial(_150m_attn_res, num_blocks=12),
+    "175M_attn_res_n2": partial(_175m_attn_res, num_blocks=2),
+    "175M_attn_res_n3": partial(_175m_attn_res, num_blocks=3),
+    "175M_attn_res_n4": partial(_175m_attn_res, num_blocks=4),
+    "175M_attn_res_n12": partial(_175m_attn_res, num_blocks=12),
     # 16-layer variant sized to align with 8-GPU PP: n_layers=16,
     # num_blocks=8 gives 2 layers per block (paper sweet spot N=8).
     # The Phase-3 launchers (phase3/launch_8gpu_{naive,adapter}.sh) pass
@@ -274,8 +281,8 @@ attn_res_configs = {
     # virtual stage boundary also coincides with a block boundary, so
     # the cross-stage caching adapter's "send only new blocks"
     # invariant is exercised at half the stage transitions.
-    "150M_attn_res_L16_n8": partial(
-        _150m_attn_res, num_blocks=8, n_layers=16, enable_weight_tying=False
+    "175M_attn_res_L16_n8": partial(
+        _175m_attn_res, num_blocks=8, n_layers=16, enable_weight_tying=False
     ),
 }
 
