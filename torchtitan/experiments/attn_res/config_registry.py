@@ -254,13 +254,21 @@ def llama3_150m_attn_res_n12() -> Trainer.Config:
 
 
 def llama3_150m_attn_res_L16_n8() -> Trainer.Config:
-    """16-layer / N=8 variant sized for PP=8 × layers_per_stage=2.
+    """16-layer / N=8 variant sized for the Phase-3 8-GPU PP layout.
 
-    Used for the Phase 3 naive-vs-adapter PP smoke on 8 GPUs: n_layers=16
-    divides evenly into 8 stages of 2 layers, and num_blocks=8 places a
-    block boundary at every stage boundary (so the cross-stage caching
-    adapter's "send only new blocks" invariant is exercised once per
-    stage). Shares every other hyperparameter with the 12-layer configs
-    so the sweep stays apples-to-apples when compared to Phase 2.
+    Used for the Phase 3 naive-vs-adapter PP smoke on 8 GPUs. The
+    launchers (phase3/launch_8gpu_{naive,adapter}.sh) pass PP=8,
+    schedule=Interleaved1F1B, layers_per_stage=1, and
+    first/last_stage_less_layers=0, which gives:
+        (n_layers=16 + first_less=0 + last_less=0) / layers_per_stage=1
+        = 16 virtual stages / PP=8 = 2 chunks per rank.
+    Two chunks per rank is the minimum Interleaved1F1B requires and is
+    what preserves the steady-state overlap the Phase-3 measurement
+    relies on (LPS=2 collapses to 1 chunk/rank and loses that). With
+    num_blocks=8, every other virtual-stage boundary coincides with a
+    block boundary, so the cross-stage caching adapter's "send only
+    new blocks" invariant is exercised at half the stage transitions.
+    Shares every other hyperparameter with the 12-layer configs so the
+    sweep stays apples-to-apples when compared to Phase 2.
     """
     return _llama3_150m_attn_res_variant("150M_attn_res_L16_n8")

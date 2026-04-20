@@ -137,9 +137,9 @@ class AttnResLlama3Model(Llama3Model):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        assert config.attn_res.enabled, (
-            "AttnResLlama3Model requires attn_res.enabled=True in its Config"
-        )
+        assert (
+            config.attn_res.enabled
+        ), "AttnResLlama3Model requires attn_res.enabled=True in its Config"
         num_blocks = config.attn_res.num_blocks
         num_layers_total = len(config.layers)
         assert num_layers_total % num_blocks == 0, (
@@ -216,11 +216,16 @@ class AttnResLlama3Model(Llama3Model):
             # This keeps the forward send size constant in stage id.
             if self._return_only_new_blocks:
                 new_blocks = block_list[initial_num_blocks:]
-                assert new_blocks, (
-                    "Stage committed no new blocks but _return_only_new_blocks "
-                    "is on. Check that num_blocks >= num_stages and each "
-                    "stage spans at least one block boundary."
-                )
+                if not new_blocks:
+                    # Stage spans no block boundary this pass: emit a
+                    # zero-first-dim stacked tensor so the adapter's P2P
+                    # hand-off keeps a static per-stage shape (receiver
+                    # sees N=0 and skips its cache add). Happens when
+                    # num_virtual_stages > num_blocks -- e.g. PP=8 with
+                    # VP=2 (16 virtual stages) and num_blocks=8, where
+                    # odd virtual stages span no is_block_start layer.
+                    empty_blocks = partial_block.new_zeros((0, *partial_block.shape))
+                    return partial_block, empty_blocks
                 return partial_block, stack_blocks(new_blocks)
             return partial_block, stack_blocks(block_list)
 

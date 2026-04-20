@@ -94,9 +94,7 @@ class TestBlockAttnResFunction(unittest.TestCase):
         norm = _unit_norm(self.D)
         # If we set all values to the same constant, output should equal it.
         const = torch.ones(self.B, self.T, self.D) * 3.14
-        out = block_attn_res(
-            [const.clone(), const.clone()], const.clone(), proj, norm
-        )
+        out = block_attn_res([const.clone(), const.clone()], const.clone(), proj, norm)
         self.assertTrue(torch.allclose(out, const, atol=1e-5))
 
     def test_gradients_flow(self):
@@ -135,9 +133,7 @@ class TestAttnResProjection(unittest.TestCase):
     """Tests for the AttnResProjection Config/Module."""
 
     def test_build_and_zero_init(self):
-        config = AttnResProjection.Config(
-            dim=16, param_init={"weight": nn.init.zeros_}
-        )
+        config = AttnResProjection.Config(dim=16, param_init={"weight": nn.init.zeros_})
         proj = config.build()
         proj.init_states()
         self.assertEqual(proj.weight.shape, torch.Size([1, 16]))
@@ -248,6 +244,39 @@ class TestAttnResLlama3Model(unittest.TestCase):
         # layer_id is a block start, so the stage commits blocks at
         # layer_id = 0, 2, 4 -> 3 new commits added to the initial 1 block.
         self.assertEqual(new_blocks.shape[0], 4)
+
+    def test_return_only_new_blocks_empty_commit(self):
+        """Under _return_only_new_blocks=True, a stage that spans no
+        is_block_start layer must return a zero-first-dim stacked tensor
+        rather than raising. This unblocks configs where
+        num_virtual_stages > num_blocks (e.g. the Phase-3 8-GPU layout:
+        PP=8, layers_per_stage=1, n_layers=16 -> 16 virtual stages /
+        2 chunks per rank, with N=8 blocks).
+        """
+        config = attn_res_configs["debugmodel_attn_res"]()
+        model = config.build()
+        model.init_states()
+
+        # Simulate a PP middle stage that owns exactly ONE non-block-start
+        # layer (layer_id=1: 1 % 2 != 0, so no commit).
+        model.tok_embeddings = None
+        model.norm = None
+        model.output = None
+        model.layers = nn.ModuleDict({"1": model.layers["1"]})
+        model._return_only_new_blocks = True
+
+        B, T, D = 2, 8, config.dim
+        partial = torch.randn(B, T, D)
+        blocks_tensor = torch.randn(1, B, T, D)
+        out = model(partial, blocks=blocks_tensor)
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(len(out), 2)
+        new_partial, new_blocks = out
+        self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
+        # Key assertion: zero new blocks, but a valid stacked tensor
+        # (shape [0, B, T, D]) so P2P gets a static per-stage shape.
+        self.assertEqual(new_blocks.shape, torch.Size([0, B, T, D]))
+        self.assertEqual(new_blocks.dtype, partial.dtype)
 
 
 if __name__ == "__main__":

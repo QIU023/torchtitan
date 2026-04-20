@@ -190,7 +190,9 @@ def _150m_attn_res(
             (closest divisor below 8 for n_layers=12). N=1 is equivalent
             to standard residuals and is disallowed.
         n_layers: Total transformer layers. Default 12 (original 150M
-            shape). Pass 16 to align with PP=8 × layers_per_stage=2.
+            shape). Pass 16 to align with the Phase-3 8-GPU PP layout
+            (PP=8, layers_per_stage=1 -> 16 virtual stages, 2 chunks
+            per rank under Interleaved1F1B).
         enable_weight_tying: Tie input embedding with output projection.
             Must be False under Pipeline Parallel — torchtitan's
             parallelize_llama explicitly raises on tying + PP.
@@ -261,9 +263,17 @@ attn_res_configs = {
     "150M_attn_res_n4": partial(_150m_attn_res, num_blocks=4),
     "150M_attn_res_n12": partial(_150m_attn_res, num_blocks=12),
     # 16-layer variant sized to align with 8-GPU PP: n_layers=16,
-    # num_blocks=8 gives 2 layers per block, which matches PP=8 with
-    # layers_per_stage=2 and (with VP=2) one block-boundary per virtual
-    # stage. Paper sweet spot N=8.
+    # num_blocks=8 gives 2 layers per block (paper sweet spot N=8).
+    # The Phase-3 launchers (phase3/launch_8gpu_{naive,adapter}.sh) pass
+    # --parallelism.pipeline_parallel_layers_per_stage=1, with
+    # first_stage_less_layers=0 and last_stage_less_layers=0, yielding
+    # (n_layers=16 + first_less=0 + last_less=0) / layers_per_stage=1
+    # = 16 virtual stages. With PP=8 that gives 16 / 8 = 2 chunks per
+    # rank, which satisfies Interleaved1F1B's ">=2 chunks per rank"
+    # requirement and preserves steady-state overlap. Every other
+    # virtual stage boundary also coincides with a block boundary, so
+    # the cross-stage caching adapter's "send only new blocks"
+    # invariant is exercised at half the stage transitions.
     "150M_attn_res_L16_n8": partial(
         _150m_attn_res, num_blocks=8, n_layers=16, enable_weight_tying=False
     ),
