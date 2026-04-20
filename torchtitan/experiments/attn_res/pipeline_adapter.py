@@ -6,72 +6,38 @@
 
 """Cross-stage caching adapter + custom ``pipelining_fn`` for AttnRes.
 
-Two pieces live here:
+:class:`CrossStageCacheAdapter` wraps a per-stage AttnRes decoder. In
+delta mode (Interleaved1F1B with :class:`BlockLayoutTables` from
+:mod:`.layout`) each hop ships only the blocks the receiver's shared
+rank cache doesn't already have; the receiver rebuilds the full stack
+by concatenating its cached prefix with the incoming delta. Per-block
+backward grads P2P-travel to the original producer via
+:class:`_SendBlockGradsBack` (consumer) and
+:class:`_RecvBlockGradsFromConsumers` (producer). Without layout tables
+the adapter is a naive full-stack passthrough.
 
-1. :class:`CrossStageCacheAdapter` -- an ``nn.Module`` that wraps a per-stage
-   AttnRes decoder. Inter-stage forward bandwidth becomes **constant in
-   stage id**: each stage only receives / sends the blocks newly committed
-   by the immediately preceding stage; prior-stage blocks are cached
-   locally per microbatch and their gradients are sent back to the
-   original producer stage out-of-band during backward.
-2. :func:`pipeline_llm_with_cache_adapter` -- a ``pipelining_fn`` plugged
-   into the experiment's ``ModelSpec``. It calls core's
-   :func:`torchtitan.distributed.pipeline_parallel.pipeline_llm`, then
-   walks the resulting schedule's stages and wraps each ``stage.submod``
-   with the adapter. This keeps all AttnRes-specific pipeline wiring
-   inside ``experiments/attn_res/`` -- no modifications to core torchtitan.
+:func:`pipeline_llm_with_cache_adapter` is a ``pipelining_fn`` plugged
+into the experiment's ``ModelSpec``; it delegates to core
+``pipeline_llm`` and (when ``TORCHTITAN_ATTNRES_CACHE=1``) wraps each
+stage's submod. Schedule must be Interleaved1F1B; otherwise we warn.
 
-Activation is gated by ``TORCHTITAN_ATTNRES_CACHE=1`` in the environment
-so naive (full-stack send) and cached modes are both A/B-runnable from
-the same binary without rebuilding model specs. When the flag is off the
-wrapper still calls core ``pipeline_llm`` and simply skips the wrapping
-step, matching Phase-2 behavior exactly.
+Microbatch keying: the adapter keys its per-microbatch cache by the
+schedule-owned integer chunk id. ``forward_one_chunk`` /
+``backward_one_chunk`` are monkey-patched to stash the index on a
+thread-local keyed per-adapter; forward and backward run synchronously
+on the same thread, so autograd hooks that fire during backward can
+read the mb index. The integer key is stable across P2P crossings
+(unlike ``id()`` of a tensor).
 
-Microbatch keying
------------------
-The adapter keys its per-microbatch cache by the integer microbatch
-index supplied by torch's schedule (``fwd_chunk_id`` / ``bwd_chunk_id``
-in :meth:`PipelineStage.forward_one_chunk` and
-:meth:`backward_one_chunk`). We monkey-patch those two methods on each
-wrapped stage to stash the index on a thread-local keyed per-adapter
-right before the submod is invoked. Because forward and backward run
-synchronously on the same thread that called the patched stage method,
-the thread-local is live for the whole duration of the inner forward
-and inner backward respectively -- so autograd hooks that accumulate
-per-block grads into the cache can read the mb index even though they
-only fire during backward.
-
-The key is stable across P2P crossings because each stage computes it
-from the schedule-owned chunk id, not from ``id()`` of a tensor (which
-would change when NCCL allocated a fresh recv buffer on the consumer).
-
-Backward grad send-back
------------------------
-Cached-prefix blocks received at a middle/last stage carry autograd
-connections back into the wrapped model's local graph, but the *other*
-end of those connections -- the producer stage that originally emitted
-the block on its own forward -- lives in a different process. The
-consumer therefore has to ship the accumulated grad back over P2P.
-
-We do this with :class:`_SendBlockGradsBack`, a ``torch.autograd.Function``
-whose forward is a structural pass-through (it repackages the cached
-prefix into the consumer's autograd graph) and whose backward does a
-batched ``dist.isend`` of the per-block grads it received back to the
-producer stage over the pipeline process group.
-
-The producer side symmetrically wraps the blocks it commits in
-:class:`_RecvBlockGradsFromConsumers`, whose backward issues one
-``dist.irecv`` per consumer stage for each committed block, sums them,
-and adds them into the producer's local grad.
-
-See ``adapter_design.md`` in the project root for the full state
-machine, invariants, and the resolved open unknowns this draft rests on.
+See ``adapter_design.md`` at the project root for the full state
+machine and invariants.
 """
 
 from __future__ import annotations
 
 import os
 import threading
+import warnings
 from collections import defaultdict
 
 import torch
@@ -84,49 +50,45 @@ from torch.distributed.pipelining.schedules import (
     PipelineScheduleSingle,
 )
 
-from torchtitan.experiments.attn_res.attn_res import stack_blocks, unstack_blocks
+# Resolve Interleaved1F1B at import time so the schedule guard is a direct
+# isinstance check instead of a string-match.
+try:
+    from torch.distributed.pipelining.schedules import get_schedule_class
+
+    _INTERLEAVED_1F1B_CLASS = get_schedule_class("Interleaved1F1B")
+except Exception:  # pragma: no cover - fallback for older torch
+    _INTERLEAVED_1F1B_CLASS = None
+
+from torchtitan.experiments.attn_res.attn_res import unstack_blocks
+from torchtitan.experiments.attn_res.layout import (
+    _grad_tag_base,
+    _infer_block_layout_tables_from_stages,
+    BlockLayoutTables,
+)
 
 
 def adapter_enabled() -> bool:
-    """Env-flag gate so the adapter is opt-in until we trust it."""
+    """Env-flag gate: adapter is opt-in until we trust it."""
     return os.environ.get("TORCHTITAN_ATTNRES_CACHE") == "1"
 
 
-# --------------------------------------------------------------------------- #
-# Per-microbatch cache
-# --------------------------------------------------------------------------- #
+# ----- Per-microbatch cache ------------------------------------------------ #
 
 
 class _PerMicrobatchCache:
-    """Maps ``(stage_id, mb_index)`` -> cached prior-stage blocks and the
-    per-block grads accumulated from the local backward.
+    """Maps ``mb_index`` -> cached blocks + per-block grads.
 
-    The key is the integer microbatch index owned by torch's pipeline
-    schedule; see the module docstring for how it gets routed into the
-    adapter. Unlike the previous ``id(partial_block)`` strategy, the
-    integer survives P2P crossings: producer and consumer both look up
-    by the same chunk id that the schedule issued.
-
-    Grad semantics: ``add_grad`` is called from a backward tensor hook,
-    one call per cached block per microbatch. ``pop_grads`` retrieves
-    them (as a list indexed by block position) so the adapter can ship
-    them back to the producer stage.
+    Retained for back-compat with unit tests; :class:`RankLocalCache` is
+    a strict superset used for the shared-across-virtual-stages path.
     """
 
     def __init__(self) -> None:
         self._forward: dict[int, list[torch.Tensor]] = {}
-        # Per-cached-block metadata: (producer_rank, producer_stage_id,
-        # block_index_within_producer). We need all three to tag the
-        # P2P send-back correctly: (producer_stage, block_index) chooses
-        # the tag; producer_rank chooses the dst rank (usually but not
-        # always == producer_stage under VP).
         self._producer_meta: dict[int, list[tuple[int, int, int]]] = {}
         self._grad_accum: dict[int, list[torch.Tensor | None]] = defaultdict(list)
 
     def put_forward(
-        self,
-        mb_index: int,
-        blocks: list[torch.Tensor],
+        self, mb_index: int, blocks: list[torch.Tensor],
         producer_meta: list[tuple[int, int, int]] | None = None,
     ) -> None:
         self._forward[mb_index] = blocks
@@ -149,42 +111,104 @@ class _PerMicrobatchCache:
         while len(slot) <= block_idx:
             slot.append(None)
         contrib = grad.detach()
-        if slot[block_idx] is None:
-            slot[block_idx] = contrib.clone()
-        else:
-            slot[block_idx] = slot[block_idx] + contrib
+        slot[block_idx] = contrib.clone() if slot[block_idx] is None else slot[block_idx] + contrib
 
     def pop_grads(self, mb_index: int) -> list[torch.Tensor | None]:
         return self._grad_accum.pop(mb_index, [])
 
 
-# --------------------------------------------------------------------------- #
-# Autograd plumbing for cross-stage grad send-back
-# --------------------------------------------------------------------------- #
+# ----- Rank-shared cache across virtual stages ----------------------------- #
 
+class RankLocalCache:
+    """Per-rank, per-microbatch accumulator shared across virtual stages.
+
+    Every adapter on the same physical rank reads/writes the SAME cache
+    (Kimi §4.1 invariant). Canonical API: ``append`` / ``get_blocks`` /
+    ``get_meta``. ``put_forward`` / ``get_forward`` / ``get_producer_meta``
+    are back-compat shims.
+    """
+
+    def __init__(self) -> None:
+        self._blocks: dict[int, list[torch.Tensor]] = {}
+        self._producer_meta: dict[int, list[tuple[int, int, int]]] = {}
+        self._grad_accum: dict[int, list[torch.Tensor | None]] = defaultdict(list)
+
+    def append(
+        self, mb_index: int, block: torch.Tensor, meta: tuple[int, int, int],
+    ) -> None:
+        self._blocks.setdefault(mb_index, []).append(block)
+        self._producer_meta.setdefault(mb_index, []).append(meta)
+
+    def get_blocks(self, mb_index: int) -> list[torch.Tensor]:
+        return self._blocks.get(mb_index, [])
+
+    def get_meta(self, mb_index: int) -> list[tuple[int, int, int]]:
+        return self._producer_meta.get(mb_index, [])
+
+    # Back-compat shims; ``put_forward`` overwrites any prior per-mb state.
+    def put_forward(
+        self, mb_index: int, blocks: list[torch.Tensor],
+        producer_meta: list[tuple[int, int, int]] | None = None,
+    ) -> None:
+        self._blocks[mb_index] = list(blocks)
+        if producer_meta is not None:
+            self._producer_meta[mb_index] = list(producer_meta)
+
+    def get_forward(self, mb_index: int) -> list[torch.Tensor]:
+        return self.get_blocks(mb_index)
+
+    def get_producer_meta(self, mb_index: int) -> list[tuple[int, int, int]]:
+        return self.get_meta(mb_index)
+
+    def drop(self, mb_index: int) -> None:
+        self._blocks.pop(mb_index, None)
+        self._producer_meta.pop(mb_index, None)
+        self._grad_accum.pop(mb_index, None)
+
+    def add_grad(self, mb_index: int, block_idx: int, grad: torch.Tensor) -> None:
+        slot = self._grad_accum[mb_index]
+        while len(slot) <= block_idx:
+            slot.append(None)
+        contrib = grad.detach()
+        slot[block_idx] = contrib.clone() if slot[block_idx] is None else slot[block_idx] + contrib
+
+    def pop_grads(self, mb_index: int) -> list[torch.Tensor | None]:
+        return self._grad_accum.pop(mb_index, [])
+
+
+# One RankLocalCache per pipeline-group rank, shared by every adapter
+# on that rank. Lock-protected against concurrent construction.
+_rank_caches: dict[int, RankLocalCache] = {}
+_rank_caches_lock = threading.Lock()
+
+
+def _get_or_create_rank_cache(pp_rank: int) -> RankLocalCache:
+    """Return (creating if absent) the shared cache for ``pp_rank``."""
+    cache = _rank_caches.get(pp_rank)
+    if cache is not None:
+        return cache
+    with _rank_caches_lock:
+        cache = _rank_caches.get(pp_rank)
+        if cache is None:
+            cache = RankLocalCache()
+            _rank_caches[pp_rank] = cache
+        return cache
+
+
+def _reset_rank_caches_for_testing() -> None:
+    """Clear the module-level registry. Unit-test isolation only."""
+    with _rank_caches_lock:
+        _rank_caches.clear()
+
+
+# ----- Autograd plumbing for cross-stage grad send-back -------------------- #
 
 class _SendBlockGradsBack(torch.autograd.Function):
-    """Consumer-side identity in forward, P2P-send-per-block in backward.
+    """Consumer-side identity forward, P2P-send-per-block backward.
 
-    Wraps the *cached prefix* of blocks the consumer stage hands to its
-    wrapped model. Forward is a pure pass-through (the blocks flow
-    straight into the local autograd graph). Backward intercepts the
-    grads on those blocks and sends each one back to the rank that
-    originally produced it.
-
-    Why we need this over a plain ``register_hook``: hooks run during the
-    consumer's local backward, but there's no autograd node that would
-    naturally emit P2P sends. We need a custom Function whose
-    ``backward`` is invoked on the grads of its *inputs*, so we can
-    isend them before returning. Returning ``None`` for each input means
-    the local graph stops here -- the only way grads reach the producer
-    is over the P2P we just posted.
-
-    Per-block grad accumulation into ``cache._grad_accum[mb_index]``
-    also happens here -- it's the single source of truth for "what grad
-    would this stage ship back". Tests can assert on it without needing
-    a real NCCL send; production runs use it as the payload for the
-    ``dist.isend``.
+    Backward accumulates per-block grads into the cache and isend-s each
+    one to the block's original producer rank. Returning ``None`` per
+    block input stops the local autograd graph here.
     """
 
     @staticmethod
@@ -202,58 +226,39 @@ class _SendBlockGradsBack(torch.autograd.Function):
             ctx.dtype = blocks[0].dtype
             ctx.device = blocks[0].device
             ctx.shape = blocks[0].shape
-        # Return detached clones in a tuple. We clone so the local
-        # autograd graph sees this Function as the *source* of the
-        # cached blocks -- otherwise autograd might route grads through
-        # the pre-clone tensor and skip our backward altogether.
-        outs = tuple(b.clone() for b in blocks)
-        return outs
+        # Clone so the Function is the source of the blocks in the local
+        # autograd graph (otherwise backward would route past).
+        return tuple(b.clone() for b in blocks)
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        group = ctx.group
-
-        # Record each block's accumulated grad in the adapter's cache so
-        # unit tests and telemetry can inspect it even when no PG is
-        # wired. This is also the payload we ship over P2P below.
         recorded_grads: list[torch.Tensor] = []
         for i, g in enumerate(grad_outputs):
             if g is None:
-                # Autograd can emit None for a block that wasn't used
-                # (e.g. unused intermediate). The producer is still
-                # expecting an irecv, so we materialize a zero grad.
                 g = torch.zeros(ctx.shape, dtype=ctx.dtype, device=ctx.device)
             recorded_grads.append(g)
             if ctx.cache is not None:
                 ctx.cache.add_grad(ctx.mb_index, i, g)
 
+        group = ctx.group
         if group is not None and dist.is_available() and dist.is_initialized():
-            reqs = []
-            for i, g in enumerate(recorded_grads):
-                dst = ctx.producer_ranks[i]
-                tag = ctx.tags[i]
-                req = dist.isend(g.contiguous(), dst=dst, group=group, tag=tag)
-                reqs.append(req)
+            reqs = [
+                dist.isend(
+                    g.contiguous(),
+                    dst=ctx.producer_ranks[i], group=group, tag=ctx.tags[i],
+                )
+                for i, g in enumerate(recorded_grads)
+            ]
             for r in reqs:
                 r.wait()
-        # None for each non-tensor arg (producer_ranks, tags, group,
-        # cache, mb_index) and None per block input -- grads leave via P2P.
         return (None, None, None, None, None) + tuple(None for _ in grad_outputs)
 
 
 class _RecvBlockGradsFromConsumers(torch.autograd.Function):
-    """Producer-side identity in forward, sum-of-irecvs in backward.
+    """Producer-side identity forward, sum-of-irecvs backward.
 
-    Wraps the blocks a producer stage emits onto the forward send path.
-    Forward is identity. Backward receives one grad tensor per consumer
-    stage (stage_id > producer_stage_id) per block, sums them, and adds
-    them into the grad that the local autograd graph would otherwise
-    have produced.
-
-    In the current AttnRes model, EVERY later stage reads EVERY earlier
-    block through its attention over blocks, so every consumer sends
-    back a grad contribution. The number of consumer stages per producer
-    is ``num_stages - producer_stage_id - 1``.
+    Backward irecvs one grad tensor per (consumer, block) and sums them
+    into the grad the local graph produced.
     """
 
     @staticmethod
@@ -272,18 +277,14 @@ class _RecvBlockGradsFromConsumers(torch.autograd.Function):
         if group is None or not (dist.is_available() and dist.is_initialized()):
             # Unit-test path: no cross-stage grad to add.
             return None, None, None, grad_output
-        # One incoming grad per consumer, per block.
-        N = ctx.shape[0]  # number of blocks this stage committed
+        N = ctx.shape[0]
         per_block_shape = ctx.shape[1:]
         extra = torch.zeros(ctx.shape, dtype=ctx.dtype, device=ctx.device)
         pending = []
-        for c_idx, src in enumerate(ctx.consumer_ranks):
+        for src in ctx.consumer_ranks:
             for b in range(N):
-                buf = torch.empty(
-                    per_block_shape, dtype=ctx.dtype, device=ctx.device
-                )
-                tag = ctx.tag_base + b
-                req = dist.irecv(buf, src=src, group=group, tag=tag)
+                buf = torch.empty(per_block_shape, dtype=ctx.dtype, device=ctx.device)
+                req = dist.irecv(buf, src=src, group=group, tag=ctx.tag_base + b)
                 pending.append((req, buf, b))
         for req, buf, b in pending:
             req.wait()
@@ -291,17 +292,10 @@ class _RecvBlockGradsFromConsumers(torch.autograd.Function):
         return None, None, None, grad_output + extra
 
 
-# --------------------------------------------------------------------------- #
-# Microbatch-index threading
-# --------------------------------------------------------------------------- #
+# ----- Microbatch-index threading ------------------------------------------ #
 
-
-# One thread-local shared across all adapters: each adapter stashes the
-# *current* mb index under its own object id. Autograd hooks registered
-# inside the adapter read from the same thread-local. Forward and
-# backward execution of a single microbatch run synchronously on the
-# same thread (torch's schedule drives them serially), so a thread-local
-# suffices -- no cross-thread handoff needed.
+# Each adapter stashes its *current* mb index under its own object id.
+# Forward and backward of a single mb run on the same thread.
 _mb_state = threading.local()
 
 
@@ -323,45 +317,62 @@ def _set_mb_index(adapter_key: int, mb_index: int | None) -> None:
         d[adapter_key] = mb_index
 
 
-# --------------------------------------------------------------------------- #
-# The adapter module
-# --------------------------------------------------------------------------- #
+# ----- state_dict key rewriting -------------------------------------------- #
+# The adapter stores its wrapped model under ``self.wrapped``. The Llama3 HF
+# state_dict_adapter keys off raw names like ``tok_embeddings.weight``, so
+# we strip the prefix on save and re-prepend on load.
 
+_WRAPPED_PREFIX = "wrapped."
+
+
+def _strip_wrapped_prefix_hook(
+    module: nn.Module, state_dict: dict, prefix: str, local_metadata: dict
+) -> dict:
+    """Save hook: drop the adapter's ``wrapped.`` namespace."""
+    target = prefix + _WRAPPED_PREFIX
+    rewrites = [k for k in state_dict if k.startswith(target)]
+    for old_key in rewrites:
+        new_key = prefix + old_key[len(target) :]
+        state_dict[new_key] = state_dict.pop(old_key)
+    return state_dict
+
+
+def _prepend_wrapped_prefix_pre_hook(
+    state_dict: dict, prefix: str, local_metadata: dict, strict: bool,
+    missing_keys: list, unexpected_keys: list, error_msgs: list,
+) -> None:
+    """Load pre-hook: add the ``wrapped.`` namespace back."""
+    target = prefix + _WRAPPED_PREFIX
+    rewrites = [
+        k for k in state_dict if k.startswith(prefix) and not k.startswith(target)
+    ]
+    for old_key in rewrites:
+        inner = old_key[len(prefix) :]
+        state_dict[target + inner] = state_dict.pop(old_key)
+
+
+# ----- The adapter module -------------------------------------------------- #
 
 class CrossStageCacheAdapter(nn.Module):
-    """Wraps an ``AttnResLlama3Model`` stage; caches prior-stage blocks.
+    """Wraps an ``AttnResLlama3Model`` stage with cross-stage caching.
 
-    Args:
-        wrapped: the per-stage AttnRes decoder (already parallelized).
-        stage_id: global stage index (counts virtual stages for VP, not
-            just pp_rank).
-        num_stages: total number of stages across PP + VP.
-        group: pipeline process group (``stage.group``); used for P2P
-            grad send-back. ``None`` falls back to a degenerate local-only
-            mode (useful for CPU unit tests).
-        stage_to_rank: optional ``stage_id -> rank-in-group`` map. When
-            ``None`` we assume the trivial identity mapping (stage i
-            lives on rank i of ``group``), which is what torchtitan's
-            default PP layout produces. Interleaved VP schedules override
-            this; the adapter's wrapper in
-            :func:`pipeline_llm_with_cache_adapter` resolves it from the
-            schedule at setup time.
+    In delta mode (``layout_tables`` supplied) each forward pulls earlier
+    blocks from the shared :class:`RankLocalCache`, receives the incoming
+    delta, rebuilds the full block stack in block-index order, and routes
+    cached/committed blocks through :class:`_SendBlockGradsBack` /
+    :class:`_RecvBlockGradsFromConsumers` for the grad send-back path.
+    Without layout tables the adapter is a naive passthrough.
 
-    Note: ``wrapped.forward`` is expected to accept
-    ``_return_only_new_blocks`` behavior when this flag is set on the
-    adapter. This draft sets it by setting
-    ``wrapped._return_only_new_blocks = True``; the wrapped model honors
-    it; see ``model.py``.
+    Adapters sharing a ``pp_rank`` share ONE :class:`RankLocalCache`.
     """
 
     def __init__(
-        self,
-        wrapped: nn.Module,
-        *,
-        stage_id: int,
-        num_stages: int,
+        self, wrapped: nn.Module, *,
+        stage_id: int, num_stages: int,
         group: "dist.ProcessGroup | None" = None,
         stage_to_rank: dict[int, int] | None = None,
+        pp_rank: int | None = None,
+        layout_tables: BlockLayoutTables | None = None,
     ) -> None:
         super().__init__()
         self.wrapped = wrapped
@@ -369,30 +380,52 @@ class CrossStageCacheAdapter(nn.Module):
         self.num_stages = num_stages
         self._group = group
         self._stage_to_rank = stage_to_rank or {i: i for i in range(num_stages)}
-        self._cache = _PerMicrobatchCache()
-
-        # Flip the wrapped model into "return only new blocks" mode.
-        # See adapter_design.md "Required model change" for the exact
-        # contract this relies on.
-        if hasattr(wrapped, "_return_only_new_blocks"):
-            wrapped._return_only_new_blocks = True
-        else:
-            # Wrapped model is an older Phase-2-only model; we fall back
-            # to the naive full-stack path and log a warning.
-            import warnings
-
-            warnings.warn(
-                "Wrapped model does not expose _return_only_new_blocks; "
-                "adapter will run in naive (full-stack) mode with no "
-                "bandwidth saving."
-            )
-
-        # Count of blocks committed by each stage; we learn it lazily as
-        # forward runs and need it so the producer side of the
-        # grad-send-back autograd.Function knows how many irecvs to post.
+        if pp_rank is None:
+            pp_rank = self._stage_to_rank.get(stage_id, stage_id)
+        self.pp_rank = pp_rank
+        self._cache = _get_or_create_rank_cache(self.pp_rank)
+        self._layout = layout_tables
+        self._delta_mode = layout_tables is not None
+        # Diagnostic counter; Functions read shapes off ctx directly.
         self._committed_block_count: dict[int, int] = {}
 
-    # ----- microbatch keying helpers ---------------------------------- #
+        # Delta mode: wrapped returns only own commits. Naive mode: full stack.
+        if hasattr(wrapped, "_return_only_new_blocks"):
+            wrapped._return_only_new_blocks = bool(self._delta_mode)
+        else:
+            warnings.warn(
+                "Wrapped model does not expose _return_only_new_blocks; "
+                "adapter will run in naive (full-stack) mode.",
+                stacklevel=2,
+            )
+
+        # Hide ``wrapped.`` from state_dict consumers.
+        self._register_state_dict_hook(_strip_wrapped_prefix_hook)
+        self._register_load_state_dict_pre_hook(
+            _prepend_wrapped_prefix_pre_hook, with_module=False
+        )
+
+    # Torchtitan trainer iterates model_parts and calls init_weights /
+    # init_states; __getattr__ delegates the rest.
+    def init_weights(self, *args, **kwargs) -> None:
+        self.wrapped.init_weights(*args, **kwargs)
+
+    def init_states(self, *args, **kwargs) -> None:
+        self.wrapped.init_states(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        """Fall back to the wrapped model for unknown attributes."""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        wrapped = self.__dict__.get("_modules", {}).get("wrapped")
+        if wrapped is None:
+            raise AttributeError(
+                f"'CrossStageCacheAdapter' object has no attribute '{name}' "
+                "and wrapped model is not yet bound."
+            )
+        return getattr(wrapped, name)
 
     def _adapter_key(self) -> int:
         return id(self)
@@ -400,233 +433,274 @@ class CrossStageCacheAdapter(nn.Module):
     def _current_mb(self) -> int:
         mb = _current_mb_index(self._adapter_key())
         assert mb is not None, (
-            "CrossStageCacheAdapter.forward called without a microbatch "
-            "index in the thread-local. This happens when the adapter's "
-            "stage.forward_one_chunk monkey-patch was not installed; see "
-            "pipeline_llm_with_cache_adapter."
+            "CrossStageCacheAdapter.forward called without an mb index; "
+            "stage.forward_one_chunk monkey-patch missing."
         )
         return mb
 
-    # ----- forward ---------------------------------------------------- #
-
-    def _forward_first_stage(
-        self, tokens: torch.Tensor, *model_args, **model_kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        out = self.wrapped(tokens, *model_args, blocks=None, **model_kwargs)
-        assert (
-            isinstance(out, tuple) and len(out) == 2
-        ), f"First stage expected tuple from wrapped model, got {type(out)}"
-        partial, new_blocks_tensor = out
-
-        mb = self._current_mb()
-        # No cache entry for stage 0 -- it has no earlier blocks to cache.
-        self._cache.put_forward(mb, [], producer_meta=[])
-
-        # Wrap the emitted blocks so their local grad gets augmented by
-        # the sum of grads sent back from each consumer stage.
-        wrapped_blocks = self._wrap_producer_blocks(new_blocks_tensor)
-        return partial, wrapped_blocks
-
-    def _forward_middle_stage(
-        self,
-        partial: torch.Tensor,
-        new_blocks_tensor: torch.Tensor,
-        *model_args,
-        **model_kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
-        mb = self._current_mb()
-
-        # 1) Pull cached earlier-stage blocks (from this stage's cache,
-        #    keyed by the schedule-issued mb index). Metadata carries
-        #    per-block (producer_rank, producer_stage_id,
-        #    index_within_producer) so the grad-send-back can tag each
-        #    P2P op unambiguously.
-        earlier_blocks = self._cache.get_forward(mb)
-        earlier_meta = self._cache.get_producer_meta(mb)
-        assert len(earlier_blocks) == len(earlier_meta), (
-            "cache inconsistency: blocks and producer_meta length mismatch"
-        )
-
-        # 2) Parse the new blocks from the immediately previous stage.
-        #    new_blocks_tensor may have shape [0, B, T, D] when the prior
-        #    stage committed no blocks; unstack_blocks returns [] then.
-        new_blocks_list = unstack_blocks(new_blocks_tensor)
-        prev_stage_id = self.stage_id - 1
-        prev_rank = self._stage_to_rank.get(prev_stage_id, prev_stage_id)
-        new_meta = [
-            (prev_rank, prev_stage_id, idx) for idx in range(len(new_blocks_list))
-        ]
-
-        # 3) Route the earlier-cached blocks through _SendBlockGradsBack
-        #    so their backward accumulates into _grad_accum and, if a
-        #    real PG is wired, posts a dist.isend per block back to
-        #    the original producer.
-        wrapped_earlier = self._wrap_cached_prefix_for_send_back(
-            earlier_blocks, earlier_meta, mb
-        )
-
-        # 4) Concatenate wrapped cached + fresh-from-prev blocks and
-        #    hand them to the wrapped model.
-        full_blocks = list(wrapped_earlier) + new_blocks_list
-        full_blocks_tensor = (
-            stack_blocks(full_blocks) if full_blocks else None
-        )
-
-        out = self.wrapped(
-            partial,
-            blocks=full_blocks_tensor,
-            *model_args,
-            **model_kwargs,
-        )
-
-        # Last stage? then out is logits.
-        if not isinstance(out, tuple):
-            return out
-
-        partial_next, new_blocks_from_this_stage = out
-
-        # 5) Cache (cached prefix + newly-received prev blocks + this
-        #    stage's commits) under the SAME mb index, so the next stage
-        #    will see them.
-        new_list = unstack_blocks(new_blocks_from_this_stage)
-        my_rank = self._stage_to_rank.get(self.stage_id, self.stage_id)
-        own_meta = [(my_rank, self.stage_id, idx) for idx in range(len(new_list))]
-        self._cache.put_forward(
-            mb,
-            earlier_blocks + new_blocks_list + new_list,
-            producer_meta=earlier_meta + new_meta + own_meta,
-        )
-
-        # 6) Wrap this stage's commits on the way out so grad sent from
-        #    future consumers is added to the producer-side local grad.
-        wrapped_new = self._wrap_producer_blocks(new_blocks_from_this_stage)
-        return partial_next, wrapped_new
-
-    def forward(self, *args, **kwargs):
-        # Torch pipelining unpacks tuple returns; stage 0 gets just the
-        # tokens (and maybe attention_masks / positions in kwargs).
-        # Middle/last stages get (partial, blocks_tensor) as positional.
-        if (
+    @staticmethod
+    def _has_blocks_signature(args) -> bool:
+        """True if ``args[1]`` is a 4-D block tensor (middle/last stage)."""
+        return (
             len(args) >= 2
             and isinstance(args[1], torch.Tensor)
             and args[1].dim() == 4
-        ):
-            return self._forward_middle_stage(args[0], args[1], *args[2:], **kwargs)
-        return self._forward_first_stage(*args, **kwargs)
+        )
 
-    # ----- grad send-back wrapping ------------------------------------ #
+    def _call_wrapped_naive(self, args, kwargs):
+        """Dispatch to the wrapped model with the appropriate signature."""
+        if self._has_blocks_signature(args):
+            partial, new_blocks_tensor, *rest = args
+            return self.wrapped(
+                partial, *rest, blocks=new_blocks_tensor, **kwargs
+            )
+        return self.wrapped(*args, blocks=None, **kwargs)
+
+    def forward(self, *args, **kwargs):
+        """Dispatch to delta-P2P, shape inference, or naive passthrough."""
+        # ``PipelineStage._shape_inference`` invokes ``self.submod(...)``
+        # directly, bypassing the ``forward_one_chunk`` patch that stashes
+        # the mb index. Route to the shape-inference helper in that case.
+        if _current_mb_index(self._adapter_key()) is None:
+            return self._forward_shape_inference(*args, **kwargs)
+        if self._delta_mode:
+            return self._forward_delta(*args, **kwargs)
+        return self._call_wrapped_naive(args, kwargs)
+
+    def _forward_shape_inference(self, *args, **kwargs):
+        """Run wrapped model and reshape its blocks output to the delta
+        size the runtime will emit; pipelining uses this return shape to
+        size the next stage's recv buffer.
+        """
+        wrapped_out = self._call_wrapped_naive(args, kwargs)
+        if not isinstance(wrapped_out, tuple):  # last stage
+            return wrapped_out
+
+        partial_out, new_blocks_out = wrapped_out
+        if not self._delta_mode or self._layout is None:
+            return partial_out, new_blocks_out
+
+        expected_K = len(self._layout.delta_to_send(self.stage_id))
+        if expected_K == new_blocks_out.shape[0]:
+            return partial_out, new_blocks_out
+
+        per_block_shape = (
+            new_blocks_out.shape[1:]
+            if new_blocks_out.shape[0] > 0 else partial_out.shape
+        )
+        return partial_out, partial_out.new_zeros((expected_K, *per_block_shape))
+
+    def _forward_delta(self, *args, **kwargs):
+        """Interleaved1F1B delta-P2P forward (spec §4.1)."""
+        mb = self._current_mb()
+        layout = self._layout
+        assert layout is not None, "_forward_delta called without layout tables"
+
+        if self.stage_id == 0:
+            partial_out, new_blocks_tensor = self.wrapped(*args, blocks=None, **kwargs)
+            return self._finish_forward(
+                mb, partial_out, new_blocks_tensor,
+                prev_recv_tensor=None, incoming_block_indices=[],
+            )
+
+        if not self._has_blocks_signature(args):
+            return self.wrapped(*args, blocks=None, **kwargs)
+        partial, recv_delta_tensor, *rest = args
+
+        # Unstack incoming delta; wire order MUST match sender's layout.
+        incoming_block_indices = layout.delta_to_send(self.stage_id - 1)
+        recv_list = unstack_blocks(recv_delta_tensor)
+        assert len(recv_list) == len(incoming_block_indices), (
+            f"Incoming delta size mismatch at stage {self.stage_id} mb {mb}: "
+            f"expected {len(incoming_block_indices)}, got {len(recv_list)}."
+        )
+
+        # Pull earlier cached blocks, route through send-back Function.
+        earlier_blocks = list(self._cache.get_blocks(mb))
+        earlier_meta = list(self._cache.get_meta(mb))
+        wrapped_earlier = self._wrap_cached_prefix_for_send_back(
+            earlier_blocks, earlier_meta, mb
+        )
+        cached_indices = [
+            layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta
+        ]
+
+        # Rebuild the full blocks tensor in block-index order.
+        pairs = list(zip(cached_indices, wrapped_earlier)) + list(
+            zip(incoming_block_indices, recv_list)
+        )
+        pairs.sort(key=lambda p: p[0])
+        ordered_blocks = [p[1] for p in pairs]
+        blocks_tensor = (
+            torch.stack(ordered_blocks, dim=0)
+            if ordered_blocks else recv_delta_tensor
+        )
+
+        wrapped_ret = self.wrapped(partial, *rest, blocks=blocks_tensor, **kwargs)
+
+        if self.stage_id == self.num_stages - 1:
+            # Last stage: keepalive keeps recv tensor on the autograd graph.
+            return self._keepalive_touch(wrapped_ret, recv_delta_tensor)
+
+        partial_out, new_blocks_tensor = wrapped_ret
+        return self._finish_forward(
+            mb, partial_out, new_blocks_tensor,
+            prev_recv_tensor=recv_delta_tensor,
+            incoming_block_indices=incoming_block_indices,
+        )
+
+    def _finish_forward(
+        self, mb: int, partial_out: torch.Tensor,
+        new_blocks_tensor: torch.Tensor, *,
+        prev_recv_tensor: torch.Tensor | None,
+        incoming_block_indices: list[int],
+    ):
+        """Common tail for first + middle stages: append relayed and
+        committed blocks to the shared rank cache, wrap own commits
+        through :class:`_RecvBlockGradsFromConsumers`, and stack the
+        outgoing delta.
+        """
+        layout = self._layout
+        assert layout is not None
+        my_commits = layout.commits_at(self.stage_id)
+        assert new_blocks_tensor.shape[0] == len(my_commits), (
+            f"Wrapped model returned {new_blocks_tensor.shape[0]} new "
+            f"blocks at stage {self.stage_id}, expected {len(my_commits)}."
+        )
+
+        # Append relayed blocks so later virtual stages on this rank see
+        # them; producer metadata comes from the static layout.
+        if prev_recv_tensor is not None:
+            recv_list = unstack_blocks(prev_recv_tensor)
+            for bidx, blk in zip(incoming_block_indices, recv_list):
+                producer_stage = layout.producer_stage_of_block(bidx)
+                producer_rank = self._stage_to_rank.get(producer_stage, producer_stage)
+                block_idx_in_producer = layout.commits_at(producer_stage).index(bidx)
+                self._cache.append(
+                    mb, blk,
+                    (producer_rank, producer_stage, block_idx_in_producer),
+                )
+
+        # Append own commits; wrap through _RecvBlockGradsFromConsumers
+        # so local grads absorb every consumer's backward irecv.
+        new_blocks_list = unstack_blocks(new_blocks_tensor)
+        for local_idx, (bidx, blk) in enumerate(zip(my_commits, new_blocks_list)):
+            self._cache.append(mb, blk, (self.pp_rank, self.stage_id, local_idx))
+        wrapped_new_blocks_tensor = self._wrap_producer_blocks(new_blocks_tensor, mb=mb)
+
+        # Build outgoing delta: subset of (cache + new), by canonical bidx.
+        out_indices = layout.delta_to_send(self.stage_id)
+        cache_by_bidx = {
+            layout.commits_at(meta[1])[meta[2]]: blk
+            for meta, blk in zip(
+                self._cache.get_meta(mb), self._cache.get_blocks(mb)
+            )
+        }
+        wrapped_new_by_bidx = {
+            my_commits[i]: wrapped_new_blocks_tensor[i]
+            for i in range(wrapped_new_blocks_tensor.shape[0])
+        }
+        send_pieces: list[torch.Tensor] = []
+        for bidx in out_indices:
+            if bidx in wrapped_new_by_bidx:
+                send_pieces.append(wrapped_new_by_bidx[bidx])
+            elif bidx in cache_by_bidx:
+                send_pieces.append(cache_by_bidx[bidx])
+            else:
+                raise RuntimeError(
+                    f"Outgoing delta asks for block {bidx} at stage "
+                    f"{self.stage_id} but it's neither cached nor committed."
+                )
+
+        out_blocks_tensor = (
+            torch.stack(send_pieces, dim=0) if send_pieces
+            else partial_out.new_zeros((0, *partial_out.shape))
+        )
+        partial_out = self._keepalive_touch(partial_out, prev_recv_tensor)
+        return partial_out, out_blocks_tensor
+
+    @staticmethod
+    def _keepalive_touch(payload, prev_recv_tensor: torch.Tensor | None):
+        """Ensure ``prev_recv_tensor`` is on the autograd graph that
+        produces ``payload``. Preserves tuple returns.
+        """
+        if prev_recv_tensor is None:
+            return payload
+        touch = 0.0 * prev_recv_tensor.sum()
+        if isinstance(payload, tuple):
+            head, *tail = payload
+            return (head + touch, *tail)
+        return payload + touch
 
     def _wrap_cached_prefix_for_send_back(
-        self,
-        blocks: list[torch.Tensor],
-        meta: list[tuple[int, int, int]],
-        mb_index: int,
+        self, blocks: list[torch.Tensor],
+        meta: list[tuple[int, int, int]], mb_index: int,
     ) -> list[torch.Tensor]:
         """Route each cached block through :class:`_SendBlockGradsBack`.
 
-        The Function's backward records each block's grad into
-        ``_cache._grad_accum[mb_index]`` (payload for inspection /
-        tests) and then P2P-sends it back to the block's producer rank.
-
-        Tag scheme: each cached block has a producer stage ``p`` and an
-        index-within-producer ``b``. Its send-back tag is
-        ``_grad_tag_base(mb, p) + b``. The producer side of
-        :class:`_RecvBlockGradsFromConsumers` computes the SAME
-        ``_grad_tag_base(mb, p)`` locally (p is the producer's own
-        stage_id) and irecvs at ``+ b`` for each of its committed
-        blocks. Since one producer may be drained by many consumers,
-        the consumer's identity is implicit in the (src, dst) of the
-        underlying P2P op; we just need the tag unique per
-        ``(mb, producer, block)`` tuple which ``_grad_tag_base`` reserves.
+        Tag: ``_grad_tag_base(mb, producer_stage) + block_idx_in_producer``
+        so the producer's :class:`_RecvBlockGradsFromConsumers` irecvs
+        at the matching tag.
         """
         if not blocks:
             return []
-
         producer_ranks = [m[0] for m in meta]
         tags = [
             _grad_tag_base(mb_index, producer_stage) + idx_in_producer
             for (_, producer_stage, idx_in_producer) in meta
         ]
         wrapped = _SendBlockGradsBack.apply(
-            producer_ranks,
-            tags,
-            self._group,
-            self._cache,
-            mb_index,
-            *blocks,
+            producer_ranks, tags, self._group, self._cache, mb_index, *blocks,
         )
         return list(wrapped)
 
-    def _wrap_producer_blocks(self, blocks_tensor: torch.Tensor) -> torch.Tensor:
-        """Route blocks this stage commits through
-        :class:`_RecvBlockGradsFromConsumers` so every later stage's
-        send-back lands in the local grad.
+    def _wrap_producer_blocks(
+        self, blocks_tensor: torch.Tensor, *, mb: int | None = None
+    ) -> torch.Tensor:
+        """Route commits through :class:`_RecvBlockGradsFromConsumers`
+        so every downstream consumer's send-back lands in the local grad.
         """
         if blocks_tensor.shape[0] == 0:
             return blocks_tensor
-        # Bookkeeping: number of blocks this stage committed at the
-        # current microbatch. _RecvBlockGradsFromConsumers reads it off
-        # ctx.shape[0] directly; we stash it too for diagnostics.
         self._committed_block_count[self.stage_id] = blocks_tensor.shape[0]
 
-        # Consumer ranks = every stage with id > this one. Each of them
-        # caches our committed blocks and will isend back one grad per
-        # (consumer, block) pair.
-        consumer_ranks = [
-            self._stage_to_rank.get(s, s)
-            for s in range(self.stage_id + 1, self.num_stages)
-        ]
+        # Consumer ranks: delta mode -> static layout; else every later stage.
+        if self._layout is not None:
+            consumer_stages = self._layout.consumer_stages_of(self.stage_id)
+        else:
+            consumer_stages = list(range(self.stage_id + 1, self.num_stages))
+        consumer_ranks = [self._stage_to_rank.get(s, s) for s in consumer_stages]
         if not consumer_ranks:
-            return blocks_tensor  # last stage has no consumers below it
+            return blocks_tensor
 
-        # Tag base keyed on (mb, this producer stage); block index is
-        # added inside the Function. Must match the consumer-side
-        # send tag computed in ``_wrap_cached_prefix_for_send_back``.
-        mb = self._current_mb()
+        if mb is None:
+            mb = self._current_mb()
         tag_base = _grad_tag_base(mb, self.stage_id)
         return _RecvBlockGradsFromConsumers.apply(
             consumer_ranks, self._group, tag_base, blocks_tensor
         )
 
-    # ----- schedule hook points --------------------------------------- #
-
     def on_microbatch_end(self, mb_index: int) -> None:
-        """Called by the schedule wrapper when a microbatch's
-        forward+backward are complete, so the adapter can drop its
-        cache. Safe to call redundantly.
+        """Drop this mb's cache once forward+backward is done.
+
+        Under VP only the LAST virtual stage on a rank drops (the shared
+        cache is READ by later virtual stages); characterized by
+        ``stage_id + P >= num_stages``.
         """
+        if self._delta_mode:
+            pp_size = self._layout.P if self._layout is not None else self.num_stages
+            if self.stage_id + pp_size < self.num_stages:
+                return
         self._cache.drop(mb_index)
 
     def extra_repr(self) -> str:
         return f"stage_id={self.stage_id}, num_stages={self.num_stages}"
 
 
-def _grad_tag_base(mb_index: int, producer_stage_id: int) -> int:
-    """Pick a P2P tag base that's unique per (mb, producer_stage).
-
-    Block index within the producer is added on top. We reserve 1024
-    blocks of tag space per (mb, producer) pair; AttnRes' num_blocks
-    is tiny (order 8) so this is wildly conservative. Different mb /
-    producer combinations must not collide because backward sends can
-    be in flight concurrently when the schedule interleaves.
-    """
-    return (mb_index * 1024 * 64) + (producer_stage_id * 1024)
-
-
-# --------------------------------------------------------------------------- #
-# Stage iteration + monkey-patching
-# --------------------------------------------------------------------------- #
-
+# ----- Stage iteration + monkey-patching ----------------------------------- #
 
 def _iter_schedule_stages(schedule: _PipelineSchedule):
-    """Yield the ``PipelineStage`` objects held by a schedule.
-
-    ``PipelineScheduleSingle`` stores one stage on ``_stage``;
-    ``PipelineScheduleMulti`` holds a list on ``_stages``. Both
-    attributes are private in torch today; the fallback branch catches
-    future renames early with an explicit error instead of an opaque
-    AttributeError.
-    """
+    """Yield the ``PipelineStage`` objects a schedule holds."""
     if isinstance(schedule, PipelineScheduleSingle):
         yield schedule._stage
     elif isinstance(schedule, PipelineScheduleMulti):
@@ -634,117 +708,74 @@ def _iter_schedule_stages(schedule: _PipelineSchedule):
     else:
         raise RuntimeError(
             f"Unexpected pipeline schedule class {type(schedule).__name__}; "
-            "cross-stage cache adapter wiring does not know how to locate "
-            "its stages. Extend _iter_schedule_stages in "
-            "torchtitan.experiments.attn_res.pipeline_adapter."
+            "extend _iter_schedule_stages."
         )
 
 
 def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
-    """Monkey-patch ``stage.forward_one_chunk`` and
-    ``stage.backward_one_chunk`` so the adapter learns the mb index the
-    schedule hands it.
-
-    Both patches are per-stage (bound via closure to the specific stage
-    + adapter pair), so wrapping multiple stages in the same process
-    (virtual-pipelining case) correctly demuxes.
-
-    After each patched call returns, we drop the mb key from the
-    thread-local: not strictly necessary but keeps the state of the
-    cache observable in tests.
+    """Patch ``forward_one_chunk`` / ``backward_one_chunk`` to stash the
+    schedule-owned mb index for the adapter. Per-(stage, adapter) via
+    closure so multi-stage ranks (VP) demux correctly.
     """
     adapter_key = id(adapter)
-    orig_forward_one_chunk = stage.forward_one_chunk
-    orig_backward_one_chunk = stage.backward_one_chunk
+    orig_fwd = stage.forward_one_chunk
+    orig_bwd = stage.backward_one_chunk
 
-    def patched_forward_one_chunk(
-        fwd_chunk_id, args, kwargs=None, save_forward_output=True
-    ):
+    def patched_fwd(fwd_chunk_id, args, kwargs=None, save_forward_output=True):
         _set_mb_index(adapter_key, fwd_chunk_id)
         try:
-            return orig_forward_one_chunk(
-                fwd_chunk_id,
-                args,
-                kwargs,
+            return orig_fwd(
+                fwd_chunk_id, args, kwargs,
                 save_forward_output=save_forward_output,
             )
         finally:
             _set_mb_index(adapter_key, None)
 
-    def patched_backward_one_chunk(
-        bwd_chunk_id,
-        loss=None,
-        full_backward: bool = True,
+    def patched_bwd(
+        bwd_chunk_id, loss=None, full_backward: bool = True,
         last_backward: bool = False,
     ):
         _set_mb_index(adapter_key, bwd_chunk_id)
         try:
-            return orig_backward_one_chunk(
-                bwd_chunk_id,
-                loss=loss,
-                full_backward=full_backward,
+            return orig_bwd(
+                bwd_chunk_id, loss=loss, full_backward=full_backward,
                 last_backward=last_backward,
             )
         finally:
-            # Drop this microbatch's cache entry -- its forward+backward
-            # pair is complete.
             adapter.on_microbatch_end(bwd_chunk_id)
             _set_mb_index(adapter_key, None)
 
-    stage.forward_one_chunk = patched_forward_one_chunk
-    stage.backward_one_chunk = patched_backward_one_chunk
+    stage.forward_one_chunk = patched_fwd
+    stage.backward_one_chunk = patched_bwd
 
 
-# --------------------------------------------------------------------------- #
-# FQN-split injection
-# --------------------------------------------------------------------------- #
-
+# ----- FQN-split injection ------------------------------------------------- #
 
 _ATTN_RES_EXTRA_LAST_STAGE_FQNS = ("final_attn_res_proj", "final_attn_res_norm")
 
 
 def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
-    """Extend the PP module-FQN split so AttnRes-specific top-level
-    modules survive ``pipeline_module_split``.
-
-    Core ``generate_llm_fqn_per_model_part`` only names ``tok_embeddings``,
-    ``layers.*``, ``norm``, ``output``. Any other top-level child of the
-    model -- in AttnRes' case ``final_attn_res_proj`` and
-    ``final_attn_res_norm`` -- gets replaced with ``None`` on every
-    stage (see ``pipeline_module_split`` in
-    ``distributed/pipeline_parallel.py``), which blows up the last
-    stage's forward when it tries to call the final cross-block
-    aggregation's norm.
-
-    We therefore compute the same FQN layout core would have produced,
-    then append the AttnRes-specific modules to the LAST stage's list,
-    and inject into ``parallelism.module_fqns_per_model_part``. If the
-    user already supplied an explicit layout we respect theirs.
+    """Extend the PP module-FQN split so AttnRes top-level modules
+    (``final_attn_res_proj`` / ``final_attn_res_norm``) survive
+    ``pipeline_module_split`` on the last stage.
     """
     if not any(hasattr(model, n) for n in _ATTN_RES_EXTRA_LAST_STAGE_FQNS):
         return
-
     parallelism = kwargs.get("parallelism")
     if parallelism is None or parallelism.module_fqns_per_model_part is not None:
         return
+    model_config = kwargs.get("model_config")
+    pp = kwargs["parallel_dims"].pp
+    if pp <= 1 or model_config is None or not hasattr(model_config, "layers"):
+        return
 
     import math as _math
-
     from torch.distributed.pipelining.schedules import PipelineScheduleSingle
-
     from torchtitan.distributed.pipeline_parallel import (
         generate_llm_fqn_per_model_part,
         get_schedule_class,
     )
 
-    parallel_dims = kwargs["parallel_dims"]
-    pp = parallel_dims.pp
-    if pp <= 1:
-        return
-
-    model_config = kwargs.get("model_config")
-    if model_config is None or not hasattr(model_config, "layers"):
-        return
     num_layers = len(model_config.layers)
     input_weight = parallelism.pipeline_parallel_first_stage_less_layers
     output_weight = parallelism.pipeline_parallel_last_stage_less_layers
@@ -756,8 +787,7 @@ def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
         )
     else:
         schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
-        is_single = issubclass(schedule_class, PipelineScheduleSingle)
-        stages_per_rank = 1 if is_single else 2
+        stages_per_rank = 1 if issubclass(schedule_class, PipelineScheduleSingle) else 2
         num_virtual_stages = pp * stages_per_rank
 
     fqns = generate_llm_fqn_per_model_part(
@@ -768,20 +798,10 @@ def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
     parallelism.module_fqns_per_model_part = fqns
 
 
-# --------------------------------------------------------------------------- #
-# Custom pipelining_fn
-# --------------------------------------------------------------------------- #
-
+# ----- Custom pipelining_fn ------------------------------------------------ #
 
 def _build_stage_to_rank(stages) -> dict[int, int]:
-    """Map ``stage_id -> rank in pipeline process group``.
-
-    For the non-VP path (one stage per rank) it's identity. For looped
-    / interleaved VP the map is non-trivial: stage 0 and N are both on
-    rank 0, stage 1 and N+1 on rank 1, etc. We read it straight off each
-    stage's ``.group_rank`` which the PipelineStage base class populates
-    from ``dist.get_rank(self.group)`` at stage construction.
-    """
+    """Map ``stage_id -> rank`` from live ``PipelineStage`` objects."""
     mapping: dict[int, int] = {}
     for stage in stages:
         mapping[stage.stage_index] = stage.group_rank
@@ -791,39 +811,74 @@ def _build_stage_to_rank(stages) -> dict[int, int]:
 def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
     """Custom ``pipelining_fn`` for AttnRes.
 
-    Calls core :func:`torchtitan.distributed.pipeline_parallel.pipeline_llm`,
-    then (when ``TORCHTITAN_ATTNRES_CACHE=1``) wraps each stage's
-    submodule with :class:`CrossStageCacheAdapter` AND monkey-patches
-    ``forward_one_chunk`` / ``backward_one_chunk`` on the stage so the
-    adapter receives the schedule's microbatch index.
-
-    Before delegating to core, we extend the auto-generated FQN split
-    to include AttnRes-specific top-level modules on the last stage
-    (``final_attn_res_proj``, ``final_attn_res_norm``) -- otherwise
-    core's module-split step replaces them with ``None`` and the last
-    stage's final cross-block aggregation crashes.
-
-    All kwargs are forwarded unchanged to core; the signature must stay
-    in sync with ``ParallelizeFunction``/pipelining contract.
-
-    Returns the same 4-tuple as core ``pipeline_llm``.
+    Delegates to core ``pipeline_llm``; when
+    ``TORCHTITAN_ATTNRES_CACHE=1`` and the schedule is Interleaved1F1B,
+    wraps each stage's submod with :class:`CrossStageCacheAdapter`.
+    Returns the same 4-tuple as core.
     """
     # Deferred import so this module stays importable without torchtitan's
-    # distributed wiring (e.g. for CPU unit tests).
+    # distributed wiring (CPU unit tests).
     from torchtitan.distributed.pipeline_parallel import pipeline_llm
 
     _inject_attn_res_fqns(model, kwargs)
-
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
     )
+    passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
 
     if not adapter_enabled():
-        return pp_schedule, model_parts, has_first_stage, has_last_stage
+        return passthrough
+
+    # Schedule guard: Interleaved1F1B is the only delta protocol we
+    # characterize; anything else falls back with a warn.
+    if _INTERLEAVED_1F1B_CLASS is None or not isinstance(
+        pp_schedule, _INTERLEAVED_1F1B_CLASS
+    ):
+        warnings.warn(
+            "cross-stage caching currently supports only Interleaved1F1B; "
+            "running without optimization"
+        )
+        return passthrough
 
     stages = list(_iter_schedule_stages(pp_schedule))
-    num_stages = len(stages)
-    stage_to_rank = _build_stage_to_rank(stages)
+    # ``stages`` is this rank's LOCAL stages; ``stage.stage_index`` is
+    # GLOBAL. Total virtual stages = parallel_dims.pp * V.
+    parallel_dims = kwargs.get("parallel_dims")
+    pp_size = parallel_dims.pp if parallel_dims is not None else len(stages)
+    num_stages = pp_size * len(stages)
+    stage_to_rank = {s: s % pp_size for s in range(num_stages)}
+
+    # Find the AttnRes config on any stage's inner model.
+    inner0 = getattr(stages[0], "submod", None)
+    inner0_cfg = getattr(inner0, "config", None)
+    attn_res_config = getattr(inner0_cfg, "attn_res", None) if inner0_cfg else None
+    if attn_res_config is None or not getattr(attn_res_config, "enabled", False):
+        warnings.warn(
+            "Could not locate an enabled AttnRes config on stage 0; "
+            "cross-stage caching falls back to naive PP."
+        )
+        return passthrough
+
+    num_blocks = attn_res_config.num_blocks
+    # ``inner0_cfg.layers`` is this stage's slice; total layers live on
+    # the outer ``model_config``.
+    n_layers_total = len(inner0_cfg.layers) * num_stages
+    model_config = kwargs.get("model_config")
+    if model_config is not None and hasattr(model_config, "layers"):
+        n_layers_total = len(model_config.layers)
+    layers_per_block = n_layers_total // num_blocks
+
+    try:
+        layout_tables = _infer_block_layout_tables_from_stages(
+            stages, pp_size=pp_size, num_blocks=num_blocks,
+            n_layers=n_layers_total, layers_per_block=layers_per_block,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        warnings.warn(
+            f"Failed to build static block-layout tables ({e!r}); "
+            "cross-stage caching falls back to naive PP."
+        )
+        return passthrough
 
     for i, stage in enumerate(stages):
         adapter = CrossStageCacheAdapter(
@@ -832,12 +887,12 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
             num_stages=num_stages,
             group=getattr(stage, "group", None),
             stage_to_rank=stage_to_rank,
+            pp_rank=getattr(stage, "group_rank", None),
+            layout_tables=layout_tables,
         )
         stage.submod = adapter
         _install_mb_index_patch(stage, adapter)
-        # Also update model_parts so downstream (optimizer build,
-        # checkpoint state_dict) sees the wrapped module. torchtitan
-        # iterates model_parts to bind optimizers and compilers.
+        # Keep model_parts in sync for optimizer/compile paths.
         if i < len(model_parts):
             model_parts[i] = adapter
 
