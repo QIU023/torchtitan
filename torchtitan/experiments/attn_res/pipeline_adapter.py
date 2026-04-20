@@ -10,22 +10,25 @@
 delta mode (Interleaved1F1B with :class:`BlockLayoutTables` from
 :mod:`.layout`) each hop ships only the blocks the receiver's shared
 rank cache doesn't already have; the receiver rebuilds the full stack
-by concatenating its cached prefix with the incoming delta. Per-block
-backward grads P2P-travel to the original producer via
-:class:`_SendBlockGradsBack` (consumer) and
-:class:`_RecvBlockGradsFromConsumers` (producer). Without layout tables
-the adapter is a naive full-stack passthrough.
+by concatenating its cached prefix with the incoming delta.
 
-Grad send-back transport: :class:`_SendBlockGradsBack.backward` and
-:class:`_RecvBlockGradsFromConsumers.backward` ONLY compute local grad
-math; they do NOT issue any NCCL calls. The actual cross-rank P2P is
-deferred to :meth:`CrossStageCacheAdapter._flush_grad_sendback`, which
-runs OUTSIDE the autograd engine's backward thread, right after
-``stage.backward_one_chunk`` returns. This is required under
-Interleaved1F1B: calling NCCL inside ``autograd.Function.backward``
-deadlocks because the engine is single-threaded depth-first and the
-schedule's own SEND_B/RECV_B ops interleave unpredictably with custom
-P2P. Flushing after ``backward_one_chunk`` removes the interleaving.
+Per-block backward grads ride the normal autograd + PP SEND_B path: the
+adapter does NOT wrap cached blocks in any ``torch.autograd.Function``,
+so the autograd graph stays live on whatever tensor each cached block
+originally came from:
+
+* Blocks this rank committed in an earlier virtual stage chain back to
+  local wrapped params directly.
+* Blocks this rank received from an earlier PP hop are slices of a
+  ``recv_delta_tensor``; when backward through ``torch.cat`` reaches
+  them, the grad flows into that recv tensor and PP's built-in
+  ``SEND_B`` ships it to the previous rank, where the adapter on that
+  rank sees it land in its own recv_delta and autograd relays further
+  back along the chain.
+
+The grad thus walks backwards hop-by-hop along the same PP stage chain
+that forward uses. No custom P2P, no deadlock risk (PP owns all NCCL),
+single-microbatch memory footprint.
 
 :func:`pipeline_llm_with_cache_adapter` is a ``pipelining_fn`` plugged
 into the experiment's ``ModelSpec``; it delegates to core
@@ -49,7 +52,6 @@ from __future__ import annotations
 import os
 import threading
 import warnings
-from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -72,7 +74,6 @@ except Exception:  # pragma: no cover - fallback for older torch
 
 from torchtitan.experiments.attn_res.attn_res import unstack_blocks
 from torchtitan.experiments.attn_res.layout import (
-    _grad_tag_base,
     _infer_block_layout_tables_from_stages,
     BlockLayoutTables,
 )
@@ -83,102 +84,27 @@ def adapter_enabled() -> bool:
     return os.environ.get("TORCHTITAN_ATTNRES_CACHE") == "1"
 
 
-# ----- Per-microbatch cache ------------------------------------------------ #
-
-
-class _PerMicrobatchCache:
-    """Maps ``mb_index`` -> cached blocks + per-block grads.
-
-    Retained for back-compat with unit tests; :class:`RankLocalCache` is
-    a strict superset used for the shared-across-virtual-stages path.
-    Also tracks producer-side pending-recv markers stashed by
-    :class:`_RecvBlockGradsFromConsumers.backward` so the adapter's
-    deferred P2P flush knows which recvs to post.
-    """
-
-    def __init__(self) -> None:
-        self._forward: dict[int, list[torch.Tensor]] = {}
-        self._producer_meta: dict[int, list[tuple[int, int, int]]] = {}
-        self._grad_accum: dict[int, list[torch.Tensor | None]] = defaultdict(list)
-        # (mb_index, producer_stage_id) -> dict describing the recv.
-        self._pending_recv: dict[tuple[int, int], dict] = {}
-
-    def put_forward(
-        self, mb_index: int, blocks: list[torch.Tensor],
-        producer_meta: list[tuple[int, int, int]] | None = None,
-    ) -> None:
-        self._forward[mb_index] = blocks
-        if producer_meta is not None:
-            self._producer_meta[mb_index] = producer_meta
-
-    def get_forward(self, mb_index: int) -> list[torch.Tensor]:
-        return self._forward.get(mb_index, [])
-
-    def get_producer_meta(self, mb_index: int) -> list[tuple[int, int, int]]:
-        return self._producer_meta.get(mb_index, [])
-
-    def drop(self, mb_index: int) -> None:
-        self._forward.pop(mb_index, None)
-        self._producer_meta.pop(mb_index, None)
-        self._grad_accum.pop(mb_index, None)
-        keys = [k for k in self._pending_recv if k[0] == mb_index]
-        for k in keys:
-            self._pending_recv.pop(k, None)
-
-    def add_grad(self, mb_index: int, block_idx: int, grad: torch.Tensor) -> None:
-        slot = self._grad_accum[mb_index]
-        while len(slot) <= block_idx:
-            slot.append(None)
-        contrib = grad.detach()
-        slot[block_idx] = contrib.clone() if slot[block_idx] is None else slot[block_idx] + contrib
-
-    def pop_grads(self, mb_index: int) -> list[torch.Tensor | None]:
-        return self._grad_accum.pop(mb_index, [])
-
-    def mark_pending_recv(
-        self, mb_index: int, *, producer_stage_id: int, num_blocks: int,
-        per_block_shape: tuple, dtype, device,
-        consumer_ranks: tuple, tag_base: int,
-    ) -> None:
-        """Record that ``producer_stage_id`` expects ``num_blocks`` recvs
-        per consumer. Called from ``_RecvBlockGradsFromConsumers.backward``;
-        consumed by the adapter's :meth:`_flush_grad_sendback`.
-        """
-        self._pending_recv[(mb_index, producer_stage_id)] = {
-            "num_blocks": num_blocks,
-            "per_block_shape": tuple(per_block_shape),
-            "dtype": dtype,
-            "device": device,
-            "consumer_ranks": tuple(consumer_ranks),
-            "tag_base": tag_base,
-        }
-
-    def pop_pending_recv(self, mb_index: int, producer_stage_id: int):
-        return self._pending_recv.pop((mb_index, producer_stage_id), None)
-
-
 # ----- Rank-shared cache across virtual stages ----------------------------- #
 
 class RankLocalCache:
-    """Per-rank, per-microbatch accumulator shared across virtual stages.
+    """Per-rank, per-microbatch forward-block cache shared across VP stages.
 
     Every adapter on the same physical rank reads/writes the SAME cache
-    (Kimi §4.1 invariant). Canonical API: ``append`` / ``get_blocks`` /
-    ``get_meta``. ``put_forward`` / ``get_forward`` / ``get_producer_meta``
-    are back-compat shims.
+    (Kimi §4.1 invariant). Holds only forward-path state: the cached
+    block tensors (autograd-live against their original source) and
+    producer metadata for layout bookkeeping.
 
-    Also holds deferred-P2P state the adapter's grad-send-back flush
-    consumes: ``_grad_accum`` (consumer side, written by
-    :class:`_SendBlockGradsBack.backward`) and ``_pending_recv``
-    (producer side, written by
-    :class:`_RecvBlockGradsFromConsumers.backward`).
+    Grad-send-back has no state here: backward rides the autograd graph
+    via PP's built-in SEND_B, so there's nothing for this cache to
+    track on the backward path.
     """
 
     def __init__(self) -> None:
         self._blocks: dict[int, list[torch.Tensor]] = {}
         self._producer_meta: dict[int, list[tuple[int, int, int]]] = {}
-        self._grad_accum: dict[int, list[torch.Tensor | None]] = defaultdict(list)
-        self._pending_recv: dict[tuple[int, int], dict] = {}
+        # Every backward marks its mb here so the step-end drop sweep
+        # on the last virtual stage knows which mbs to evict.
+        self._seen_mbs: set[int] = set()
 
     def append(
         self, mb_index: int, block: torch.Tensor, meta: tuple[int, int, int],
@@ -192,56 +118,19 @@ class RankLocalCache:
     def get_meta(self, mb_index: int) -> list[tuple[int, int, int]]:
         return self._producer_meta.get(mb_index, [])
 
-    # Back-compat shims; ``put_forward`` overwrites any prior per-mb state.
     def put_forward(
         self, mb_index: int, blocks: list[torch.Tensor],
         producer_meta: list[tuple[int, int, int]] | None = None,
     ) -> None:
+        """Back-compat shim used by unit tests: overwrite the per-mb list."""
         self._blocks[mb_index] = list(blocks)
         if producer_meta is not None:
             self._producer_meta[mb_index] = list(producer_meta)
 
-    def get_forward(self, mb_index: int) -> list[torch.Tensor]:
-        return self.get_blocks(mb_index)
-
-    def get_producer_meta(self, mb_index: int) -> list[tuple[int, int, int]]:
-        return self.get_meta(mb_index)
-
     def drop(self, mb_index: int) -> None:
         self._blocks.pop(mb_index, None)
         self._producer_meta.pop(mb_index, None)
-        self._grad_accum.pop(mb_index, None)
-        keys = [k for k in self._pending_recv if k[0] == mb_index]
-        for k in keys:
-            self._pending_recv.pop(k, None)
-
-    def add_grad(self, mb_index: int, block_idx: int, grad: torch.Tensor) -> None:
-        slot = self._grad_accum[mb_index]
-        while len(slot) <= block_idx:
-            slot.append(None)
-        contrib = grad.detach()
-        slot[block_idx] = contrib.clone() if slot[block_idx] is None else slot[block_idx] + contrib
-
-    def pop_grads(self, mb_index: int) -> list[torch.Tensor | None]:
-        return self._grad_accum.pop(mb_index, [])
-
-    def mark_pending_recv(
-        self, mb_index: int, *, producer_stage_id: int, num_blocks: int,
-        per_block_shape: tuple, dtype, device,
-        consumer_ranks: tuple, tag_base: int,
-    ) -> None:
-        """Record a producer-side pending-recv descriptor for the flush."""
-        self._pending_recv[(mb_index, producer_stage_id)] = {
-            "num_blocks": num_blocks,
-            "per_block_shape": tuple(per_block_shape),
-            "dtype": dtype,
-            "device": device,
-            "consumer_ranks": tuple(consumer_ranks),
-            "tag_base": tag_base,
-        }
-
-    def pop_pending_recv(self, mb_index: int, producer_stage_id: int):
-        return self._pending_recv.pop((mb_index, producer_stage_id), None)
+        self._seen_mbs.discard(mb_index)
 
 
 # One RankLocalCache per pipeline-group rank, shared by every adapter
@@ -267,110 +156,6 @@ def _reset_rank_caches_for_testing() -> None:
     """Clear the module-level registry. Unit-test isolation only."""
     with _rank_caches_lock:
         _rank_caches.clear()
-
-
-# ----- Autograd plumbing for cross-stage grad send-back -------------------- #
-
-class _SendBlockGradsBack(torch.autograd.Function):
-    """Consumer-side identity forward; backward ONLY accumulates grads.
-
-    The Function exists so each cached-prefix block participates in the
-    consumer's local autograd graph (the clones give it a graph node we
-    own). Backward records ``grad_outputs[i]`` into
-    ``cache._grad_accum[mb_index]`` keyed by block-position; the actual
-    P2P send to the producer rank is deferred to
-    :meth:`CrossStageCacheAdapter._flush_grad_sendback`, which runs
-    OUTSIDE the autograd engine (right after ``backward_one_chunk``).
-    Returning ``None`` for each tensor input stops the local graph here:
-    the "real" grad for cached blocks leaves via the deferred isend.
-    """
-
-    @staticmethod
-    def forward(ctx, producer_ranks, tags, group, cache, mb_index, *blocks):
-        assert len(producer_ranks) == len(blocks) == len(tags), (
-            "producer_ranks / tags / blocks length mismatch"
-        )
-        ctx.producer_ranks = tuple(producer_ranks)
-        ctx.tags = tuple(tags)
-        ctx.group = group
-        ctx.cache = cache
-        ctx.mb_index = mb_index
-        ctx.num_blocks = len(blocks)
-        if blocks:
-            ctx.dtype = blocks[0].dtype
-            ctx.device = blocks[0].device
-            ctx.shape = blocks[0].shape
-        # Clone so the Function is the source of the blocks in the local
-        # autograd graph (otherwise backward would route past).
-        return tuple(b.clone() for b in blocks)
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        # Accumulate ONLY — no NCCL here. The flush helper picks these
-        # up after ``backward_one_chunk`` returns and posts the isends.
-        # During the flush's secondary backward (which walks from the
-        # producer's committed-block tensor back through the wrapped
-        # model, potentially crossing cached_prefix inputs that were
-        # routed through this Function), the cache's
-        # ``_in_secondary_backward`` flag is set — skip accumulation in
-        # that case to avoid double-counting.
-        if ctx.cache is not None and not getattr(
-            ctx.cache, "_in_secondary_backward", False
-        ):
-            for i, g in enumerate(grad_outputs):
-                if g is None:
-                    g = torch.zeros(ctx.shape, dtype=ctx.dtype, device=ctx.device)
-                ctx.cache.add_grad(ctx.mb_index, i, g)
-        return (None, None, None, None, None) + tuple(None for _ in grad_outputs)
-
-
-class _RecvBlockGradsFromConsumers(torch.autograd.Function):
-    """Producer-side identity forward; backward ONLY returns local grad.
-
-    The Function exists so committed blocks participate in the
-    producer's local autograd graph (the clone gives it a graph node we
-    own). Backward returns ``grad_output`` unchanged so the local
-    contribution flows into params normally. The cross-stage
-    contribution (a sum of per-consumer irecvs) is applied in a separate
-    tiny backward pass driven by
-    :meth:`CrossStageCacheAdapter._flush_grad_sendback`, which posts the
-    irecvs OUTSIDE the autograd engine (after ``backward_one_chunk``
-    returns). Marker recorded on the cache so the flush helper knows
-    which producer-stage block set to poll for.
-    """
-
-    @staticmethod
-    def forward(ctx, consumer_ranks, group, tag_base, cache, mb_index,
-                producer_stage_id, blocks_tensor):
-        ctx.consumer_ranks = tuple(consumer_ranks)
-        ctx.group = group
-        ctx.tag_base = tag_base
-        ctx.shape = blocks_tensor.shape
-        ctx.dtype = blocks_tensor.dtype
-        ctx.device = blocks_tensor.device
-        ctx.cache = cache
-        ctx.mb_index = mb_index
-        ctx.producer_stage_id = producer_stage_id
-        return blocks_tensor.clone()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # Record marker: flush helper reads this to know how many recvs
-        # to post per committed block for this (mb, producer_stage).
-        # No NCCL here; returning ``grad_output`` unchanged lets the
-        # local producer-side autograd propagate normally into params.
-        if ctx.cache is not None:
-            ctx.cache.mark_pending_recv(
-                ctx.mb_index,
-                producer_stage_id=ctx.producer_stage_id,
-                num_blocks=ctx.shape[0],
-                per_block_shape=tuple(ctx.shape[1:]),
-                dtype=ctx.dtype,
-                device=ctx.device,
-                consumer_ranks=ctx.consumer_ranks,
-                tag_base=ctx.tag_base,
-            )
-        return (None, None, None, None, None, None, grad_output)
 
 
 # ----- Microbatch-index threading ------------------------------------------ #
@@ -439,9 +224,14 @@ class CrossStageCacheAdapter(nn.Module):
 
     In delta mode (``layout_tables`` supplied) each forward pulls earlier
     blocks from the shared :class:`RankLocalCache`, receives the incoming
-    delta, rebuilds the full block stack in block-index order, and routes
-    cached/committed blocks through :class:`_SendBlockGradsBack` /
-    :class:`_RecvBlockGradsFromConsumers` for the grad send-back path.
+    delta, rebuilds the full block stack in block-index order, and lets
+    backward flow through the autograd graph naturally. Cached-prefix
+    blocks are passed through WITHOUT wrapping in any autograd.Function:
+    their grad lands either on local wrapped params (same-rank earlier
+    virtual stage) or on the recv_delta_tensor they were sliced from
+    (earlier PP hop), in which case PP's built-in ``SEND_B`` ships it
+    back to the previous rank.
+
     Without layout tables the adapter is a naive passthrough.
 
     Adapters sharing a ``pp_rank`` share ONE :class:`RankLocalCache`.
@@ -467,8 +257,6 @@ class CrossStageCacheAdapter(nn.Module):
         self._cache = _get_or_create_rank_cache(self.pp_rank)
         self._layout = layout_tables
         self._delta_mode = layout_tables is not None
-        # Diagnostic counter; Functions read shapes off ctx directly.
-        self._committed_block_count: dict[int, int] = {}
 
         # Delta mode: wrapped returns only own commits. Naive mode: full stack.
         if hasattr(wrapped, "_return_only_new_blocks"):
@@ -572,7 +360,14 @@ class CrossStageCacheAdapter(nn.Module):
         return partial_out, partial_out.new_zeros((expected_K, *per_block_shape))
 
     def _forward_delta(self, *args, **kwargs):
-        """Interleaved1F1B delta-P2P forward (spec §4.1)."""
+        """Interleaved1F1B delta forward (spec §4.1).
+
+        Cached-prefix blocks are passed through UNWRAPPED, so backward
+        through ``torch.cat`` routes grads along the original autograd
+        graph: local wrapped params for own earlier commits, or the
+        prior ``recv_delta_tensor`` for earlier PP hops (which PP's
+        built-in ``SEND_B`` then ships back to the producer rank).
+        """
         mb = self._current_mb()
         layout = self._layout
         assert layout is not None, "_forward_delta called without layout tables"
@@ -596,18 +391,19 @@ class CrossStageCacheAdapter(nn.Module):
             f"expected {len(incoming_block_indices)}, got {len(recv_list)}."
         )
 
-        # Pull earlier cached blocks, route through send-back Function.
+        # Pull earlier cached blocks straight out of the rank cache: no
+        # wrapping, so their autograd graph is the ORIGINAL source
+        # (either local params from a prior v on this rank, or slices of
+        # an older recv_delta_tensor that PP's SEND_B will drain on
+        # backward).
         earlier_blocks = list(self._cache.get_blocks(mb))
         earlier_meta = list(self._cache.get_meta(mb))
-        wrapped_earlier = self._wrap_cached_prefix_for_send_back(
-            earlier_blocks, earlier_meta, mb
-        )
         cached_indices = [
             layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta
         ]
 
         # Rebuild the full blocks tensor in block-index order.
-        pairs = list(zip(cached_indices, wrapped_earlier)) + list(
+        pairs = list(zip(cached_indices, earlier_blocks)) + list(
             zip(incoming_block_indices, recv_list)
         )
         pairs.sort(key=lambda p: p[0])
@@ -637,8 +433,7 @@ class CrossStageCacheAdapter(nn.Module):
         incoming_block_indices: list[int],
     ):
         """Common tail for first + middle stages: append relayed and
-        committed blocks to the shared rank cache, wrap own commits
-        through :class:`_RecvBlockGradsFromConsumers`, and stack the
+        committed blocks to the shared rank cache, then stack the
         outgoing delta.
         """
         layout = self._layout
@@ -650,7 +445,9 @@ class CrossStageCacheAdapter(nn.Module):
         )
 
         # Append relayed blocks so later virtual stages on this rank see
-        # them; producer metadata comes from the static layout.
+        # them; producer metadata comes from the static layout. Slices
+        # of ``prev_recv_tensor`` stay autograd-live against it, so
+        # PP's SEND_B on backward will drain their grads upstream.
         if prev_recv_tensor is not None:
             recv_list = unstack_blocks(prev_recv_tensor)
             for bidx, blk in zip(incoming_block_indices, recv_list):
@@ -662,12 +459,13 @@ class CrossStageCacheAdapter(nn.Module):
                     (producer_rank, producer_stage, block_idx_in_producer),
                 )
 
-        # Append own commits; wrap through _RecvBlockGradsFromConsumers
-        # so local grads absorb every consumer's backward irecv.
+        # Append own commits. No wrapping: they're autograd-live against
+        # this stage's wrapped params and any later virtual stage on
+        # this rank that reads them back from the cache gets their grad
+        # routed straight to those params via cat-backward.
         new_blocks_list = unstack_blocks(new_blocks_tensor)
         for local_idx, (bidx, blk) in enumerate(zip(my_commits, new_blocks_list)):
             self._cache.append(mb, blk, (self.pp_rank, self.stage_id, local_idx))
-        wrapped_new_blocks_tensor = self._wrap_producer_blocks(new_blocks_tensor, mb=mb)
 
         # Build outgoing delta: subset of (cache + new), by canonical bidx.
         out_indices = layout.delta_to_send(self.stage_id)
@@ -677,14 +475,14 @@ class CrossStageCacheAdapter(nn.Module):
                 self._cache.get_meta(mb), self._cache.get_blocks(mb)
             )
         }
-        wrapped_new_by_bidx = {
-            my_commits[i]: wrapped_new_blocks_tensor[i]
-            for i in range(wrapped_new_blocks_tensor.shape[0])
+        new_by_bidx = {
+            my_commits[i]: new_blocks_tensor[i]
+            for i in range(new_blocks_tensor.shape[0])
         }
         send_pieces: list[torch.Tensor] = []
         for bidx in out_indices:
-            if bidx in wrapped_new_by_bidx:
-                send_pieces.append(wrapped_new_by_bidx[bidx])
+            if bidx in new_by_bidx:
+                send_pieces.append(new_by_bidx[bidx])
             elif bidx in cache_by_bidx:
                 send_pieces.append(cache_by_bidx[bidx])
             else:
@@ -713,239 +511,31 @@ class CrossStageCacheAdapter(nn.Module):
             return (head + touch, *tail)
         return payload + touch
 
-    def _wrap_cached_prefix_for_send_back(
-        self, blocks: list[torch.Tensor],
-        meta: list[tuple[int, int, int]], mb_index: int,
-    ) -> list[torch.Tensor]:
-        """Route each cached block through :class:`_SendBlockGradsBack`.
-
-        Tag: ``_grad_tag_base(mb, producer_stage) + block_idx_in_producer``
-        so the producer's :class:`_RecvBlockGradsFromConsumers` irecvs
-        at the matching tag.
-        """
-        if not blocks:
-            return []
-        producer_ranks = [m[0] for m in meta]
-        tags = [
-            _grad_tag_base(mb_index, producer_stage) + idx_in_producer
-            for (_, producer_stage, idx_in_producer) in meta
-        ]
-        wrapped = _SendBlockGradsBack.apply(
-            producer_ranks, tags, self._group, self._cache, mb_index, *blocks,
-        )
-        return list(wrapped)
-
-    def _wrap_producer_blocks(
-        self, blocks_tensor: torch.Tensor, *, mb: int | None = None
-    ) -> torch.Tensor:
-        """Route commits through :class:`_RecvBlockGradsFromConsumers`
-        so every downstream consumer's send-back lands in the local grad.
-        """
-        if blocks_tensor.shape[0] == 0:
-            return blocks_tensor
-        self._committed_block_count[self.stage_id] = blocks_tensor.shape[0]
-
-        # Consumer ranks: delta mode -> static layout; else every later stage.
-        if self._layout is not None:
-            consumer_stages = self._layout.consumer_stages_of(self.stage_id)
-        else:
-            consumer_stages = list(range(self.stage_id + 1, self.num_stages))
-        consumer_ranks = [self._stage_to_rank.get(s, s) for s in consumer_stages]
-        if not consumer_ranks:
-            return blocks_tensor
-
-        if mb is None:
-            mb = self._current_mb()
-        tag_base = _grad_tag_base(mb, self.stage_id)
-        return _RecvBlockGradsFromConsumers.apply(
-            consumer_ranks, self._group, tag_base,
-            self._cache, mb, self.stage_id, blocks_tensor,
-        )
-
-    def _flush_grad_sendback(self, mb_index: int) -> None:
-        """Post the deferred grad send-back P2P for ``mb_index``.
-
-        Runs AFTER ``stage.backward_one_chunk`` returns (invoked from
-        the backward monkey-patch), so it's outside the autograd
-        engine's backward thread and can safely call NCCL.
-
-        Sequence:
-
-        1. Consumer side: iterate ``cache._grad_accum[mb]`` entries; for
-           each block whose producer rank is NOT this rank, build a
-           ``P2POp(isend, grad, producer_rank, group, tag)``.
-        2. Producer side: for each committed block at this stage, read
-           the pending-recv descriptor recorded by
-           :class:`_RecvBlockGradsFromConsumers.backward` and build a
-           ``P2POp(irecv, buf, consumer_rank, group, tag)`` per
-           (consumer_rank, block_idx). Track the buffers so we can
-           reduce them into a per-block sum after the wait completes.
-        3. ``batch_isend_irecv`` the ops (one NCCL group call) and
-           ``wait()`` on every returned handle. If ``batch_isend_irecv``
-           is unavailable we fall back to per-op ``isend/irecv`` + wait.
-        4. For each committed block with received contributions, run
-           ``torch.autograd.backward([cached_block], [recv_sum])`` so
-           the remote contribution flows into the producer's params.
-           The primary backward pass MUST have been run with
-           ``retain_graph=True`` so the producer's subgraph activations
-           are still alive; the backward monkey-patch forces this.
-        """
-        if not self._delta_mode or self._layout is None:
-            return
-        if self._group is None or not (dist.is_available() and dist.is_initialized()):
-            return
-
-        cache = self._cache
-        meta = list(cache.get_meta(mb_index))
-        blocks = list(cache.get_blocks(mb_index))
-        grads = cache.pop_grads(mb_index)
-
-        p2p_ops: list = []
-        # Keep handles for recv buffers so we can sum them after wait().
-        # Key: (producer_stage_id, block_local_idx) -> list[torch.Tensor]
-        recv_bufs: dict[tuple[int, int], list[torch.Tensor]] = {}
-
-        # --- 1) Consumer side: isend each accumulated grad to its producer ---
-        for i, grad in enumerate(grads):
-            if grad is None:
-                continue
-            if i >= len(meta):
-                continue
-            producer_rank, producer_stage_id, idx_in_producer = meta[i]
-            if producer_rank == self.pp_rank:
-                # Same physical rank — the producer's flush will
-                # pick up the grad from the shared cache directly, no
-                # P2P needed. Re-stash it so the producer can find it
-                # under the (stage, block_idx) key.
-                cache.mark_pending_recv  # reference kept; flow uses _grad_accum readback
-                # Write the grad under a (mb, producer_stage, idx) slot
-                # the producer flush can poll. We use a dedicated local
-                # dict on the cache for clarity.
-                key = (mb_index, producer_stage_id, idx_in_producer)
-                if not hasattr(cache, "_intra_rank_grads"):
-                    cache._intra_rank_grads = {}  # type: ignore[attr-defined]
-                cache._intra_rank_grads[key] = grad.detach()  # type: ignore[attr-defined]
-                continue
-            tag = _grad_tag_base(mb_index, producer_stage_id) + idx_in_producer
-            p2p_ops.append(
-                dist.P2POp(
-                    dist.isend, grad.contiguous().detach(),
-                    peer=producer_rank, group=self._group, tag=tag,
-                )
-            )
-
-        # --- 2) Producer side: irecv each consumer contribution ---
-        pending = cache.pop_pending_recv(mb_index, self.stage_id)
-        my_commits = self._layout.commits_at(self.stage_id)
-        if pending is not None and my_commits:
-            num_blocks = pending["num_blocks"]
-            per_block_shape = pending["per_block_shape"]
-            dtype = pending["dtype"]
-            device = pending["device"]
-            tag_base = pending["tag_base"]
-            for src_rank in pending["consumer_ranks"]:
-                for b in range(num_blocks):
-                    if src_rank == self.pp_rank:
-                        # Same-rank consumer: grad lives in shared cache
-                        # under the intra_rank_grads slot.
-                        continue
-                    buf = torch.zeros(per_block_shape, dtype=dtype, device=device)
-                    p2p_ops.append(
-                        dist.P2POp(
-                            dist.irecv, buf,
-                            peer=src_rank, group=self._group, tag=tag_base + b,
-                        )
-                    )
-                    recv_bufs.setdefault((self.stage_id, b), []).append(buf)
-
-        # --- 3) Drive the P2P and wait ---
-        if p2p_ops:
-            reqs = dist.batch_isend_irecv(p2p_ops)
-            for r in reqs:
-                r.wait()
-
-        # --- 4) Apply the received sums via a tiny secondary backward ---
-        # Also fold in any same-rank grads the consumer left in the
-        # shared cache (intra_rank_grads).
-        intra = getattr(cache, "_intra_rank_grads", None) if pending is not None else None
-
-        if pending is not None and my_commits:
-            summed: dict[int, torch.Tensor] = {}
-            for b in range(pending["num_blocks"]):
-                bufs = recv_bufs.get((self.stage_id, b), [])
-                running: torch.Tensor | None = None
-                for buf in bufs:
-                    running = buf if running is None else running + buf
-                if intra is not None:
-                    intra_key = (mb_index, self.stage_id, b)
-                    extra = intra.pop(intra_key, None)
-                    if extra is not None:
-                        running = extra.clone() if running is None else running + extra
-                if running is not None:
-                    summed[b] = running
-
-            if summed:
-                # Locate each committed-block tensor in the shared cache
-                # by its (producer_stage=self.stage_id, block_local_idx)
-                # meta. The producer append order matches local_idx.
-                per_block_tensor: dict[int, torch.Tensor] = {}
-                for pos, m in enumerate(meta):
-                    if m[1] == self.stage_id:
-                        per_block_tensor[m[2]] = blocks[pos]
-                targets: list[torch.Tensor] = []
-                target_grads: list[torch.Tensor] = []
-                for b, g in summed.items():
-                    tensor = per_block_tensor.get(b)
-                    if tensor is None or not tensor.requires_grad:
-                        continue
-                    targets.append(tensor)
-                    target_grads.append(g)
-                if targets:
-                    # Secondary backward pass for the cross-rank grad
-                    # contribution. Restrict propagation to THIS stage's
-                    # parameters via ``inputs=`` so we don't double-
-                    # count grads that the primary backward has already
-                    # routed through cached-prefix tensors (those are
-                    # wrapped by _SendBlockGradsBack, whose backward
-                    # also silently skips during the secondary pass
-                    # via the cache's ``_in_secondary_backward`` flag).
-                    # The primary backward kept the graph alive via
-                    # ``retain_graph=True`` in the monkey-patch.
-                    params = [
-                        p for p in self.wrapped.parameters() if p.requires_grad
-                    ]
-                    cache._in_secondary_backward = True  # type: ignore[attr-defined]
-                    try:
-                        if params:
-                            torch.autograd.backward(
-                                targets,
-                                grad_tensors=target_grads,
-                                retain_graph=False,
-                                inputs=params,
-                            )
-                        else:
-                            # No local params; fall back to a plain backward
-                            # (the graph will still free correctly).
-                            torch.autograd.backward(
-                                targets,
-                                grad_tensors=target_grads,
-                                retain_graph=False,
-                            )
-                    finally:
-                        cache._in_secondary_backward = False  # type: ignore[attr-defined]
-
-    def on_microbatch_end(self, mb_index: int) -> None:
-        """Drop this mb's cache once forward+backward is done.
-
-        Under VP only the LAST virtual stage on a rank drops (the shared
-        cache is READ by later virtual stages); characterized by
-        ``stage_id + P >= num_stages``.
+    def _drop_all_seen_and_clear(self) -> None:
+        """Drop every mb the cache saw during the step and clear the
+        seen-set. Called by the step-end monkey-patch after every
+        adapter on this rank has finished backward. Honors the VP
+        drop-guard: only the LAST virtual stage on the rank evicts;
+        earlier virtual stages no-op so the shared cache survives for
+        them.
         """
         if self._delta_mode:
             pp_size = self._layout.P if self._layout is not None else self.num_stages
             if self.stage_id + pp_size < self.num_stages:
                 return
-        self._cache.drop(mb_index)
+        seen = list(self._cache._seen_mbs)
+        for mb_index in seen:
+            self._cache.drop(mb_index)
+        # Defensive: ensure the seen-set is clear even if drop() didn't
+        # remove every entry.
+        self._cache._seen_mbs.clear()
+
+    def on_microbatch_end(self, mb_index: int) -> None:
+        """Mark ``mb_index`` as seen on this rank so the step-end sweep
+        drops it. Actual eviction is deferred to ``pp_schedule.step``
+        return; see :func:`_install_step_drop_patch`.
+        """
+        self._cache._seen_mbs.add(mb_index)
 
     def extra_repr(self) -> str:
         return f"stage_id={self.stage_id}, num_stages={self.num_stages}"
@@ -971,12 +561,10 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
     schedule-owned mb index for the adapter. Per-(stage, adapter) via
     closure so multi-stage ranks (VP) demux correctly.
 
-    The backward patch additionally (i) forces ``retain_graph=True`` on
-    the primary ``torch.autograd.backward`` call so the secondary
-    flush backward can re-enter the producer's subgraph, and (ii) fires
-    :meth:`CrossStageCacheAdapter._flush_grad_sendback` right after the
-    schedule's own backward returns, so all cross-rank grad P2P lives
-    OUTSIDE the autograd engine's backward thread.
+    Backward is a plain call: no retain_graph override, no custom
+    transport. The cached-prefix autograd graph + PP's built-in SEND_B
+    route all cross-rank grads; the adapter only needs the mb index
+    threaded through forward + on_microbatch_end.
     """
     adapter_key = id(adapter)
     orig_fwd = stage.forward_one_chunk
@@ -997,48 +585,46 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         last_backward: bool = False,
     ):
         _set_mb_index(adapter_key, bwd_chunk_id)
-        # Only install the retain-graph override when delta mode is
-        # active AND a real process group is wired; naive mode and the
-        # no-pg CPU test path don't need a secondary backward and
-        # shouldn't pay the retain-graph memory cost.
-        override_installed = False
-        orig_autograd_backward = torch.autograd.backward
-        if adapter._delta_mode and adapter._group is not None:
-            def _retain_graph_backward(*a, **kw):
-                # Force retain_graph=True for the PRIMARY backward so
-                # the flush's secondary backward can re-enter the
-                # producer's subgraph. The flush explicitly passes
-                # retain_graph=False itself, which wins here since
-                # kw["retain_graph"] will already be set.
-                kw.setdefault("retain_graph", True)
-                return orig_autograd_backward(*a, **kw)
-            torch.autograd.backward = _retain_graph_backward  # type: ignore[assignment]
-            override_installed = True
         try:
-            result = orig_bwd(
+            return orig_bwd(
                 bwd_chunk_id, loss=loss, full_backward=full_backward,
                 last_backward=last_backward,
             )
-            # Drop the retain-graph override BEFORE the flush so the
-            # flush's secondary backward actually frees intermediate
-            # activations (retain_graph=False path).
-            if override_installed:
-                torch.autograd.backward = orig_autograd_backward  # type: ignore[assignment]
-                override_installed = False
-            # Flush the deferred grad P2P. Must happen after
-            # ``orig_bwd`` has accumulated the local grads and the
-            # Function backwards have populated _grad_accum /
-            # _pending_recv on the cache.
-            adapter._flush_grad_sendback(bwd_chunk_id)
-            return result
         finally:
-            if override_installed:
-                torch.autograd.backward = orig_autograd_backward  # type: ignore[assignment]
+            # Mark the mb as seen so the step-end drop sweep evicts it.
+            # We don't drop here: the shared rank cache is still live
+            # for peers / later virtual stages.
             adapter.on_microbatch_end(bwd_chunk_id)
             _set_mb_index(adapter_key, None)
 
     stage.forward_one_chunk = patched_fwd
     stage.backward_one_chunk = patched_bwd
+
+
+def _install_step_drop_patch(
+    pp_schedule: _PipelineSchedule, adapters: list[CrossStageCacheAdapter]
+) -> None:
+    """Wrap ``pp_schedule.step`` so every registered adapter on this
+    rank evicts its seen mbs from the shared cache EXACTLY ONCE after
+    ``orig_step`` returns. The VP drop-guard inside
+    :meth:`_drop_all_seen_and_clear` ensures only the last virtual
+    stage on the rank actually frees memory.
+    """
+    orig_step = pp_schedule.step
+
+    def patched_step(*args, **kwargs):
+        try:
+            return orig_step(*args, **kwargs)
+        finally:
+            for adapter in adapters:
+                try:
+                    adapter._drop_all_seen_and_clear()
+                except Exception:
+                    # Swallow per-adapter drop failures so one poisoned
+                    # adapter doesn't prevent the others from clearing.
+                    pass
+
+    pp_schedule.step = patched_step  # type: ignore[method-assign]
 
 
 # ----- FQN-split injection ------------------------------------------------- #
@@ -1172,6 +758,7 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
         )
         return passthrough
 
+    installed_adapters: list[CrossStageCacheAdapter] = []
     for i, stage in enumerate(stages):
         adapter = CrossStageCacheAdapter(
             stage.submod,
@@ -1184,8 +771,14 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
         )
         stage.submod = adapter
         _install_mb_index_patch(stage, adapter)
+        installed_adapters.append(adapter)
         # Keep model_parts in sync for optimizer/compile paths.
         if i < len(model_parts):
             model_parts[i] = adapter
+
+    # Install step-end drop sweep AFTER every per-mb patch. The VP
+    # drop-guard in _drop_all_seen_and_clear ensures only the last
+    # virtual stage on the rank frees memory.
+    _install_step_drop_patch(pp_schedule, installed_adapters)
 
     return pp_schedule, model_parts, has_first_stage, has_last_stage
