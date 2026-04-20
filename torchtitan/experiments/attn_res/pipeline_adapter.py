@@ -584,13 +584,67 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         bwd_chunk_id, loss=None, full_backward: bool = True,
         last_backward: bool = False,
     ):
+        # ------------------------------------------------------------------
+        # TEMPORARY FIX — scale-limited to smoke configs only.
+        # ------------------------------------------------------------------
+        # Under delta mode, rank R caches its OWN v<current commits and
+        # re-reads them from later virtual stages on the same rank. When
+        # stage R+P's backward fires first (reverse schedule order),
+        # autograd traverses cat(cache) -> b0 -> stage R's v=0 forward
+        # graph and, without retain_graph, frees it. Then stage R's own
+        # backward (initiated later by PP SEND_B from stage R+1) tries to
+        # traverse the same graph and dies with "backward through the
+        # graph a second time".
+        #
+        # This hack forces retain_graph=True on every stage's primary
+        # backward so the graph survives the second traversal.
+        #
+        # Cost: each in-flight mb retains its stage graph until the rank
+        # cache evicts at step end. For our 150M smoke on 8x RTX 5090
+        # (1 layer / virtual stage, M=4 mbs in flight) that shows up as
+        # +5 GiB on rank 7 (11.9 GiB vs 6.9 GiB for naive PP). Still
+        # under 32 GiB so training completes, and 1000-step loss curves
+        # align with naive within bf16 tolerance (verified).
+        #
+        # Why it DOES NOT scale:
+        #   peak_extra_mem ~= M * per_stage_activation_footprint
+        # - 1.5B at M=8: tens of GiB per rank.
+        # - 48B at M>=32: TB-scale. Catastrophic.
+        #
+        # Proper fix (follow-up): replace this override with a pair of
+        # thin, local-only autograd.Functions:
+        #   - _LocalCacheAugment wraps own commits at producer emission.
+        #     Its backward adds any captured grad to the incoming grad
+        #     before propagating to wrapped params.
+        #   - _LocalCacheCapture wraps cached own-commits at consumer
+        #     read time. Its backward writes grad into a per-(mb,
+        #     producer, idx) slot and returns None, stopping autograd
+        #     from traversing the producer stage's graph.
+        # Both are pure Python + a dict; zero NCCL; graph lives the
+        # normal single-backward window so peak memory is naive-PP
+        # baseline again. This is the scale-up path.
+        # ------------------------------------------------------------------
         _set_mb_index(adapter_key, bwd_chunk_id)
+        orig_autograd_backward = torch.autograd.backward
+
+        def retain_graph_backward(
+            tensors, grad_tensors=None, retain_graph=None, create_graph=False,
+            grad_variables=None, inputs=None,
+        ):
+            return orig_autograd_backward(
+                tensors, grad_tensors=grad_tensors,
+                retain_graph=True, create_graph=create_graph,
+                grad_variables=grad_variables, inputs=inputs,
+            )
+
+        torch.autograd.backward = retain_graph_backward
         try:
             return orig_bwd(
                 bwd_chunk_id, loss=loss, full_backward=full_backward,
                 last_backward=last_backward,
             )
         finally:
+            torch.autograd.backward = orig_autograd_backward
             # Mark the mb as seen so the step-end drop sweep evicts it.
             # We don't drop here: the shared rank cache is still live
             # for peers / later virtual stages.
