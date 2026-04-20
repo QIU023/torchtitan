@@ -256,7 +256,11 @@ class _LocalCacheAugment(torch.autograd.Function):
     def forward(ctx, block_tensor, slot_key, rank_cache):  # type: ignore[override]
         ctx.slot_key = slot_key
         ctx.rank_cache = rank_cache
-        return block_tensor
+        # MUST return a distinct Python object from the input so autograd
+        # builds a fresh node here instead of reusing the input's existing
+        # grad_fn. ``view(shape)`` is a zero-copy shape-preserving view
+        # that creates a new Tensor wrapper.
+        return block_tensor.view(block_tensor.shape)
 
     @staticmethod
     def backward(ctx, grad_out):  # type: ignore[override]
@@ -282,7 +286,8 @@ class _LocalCacheCapture(torch.autograd.Function):
     def forward(ctx, block_tensor, slot_key, rank_cache):  # type: ignore[override]
         ctx.slot_key = slot_key
         ctx.rank_cache = rank_cache
-        return block_tensor
+        # See _LocalCacheAugment.forward — return a distinct view.
+        return block_tensor.view(block_tensor.shape)
 
     @staticmethod
     def backward(ctx, grad_out):  # type: ignore[override]
