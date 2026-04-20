@@ -177,21 +177,29 @@ def _debugmodel_attn_res() -> AttnResLlama3Model.Config:
     )
 
 
-def _150m_attn_res(num_blocks: int = 6) -> AttnResLlama3Model.Config:
+def _150m_attn_res(
+    num_blocks: int = 6,
+    n_layers: int = _150M_N_LAYERS,
+    enable_weight_tying: bool = True,
+) -> AttnResLlama3Model.Config:
     """~150M dense Llama3 with Block AttnRes enabled.
 
     Args:
         num_blocks: Number of attention-residual blocks. Must divide
-            ``n_layers=12``. Paper sweet spot is ``N=8``; default is 6
-            (closest divisor below 8). Valid values: {2, 3, 4, 6, 12}.
-            N=1 is equivalent to standard residuals and is disallowed.
+            ``n_layers``. Paper sweet spot is ``N=8``; default is 6
+            (closest divisor below 8 for n_layers=12). N=1 is equivalent
+            to standard residuals and is disallowed.
+        n_layers: Total transformer layers. Default 12 (original 150M
+            shape). Pass 16 to align with PP=8 × layers_per_stage=2.
+        enable_weight_tying: Tie input embedding with output projection.
+            Must be False under Pipeline Parallel — torchtitan's
+            parallelize_llama explicitly raises on tying + PP.
 
     All per-layer and final pseudo-queries are zero-initialized so
     training begins numerically equivalent to standard residuals (uniform
     softmax over sources). Uses GQA (n_kv_heads=4) and tied embeddings to
     keep parameter count mostly in the transformer stack.
     """
-    n_layers = _150M_N_LAYERS
     if num_blocks < 2 or n_layers % num_blocks != 0:
         raise ValueError(
             f"num_blocks={num_blocks} must be >=2 and divide "
@@ -205,7 +213,7 @@ def _150m_attn_res(num_blocks: int = 6) -> AttnResLlama3Model.Config:
     return AttnResLlama3Model.Config(
         dim=dim,
         vocab_size=vocab_size,
-        enable_weight_tying=True,
+        enable_weight_tying=enable_weight_tying,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
@@ -252,6 +260,13 @@ attn_res_configs = {
     "150M_attn_res_n3": partial(_150m_attn_res, num_blocks=3),
     "150M_attn_res_n4": partial(_150m_attn_res, num_blocks=4),
     "150M_attn_res_n12": partial(_150m_attn_res, num_blocks=12),
+    # 16-layer variant sized to align with 8-GPU PP: n_layers=16,
+    # num_blocks=8 gives 2 layers per block, which matches PP=8 with
+    # layers_per_stage=2 and (with VP=2) one block-boundary per virtual
+    # stage. Paper sweet spot N=8.
+    "150M_attn_res_L16_n8": partial(
+        _150m_attn_res, num_blocks=8, n_layers=16, enable_weight_tying=False
+    ),
 }
 
 

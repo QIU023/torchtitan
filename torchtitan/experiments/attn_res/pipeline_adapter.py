@@ -261,6 +261,74 @@ def _iter_schedule_stages(schedule: _PipelineSchedule):
         )
 
 
+_ATTN_RES_EXTRA_LAST_STAGE_FQNS = ("final_attn_res_proj", "final_attn_res_norm")
+
+
+def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
+    """Extend the PP module-FQN split so AttnRes-specific top-level modules
+    survive ``pipeline_module_split``.
+
+    Core ``generate_llm_fqn_per_model_part`` only names ``tok_embeddings``,
+    ``layers.*``, ``norm``, ``output``. Any other top-level child of the
+    model — in AttnRes' case ``final_attn_res_proj`` and
+    ``final_attn_res_norm`` — gets replaced with ``None`` on every stage
+    (see ``pipeline_module_split`` in ``distributed/pipeline_parallel.py``),
+    which blows up the last stage's forward when it tries to call the
+    final cross-block aggregation's norm.
+
+    We therefore compute the same FQN layout core would have produced,
+    then append the AttnRes-specific modules to the LAST stage's list,
+    and inject into ``parallelism.module_fqns_per_model_part``. If the
+    user already supplied an explicit layout we respect theirs.
+    """
+    # Only intervene when the model actually has these modules (e.g. the
+    # AttnRes experiment); otherwise we'd silently change non-AttnRes
+    # behavior.
+    if not any(hasattr(model, n) for n in _ATTN_RES_EXTRA_LAST_STAGE_FQNS):
+        return
+
+    parallelism = kwargs.get("parallelism")
+    if parallelism is None or parallelism.module_fqns_per_model_part is not None:
+        return
+
+    from torchtitan.distributed.pipeline_parallel import (
+        generate_llm_fqn_per_model_part,
+        get_schedule_class,
+    )
+    from torch.distributed.pipelining.schedules import PipelineScheduleSingle
+    import math as _math
+
+    parallel_dims = kwargs["parallel_dims"]
+    pp = parallel_dims.pp
+    if pp <= 1:
+        return
+
+    model_config = kwargs.get("model_config")
+    if model_config is None or not hasattr(model_config, "layers"):
+        return
+    num_layers = len(model_config.layers)
+    input_weight = parallelism.pipeline_parallel_first_stage_less_layers
+    output_weight = parallelism.pipeline_parallel_last_stage_less_layers
+    layers_per_stage = parallelism.pipeline_parallel_layers_per_stage
+
+    if layers_per_stage is not None:
+        num_virtual_stages = _math.ceil(
+            (num_layers + input_weight + output_weight) / layers_per_stage
+        )
+    else:
+        schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
+        is_single = issubclass(schedule_class, PipelineScheduleSingle)
+        stages_per_rank = 1 if is_single else 2
+        num_virtual_stages = pp * stages_per_rank
+
+    fqns = generate_llm_fqn_per_model_part(
+        num_virtual_stages, num_layers, input_weight, output_weight
+    )
+    extras = [n for n in _ATTN_RES_EXTRA_LAST_STAGE_FQNS if hasattr(model, n)]
+    fqns[-1].extend(extras)
+    parallelism.module_fqns_per_model_part = fqns
+
+
 def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
     """Custom ``pipelining_fn`` for AttnRes.
 
@@ -270,6 +338,12 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
     ``submod._return_only_new_blocks = True`` on the wrapped model so it
     returns only this stage's committed blocks at intermediate stages.
 
+    Before delegating to core, we extend the auto-generated FQN split to
+    include AttnRes-specific top-level modules on the last stage
+    (``final_attn_res_proj``, ``final_attn_res_norm``) — otherwise core's
+    module-split step replaces them with ``None`` and the last stage's
+    final cross-block aggregation crashes.
+
     All kwargs are forwarded unchanged to core; the signature must stay in
     sync with ``ParallelizeFunction``/pipelining contract.
 
@@ -278,6 +352,8 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
     # Deferred import so this module stays importable without torchtitan's
     # distributed wiring (e.g. for CPU unit tests).
     from torchtitan.distributed.pipeline_parallel import pipeline_llm
+
+    _inject_attn_res_fqns(model, kwargs)
 
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs

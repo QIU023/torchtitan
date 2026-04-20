@@ -251,3 +251,16 @@ def llama3_150m_attn_res_n12() -> Trainer.Config:
     N=12 is the largest divisor of n_layers=12 available here).
     """
     return _llama3_150m_attn_res_variant("150M_attn_res_n12")
+
+
+def llama3_150m_attn_res_L16_n8() -> Trainer.Config:
+    """16-layer / N=8 variant sized for PP=8 × layers_per_stage=2.
+
+    Used for the Phase 3 naive-vs-adapter PP smoke on 8 GPUs: n_layers=16
+    divides evenly into 8 stages of 2 layers, and num_blocks=8 places a
+    block boundary at every stage boundary (so the cross-stage caching
+    adapter's "send only new blocks" invariant is exercised once per
+    stage). Shares every other hyperparameter with the 12-layer configs
+    so the sweep stays apples-to-apples when compared to Phase 2.
+    """
+    return _llama3_150m_attn_res_variant("150M_attn_res_L16_n8")
