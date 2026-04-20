@@ -12,23 +12,25 @@ delta mode (Interleaved1F1B with :class:`BlockLayoutTables` from
 rank cache doesn't already have; the receiver rebuilds the full stack
 by concatenating its cached prefix with the incoming delta.
 
-Per-block backward grads ride the normal autograd + PP SEND_B path: the
-adapter does NOT wrap cached blocks in any ``torch.autograd.Function``,
-so the autograd graph stays live on whatever tensor each cached block
-originally came from:
+Per-block backward grads ride the normal autograd + PP SEND_B path:
 
-* Blocks this rank committed in an earlier virtual stage chain back to
-  local wrapped params directly.
 * Blocks this rank received from an earlier PP hop are slices of a
-  ``recv_delta_tensor``; when backward through ``torch.cat`` reaches
-  them, the grad flows into that recv tensor and PP's built-in
-  ``SEND_B`` ships it to the previous rank, where the adapter on that
-  rank sees it land in its own recv_delta and autograd relays further
-  back along the chain.
+  ``recv_delta_tensor``; their grad flows back through that tensor
+  and PP's built-in ``SEND_B`` ships it to the previous rank.
+* Blocks this rank committed in an earlier virtual stage are wrapped
+  in :class:`_LocalCacheAugment` at producer emission and
+  :class:`_LocalCacheCapture` at consumer read. The Capture severs
+  the consumer->producer autograd link (so the consumer's backward
+  never traverses and frees the producer's forward graph) and
+  deposits the grad in a rank-local slot; the Augment pops the slot
+  and sums the captured grad into the producer's incoming grad when
+  the producer's own backward runs. Both classes are pure local
+  Python + a dict -- zero NCCL, zero cross-rank state.
 
 The grad thus walks backwards hop-by-hop along the same PP stage chain
 that forward uses. No custom P2P, no deadlock risk (PP owns all NCCL),
-single-microbatch memory footprint.
+each stage's forward graph is traversed exactly once per mb so peak
+memory is the naive-PP baseline.
 
 :func:`pipeline_llm_with_cache_adapter` is a ``pipelining_fn`` plugged
 into the experiment's ``ModelSpec``; it delegates to core
@@ -105,6 +107,12 @@ class RankLocalCache:
         # Every backward marks its mb here so the step-end drop sweep
         # on the last virtual stage knows which mbs to evict.
         self._seen_mbs: set[int] = set()
+        # Captured grads for the local-only _LocalCacheAugment/Capture
+        # dance. Keyed by (mb_index, producer_stage_id, block_idx). A
+        # consumer-side Capture.backward accumulates grad here; the
+        # producer-side Augment.backward pops and sums the captured
+        # grad into its incoming grad when stage R's own backward runs.
+        self._captured_grads: dict[tuple[int, int, int], torch.Tensor] = {}
 
     def append(
         self, mb_index: int, block: torch.Tensor, meta: tuple[int, int, int],
@@ -131,6 +139,46 @@ class RankLocalCache:
         self._blocks.pop(mb_index, None)
         self._producer_meta.pop(mb_index, None)
         self._seen_mbs.discard(mb_index)
+        # Drop any leftover captured-grad slots for this mb (defensive).
+        for key in list(self._captured_grads.keys()):
+            if key[0] == mb_index:
+                self._captured_grads.pop(key, None)
+
+    # ----- captured-grad slot helpers -------------------------------- #
+
+    def capture_grad(
+        self, key: tuple[int, int, int], grad: torch.Tensor,
+    ) -> None:
+        """Accumulate (sum) ``grad`` into the captured-grad slot at
+        ``key``. Multiple consumer-side Captures for the same producer
+        block (V>2, one cached block read by >1 later virtual stage on
+        the same rank) sum into the same slot.
+        """
+        prior = self._captured_grads.get(key)
+        if prior is None:
+            # detach()+clone() would lose autograd on the grad itself;
+            # the grad tensor is just a regular tensor at this point
+            # (it's a backward-produced value, not leaf), so storing a
+            # reference is fine. We deliberately do NOT clone so that
+            # in the common V=2 case there's zero extra memory.
+            self._captured_grads[key] = grad
+        else:
+            self._captured_grads[key] = prior + grad
+
+    def pop_grad(
+        self, key: tuple[int, int, int],
+    ) -> torch.Tensor | None:
+        """Return-and-clear the captured-grad slot at ``key``. Returns
+        ``None`` if the slot is empty (the producer's cached block was
+        never consumed on this rank during this mb's backward window).
+        """
+        return self._captured_grads.pop(key, None)
+
+    def has_captured_for_mb(self, mb_index: int) -> bool:
+        """True iff any captured-grad slot for ``mb_index`` survives.
+        Called by the mb-end assertion as a lingering-bug canary.
+        """
+        return any(k[0] == mb_index for k in self._captured_grads)
 
 
 # One RankLocalCache per pipeline-group rank, shared by every adapter
@@ -156,6 +204,94 @@ def _reset_rank_caches_for_testing() -> None:
     """Clear the module-level registry. Unit-test isolation only."""
     with _rank_caches_lock:
         _rank_caches.clear()
+
+
+# ----- Local-only autograd Functions for own-rank cached commits ----------- #
+#
+# These two Functions together replace the prior process-global
+# `retain_graph=True` monkey-patch. Both are LOCAL to a single rank: no
+# NCCL, no cross-rank side effects, no collective ops. Their only state
+# is a Python dict slot on the rank-local :class:`RankLocalCache`, keyed
+# by ``(mb_index, producer_stage_id, block_idx_within_producer)``.
+#
+# They only wrap ONE specific autograd liability: a block that stage R
+# commits on this rank during an earlier virtual v and that a LATER
+# virtual stage on THE SAME rank reads back from the shared cache.
+# Without any intervention, that later stage's backward traverses into
+# stage R's forward graph via torch.cat's grad path and FREES IT;
+# stage R's own backward later (from PP SEND_B on the outgoing delta)
+# tries to traverse the same graph and dies with "backward through the
+# graph a second time".
+#
+# _LocalCacheCapture (applied at consumer read time) severs the
+# consumer->producer graph link by returning None for its tensor
+# input's grad — the producer's graph is never traversed by the
+# consumer's backward, so it's not freed early. It deposits the grad
+# that WOULD have flowed into the producer into a slot on the rank
+# cache.
+#
+# _LocalCacheAugment (applied at producer emission, BEFORE caching)
+# sits on the producer's own autograd path. When stage R's own
+# backward finally runs, any incoming grad at the augment is summed
+# with the captured slot before it flows into stage R's forward graph
+# and ultimately into R's wrapped params. Net effect: params get the
+# exact same total grad they would get from naive autograd, but each
+# stage's graph is traversed exactly once.
+#
+# Recv-originated cached blocks (sliced from a prior recv_delta tensor)
+# are NOT wrapped: their grad already flows back through PP's built-in
+# SEND_B to the producer rank via the recv-delta autograd chain, and
+# wrapping them would strand that cross-rank grad channel.
+
+
+class _LocalCacheAugment(torch.autograd.Function):
+    """Identity forward; backward sums (incoming_grad + captured_grad).
+
+    ``slot_key`` is ``(mb_index, producer_stage_id, block_idx)``. The
+    rank_cache reference is passed at call time so the Function stays
+    process-global / stateless and the cache stays per-rank.
+    """
+
+    @staticmethod
+    def forward(ctx, block_tensor, slot_key, rank_cache):  # type: ignore[override]
+        ctx.slot_key = slot_key
+        ctx.rank_cache = rank_cache
+        return block_tensor
+
+    @staticmethod
+    def backward(ctx, grad_out):  # type: ignore[override]
+        captured = ctx.rank_cache.pop_grad(ctx.slot_key)
+        if captured is None:
+            combined = grad_out
+        else:
+            combined = grad_out + captured
+        # slot_key and rank_cache are non-Tensor inputs -> None grads.
+        return combined, None, None
+
+
+class _LocalCacheCapture(torch.autograd.Function):
+    """Identity forward; backward deposits grad in the slot and STOPS.
+
+    Returning ``None`` for the tensor input tells autograd NOT to
+    propagate grad further upstream. This is exactly what prevents the
+    consumer's backward from traversing the producer stage's forward
+    graph and freeing it before stage R's own backward runs.
+    """
+
+    @staticmethod
+    def forward(ctx, block_tensor, slot_key, rank_cache):  # type: ignore[override]
+        ctx.slot_key = slot_key
+        ctx.rank_cache = rank_cache
+        return block_tensor
+
+    @staticmethod
+    def backward(ctx, grad_out):  # type: ignore[override]
+        # Accumulate (sum) into the slot. V>2 / multiple later virtual
+        # stages on this rank reading the same producer block will each
+        # fire a Capture.backward; the cache's capture_grad sums them.
+        ctx.rank_cache.capture_grad(ctx.slot_key, grad_out)
+        # None for tensor input: autograd stops traversing here.
+        return None, None, None
 
 
 # ----- Microbatch-index threading ------------------------------------------ #
@@ -225,12 +361,22 @@ class CrossStageCacheAdapter(nn.Module):
     In delta mode (``layout_tables`` supplied) each forward pulls earlier
     blocks from the shared :class:`RankLocalCache`, receives the incoming
     delta, rebuilds the full block stack in block-index order, and lets
-    backward flow through the autograd graph naturally. Cached-prefix
-    blocks are passed through WITHOUT wrapping in any autograd.Function:
-    their grad lands either on local wrapped params (same-rank earlier
-    virtual stage) or on the recv_delta_tensor they were sliced from
-    (earlier PP hop), in which case PP's built-in ``SEND_B`` ships it
-    back to the previous rank.
+    backward flow through the autograd graph. Cached-prefix blocks are
+    handled two ways depending on who committed them:
+
+    * **Different rank** (producer_rank != self.pp_rank) → cached block
+      is a slice of an older ``recv_delta_tensor``. Passed through
+      unwrapped; its grad flows back via that tensor and PP's built-in
+      ``SEND_B`` drains it to the producer rank.
+    * **Same rank** (producer_rank == self.pp_rank) → cached block
+      came from an earlier virtual stage on this rank. Wrapped in
+      :class:`_LocalCacheCapture` at read time, severing the
+      consumer->producer autograd link (so the consumer's backward
+      does not traverse the producer's forward graph and free it
+      early) and depositing the grad in a rank-local slot. The
+      matching producer-side :class:`_LocalCacheAugment` wraps the
+      block at emission time and re-injects the captured grad during
+      the PRODUCER's own backward pass.
 
     Without layout tables the adapter is a naive passthrough.
 
@@ -362,11 +508,16 @@ class CrossStageCacheAdapter(nn.Module):
     def _forward_delta(self, *args, **kwargs):
         """Interleaved1F1B delta forward (spec §4.1).
 
-        Cached-prefix blocks are passed through UNWRAPPED, so backward
-        through ``torch.cat`` routes grads along the original autograd
-        graph: local wrapped params for own earlier commits, or the
-        prior ``recv_delta_tensor`` for earlier PP hops (which PP's
-        built-in ``SEND_B`` then ships back to the producer rank).
+        Cached-prefix blocks whose producer is on a DIFFERENT rank are
+        passed through unwrapped: their autograd graph already goes
+        back to the original ``recv_delta_tensor`` and PP's built-in
+        ``SEND_B`` drains it to the producer rank. Cached-prefix
+        blocks whose producer is ON THIS RANK (earlier virtual stage)
+        are wrapped in :class:`_LocalCacheCapture` at read time,
+        severing the consumer->producer autograd link and depositing
+        their grad in a rank-local captured-grad slot for the matching
+        producer-side :class:`_LocalCacheAugment` to re-inject during
+        the producer's own backward pass.
         """
         mb = self._current_mb()
         layout = self._layout
@@ -391,16 +542,34 @@ class CrossStageCacheAdapter(nn.Module):
             f"expected {len(incoming_block_indices)}, got {len(recv_list)}."
         )
 
-        # Pull earlier cached blocks straight out of the rank cache: no
-        # wrapping, so their autograd graph is the ORIGINAL source
-        # (either local params from a prior v on this rank, or slices of
-        # an older recv_delta_tensor that PP's SEND_B will drain on
-        # backward).
-        earlier_blocks = list(self._cache.get_blocks(mb))
+        # Pull earlier cached blocks out of the rank cache. Recv-
+        # originated entries (``producer_rank != self.pp_rank``) stay
+        # unwrapped: their grad flows back via the original
+        # ``recv_delta_tensor`` they were sliced from, which PP's
+        # built-in ``SEND_B`` drains back to the producer rank.
+        # Own-rank cached commits (producer_rank == self.pp_rank) get
+        # wrapped in :class:`_LocalCacheCapture`; that severs the
+        # consumer->producer autograd link so the producer's forward
+        # graph is not freed by THIS stage's backward. The grad that
+        # would have flowed upstream is deposited in the rank cache's
+        # captured-grad slot, to be summed into the producer stage's
+        # incoming grad by the matching :class:`_LocalCacheAugment`
+        # when the producer's own backward runs.
+        earlier_blocks_raw = list(self._cache.get_blocks(mb))
         earlier_meta = list(self._cache.get_meta(mb))
         cached_indices = [
             layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta
         ]
+        earlier_blocks: list[torch.Tensor] = []
+        for blk, meta in zip(earlier_blocks_raw, earlier_meta):
+            producer_rank, producer_stage, block_idx_in_producer = meta
+            if producer_rank == self.pp_rank:
+                slot_key = (mb, producer_stage, block_idx_in_producer)
+                earlier_blocks.append(
+                    _LocalCacheCapture.apply(blk, slot_key, self._cache)
+                )
+            else:
+                earlier_blocks.append(blk)
 
         # Rebuild the full blocks tensor in block-index order.
         pairs = list(zip(cached_indices, earlier_blocks)) + list(
@@ -459,15 +628,28 @@ class CrossStageCacheAdapter(nn.Module):
                     (producer_rank, producer_stage, block_idx_in_producer),
                 )
 
-        # Append own commits. No wrapping: they're autograd-live against
-        # this stage's wrapped params and any later virtual stage on
-        # this rank that reads them back from the cache gets their grad
-        # routed straight to those params via cat-backward.
+        # Append own commits. Each block is wrapped in
+        # :class:`_LocalCacheAugment` BEFORE caching and before being
+        # used to build the outgoing delta; the wrapped (identity-
+        # forward) tensor is the same object in both places, so when
+        # this stage's own backward runs on the delta path the augment
+        # sees the incoming grad plus any captured grad deposited by a
+        # later same-rank virtual stage's :class:`_LocalCacheCapture`.
         new_blocks_list = unstack_blocks(new_blocks_tensor)
-        for local_idx, (bidx, blk) in enumerate(zip(my_commits, new_blocks_list)):
-            self._cache.append(mb, blk, (self.pp_rank, self.stage_id, local_idx))
+        wrapped_new_blocks: list[torch.Tensor] = []
+        for local_idx, blk in enumerate(new_blocks_list):
+            slot_key = (mb, self.stage_id, local_idx)
+            wrapped = _LocalCacheAugment.apply(blk, slot_key, self._cache)
+            wrapped_new_blocks.append(wrapped)
+            self._cache.append(
+                mb, wrapped, (self.pp_rank, self.stage_id, local_idx)
+            )
 
         # Build outgoing delta: subset of (cache + new), by canonical bidx.
+        # ``cache_by_bidx`` reads from the rank cache directly so
+        # relayed (recv-originated) blocks that show up in the outgoing
+        # delta also route grad correctly via their existing autograd
+        # link to ``prev_recv_tensor``.
         out_indices = layout.delta_to_send(self.stage_id)
         cache_by_bidx = {
             layout.commits_at(meta[1])[meta[2]]: blk
@@ -476,8 +658,8 @@ class CrossStageCacheAdapter(nn.Module):
             )
         }
         new_by_bidx = {
-            my_commits[i]: new_blocks_tensor[i]
-            for i in range(new_blocks_tensor.shape[0])
+            my_commits[i]: wrapped_new_blocks[i]
+            for i in range(len(wrapped_new_blocks))
         }
         send_pieces: list[torch.Tensor] = []
         for bidx in out_indices:
@@ -534,8 +716,34 @@ class CrossStageCacheAdapter(nn.Module):
         """Mark ``mb_index`` as seen on this rank so the step-end sweep
         drops it. Actual eviction is deferred to ``pp_schedule.step``
         return; see :func:`_install_step_drop_patch`.
+
+        In delta mode, this is also the moment to assert that every
+        :class:`_LocalCacheCapture` deposit for this mb has been drained
+        by a matching :class:`_LocalCacheAugment` -- a surviving slot
+        would mean a producer's backward never ran, which is a bug.
+        Interleaved1F1B runs backward in reverse virtual-stage order
+        on each rank, so the EARLIEST virtual stage on this rank is
+        the last to call on_microbatch_end for a given mb. That is
+        the only point at which every producer-side Augment has had a
+        chance to drain its slot, so we guard the assertion to fire
+        there only (``stage_id < pp_size`` == "this rank's earliest
+        virtual stage").
         """
         self._cache._seen_mbs.add(mb_index)
+        if self._delta_mode and self._layout is not None:
+            pp_size = self._layout.P
+            # Earliest virtual stage on this rank: stage_id < pp_size.
+            # Its backward fires LAST among the rank's virtual stages
+            # for this mb, so by the time we reach here every slot
+            # for this mb should have been popped by an Augment.
+            if self.stage_id < pp_size:
+                assert not self._cache.has_captured_for_mb(mb_index), (
+                    f"Captured grad slot for mb {mb_index} survived past "
+                    f"stage {self.stage_id}'s backward on rank {self.pp_rank}; "
+                    "producer-side _LocalCacheAugment never fired. "
+                    "This indicates a producer forward graph was never "
+                    "backward-traversed for this mb."
+                )
 
     def extra_repr(self) -> str:
         return f"stage_id={self.stage_id}, num_stages={self.num_stages}"
@@ -584,67 +792,23 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         bwd_chunk_id, loss=None, full_backward: bool = True,
         last_backward: bool = False,
     ):
-        # ------------------------------------------------------------------
-        # TEMPORARY FIX — scale-limited to smoke configs only.
-        # ------------------------------------------------------------------
-        # Under delta mode, rank R caches its OWN v<current commits and
-        # re-reads them from later virtual stages on the same rank. When
-        # stage R+P's backward fires first (reverse schedule order),
-        # autograd traverses cat(cache) -> b0 -> stage R's v=0 forward
-        # graph and, without retain_graph, frees it. Then stage R's own
-        # backward (initiated later by PP SEND_B from stage R+1) tries to
-        # traverse the same graph and dies with "backward through the
-        # graph a second time".
-        #
-        # This hack forces retain_graph=True on every stage's primary
-        # backward so the graph survives the second traversal.
-        #
-        # Cost: each in-flight mb retains its stage graph until the rank
-        # cache evicts at step end. For our 175M smoke on 8x RTX 5090
-        # (1 layer / virtual stage, M=4 mbs in flight) that shows up as
-        # +5 GiB on rank 7 (11.9 GiB vs 6.9 GiB for naive PP). Still
-        # under 32 GiB so training completes, and 1000-step loss curves
-        # align with naive within bf16 tolerance (verified).
-        #
-        # Why it DOES NOT scale:
-        #   peak_extra_mem ~= M * per_stage_activation_footprint
-        # - 1.5B at M=8: tens of GiB per rank.
-        # - 48B at M>=32: TB-scale. Catastrophic.
-        #
-        # Proper fix (follow-up): replace this override with a pair of
-        # thin, local-only autograd.Functions:
-        #   - _LocalCacheAugment wraps own commits at producer emission.
-        #     Its backward adds any captured grad to the incoming grad
-        #     before propagating to wrapped params.
-        #   - _LocalCacheCapture wraps cached own-commits at consumer
-        #     read time. Its backward writes grad into a per-(mb,
-        #     producer, idx) slot and returns None, stopping autograd
-        #     from traversing the producer stage's graph.
-        # Both are pure Python + a dict; zero NCCL; graph lives the
-        # normal single-backward window so peak memory is naive-PP
-        # baseline again. This is the scale-up path.
-        # ------------------------------------------------------------------
+        # Plain backward pass. The double-backward risk on own-rank
+        # cached commits is now handled structurally by
+        # :class:`_LocalCacheAugment` / :class:`_LocalCacheCapture`:
+        # the consumer-side Capture severs the consumer->producer
+        # autograd link (so the producer's graph is NOT traversed or
+        # freed by this stage's backward), and the producer-side
+        # Augment sums the captured grad into the producer's own
+        # incoming grad when THE PRODUCER's backward runs. Each
+        # stage's forward graph is thus traversed exactly once per mb,
+        # which is the naive-PP baseline.
         _set_mb_index(adapter_key, bwd_chunk_id)
-        orig_autograd_backward = torch.autograd.backward
-
-        def retain_graph_backward(
-            tensors, grad_tensors=None, retain_graph=None, create_graph=False,
-            grad_variables=None, inputs=None,
-        ):
-            return orig_autograd_backward(
-                tensors, grad_tensors=grad_tensors,
-                retain_graph=True, create_graph=create_graph,
-                grad_variables=grad_variables, inputs=inputs,
-            )
-
-        torch.autograd.backward = retain_graph_backward
         try:
             return orig_bwd(
                 bwd_chunk_id, loss=loss, full_backward=full_backward,
                 last_backward=last_backward,
             )
         finally:
-            torch.autograd.backward = orig_autograd_backward
             # Mark the mb as seen so the step-end drop sweep evicts it.
             # We don't drop here: the shared rank cache is still live
             # for peers / later virtual stages.

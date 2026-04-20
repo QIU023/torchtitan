@@ -35,6 +35,8 @@ from torchtitan.experiments.attn_res.pipeline_adapter import (
     _current_mb_index,
     _get_or_create_rank_cache,
     _install_mb_index_patch,
+    _LocalCacheAugment,
+    _LocalCacheCapture,
     _reset_rank_caches_for_testing,
     _set_mb_index,
     BlockLayoutTables,
@@ -635,6 +637,72 @@ class TestForwardDeltaNumerics(unittest.TestCase):
             f"forward diverges: naive={naive_out}, adapter={out}",
         )
 
+    def test_backward_grad_equivalence_4stage_vp2(self):
+        """V=2 canary for the _LocalCacheAugment / _LocalCacheCapture
+        dance: with P=2, V=2, num_stages=4, rank 0 hosts stages {0, 2}.
+        Stage 2's forward reads block 0 (committed by stage 0 on the
+        same rank) back from the shared cache -- this is the exact
+        "same-rank own-commit cache read" path the new Functions cover.
+        Param grads must match naive autograd.
+        """
+        torch.manual_seed(42)
+        P, V = 2, 2
+        num_stages = P * V
+        num_blocks = num_stages
+        n_layers = num_stages
+        B, T, D = 2, 3, 4
+
+        layout = BlockLayoutTables(
+            pp_size=P, virtual_stages_per_rank=V,
+            num_blocks=num_blocks, n_layers=n_layers, layers_per_block=1,
+        )
+
+        naive = self._build_chain(num_stages)
+        adapt = self._build_chain(num_stages)
+        with torch.no_grad():
+            for n, a in zip(naive, adapt):
+                a.w.copy_(n.w)
+
+        tokens = torch.randn(B, T, D)
+
+        # Naive path
+        p = tokens
+        bl = None
+        for st in naive[:-1]:
+            p, bl = st(p, blocks=bl)
+        naive_out = naive[-1](p, blocks=bl)
+        naive_out.sum().backward()
+
+        # Adapter path
+        stage_to_rank = {s: s % P for s in range(num_stages)}
+        adapters = [
+            CrossStageCacheAdapter(
+                adapt[s], stage_id=s, num_stages=num_stages, group=None,
+                stage_to_rank=stage_to_rank, pp_rank=s % P,
+                layout_tables=layout,
+            )
+            for s in range(num_stages)
+        ]
+        for a in adapters:
+            _set_mb_index(id(a), 0)
+        try:
+            p0, b0 = adapters[0](tokens)
+            prev_p, prev_b = p0, b0
+            for s in range(1, num_stages - 1):
+                prev_p, prev_b = adapters[s](prev_p, prev_b)
+            out = adapters[-1](prev_p, prev_b)
+        finally:
+            for a in adapters:
+                _set_mb_index(id(a), None)
+        out.sum().backward()
+
+        for s in range(num_stages):
+            self.assertTrue(
+                torch.allclose(adapt[s].w.grad, naive[s].w.grad, atol=1e-5),
+                f"stage {s} grad diverges: naive={naive[s].w.grad}, "
+                f"adapter={adapt[s].w.grad}",
+            )
+
     def test_backward_grad_equivalence_2stage(self):
         """Canary for the pure-autograd-through-PP-SEND_B design:
         with num_stages=2 and layer_to_stage wired so each rank has
@@ -838,6 +906,219 @@ class TestDropLifecycleUnderVP(unittest.TestCase):
         a2._drop_all_seen_and_clear()
         self.assertEqual(len(a0._cache.get_blocks(0)), 0)
         self.assertNotIn(0, a0._cache._seen_mbs)
+
+
+# --------------------------------------------------------------------------- #
+# Local-only autograd.Function dance (replaces the retain_graph monkey-patch)
+# --------------------------------------------------------------------------- #
+
+
+class TestLocalCacheAutogradFunctions(unittest.TestCase):
+    """Unit tests for :class:`_LocalCacheAugment` / :class:`_LocalCacheCapture`.
+
+    These two Functions together replace the process-global
+    ``retain_graph=True`` override. The gate for integrating them into
+    ``_forward_delta`` / ``_finish_forward`` is that the four tests
+    below all pass on CPU with pure autograd -- no PG, no schedule.
+    """
+
+    def setUp(self) -> None:
+        _reset_rank_caches_for_testing()
+
+    def tearDown(self) -> None:
+        _reset_rank_caches_for_testing()
+
+    def test_local_cache_capture_blocks_backward_propagation(self):
+        """Capture.backward deposits grad in the slot and returns None for
+        its tensor input, stopping autograd from traversing upstream
+        (a, b are never reached). Captured slot holds the grad that
+        arrived at the Capture's input.
+        """
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+
+        a = torch.randn(3, 4, requires_grad=True)
+        b = a * 2.0  # non-leaf, autograd-live to a
+        captured_in = _LocalCacheCapture.apply(b, key, cache)
+        # Further ops downstream of the capture must still get their
+        # grads the usual way.
+        c = captured_in + 5.0
+        loss = c.sum()
+        loss.backward()
+
+        # Captured slot holds what flowed into the capture's input.
+        slot = cache._captured_grads.get(key)
+        self.assertIsNotNone(slot)
+        # dL/d(captured_in) = dL/dc * 1 = ones_like(c)
+        self.assertTrue(torch.allclose(slot, torch.ones_like(b)))
+
+        # Autograd must NOT have populated a.grad (capture severed the
+        # link). torch marks a.grad as None (it's a leaf tensor that
+        # was never in the backward path this time).
+        self.assertIsNone(a.grad)
+
+    def test_local_cache_augment_adds_captured_to_incoming_grad(self):
+        """Augment.backward pops the captured slot and sums it into
+        the incoming grad before propagating to the wrapped tensor.
+        Pre-populate the slot with a known value G and verify
+        ``b.grad == incoming + G``.
+        """
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+
+        a = torch.randn(3, 4, requires_grad=True)
+        b = a * 3.0  # autograd-live to a
+        augmented = _LocalCacheAugment.apply(b, key, cache)
+        c = augmented * 1.0  # incoming grad path
+        loss = c.sum()
+
+        # Pre-populate the captured slot (simulate an earlier
+        # consumer-side Capture having already deposited G).
+        G = torch.full_like(b, 7.0)
+        cache.capture_grad(key, G)
+
+        loss.backward()
+
+        # dL/d(augmented) = ones_like(c). Augment.backward should have
+        # returned ones + G. So d(c.sum())/db = ones + G, and d/da = 3 * (ones + G).
+        expected_a_grad = 3.0 * (torch.ones_like(a) + G)
+        self.assertIsNotNone(a.grad)
+        self.assertTrue(torch.allclose(a.grad, expected_a_grad))
+        # Slot should now be empty (pop semantics).
+        self.assertNotIn(key, cache._captured_grads)
+
+    def test_multi_consumer_augment_sums_across_captures(self):
+        """V>2: producer's Augment sees ``incoming + sum_of_all_captures``.
+
+        Build two independent consumer branches that each wrap the
+        same producer-augmented tensor in Capture (simulating one
+        producer, two later virtual stages on the same rank). Call a
+        joint backward and verify the augment receives the incoming
+        grad plus BOTH capture contributions summed.
+        """
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+
+        a = torch.randn(3, 4, requires_grad=True)
+        b = a * 2.0  # shared producer
+        # Producer-side wrapper: the augmented tensor is what downstream
+        # consumers will cache and what the producer's own downstream
+        # consumes in its incoming grad path.
+        augmented = _LocalCacheAugment.apply(b, key, cache)
+
+        # Producer's OWN downstream path (simulating the SEND_F/etc.
+        # incoming grad that eventually returns to this node).
+        own_path = augmented * 1.0
+        own_loss = own_path.sum()
+
+        # Two consumer branches wrap the augmented tensor in Capture,
+        # then do independent computations. Their gradients will land
+        # in the captured-grad slot, NOT in a.grad, because Capture
+        # severs upstream propagation.
+        cap1 = _LocalCacheCapture.apply(augmented, key, cache)
+        cap2 = _LocalCacheCapture.apply(augmented, key, cache)
+        cons1_loss = (cap1 * 2.0).sum()  # dL1/d(cap1) = 2 * ones
+        cons2_loss = (cap2 * 5.0).sum()  # dL2/d(cap2) = 5 * ones
+
+        total_loss = own_loss + cons1_loss + cons2_loss
+        total_loss.backward()
+
+        # Slot should be empty after Augment.backward popped it.
+        self.assertNotIn(key, cache._captured_grads)
+
+        # a.grad = 2.0 * augment_back = 2.0 * (incoming_from_own_path +
+        #   sum_of_both_captures) = 2.0 * (1*ones + 2*ones + 5*ones)
+        #                         = 2.0 * 8 * ones = 16 * ones.
+        expected_a_grad = torch.full_like(a, 2.0 * (1.0 + 2.0 + 5.0))
+        self.assertIsNotNone(a.grad)
+        self.assertTrue(
+            torch.allclose(a.grad, expected_a_grad),
+            f"a.grad={a.grad}, expected={expected_a_grad}",
+        )
+
+    def test_producer_param_grad_equivalence_to_naive(self):
+        """End-to-end param-grad equivalence on a toy mimic of the real
+        pattern: a producer "stage-0" param emits a block that flows
+        into BOTH (a) the delta sent forward to later stages (and
+        eventually returns a grad via SEND_B) AND (b) the shared cache,
+        from which a later virtual stage on the same rank reads it.
+
+        In the wrapped path we put Augment at emission time (wrapping
+        the producer's output BEFORE it forks into delta+cache), and
+        Capture at the consumer's read-from-cache site. Run once with
+        no wrappers (baseline), once with Augment+Capture. All param
+        grads must match.
+        """
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+
+        torch.manual_seed(11)
+        tokens = torch.randn(2, 4, requires_grad=False)
+
+        # Helper: do the shared forward computation. In the real adapter
+        # the producer's block goes into two places: (1) the outgoing
+        # delta consumed by a later stage (a LATER DIFFERENT-RANK stage
+        # whose grad comes back through autograd+SEND_B), and (2) the
+        # rank-local cache, read by the same-rank later virtual stage.
+        # We model path (1) with a direct use and path (2) with a
+        # "cache" variable re-used downstream.
+        def _forward_joint(
+            w_p_, w_delta_, w_c_, use_wrappers: bool,
+        ) -> torch.Tensor:
+            block = tokens @ w_p_  # producer emission
+            # Producer emission goes through the augment when wrappers
+            # are on; otherwise identity.
+            emitted = (
+                _LocalCacheAugment.apply(block, key, cache)
+                if use_wrappers else block
+            )
+            # Path 1: outgoing delta (modeled as a direct downstream
+            # computation that ends in a scalar). This is the SEND_B
+            # analogue: the grad that returns here from the later
+            # stage's backward. No wrapping: it's analogous to the
+            # recv-delta autograd chain that PP manages.
+            delta_path = (emitted @ w_delta_).sum()
+            # Path 2: later virtual stage on the SAME rank reads the
+            # cached block. In wrapped mode, it reads through Capture.
+            cached_read = (
+                _LocalCacheCapture.apply(emitted, key, cache)
+                if use_wrappers else emitted
+            )
+            consumer_path = (cached_read @ w_c_ + cached_read * 0.3).sum()
+            return delta_path + consumer_path
+
+        # --- baseline (no wrappers): naive autograd over the joint
+        # forward. All three params' grads are what we must match.
+        w_p = nn.Parameter(torch.randn(4, 4))
+        w_delta = nn.Parameter(torch.randn(4, 4))
+        w_c = nn.Parameter(torch.randn(4, 4))
+        loss_n = _forward_joint(w_p, w_delta, w_c, use_wrappers=False)
+        loss_n.backward()
+        naive_wp = w_p.grad.detach().clone()
+        naive_wd = w_delta.grad.detach().clone()
+        naive_wc = w_c.grad.detach().clone()
+
+        # --- wrapped path: Augment at emission, Capture at cached read.
+        w_p2 = nn.Parameter(w_p.detach().clone())
+        w_delta2 = nn.Parameter(w_delta.detach().clone())
+        w_c2 = nn.Parameter(w_c.detach().clone())
+        loss_a = _forward_joint(w_p2, w_delta2, w_c2, use_wrappers=True)
+        loss_a.backward()
+
+        self.assertTrue(
+            torch.allclose(w_p2.grad, naive_wp, atol=1e-5),
+            f"producer w_p grad diverges: naive={naive_wp} wrapped={w_p2.grad}",
+        )
+        self.assertTrue(
+            torch.allclose(w_delta2.grad, naive_wd, atol=1e-5),
+            f"delta w_delta grad diverges: naive={naive_wd} wrapped={w_delta2.grad}",
+        )
+        self.assertTrue(
+            torch.allclose(w_c2.grad, naive_wc, atol=1e-5),
+            f"consumer w_c grad diverges: naive={naive_wc} wrapped={w_c2.grad}",
+        )
+        # Slot must be empty after the full backward.
+        self.assertNotIn(key, cache._captured_grads)
 
 
 if __name__ == "__main__":
