@@ -89,13 +89,22 @@ Three tracks share this folder:
 1. **Single-GPU dense correctness** (Llama3-proportioned flavors).
    `175M_attn_res` has a recorded 20 k-step loss curve vs baseline; see
    the RFC on [pytorch/torchtitan#3029](https://github.com/pytorch/torchtitan/issues/3029).
-2. **PP cross-stage caching adapter**. Forward-delta correctness + 41/41
-   CPU tests pass; 8-GPU end-to-end backward is still being
-   stabilized — see the Status block in the RFC.
+2. **PP cross-stage caching adapter**. Validated on **4-GPU PP=4 V=2,
+   1000 steps**: naive-vs-adapter loss delta stays inside the
+   naive-vs-naive nondeterminism band (|Δ_naive→adapter| max 0.06 vs
+   |Δ_naive→naive| max 0.13); memory accounting matches the design
+   (+260 MB cache on rank 3 for 175M at M=4 mb). 41 / 41 CPU tests pass.
+   Still pending: longer-horizon (≥ 5 k step) stability, PP=8 scale-up,
+   AttnRes-vs-non-AttnRes delta preservation under PP, and the
+   1.5–2 B PCIe-overhead headline plot.
 3. **MoE + MLA + AttnRes** (DSv3-shape flavors). Architectural match for
    Kimi's production line (paper §5: "MoE Transformer following the
    Moonlight / DeepSeek-V3 design"). CPU tests cover forward + backward
-   on the debug flavor; 8-GPU MoE training validation is a follow-up.
+   on the debug flavor. **Not yet PP-tested**: the adapter + MoE + EP
+   combination is architecturally compatible (duck-typed integration)
+   but has never been exercised end-to-end — stabilize dense PP first,
+   then bring MoE online starting from `dsv3_debugmodel_attn_res` on
+   single GPU before layering PP.
 
 ## Ownership
 
