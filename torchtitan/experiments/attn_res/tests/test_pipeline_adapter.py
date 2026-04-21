@@ -34,8 +34,8 @@ from torchtitan.experiments.attn_res.attn_res import stack_blocks, unstack_block
 from torchtitan.experiments.attn_res.pipeline_adapter import (
     _current_mb_index,
     _get_or_create_rank_cache,
+    _install_augment_hook,
     _install_mb_index_patch,
-    _LocalCacheAugment,
     _LocalCacheCapture,
     _reset_rank_caches_for_testing,
     _set_mb_index,
@@ -914,9 +914,10 @@ class TestDropLifecycleUnderVP(unittest.TestCase):
 
 
 class TestLocalCacheAutogradFunctions(unittest.TestCase):
-    """Unit tests for :class:`_LocalCacheAugment` / :class:`_LocalCacheCapture`.
+    """Unit tests for the hook-based augment + :class:`_LocalCacheCapture`.
 
-    These two Functions together replace the process-global
+    The producer-side ``_install_augment_hook`` and the consumer-side
+    ``_LocalCacheCapture`` together replace the prior process-global
     ``retain_graph=True`` override. The gate for integrating them into
     ``_forward_delta`` / ``_finish_forward`` is that the four tests
     below all pass on CPU with pure autograd -- no PG, no schedule.
@@ -930,15 +931,18 @@ class TestLocalCacheAutogradFunctions(unittest.TestCase):
 
     def test_local_cache_capture_blocks_backward_propagation(self):
         """Capture.backward deposits grad in the slot and returns None for
-        its tensor input, stopping autograd from traversing upstream
-        (a, b are never reached). Captured slot holds the grad that
-        arrived at the Capture's input.
+        its tensor input. The real adapter pairs this with a DETACHED
+        cache entry (so the input has no upstream grad_fn at all); this
+        unit test mirrors that contract by detaching ``b`` before passing
+        it to Capture, so the upstream tensor ``a`` cannot receive a
+        grad even in principle.
         """
         cache = RankLocalCache()
         key = (0, 0, 0)
 
         a = torch.randn(3, 4, requires_grad=True)
-        b = a * 2.0  # non-leaf, autograd-live to a
+        b = (a * 2.0).detach()
+        b.requires_grad_(True)  # leaf with grad enabled — adapter pattern
         captured_in = _LocalCacheCapture.apply(b, key, cache)
         # Further ops downstream of the capture must still get their
         # grads the usual way.
@@ -952,24 +956,24 @@ class TestLocalCacheAutogradFunctions(unittest.TestCase):
         # dL/d(captured_in) = dL/dc * 1 = ones_like(c)
         self.assertTrue(torch.allclose(slot, torch.ones_like(b)))
 
-        # Autograd must NOT have populated a.grad (capture severed the
-        # link). torch marks a.grad as None (it's a leaf tensor that
-        # was never in the backward path this time).
+        # Capture severed the path; a is upstream of the (detached) b
+        # but autograd cannot reach a via the Capture.
         self.assertIsNone(a.grad)
 
-    def test_local_cache_augment_adds_captured_to_incoming_grad(self):
-        """Augment.backward pops the captured slot and sums it into
-        the incoming grad before propagating to the wrapped tensor.
-        Pre-populate the slot with a known value G and verify
-        ``b.grad == incoming + G``.
+    def test_augment_hook_adds_captured_to_incoming_grad(self):
+        """``_install_augment_hook`` installs a tensor grad hook that,
+        when the producer block's grad fires during the producer's own
+        backward, pops the matching captured-grad slot and sums it
+        into the incoming grad. Pre-populate the slot with a known
+        value G and verify the upstream gradient picks up ``incoming + G``.
         """
         cache = RankLocalCache()
         key = (0, 0, 0)
 
         a = torch.randn(3, 4, requires_grad=True)
         b = a * 3.0  # autograd-live to a
-        augmented = _LocalCacheAugment.apply(b, key, cache)
-        c = augmented * 1.0  # incoming grad path
+        _install_augment_hook(b, key, cache)
+        c = b * 1.0  # incoming grad path
         loss = c.sum()
 
         # Pre-populate the captured slot (simulate an earlier
@@ -979,56 +983,53 @@ class TestLocalCacheAutogradFunctions(unittest.TestCase):
 
         loss.backward()
 
-        # dL/d(augmented) = ones_like(c). Augment.backward should have
-        # returned ones + G. So d(c.sum())/db = ones + G, and d/da = 3 * (ones + G).
+        # dL/db incoming = ones_like(c). Hook adds G. So upstream
+        # d/da = 3 * (ones + G).
         expected_a_grad = 3.0 * (torch.ones_like(a) + G)
         self.assertIsNotNone(a.grad)
         self.assertTrue(torch.allclose(a.grad, expected_a_grad))
         # Slot should now be empty (pop semantics).
         self.assertNotIn(key, cache._captured_grads)
 
-    def test_multi_consumer_augment_sums_across_captures(self):
-        """V>2: producer's Augment sees ``incoming + sum_of_all_captures``.
+    def test_multi_consumer_hook_sums_across_captures(self):
+        """V>2: producer's hook sees ``incoming + sum_of_all_captures``.
 
-        Build two independent consumer branches that each wrap the
-        same producer-augmented tensor in Capture (simulating one
-        producer, two later virtual stages on the same rank). Call a
-        joint backward and verify the augment receives the incoming
-        grad plus BOTH capture contributions summed.
+        Two independent consumer branches each wrap the SAME detached
+        cache entry (simulating one producer, two later virtual stages
+        on the same rank). The producer-side hook fires once on the
+        producer's own backward path and reads ``capture_grad`` which
+        was summed across both consumer Captures.
         """
         cache = RankLocalCache()
         key = (0, 0, 0)
 
         a = torch.randn(3, 4, requires_grad=True)
         b = a * 2.0  # shared producer
-        # Producer-side wrapper: the augmented tensor is what downstream
-        # consumers will cache and what the producer's own downstream
-        # consumes in its incoming grad path.
-        augmented = _LocalCacheAugment.apply(b, key, cache)
+        _install_augment_hook(b, key, cache)
 
-        # Producer's OWN downstream path (simulating the SEND_F/etc.
-        # incoming grad that eventually returns to this node).
-        own_path = augmented * 1.0
+        # Producer's OWN downstream path (simulating the SEND_B grad
+        # that eventually arrives at the producer block).
+        own_path = b * 1.0
         own_loss = own_path.sum()
 
-        # Two consumer branches wrap the augmented tensor in Capture,
-        # then do independent computations. Their gradients will land
-        # in the captured-grad slot, NOT in a.grad, because Capture
-        # severs upstream propagation.
-        cap1 = _LocalCacheCapture.apply(augmented, key, cache)
-        cap2 = _LocalCacheCapture.apply(augmented, key, cache)
+        # Two consumer branches read DETACHED copies of b from the
+        # cache and wrap each in Capture. Both Captures' grads sum
+        # into the same slot via cache.capture_grad.
+        cached = b.detach()
+        cached.requires_grad_(True)
+        cap1 = _LocalCacheCapture.apply(cached, key, cache)
+        cap2 = _LocalCacheCapture.apply(cached, key, cache)
         cons1_loss = (cap1 * 2.0).sum()  # dL1/d(cap1) = 2 * ones
         cons2_loss = (cap2 * 5.0).sum()  # dL2/d(cap2) = 5 * ones
 
         total_loss = own_loss + cons1_loss + cons2_loss
         total_loss.backward()
 
-        # Slot should be empty after Augment.backward popped it.
+        # Slot must be drained by the producer's hook.
         self.assertNotIn(key, cache._captured_grads)
 
-        # a.grad = 2.0 * augment_back = 2.0 * (incoming_from_own_path +
-        #   sum_of_both_captures) = 2.0 * (1*ones + 2*ones + 5*ones)
-        #                         = 2.0 * 8 * ones = 16 * ones.
+        # a.grad = 2.0 * (incoming_from_own_path + sum_of_both_captures)
+        #        = 2.0 * (1*ones + 2*ones + 5*ones) = 16 * ones.
         expected_a_grad = torch.full_like(a, 2.0 * (1.0 + 2.0 + 5.0))
         self.assertIsNotNone(a.grad)
         self.assertTrue(
@@ -1038,16 +1039,15 @@ class TestLocalCacheAutogradFunctions(unittest.TestCase):
 
     def test_producer_param_grad_equivalence_to_naive(self):
         """End-to-end param-grad equivalence on a toy mimic of the real
-        pattern: a producer "stage-0" param emits a block that flows
-        into BOTH (a) the delta sent forward to later stages (and
-        eventually returns a grad via SEND_B) AND (b) the shared cache,
-        from which a later virtual stage on the same rank reads it.
+        pattern: a producer emits a block that flows into BOTH (a) the
+        delta sent forward to later stages (returns grad via SEND_B)
+        AND (b) the shared cache, from which a later same-rank virtual
+        stage reads it.
 
-        In the wrapped path we put Augment at emission time (wrapping
-        the producer's output BEFORE it forks into delta+cache), and
-        Capture at the consumer's read-from-cache site. Run once with
-        no wrappers (baseline), once with Augment+Capture. All param
-        grads must match.
+        In the wrapped path the producer block carries an
+        ``_install_augment_hook`` and the cached read site uses Capture
+        on a DETACHED cache entry. Run once without wrappers (baseline),
+        once with the hook+Capture pair. All param grads must match.
         """
         cache = RankLocalCache()
         key = (0, 0, 0)
@@ -1055,35 +1055,23 @@ class TestLocalCacheAutogradFunctions(unittest.TestCase):
         torch.manual_seed(11)
         tokens = torch.randn(2, 4, requires_grad=False)
 
-        # Helper: do the shared forward computation. In the real adapter
-        # the producer's block goes into two places: (1) the outgoing
-        # delta consumed by a later stage (a LATER DIFFERENT-RANK stage
-        # whose grad comes back through autograd+SEND_B), and (2) the
-        # rank-local cache, read by the same-rank later virtual stage.
-        # We model path (1) with a direct use and path (2) with a
-        # "cache" variable re-used downstream.
         def _forward_joint(
             w_p_, w_delta_, w_c_, use_wrappers: bool,
         ) -> torch.Tensor:
             block = tokens @ w_p_  # producer emission
-            # Producer emission goes through the augment when wrappers
-            # are on; otherwise identity.
-            emitted = (
-                _LocalCacheAugment.apply(block, key, cache)
-                if use_wrappers else block
-            )
-            # Path 1: outgoing delta (modeled as a direct downstream
-            # computation that ends in a scalar). This is the SEND_B
-            # analogue: the grad that returns here from the later
-            # stage's backward. No wrapping: it's analogous to the
-            # recv-delta autograd chain that PP manages.
-            delta_path = (emitted @ w_delta_).sum()
-            # Path 2: later virtual stage on the SAME rank reads the
-            # cached block. In wrapped mode, it reads through Capture.
-            cached_read = (
-                _LocalCacheCapture.apply(emitted, key, cache)
-                if use_wrappers else emitted
-            )
+            if use_wrappers:
+                _install_augment_hook(block, key, cache)
+            # Path 1: outgoing delta (analogue of SEND_B downstream).
+            delta_path = (block @ w_delta_).sum()
+            # Path 2: later same-rank virtual stage reads the cached
+            # block. In the wrapped flow the cache stores a DETACHED
+            # leaf; Capture intercepts the grad and stores it in a slot.
+            if use_wrappers:
+                cached = block.detach()
+                cached.requires_grad_(True)
+                cached_read = _LocalCacheCapture.apply(cached, key, cache)
+            else:
+                cached_read = block
             consumer_path = (cached_read @ w_c_ + cached_read * 0.3).sum()
             return delta_path + consumer_path
 
@@ -1098,7 +1086,8 @@ class TestLocalCacheAutogradFunctions(unittest.TestCase):
         naive_wd = w_delta.grad.detach().clone()
         naive_wc = w_c.grad.detach().clone()
 
-        # --- wrapped path: Augment at emission, Capture at cached read.
+        # --- wrapped path: hook at emission, Capture on detached cache
+        # read.
         w_p2 = nn.Parameter(w_p.detach().clone())
         w_delta2 = nn.Parameter(w_delta.detach().clone())
         w_c2 = nn.Parameter(w_c.detach().clone())
