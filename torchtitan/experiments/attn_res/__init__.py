@@ -6,14 +6,14 @@
 
 """Block Attention Residuals experiment (Kimi Team, 2026).
 
-Registers Llama3 dense model flavors with Block AttnRes enabled and exposes
-them through torchtitan's standard ``--module attn_res --config <name>`` path.
+Registers dense AttnRes-native model flavors and exposes them through
+torchtitan's standard ``--module attn_res --config <name>`` path.
 
-Design: the experiment is self-contained under this folder. Core torchtitan
-model files (``torchtitan/models/common/decoder.py``,
-``torchtitan/models/llama3/model.py``) are not modified; all AttnRes forward
-paths live in :mod:`torchtitan.experiments.attn_res.model` as subclasses of
-the core blocks.
+Design: the experiment is self-contained under this folder. Model classes
+(``AttnResModel``, ``AttnResTransformerBlock``) inherit only from the shared
+``torchtitan.models.common.decoder`` bases — no coupling to Llama3. This
+keeps AttnRes free to pivot to MoE (Kimi's production architecture) without
+waiting on changes to the Llama3 model family.
 """
 
 from collections.abc import Callable
@@ -21,8 +21,8 @@ from functools import partial
 
 import torch.nn as nn
 
-# Total number of transformer layers for the 175M Llama3 dense config.
-# Fixed by the Llama3 shape; all num_blocks values must divide it (see
+# Total number of transformer layers for the 175M dense AttnRes config.
+# All num_blocks values must divide n_layers (see
 # _175m_attn_res). Name reflects total parameter count (~174M with tied
 # embedding counted once); torchtitan's size-log convention reports this
 # as 75.5M non-embedding.
@@ -31,8 +31,8 @@ _175M_N_LAYERS = 12
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.experiments.attn_res.attn_res import AttnResConfig, AttnResProjection
 from torchtitan.experiments.attn_res.model import (
-    AttnResLlama3Model,
-    AttnResLlama3TransformerBlock,
+    AttnResModel,
+    AttnResTransformerBlock,
 )
 from torchtitan.experiments.attn_res.pipeline_adapter import (
     pipeline_llm_with_cache_adapter,
@@ -53,8 +53,8 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 
 __all__ = [
-    "AttnResLlama3Model",
-    "AttnResLlama3TransformerBlock",
+    "AttnResModel",
+    "AttnResTransformerBlock",
     "attn_res_configs",
     "model_registry",
 ]
@@ -95,11 +95,11 @@ def _build_attn_res_layers(
     n_heads: int,
     hidden_dim: int,
     n_kv_heads: int | None = None,
-) -> list[AttnResLlama3TransformerBlock.Config]:
-    layers: list[AttnResLlama3TransformerBlock.Config] = []
+) -> list[AttnResTransformerBlock.Config]:
+    layers: list[AttnResTransformerBlock.Config] = []
     for layer_id in range(n_layers):
         layers.append(
-            AttnResLlama3TransformerBlock.Config(
+            AttnResTransformerBlock.Config(
                 attention_norm=RMSNorm.Config(
                     normalized_shape=dim, param_init=_NORM_INIT
                 ),
@@ -137,7 +137,7 @@ def _build_attn_res_layers(
     return layers
 
 
-def _debugmodel_attn_res() -> AttnResLlama3Model.Config:
+def _debugmodel_attn_res() -> AttnResModel.Config:
     """Debug model with Block Attention Residuals enabled.
 
     6 layers / 3 blocks = 2 layers per block, so every even-indexed layer
@@ -147,7 +147,7 @@ def _debugmodel_attn_res() -> AttnResLlama3Model.Config:
     n_heads = 16
     n_layers = 6
     num_blocks = 3
-    return AttnResLlama3Model.Config(
+    return AttnResModel.Config(
         dim=dim,
         vocab_size=2048,
         tok_embeddings=Embedding.Config(
@@ -184,8 +184,8 @@ def _175m_attn_res(
     num_blocks: int = 6,
     n_layers: int = _175M_N_LAYERS,
     enable_weight_tying: bool = True,
-) -> AttnResLlama3Model.Config:
-    """~175M dense Llama3 with Block AttnRes enabled.
+) -> AttnResModel.Config:
+    """~175M dense AttnRes-native model with Block AttnRes enabled.
 
     Parameter count: 174,017,280 total (tied embedding counted once) /
     75,555,072 as reported by torchtitan's size-log under the tied-
@@ -219,7 +219,7 @@ def _175m_attn_res(
     n_heads = 12
     n_kv_heads = 4
     vocab_size = 128256
-    return AttnResLlama3Model.Config(
+    return AttnResModel.Config(
         dim=dim,
         vocab_size=vocab_size,
         enable_weight_tying=enable_weight_tying,

@@ -393,7 +393,7 @@ def _prepend_wrapped_prefix_pre_hook(
 # ----- The adapter module -------------------------------------------------- #
 
 class CrossStageCacheAdapter(nn.Module):
-    """Wraps an ``AttnResLlama3Model`` stage with cross-stage caching.
+    """Wraps an ``AttnResModel`` stage with cross-stage caching.
 
     In delta mode (``layout_tables`` supplied) each forward pulls earlier
     blocks from the shared :class:`RankLocalCache`, receives the incoming

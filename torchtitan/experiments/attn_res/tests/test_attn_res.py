@@ -8,7 +8,7 @@
 
 Covers the core ``block_attn_res`` primitive, the ``AttnResProjection``
 config/build path, the stack/unstack helpers, and end-to-end forward and
-backward on a debug-sized ``AttnResLlama3Model``. CPU only -- no GPU or
+backward on a debug-sized ``AttnResModel``. CPU only -- no GPU or
 distributed setup required.
 """
 
@@ -176,8 +176,8 @@ class TestStackUnstackBlocks(unittest.TestCase):
         self.assertIsNotNone(b1.grad)
 
 
-class TestAttnResLlama3Model(unittest.TestCase):
-    """End-to-end tests of a debug-sized AttnResLlama3Model.
+class TestAttnResModel(unittest.TestCase):
+    """End-to-end tests of a debug-sized AttnResModel.
 
     Builds the ``debugmodel_attn_res`` config (6 layers / 3 blocks), runs a
     forward pass on random tokens, and checks the output shape, zero-init of

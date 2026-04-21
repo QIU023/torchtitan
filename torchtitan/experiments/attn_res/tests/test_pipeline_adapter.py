@@ -123,7 +123,7 @@ class TestMbIndexThreading(unittest.TestCase):
 
 class _InnerToy(nn.Module):
     """Tiny inner model with a mix of params and a buffer -- stands in
-    for ``AttnResLlama3Model`` for the state_dict key-layout tests.
+    for ``AttnResModel`` for the state_dict key-layout tests.
     """
 
     def __init__(self):

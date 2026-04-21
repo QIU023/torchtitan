@@ -22,7 +22,7 @@ baseline × 1.25 compute at matched size, with PP-friendly `N ≈ 8`.
 | File | Role |
 | --- | --- |
 | [`attn_res.py`](./attn_res.py) | `block_attn_res()` primitive, `AttnResConfig`, `AttnResProjection` (pseudo-query, zero-initialized), `stack_blocks` / `unstack_blocks` |
-| [`model.py`](./model.py) | `AttnResLlama3TransformerBlock` (subclass of `Llama3TransformerBlock`) and `AttnResLlama3Model` (subclass of `Llama3Model`) |
+| [`model.py`](./model.py) | `AttnResTransformerBlock` and `AttnResModel` (standalone dense classes inheriting only from the shared `torchtitan.models.common.decoder` bases — no Llama3 coupling) |
 | [`__init__.py`](./__init__.py) | Model flavors: `debugmodel_attn_res`, `175M_attn_res`; `model_registry(flavor)` |
 | [`config_registry.py`](./config_registry.py) | Trainer configs: `llama3_175m_baseline`, `llama3_175m_attn_res` (shared hyperparameters, only model flavor differs) |
 | [`tests/`](./tests/) | CPU unit tests for the primitive, projection, stack/unstack, and end-to-end debug model |
@@ -51,11 +51,11 @@ bash run_train.sh --module attn_res --config llama3_175m_attn_res \
   zero-initialized so that softmax weights are uniform at step 0 and the
   model is numerically equivalent to standard residuals for the first
   forward. Training stability depends on this.
-- **FSDP dispatch.** `AttnResLlama3TransformerBlock.forward` routes through
+- **FSDP dispatch.** `AttnResTransformerBlock.forward` routes through
   `__call__` (not `forward_attn_res` directly) when AttnRes kwargs are
   provided, so FSDP2's pre-forward `all_gather` hook fires on the block
   unit and AttnRes sub-params unshard before the `rms_norm` mul.
-- **PP intermediate stage.** `AttnResLlama3Model.forward` returns
+- **PP intermediate stage.** `AttnResModel.forward` returns
   `(partial_block, stack_blocks(blocks))` at non-last stages so
   `PipelineStage` sends both tensors via P2P. The last stage (identified
   by `self.output is not None`) applies a final cross-block aggregation
