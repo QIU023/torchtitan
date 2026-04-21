@@ -6,11 +6,21 @@
 
 """Trainer configs for the Block AttnRes experiment.
 
-Exposes two sibling configs that share every hyperparameter EXCEPT the model
-flavor so the only measurable delta is Block AttnRes itself:
+Two flavor families are registered here:
 
-- ``llama3_175m_baseline``: plain ~175M Llama3 dense, standard residuals.
-- ``llama3_175m_attn_res``: same shape, Block AttnRes enabled (N=6 blocks).
+1. Dense + GQA (Llama3-shape) — the single-GPU A/B reference:
+   - ``llama3_175m_baseline``: plain ~175M Llama3 dense, standard residuals.
+   - ``llama3_175m_attn_res``: same shape, Block AttnRes enabled
+     (N=6 blocks).
+   - Plus N-ablation variants.
+
+2. MoE + MLA (DeepSeek-V3 shape) — the production-adjacent target:
+   - ``dsv3_attn_res_debugmodel``: small MoE debug (6 layers, 8 experts,
+     N=3). CPU / single-GPU smoke.
+   - ``dsv3_attn_res_16b``: ~16B MoE + MLA + AttnRes (N=9, 3 layers per
+     block). The A/B baseline for this is upstream
+     ``--module deepseek_v3 --config deepseek_v3_16b``; every hyperparameter
+     matches that config so the only measured delta is AttnRes.
 """
 
 from collections.abc import Callable
@@ -24,7 +34,12 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.validate import Validator
-from torchtitan.config import ActivationCheckpointConfig, TrainingConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    CompileConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.attn_res import model_registry as attn_res_model_registry
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -272,3 +287,102 @@ def llama3_175m_attn_res_L16_n8() -> Trainer.Config:
     sweep stays apples-to-apples when compared to Phase 2.
     """
     return _llama3_175m_attn_res_variant("175M_attn_res_L16_n8")
+
+
+# ------------------------------------------------------------------------- #
+# DSv3-shaped MoE + MLA + AttnRes Trainer configs.
+#
+# Hyperparameters mirror upstream ``torchtitan.models.deepseek_v3.config_registry``
+# so the only training-level delta between ``deepseek_v3_16b`` (baseline,
+# run via --module deepseek_v3) and ``dsv3_attn_res_16b`` (our variant,
+# run via --module attn_res) is Block AttnRes itself.
+# ------------------------------------------------------------------------- #
+
+
+def dsv3_attn_res_debugmodel() -> Trainer.Config:
+    """Tiny DSv3-shape MoE + AttnRes debug config.
+
+    6 layers (1 dense + 5 MoE), 8 experts, N=3 AttnRes blocks. Uses the
+    bundled test tokenizer and c4_test dataset; finishes in a few seconds
+    on CPU. Meant for unit / smoke tests, not a training target.
+    """
+    return Trainer.Config(
+        hf_assets_path="./tests/assets/tokenizer",
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model_spec=attn_res_model_registry("dsv3_debugmodel_attn_res"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=8,
+            seq_len=2048,
+            steps=10,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+    )
+
+
+def dsv3_attn_res_16b() -> Trainer.Config:
+    """~16B MoE + MLA + AttnRes (N=9). Production-adjacent training target.
+
+    Matches ``deepseek_v3.deepseek_v3_16b`` training hyperparameters
+    verbatim; the only delta is Block AttnRes on every layer. For A/B
+    comparison, run the baseline as
+    ``--module deepseek_v3 --config deepseek_v3_16b`` and this as
+    ``--module attn_res --config dsv3_attn_res_16b`` with matching seed
+    and data order.
+    """
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/deepseek-moe-16b-base",
+        model_spec=attn_res_model_registry("dsv3_16b_attn_res"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        optimizer=OptimizersContainer.Config(lr=2.2e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=4,
+            seq_len=4096,
+            steps=1000,
+        ),
+        parallelism=ParallelismConfig(
+            pipeline_parallel_schedule="Interleaved1F1B",
+            expert_parallel_degree=8,
+            expert_tensor_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(interval=10),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        compile=CompileConfig(enable=True, components=["loss"]),
+    )
+
+
+def _dsv3_attn_res_16b_nvariant(flavor: str) -> Trainer.Config:
+    """Helper: baseline 16B trainer config + a specific AttnRes num_blocks flavor.
+
+    Used to build N-ablation runs that share every hyperparameter with the
+    primary ``dsv3_attn_res_16b`` except ``num_blocks``.
+    """
+    config = dsv3_attn_res_16b()
+    config.model_spec = attn_res_model_registry(flavor)
+    return config
+
+
+def dsv3_attn_res_16b_n3() -> Trainer.Config:
+    """Ablation: N=3 (9 layers per block). Coarse grouping, bandwidth-light."""
+    return _dsv3_attn_res_16b_nvariant("dsv3_16b_attn_res_n3")
+
+
+def dsv3_attn_res_16b_n27() -> Trainer.Config:
+    """Ablation: N=27 (1 layer per block = Full-AttnRes on this L=27 shape)."""
+    return _dsv3_attn_res_16b_nvariant("dsv3_16b_attn_res_n27")

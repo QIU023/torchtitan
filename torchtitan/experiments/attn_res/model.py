@@ -55,21 +55,47 @@ from torchtitan.experiments.attn_res.attn_res import (
     stack_blocks,
     unstack_blocks,
 )
-from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    ScaledDotProductAttention,
+    VarlenAttention,
+)
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.rmsnorm import RMSNorm
-from torchtitan.models.utils import get_dense_model_nparams_and_flops
+from torchtitan.models.utils import (
+    get_dense_model_nparams_and_flops,
+    get_moe_model_nparams_and_flops,
+)
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import has_cuda_capability
 
 
 class AttnResTransformerBlock(TransformerBlock):
-    """Dense transformer block with Block AttnRes over its two sub-layers.
+    """Transformer block with Block AttnRes wrapping each sub-layer.
 
     Inherits from the shared ``TransformerBlock`` base (not Llama3-specific).
-    Reuses the same attention / feed-forward / attention_norm / ffn_norm
-    fields as any other dense block, so ``parallelize_llama`` and the
-    torchtitan TP / FSDP / AC / compile passes apply unchanged (they
-    duck-type on those four attribute names, not on the concrete class).
+    The FFN branch is chosen per-layer from the block's Config:
+
+    - ``config.moe`` set, ``config.feed_forward`` None → MoE layer (``self.moe``)
+    - ``config.feed_forward`` set, ``config.moe`` None → dense layer
+      (``self.feed_forward``)
+
+    This mirrors DeepSeek-V3's block convention (``DeepSeekV3TransformerBlock``)
+    so a model can use the DSv3 pattern of first-N-dense-then-MoE layers, or
+    uniformly dense / uniformly MoE. The MoE module itself is torchtitan's
+    shared ``torchtitan.models.common.moe.MoE``; no MoE code is duplicated
+    here.
+
+    Attention is whatever ``BaseAttention.Config`` subclass is given — the
+    block duck-types on ``self.attention.forward``, so DSv3's MLA
+    (``torchtitan.models.deepseek_v3.model.Attention``) and the standard
+    GQA config both work.
+
+    The four standard attribute names (``attention``, ``attention_norm``,
+    ``ffn_norm``, plus one of ``moe`` / ``feed_forward``) are preserved so
+    ``parallelize_llama`` / ``parallelize_deepseekv3`` / the TP / FSDP / AC /
+    compile passes apply unchanged — they duck-type on those names, not on
+    the concrete class.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -82,13 +108,26 @@ class AttnResTransformerBlock(TransformerBlock):
     def __init__(self, config: Config):
         super().__init__()
         self.attention = config.attention.build()
-        assert config.feed_forward is not None, (
-            "AttnResTransformerBlock requires a dense feed_forward. "
-            "MoE support will come in a follow-up experiment."
-        )
-        self.feed_forward = config.feed_forward.build()
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
+
+        # FFN branch: MoE or dense, per-layer (DSv3 pattern).
+        self.moe_enabled = config.moe is not None
+        if self.moe_enabled:
+            assert config.feed_forward is None, (
+                "AttnResTransformerBlock cannot have both moe and "
+                "feed_forward set; choose one per layer."
+            )
+            assert config.moe is not None
+            self.moe = config.moe.build()
+        else:
+            assert config.feed_forward is not None, (
+                "AttnResTransformerBlock requires either `moe` or "
+                "`feed_forward` on its Config."
+            )
+            self.feed_forward = config.feed_forward.build()
+
+        # AttnRes-specific params (four per block).
         self.attn_res_proj = config.attn_res_proj.build()
         self.mlp_res_proj = config.mlp_res_proj.build()
         self.attn_res_norm = config.attn_res_norm.build()
@@ -116,6 +155,11 @@ class AttnResTransformerBlock(TransformerBlock):
         ``__call__`` from the model's layer loop so FSDP2's pre-forward
         ``all_gather`` hook fires and AttnRes sub-params unshard before
         ``rms_norm``'s mul.
+
+        The FFN branch is chosen at init time (``self.moe_enabled``)
+        so the per-step control flow is a single ``if`` on a static
+        flag — no ``hasattr`` checks, no dynamic dispatch, torch.compile
+        can fold the unused branch away.
         """
         # Pre-attention cross-block aggregation.
         h = block_attn_res(
@@ -135,8 +179,12 @@ class AttnResTransformerBlock(TransformerBlock):
         # Pre-MLP cross-block aggregation.
         h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm)
 
-        mlp_out = self.feed_forward(self.ffn_norm(h))
-        partial_block = partial_block + mlp_out
+        # FFN: MoE or dense, per the flag set at init.
+        if self.moe_enabled:
+            ffn_out = self.moe(self.ffn_norm(h))
+        else:
+            ffn_out = self.feed_forward(self.ffn_norm(h))
+        partial_block = partial_block + ffn_out
 
         return blocks, partial_block
 
@@ -173,8 +221,15 @@ class AttnResModel(Decoder):
             trainer_config,
             **kwargs,
         ) -> None:
+            # Local import to avoid a top-level cross-experiment dep when
+            # only the dense GQA code path is exercised.
+            from torchtitan.models.deepseek_v3.model import (
+                Attention as DSv3MLAAttention,
+            )
+
             training = trainer_config.training
             parallelism = trainer_config.parallelism
+            debug = trainer_config.debug
             seq_len = training.seq_len
             if seq_len > self.rope.max_seq_len:
                 logger.warning(
@@ -183,28 +238,92 @@ class AttnResModel(Decoder):
                 )
             self.rope = dataclasses.replace(self.rope, max_seq_len=seq_len)
 
-            if parallelism.context_parallel_degree > 1 and isinstance(
-                self.layers[0].attention.inner_attention, VarlenAttention.Config
-            ):
-                raise NotImplementedError(
-                    "Context Parallel only supports SDPA and FlexAttention. "
-                    "Varlen attention is not supported with CP."
-                )
+            # Branch on attention type. Both branches use a single sentinel
+            # attention config (layer 0) to pick the path; all layers in a
+            # single model share the same attention family.
+            attn0 = self.layers[0].attention
+            is_mla = isinstance(attn0, DSv3MLAAttention.Config)
 
-            tp = parallelism.tensor_parallel_degree
-            if tp > 1:
-                n_heads = self.layers[0].attention.n_heads
-                n_kv_heads = self.layers[0].attention.n_kv_heads or n_heads
-                if n_heads % tp != 0:
-                    raise ValueError(
-                        f"tensor_parallel_degree ({tp}) must divide "
-                        f"n_heads ({n_heads})."
+            if is_mla:
+                # MLA needs per-layer rope fields synced (DSv3 pattern:
+                # see torchtitan/models/deepseek_v3/model.py). These fields
+                # live on DSv3MLAAttention.Config, not on the shared RoPE,
+                # so we propagate them explicitly.
+                for layer_cfg in self.layers:
+                    assert isinstance(layer_cfg.attention, DSv3MLAAttention.Config)
+                    layer_cfg.attention.rope_max_seq_len = seq_len
+                    layer_cfg.attention.rope_factor = self.rope.rope_factor
+                    layer_cfg.attention.rope_original_seq_len = (
+                        self.rope.original_seq_len
                     )
-                if n_kv_heads % tp != 0:
-                    raise ValueError(
-                        f"tensor_parallel_degree ({tp}) must divide "
-                        f"n_kv_heads ({n_kv_heads})."
+                # MLA + CP requires SDPA inner attention (DSv3 constraint).
+                if parallelism.context_parallel_degree > 1 and not isinstance(
+                    attn0.inner_attention, ScaledDotProductAttention.Config
+                ):
+                    raise NotImplementedError(
+                        "Context Parallel with MLA attention only supports "
+                        "ScaledDotProductAttention. Got "
+                        f"{type(attn0.inner_attention).__name__}."
                     )
+            else:
+                # GQA path: CP is incompatible with varlen attention.
+                if parallelism.context_parallel_degree > 1 and isinstance(
+                    attn0.inner_attention, VarlenAttention.Config
+                ):
+                    raise NotImplementedError(
+                        "Context Parallel only supports SDPA and "
+                        "FlexAttention. Varlen attention is not supported "
+                        "with CP."
+                    )
+                # TP divisibility on heads / kv-heads (GQA-only; MLA's
+                # wq / wq_b / wkv_b layout is validated by
+                # parallelize_deepseekv3 itself).
+                tp = parallelism.tensor_parallel_degree
+                if tp > 1:
+                    n_heads = attn0.n_heads
+                    n_kv_heads = attn0.n_kv_heads or n_heads
+                    if n_heads % tp != 0:
+                        raise ValueError(
+                            f"tensor_parallel_degree ({tp}) must divide "
+                            f"n_heads ({n_heads})."
+                        )
+                    if n_kv_heads % tp != 0:
+                        raise ValueError(
+                            f"tensor_parallel_degree ({tp}) must divide "
+                            f"n_kv_heads ({n_kv_heads})."
+                        )
+
+            # MoE hooks (DSv3 pattern): one pass over layers wiring up
+            # routing-debug flags, the grouped-mm SM90 guard, and the
+            # DeepEP backend swap. Layers without MoE (``layer_cfg.moe is
+            # None``) are skipped.
+            for layer_cfg in self.layers:
+                if layer_cfg.moe is None:
+                    continue
+                if (
+                    layer_cfg.moe.experts.use_grouped_mm
+                    and not has_cuda_capability(9, 0)
+                ):
+                    logger.warning(
+                        "Failed to use grouped mm, which is only supported "
+                        "on SM90 or later",
+                    )
+                    layer_cfg.moe.experts.use_grouped_mm = False
+                layer_cfg.moe.router._debug_force_load_balance = (
+                    debug.moe_force_load_balance
+                )
+                if parallelism.expert_parallel_comm_backend in (
+                    "deepep",
+                    "hybridep",
+                ):
+                    from torchtitan.models.common.moe_deepep import DeepEPMoE
+
+                    init_kwargs = {
+                        f.name: getattr(layer_cfg.moe, f.name)
+                        for f in dataclasses.fields(layer_cfg.moe)
+                        if f.init
+                    }
+                    layer_cfg.moe = DeepEPMoE.Config(**init_kwargs)
 
             if self.enable_weight_tying and parallelism.pipeline_parallel_degree > 1:
                 raise NotImplementedError(
@@ -214,13 +333,42 @@ class AttnResModel(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            # Reuse the dense helper; AttnRes adds ~0.05 % params via the
-            # pseudo-queries, negligible in the flop estimate.
+            # Local import for the isinstance check; see update_from_config.
+            from torchtitan.models.deepseek_v3.model import (
+                Attention as DSv3MLAAttention,
+            )
+
+            has_moe = any(layer.moe is not None for layer in self.layers)
+            attn0 = self.layers[0].attention
+
+            # head_dims convention depends on attention family:
+            #  - GQA: 2 * head_dim (query + key combined footprint)
+            #  - MLA: qk_nope + qk_rope + v_head (DSv3 convention)
+            if isinstance(attn0, DSv3MLAAttention.Config):
+                head_dims = (
+                    attn0.qk_nope_head_dim
+                    + attn0.qk_rope_head_dim
+                    + attn0.v_head_dim
+                )
+            else:
+                head_dims = 2 * (self.dim // attn0.n_heads)
+
+            if has_moe:
+                # MoE helper needs the model config for expert-count math.
+                # AttnRes adds ~0.05% params via pseudo-queries -- negligible
+                # at MoE scale.
+                return get_moe_model_nparams_and_flops(
+                    self,
+                    model,
+                    attn0.n_heads,
+                    head_dims,
+                    seq_len,
+                )
             return get_dense_model_nparams_and_flops(
                 model,
                 n_layers=len(self.layers),
-                n_heads=self.layers[0].attention.n_heads,
-                head_dims=2 * (self.dim // self.layers[0].attention.n_heads),
+                n_heads=attn0.n_heads,
+                head_dims=head_dims,
                 seq_len=seq_len,
                 enable_weight_tying=self.enable_weight_tying,
             )

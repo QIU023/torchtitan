@@ -6,18 +6,31 @@
 
 """Block Attention Residuals experiment (Kimi Team, 2026).
 
-Registers dense AttnRes-native model flavors and exposes them through
-torchtitan's standard ``--module attn_res --config <name>`` path.
+Registers two families of AttnRes-native model flavors and exposes them
+through torchtitan's standard ``--module attn_res --config <name>`` path:
+
+1. **Dense + GQA** (``175M_attn_res`` and ablation variants) — the
+   single-GPU reference used for the RFC evidence runs.
+2. **MoE + MLA** (``dsv3_*_attn_res``) — DeepSeek-V3-shaped Mixture-of-
+   Experts variants with AttnRes wired in. Closest open architectural
+   match to Kimi's production line (Kimi Linear / K2 follow the
+   "Moonlight / DeepSeek-V3 design" per paper §5). Reuses torchtitan's
+   shared MoE (``models/common/moe.py``) and DSv3's MLA ``Attention``
+   class unchanged — no MoE / MLA code duplicated here.
 
 Design: the experiment is self-contained under this folder. Model classes
 (``AttnResModel``, ``AttnResTransformerBlock``) inherit only from the shared
-``torchtitan.models.common.decoder`` bases — no coupling to Llama3. This
-keeps AttnRes free to pivot to MoE (Kimi's production architecture) without
-waiting on changes to the Llama3 model family.
+``torchtitan.models.common.decoder`` bases — no coupling to Llama3 or to
+DSv3 model classes. The block's FFN branch is chosen per-layer
+(``moe`` OR ``feed_forward``, DSv3 pattern), so a single model can mix
+first-N-dense-then-MoE layers without a separate block class. AttnRes is
+free to pivot further (e.g. add KDA when Kimi open-sources it) without
+reaching back into core torchtitan.
 """
 
 from collections.abc import Callable
 from functools import partial
+from typing import Literal
 
 import torch.nn as nn
 
@@ -29,6 +42,7 @@ import torch.nn as nn
 _175M_N_LAYERS = 12
 
 from torchtitan.components.loss import build_cross_entropy_loss
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.experiments.attn_res.attn_res import AttnResConfig, AttnResProjection
 from torchtitan.experiments.attn_res.model import (
     AttnResModel,
@@ -44,9 +58,25 @@ from torchtitan.models.common import (
     RMSNorm,
     RoPE,
 )
-from torchtitan.models.common.attention import ScaledDotProductAttention
-from torchtitan.models.common.config_utils import make_ffn_config, make_gqa_config
+from torchtitan.models.common.attention import FlexAttention, ScaledDotProductAttention
+from torchtitan.models.common.config_utils import (
+    make_experts_config,
+    make_ffn_config,
+    make_gqa_config,
+    make_moe_config,
+    make_router_config,
+)
 from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
+# DSv3-family imports: MLA attention (private to DSv3, reused per
+# experiments/ one-way dependency rule), the MoE parallelize function,
+# and the HF state-dict adapter used by MoE flavors. The Attention-config
+# builder ``_make_dsv3_attn_config`` is nominally private but is the
+# single source of truth for DSv3 MLA config assembly; duplicating it
+# would drift as DSv3's config surface evolves.
+from torchtitan.models.deepseek_v3 import _make_dsv3_attn_config
+from torchtitan.models.deepseek_v3.model import Attention as DSv3MLAAttention
+from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
+from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
@@ -260,11 +290,284 @@ def _175m_attn_res(
     )
 
 
+def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
+    """DSv3 depth-scaled init for GroupedExperts w1/w2/w3 weights."""
+    return {
+        "w1": partial(nn.init.trunc_normal_, std=0.02),
+        "w2": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "w3": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+    }
+
+
+def _build_dsv3_attn_res_layers(
+    *,
+    n_layers: int,
+    n_dense_layers: int,
+    dim: int,
+    n_heads: int,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int,
+    mscale: float,
+    dense_hidden_dim: int,
+    moe_hidden_dim: int,
+    num_experts: int,
+    num_shared_experts: int,
+    router_top_k: int,
+    router_score_func: Literal["sigmoid", "softmax"],
+    router_num_expert_groups: int | None = None,
+    router_num_limited_groups: int | None = None,
+    router_route_scale: float = 1.0,
+    router_route_norm: bool = False,
+    score_before_experts: bool = False,
+    inner_attention=None,
+    mask_type: str = "causal",
+) -> list[AttnResTransformerBlock.Config]:
+    """Build DSv3-shaped layers (MLA attention + mixed dense/MoE FFN)
+    with AttnRes wiring on every layer.
+
+    Structural equivalent of ``_build_dsv3_layers`` in
+    ``torchtitan/models/deepseek_v3/__init__.py``, but emits
+    :class:`AttnResTransformerBlock.Config` and appends the four AttnRes
+    fields (pre-attn + pre-MLP pseudo-queries and their norms) to every
+    layer. The MLA attention config is built by DSv3's own
+    ``_make_dsv3_attn_config`` (reused verbatim) so our MLA layer config
+    cannot drift from DSv3's canonical shape.
+
+    Layers ``0..n_dense_layers-1`` get a dense FeedForward; layers
+    ``n_dense_layers..n_layers-1`` get a MoE. This matches DSv3's
+    first-N-dense-then-MoE convention. AttnRes is orthogonal: every
+    layer has the four AttnRes params regardless of FFN type.
+    """
+    layers: list[AttnResTransformerBlock.Config] = []
+    for layer_id in range(n_layers):
+        attn_cfg = _make_dsv3_attn_config(
+            layer_id=layer_id,
+            dim=dim,
+            n_heads=n_heads,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            mscale=mscale,
+            inner_attention=inner_attention,
+            mask_type=mask_type,
+        )
+
+        if layer_id < n_dense_layers:
+            ffn_cfg = make_ffn_config(
+                dim=dim,
+                hidden_dim=dense_hidden_dim,
+                w1_param_init=_LINEAR_INIT,
+                w2w3_param_init=_depth_init(layer_id),
+            )
+            moe_cfg = None
+        else:
+            ffn_cfg = None
+            moe_cfg = make_moe_config(
+                num_experts=num_experts,
+                score_before_experts=score_before_experts,
+                router=make_router_config(
+                    dim=dim,
+                    num_experts=num_experts,
+                    gate_param_init=_depth_init(layer_id),
+                    top_k=router_top_k,
+                    score_func=router_score_func,
+                    num_expert_groups=router_num_expert_groups,
+                    num_limited_groups=router_num_limited_groups,
+                    route_scale=router_route_scale,
+                    route_norm=router_route_norm,
+                ),
+                experts=make_experts_config(
+                    dim=dim,
+                    hidden_dim=moe_hidden_dim,
+                    num_experts=num_experts,
+                    param_init=_depth_experts_init(layer_id),
+                ),
+                shared_experts=make_ffn_config(
+                    dim=dim,
+                    hidden_dim=moe_hidden_dim * num_shared_experts,
+                    w1_param_init=_LINEAR_INIT,
+                    w2w3_param_init=_depth_init(layer_id),
+                ),
+            )
+
+        layers.append(
+            AttnResTransformerBlock.Config(
+                attention=attn_cfg,
+                attention_norm=RMSNorm.Config(
+                    normalized_shape=dim, param_init=_NORM_INIT
+                ),
+                ffn_norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+                feed_forward=ffn_cfg,
+                moe=moe_cfg,
+                attn_res_proj=AttnResProjection.Config(
+                    dim=dim, param_init=_ATTN_RES_PROJ_INIT
+                ),
+                mlp_res_proj=AttnResProjection.Config(
+                    dim=dim, param_init=_ATTN_RES_PROJ_INIT
+                ),
+                attn_res_norm=RMSNorm.Config(
+                    normalized_shape=dim, param_init=_NORM_INIT
+                ),
+                mlp_res_norm=RMSNorm.Config(
+                    normalized_shape=dim, param_init=_NORM_INIT
+                ),
+            )
+        )
+    return layers
+
+
+def _dsv3_debugmodel_attn_res() -> AttnResModel.Config:
+    """Small DSv3-shaped AttnRes model for unit / smoke testing.
+
+    6 layers (1 dense + 5 MoE), 8 experts, N=3 AttnRes blocks (2 layers
+    per block). Dim 256, 16 heads. Same attention + routing shape as
+    DSv3's own ``debugmodel``, plus AttnRes on every layer. Meant for
+    CPU tests and sub-second GPU smoke runs; not a training target.
+    """
+    dim = 256
+    n_layers = 6
+    vocab_size = 2048
+    n_heads = 16
+    rope_dim = 64
+    num_blocks = 3
+
+    layers = _build_dsv3_attn_res_layers(
+        n_layers=n_layers,
+        n_dense_layers=1,
+        dim=dim,
+        n_heads=n_heads,
+        q_lora_rank=0,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=128,
+        mscale=0.70,
+        dense_hidden_dim=1024,
+        moe_hidden_dim=256,
+        num_experts=8,
+        num_shared_experts=2,
+        router_top_k=3,
+        router_score_func="softmax",
+        score_before_experts=False,
+    )
+    return AttnResModel.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        output=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096 * 4,
+            theta=10000.0,
+            backend="complex",
+            scaling="yarn",
+            rope_factor=40.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        layers=layers,
+        attn_res=AttnResConfig(enabled=True, num_blocks=num_blocks),
+        final_attn_res_proj=AttnResProjection.Config(
+            dim=dim, param_init=_ATTN_RES_PROJ_INIT
+        ),
+        final_attn_res_norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+    )
+
+
+def _dsv3_16b_attn_res(num_blocks: int = 9) -> AttnResModel.Config:
+    """~16B DSv3 MoE + AttnRes. Training-scale MoE target.
+
+    Mirrors ``deepseek_v3_16b`` shape (27 layers, dim=2048, 64 experts,
+    MLA + fine-grained routing) and adds AttnRes. ``n_layers=27`` has
+    divisors ``{1, 3, 9, 27}``; N=9 gives 3 layers per block —
+    halfway between N=3 (coarse) and N=27 (per-layer, Full-AttnRes).
+    Paper prescribes ``N ≈ 8`` at large scale; N=9 is the closest
+    divisor of 27 to that target.
+    """
+    if num_blocks < 2 or 27 % num_blocks != 0:
+        raise ValueError(
+            f"num_blocks={num_blocks} must be >=2 and divide 27. "
+            f"Valid: {sorted(d for d in range(2, 28) if 27 % d == 0)}"
+        )
+
+    dim = 2048
+    n_layers = 27
+    vocab_size = 102400
+    n_heads = 16
+    rope_dim = 64
+
+    layers = _build_dsv3_attn_res_layers(
+        n_layers=n_layers,
+        n_dense_layers=1,
+        dim=dim,
+        n_heads=n_heads,
+        q_lora_rank=0,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=128,
+        mscale=0.70,
+        dense_hidden_dim=10944,
+        moe_hidden_dim=1408,
+        num_experts=64,
+        num_shared_experts=2,
+        router_top_k=6,
+        router_score_func="softmax",
+        score_before_experts=False,
+        inner_attention=FlexAttention.Config(),
+        mask_type="block_causal",
+    )
+    return AttnResModel.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        output=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096 * 4,
+            theta=10000.0,
+            backend="complex",
+            scaling="yarn",
+            rope_factor=40.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        layers=layers,
+        attn_res=AttnResConfig(enabled=True, num_blocks=num_blocks),
+        final_attn_res_proj=AttnResProjection.Config(
+            dim=dim, param_init=_ATTN_RES_PROJ_INIT
+        ),
+        final_attn_res_norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+    )
+
+
 attn_res_configs = {
     "debugmodel_attn_res": _debugmodel_attn_res,
     "175M_attn_res": _175m_attn_res,  # default N=6
-    # Ablation flavors over num_blocks. n_layers=12, so divisors are
-    # {2, 3, 4, 6, 12}. N=1 is degenerate (= standard residuals).
+    # Dense + GQA ablation flavors over num_blocks. n_layers=12, so
+    # divisors are {2, 3, 4, 6, 12}. N=1 is degenerate (= standard
+    # residuals).
     "175M_attn_res_n2": partial(_175m_attn_res, num_blocks=2),
     "175M_attn_res_n3": partial(_175m_attn_res, num_blocks=3),
     "175M_attn_res_n4": partial(_175m_attn_res, num_blocks=4),
@@ -284,22 +587,52 @@ attn_res_configs = {
     "175M_attn_res_L16_n8": partial(
         _175m_attn_res, num_blocks=8, n_layers=16, enable_weight_tying=False
     ),
+    # DSv3-shaped MoE + MLA + AttnRes flavors. Architecturally closest
+    # open match to Kimi's production design. See _build_dsv3_attn_res_layers.
+    "dsv3_debugmodel_attn_res": _dsv3_debugmodel_attn_res,
+    "dsv3_16b_attn_res": _dsv3_16b_attn_res,  # N=9 (3 layers/block)
+    "dsv3_16b_attn_res_n3": partial(_dsv3_16b_attn_res, num_blocks=3),
+    "dsv3_16b_attn_res_n27": partial(_dsv3_16b_attn_res, num_blocks=27),
 }
 
 
 def model_registry(flavor: str) -> ModelSpec:
+    """Build a ``ModelSpec`` for ``flavor``.
+
+    Parallelize / post-optimizer / state-dict-adapter are chosen from the
+    Config itself:
+
+    - If any layer has ``moe`` set, the flavor is DSv3-shaped → use
+      ``parallelize_deepseekv3`` (handles EP + TP + MLA layout),
+      ``register_moe_load_balancing_hook`` (load-balance aux grad hook),
+      and ``DeepSeekV3StateDictAdapter`` (HF conversion for DSv3 shape).
+    - Otherwise it is Llama3-proportioned dense → keep ``parallelize_llama``
+      and the Llama3 state-dict adapter.
+
+    The cross-stage caching ``pipelining_fn`` is the same for both because
+    it wraps core ``pipeline_llm`` and is agnostic to the model shape.
+    """
     config = attn_res_configs[flavor]()
+    has_moe = any(layer.moe is not None for layer in config.layers)
+    if has_moe:
+        parallelize_fn = parallelize_deepseekv3
+        post_optimizer_build_fn = register_moe_load_balancing_hook
+        state_dict_adapter = DeepSeekV3StateDictAdapter
+    else:
+        parallelize_fn = parallelize_llama
+        post_optimizer_build_fn = None
+        state_dict_adapter = Llama3StateDictAdapter
     return ModelSpec(
         name="attn_res",
         flavor=flavor,
         model=config,
-        parallelize_fn=parallelize_llama,
+        parallelize_fn=parallelize_fn,
         # Custom pipelining_fn wraps core pipeline_llm with the AttnRes
         # cross-stage caching adapter (opt-in via TORCHTITAN_ATTNRES_CACHE=1).
         # When the flag is unset, this is a thin passthrough over
         # torchtitan.distributed.pipeline_parallel.pipeline_llm.
         pipelining_fn=pipeline_llm_with_cache_adapter,
         build_loss_fn=build_cross_entropy_loss,
-        post_optimizer_build_fn=None,
-        state_dict_adapter=Llama3StateDictAdapter,
+        post_optimizer_build_fn=post_optimizer_build_fn,
+        state_dict_adapter=state_dict_adapter,
     )
