@@ -25,6 +25,7 @@ from torchtitan.experiments.attn_res.attn_res import (
     stack_blocks,
     unstack_blocks,
 )
+from torchtitan.experiments.attn_res.model import AttnResTransformerBlock  # noqa: F401 -- imported for the direct block test below
 from torchtitan.models.common.rmsnorm import RMSNorm
 
 
@@ -277,6 +278,61 @@ class TestAttnResModel(unittest.TestCase):
         # (shape [0, B, T, D]) so P2P gets a static per-stage shape.
         self.assertEqual(new_blocks.shape, torch.Size([0, B, T, D]))
         self.assertEqual(new_blocks.dtype, partial.dtype)
+
+
+class TestAttnResTransformerBlockDirect(unittest.TestCase):
+    """Tests that call ``AttnResTransformerBlock.forward`` directly (not
+    through ``AttnResModel``).
+
+    Since the Llama3-subclass refactor, the block has exactly ONE forward
+    path — ``(blocks, partial_block, is_block_start, freqs_cis, ...)
+    -> (blocks, partial_block)``. No fallback-to-standard-residual mode
+    remains. These tests pin that contract so a regression that
+    accidentally re-introduces positional-argument ambiguity is caught.
+    """
+
+    def _first_layer(self):
+        config = attn_res_configs["debugmodel_attn_res"]()
+        model = config.build()
+        model.init_states()
+        layer = model.layers["0"]
+        return layer, model.freqs_cis, config.dim
+
+    def test_direct_forward_returns_blocks_and_partial(self):
+        layer, freqs_cis, D = self._first_layer()
+        B, T = 2, 4
+        partial = torch.randn(B, T, D)
+        # Layer 0 is a block start in debugmodel (layers_per_block=2).
+        blocks, new_partial = layer(
+            [],
+            partial,
+            True,  # is_block_start
+            freqs_cis,
+            None,  # attention_masks
+            None,  # positions
+        )
+        # After a block start at an empty blocks list, the committed
+        # partial becomes blocks[0]; new_partial is attention+MLP output.
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].shape, torch.Size([B, T, D]))
+        self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
+
+    def test_direct_forward_non_block_start_keeps_blocks(self):
+        layer, freqs_cis, D = self._first_layer()
+        B, T = 2, 4
+        b0 = torch.randn(B, T, D)
+        partial = torch.randn(B, T, D)
+        blocks, new_partial = layer(
+            [b0],
+            partial,
+            False,  # NOT a block start
+            freqs_cis,
+            None,
+            None,
+        )
+        # Non-start: blocks list length unchanged.
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
 
 
 if __name__ == "__main__":
