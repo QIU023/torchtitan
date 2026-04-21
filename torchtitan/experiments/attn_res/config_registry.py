@@ -163,11 +163,86 @@ def _llama3_175m_plain_config() -> Llama3Model.Config:
     )
 
 
+def _llama3_175m_plain_L16_config() -> Llama3Model.Config:
+    """16-layer plain Llama3 dense config; shape-matched to llama3_175m_attn_res_L16_n8
+    minus the AttnRes pseudo-queries and norms.
+
+    Exists so the 4-GPU PP=4 V=2 + layers_per_stage=2 configuration can be
+    run as a no-AttnRes baseline under the same ``--module attn_res``
+    machinery (no per-model-family launcher duplication) and against the
+    same PP slicing as the AttnRes variant. Every other architectural
+    field (dim, heads, kv_heads, FFN hidden dim, RoPE, vocab, tying) is
+    kept bit-identical to ``_175m_attn_res(n_layers=16,
+    enable_weight_tying=False)`` so the only difference in a matched
+    A/B is Block AttnRes itself.
+
+    Weight tying is False (required under PP; torchtitan's
+    ``parallelize_llama`` raises on tying + PP). ``_EMBEDDING_SKIP_INIT``
+    is preserved — nn.Embedding's own ``reset_parameters`` still runs in
+    the constructor and leaves the weight at ``N(0, 1)``; the
+    experiment-level init just opts out of re-initializing it.
+    """
+    dim = 768
+    n_heads = 12
+    n_kv_heads = 4
+    n_layers = 16
+    vocab_size = 128256
+    return Llama3Model.Config(
+        dim=dim,
+        vocab_size=vocab_size,
+        enable_weight_tying=False,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_SKIP_INIT,
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        output=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=dim // n_heads,
+            max_seq_len=8192,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+        layers=_build_plain_llama3_layers(
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            hidden_dim=compute_ffn_hidden_dim(
+                dim, multiple_of=256, ffn_dim_multiplier=1.0
+            ),
+        ),
+    )
+
+
 def _baseline_model_registry() -> ModelSpec:
     return ModelSpec(
         name="llama3",
         flavor="175M",
         model=_llama3_175m_plain_config(),
+        parallelize_fn=parallelize_llama,
+        pipelining_fn=pipeline_llm,
+        build_loss_fn=build_cross_entropy_loss,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=Llama3StateDictAdapter,
+    )
+
+
+def _baseline_L16_model_registry() -> ModelSpec:
+    """ModelSpec for the L16 plain baseline. Uses core pipeline_llm (no
+    cross-stage caching adapter -- baseline has no AttnRes blocks to
+    cache), parallelize_llama, and the stock Llama3 state-dict adapter.
+    """
+    return ModelSpec(
+        name="llama3",
+        flavor="175M_L16",
+        model=_llama3_175m_plain_L16_config(),
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llm,
         build_loss_fn=build_cross_entropy_loss,
@@ -386,3 +461,26 @@ def dsv3_attn_res_16b_n3() -> Trainer.Config:
 def dsv3_attn_res_16b_n27() -> Trainer.Config:
     """Ablation: N=27 (1 layer per block = Full-AttnRes on this L=27 shape)."""
     return _dsv3_attn_res_16b_nvariant("dsv3_16b_attn_res_n27")
+
+
+def llama3_175m_baseline_L16() -> Trainer.Config:
+    """16-layer plain Llama3 dense baseline sized to match
+    ``llama3_175m_attn_res_L16_n8`` minus AttnRes.
+
+    Purpose: serves as the no-AttnRes reference for all PP-scale
+    AttnRes-vs-baseline A/B comparisons. Shares every hyperparameter
+    with ``llama3_175m_baseline`` EXCEPT the ``model_spec`` (which
+    swaps the 12-layer plain Llama3 for the 16-layer plain Llama3 so
+    the PP slicing matches the L16_n8 AttnRes variant, and the 4-GPU
+    launchers in ``phase3/`` can point at it directly).
+
+    The 4-GPU PP=4 V=2 reference config is:
+
+        bash phase3/launch_4gpu_baseline_L16.sh
+
+    Run any A/B against this baseline by setting ``STEPS`` identically
+    on both sides.
+    """
+    config = llama3_175m_baseline()
+    config.model_spec = _baseline_L16_model_registry()
+    return config
