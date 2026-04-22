@@ -118,6 +118,11 @@ class RankLocalCache:
         # producer-side Augment.backward pops and sums the captured
         # grad into its incoming grad when stage R's own backward runs.
         self._captured_grads: dict[tuple[int, int, int], torch.Tensor] = {}
+        # Parallel counter: how many Capture.backward calls have deposited
+        # into each slot. The producer-side hook compares this against
+        # ``layout.expected_same_rank_captures(...)`` to turn silent grad
+        # loss (a consumer's backward never fired) into an explicit warning.
+        self._capture_counts: dict[tuple[int, int, int], int] = {}
 
     def append(
         self, mb_index: int, block: torch.Tensor, meta: tuple[int, int, int],
@@ -144,10 +149,15 @@ class RankLocalCache:
         self._blocks.pop(mb_index, None)
         self._producer_meta.pop(mb_index, None)
         self._seen_mbs.discard(mb_index)
-        # Drop any leftover captured-grad slots for this mb (defensive).
+        # Drop any leftover captured-grad slots + counters for this mb
+        # (defensive; the on_microbatch_end assertion should have already
+        # caught any real leak).
         for key in list(self._captured_grads.keys()):
             if key[0] == mb_index:
                 self._captured_grads.pop(key, None)
+        for key in list(self._capture_counts.keys()):
+            if key[0] == mb_index:
+                self._capture_counts.pop(key, None)
 
     # ----- captured-grad slot helpers -------------------------------- #
 
@@ -155,29 +165,45 @@ class RankLocalCache:
         self, key: tuple[int, int, int], grad: torch.Tensor,
     ) -> None:
         """Accumulate (sum) ``grad`` into the captured-grad slot at
-        ``key``. Multiple consumer-side Captures for the same producer
-        block (V>2, one cached block read by >1 later virtual stage on
-        the same rank) sum into the same slot.
+        ``key`` and bump the capture counter. Multiple consumer-side
+        Captures for the same producer block (V>2, one cached block
+        read by >1 later virtual stage on the same rank) sum into the
+        same slot.
+
+        The first deposit is ``detach().clone()``-ed to decouple from
+        whatever storage the autograd engine / FSDP2 post-backward
+        pipeline hands us. The per-mb cost is O(Np*d) per consumer,
+        which is insignificant next to the PP collective cost at
+        realistic scale, and it removes a fragility: if a downstream
+        framework were to reuse the grad tensor's storage, the slot
+        value would silently corrupt.
         """
         prior = self._captured_grads.get(key)
         if prior is None:
-            # detach()+clone() would lose autograd on the grad itself;
-            # the grad tensor is just a regular tensor at this point
-            # (it's a backward-produced value, not leaf), so storing a
-            # reference is fine. We deliberately do NOT clone so that
-            # in the common V=2 case there's zero extra memory.
-            self._captured_grads[key] = grad
+            self._captured_grads[key] = grad.detach().clone()
         else:
+            # `prior` is already our own detached clone, so out-of-place
+            # addition keeps the semantics clean without aliasing.
             self._captured_grads[key] = prior + grad
+        self._capture_counts[key] = self._capture_counts.get(key, 0) + 1
 
     def pop_grad(
         self, key: tuple[int, int, int],
-    ) -> torch.Tensor | None:
-        """Return-and-clear the captured-grad slot at ``key``. Returns
-        ``None`` if the slot is empty (the producer's cached block was
-        never consumed on this rank during this mb's backward window).
+    ) -> tuple[torch.Tensor | None, int]:
+        """Return-and-clear ``(captured_grad, capture_count)`` for
+        ``key``. ``captured_grad`` is ``None`` / ``capture_count`` is
+        ``0`` when no consumer deposited into this slot during the
+        current mb's backward window.
+
+        The producer-side hook uses ``capture_count`` to validate
+        against the static expectation from
+        :meth:`BlockLayoutTables.expected_same_rank_captures` -- any
+        mismatch means a producer's forward graph never saw a
+        consumer's backward, which would silently drop grad.
         """
-        return self._captured_grads.pop(key, None)
+        grad = self._captured_grads.pop(key, None)
+        count = self._capture_counts.pop(key, 0)
+        return grad, count
 
     def has_captured_for_mb(self, mb_index: int) -> bool:
         """True iff any captured-grad slot for ``mb_index`` survives.
@@ -272,11 +298,21 @@ def _install_augment_hook(
     block_tensor: torch.Tensor,
     slot_key: tuple[int, int, int],
     rank_cache: "RankLocalCache",
+    *,
+    expected_captures: int | None = None,
 ) -> None:
     """Register a tensor grad hook on ``block_tensor`` that, when the
     tensor receives its incoming grad during the producer stage's own
     backward, pops the matching captured-grad slot from ``rank_cache``
     and SUMS the captured grad into the incoming grad.
+
+    ``expected_captures``, if provided, is the number of same-rank
+    later virtual stages that SHOULD deposit into this slot during the
+    mb's backward window (from
+    :meth:`BlockLayoutTables.expected_same_rank_captures`). The hook
+    warns when the observed count diverges -- the common failure that
+    this catches is a consumer's backward silently not firing, which
+    would drop its grad contribution into the bit bucket.
 
     Replaces the prior ``_LocalCacheAugment`` autograd.Function pattern:
     under real PP scheduling the Function's output-view trick did not
@@ -293,8 +329,22 @@ def _install_augment_hook(
     only ever sees the detached cache entry — see ``_append_own_commit``).
     """
     def _hook(grad: torch.Tensor) -> torch.Tensor:
-        captured = rank_cache.pop_grad(slot_key)
-        _dbg(f"augment_hook slot={slot_key} captured={'yes' if captured is not None else 'no'}")
+        captured, count = rank_cache.pop_grad(slot_key)
+        _dbg(
+            f"augment_hook slot={slot_key} "
+            f"captured={'yes' if captured is not None else 'no'} "
+            f"count={count} expected={expected_captures}"
+        )
+        if expected_captures is not None and count != expected_captures:
+            warnings.warn(
+                f"AttnRes adapter: capture-count mismatch at slot "
+                f"{slot_key}: observed {count} deposits, layout expected "
+                f"{expected_captures}. This indicates a same-rank "
+                "consumer's backward did not fire (silent grad loss) "
+                "or an unexpected consumer deposited an extra grad. "
+                "Escalate with -W error::UserWarning under CI.",
+                stacklevel=1,
+            )
         if captured is None:
             return grad
         return grad + captured
@@ -692,7 +742,13 @@ class CrossStageCacheAdapter(nn.Module):
         new_blocks_list = unstack_blocks(new_blocks_tensor)
         for local_idx, blk in enumerate(new_blocks_list):
             slot_key = (mb, self.stage_id, local_idx)
-            _install_augment_hook(blk, slot_key, self._cache)
+            expected_captures = layout.expected_same_rank_captures(
+                self.stage_id, local_idx,
+            )
+            _install_augment_hook(
+                blk, slot_key, self._cache,
+                expected_captures=expected_captures,
+            )
             # Cache entry must be detached so same-rank consumers cannot
             # reach the producer's forward graph via autograd.
             self._cache.append(

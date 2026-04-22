@@ -119,6 +119,30 @@ class BlockLayoutTables:
         """Stages that consume ``block_idx`` via their shared rank cache."""
         return list(self._cache_consumers_of_block.get(block_idx, ()))
 
+    def expected_same_rank_captures(
+        self, producer_stage: int, block_idx_in_producer: int,
+    ) -> int:
+        """Count of later same-rank virtual stages that read producer
+        ``producer_stage``'s ``block_idx_in_producer``-th commit from
+        their shared rank cache.
+
+        Each such consumer triggers exactly one
+        :class:`pipeline_adapter._LocalCacheCapture.backward` deposit
+        into the producer's captured-grad slot for the current mb. The
+        producer-side hook uses this count to turn silent grad loss
+        (a consumer backward that never ran) into an explicit warning
+        at the moment its own backward fires.
+        """
+        commits = self._commits_at.get(producer_stage, [])
+        if block_idx_in_producer < 0 or block_idx_in_producer >= len(commits):
+            return 0
+        b = commits[block_idx_in_producer]
+        producer_rank = producer_stage % self.P
+        return sum(
+            1 for c in self._cache_consumers_of_block.get(b, [])
+            if c % self.P == producer_rank and c > producer_stage
+        )
+
     # ----- the full simulation ----------------------------------------- #
 
     def _build(self) -> None:

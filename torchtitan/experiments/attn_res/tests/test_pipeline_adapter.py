@@ -1110,5 +1110,351 @@ class TestLocalCacheAutogradFunctions(unittest.TestCase):
         self.assertNotIn(key, cache._captured_grads)
 
 
+class TestCaptureCountAudit(unittest.TestCase):
+    """Validates the hook's capture-count audit against
+    :meth:`BlockLayoutTables.expected_same_rank_captures`.
+
+    Silent grad loss (a same-rank consumer's backward silently not
+    firing) was previously invisible because the hook would just
+    ``pop_grad`` returning ``None`` and do nothing. These tests pin
+    down the observed-vs-expected comparison now wired through the
+    layout tables.
+    """
+
+    def setUp(self) -> None:
+        _reset_rank_caches_for_testing()
+
+    def tearDown(self) -> None:
+        _reset_rank_caches_for_testing()
+
+    def test_no_warning_when_count_matches_expected(self):
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+        a = torch.randn(3, 4, requires_grad=True)
+        b = a * 2.0
+        _install_augment_hook(b, key, cache, expected_captures=2)
+
+        cached = b.detach()
+        cached.requires_grad_(True)
+        cap1 = _LocalCacheCapture.apply(cached, key, cache)
+        cap2 = _LocalCacheCapture.apply(cached, key, cache)
+        total = (b * 1.0).sum() + (cap1 * 2.0).sum() + (cap2 * 5.0).sum()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            total.backward()
+
+        audit_warns = [x for x in w if "capture-count mismatch" in str(x.message)]
+        self.assertEqual(
+            audit_warns, [], f"unexpected capture-count warning: {audit_warns}"
+        )
+
+    def test_warning_when_consumer_backward_missing(self):
+        """Layout expects 1 same-rank consumer deposit; no Capture fires,
+        so count=0 and the hook warns.
+        """
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+        a = torch.randn(3, 4, requires_grad=True)
+        b = a * 2.0
+        _install_augment_hook(b, key, cache, expected_captures=1)
+
+        # Only the producer's own backward runs; the consumer-side
+        # Capture never executes -> 0 deposits where 1 was expected.
+        (b * 1.0).sum().backward()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            # re-issue to observe: run in a second backward to exercise
+            # the warn path deterministically.
+            a2 = torch.randn(3, 4, requires_grad=True)
+            b2 = a2 * 2.0
+            _install_augment_hook(b2, key, cache, expected_captures=1)
+            (b2 * 1.0).sum().backward()
+        msgs = [str(x.message) for x in w]
+        self.assertTrue(
+            any("capture-count mismatch" in m for m in msgs),
+            f"expected capture-count warning, got {msgs}",
+        )
+
+    def test_warning_when_extra_consumer_deposits(self):
+        """Layout expects 1 deposit; two Captures deposit. Hook still
+        sums both into producer grad (correctness preserved) but warns
+        because the static layout didn't predict the extra consumer.
+        """
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+        a = torch.randn(3, 4, requires_grad=True)
+        b = a * 2.0
+        _install_augment_hook(b, key, cache, expected_captures=1)
+
+        cached = b.detach()
+        cached.requires_grad_(True)
+        cap1 = _LocalCacheCapture.apply(cached, key, cache)
+        cap2 = _LocalCacheCapture.apply(cached, key, cache)
+        total = (b * 1.0).sum() + cap1.sum() + cap2.sum()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            total.backward()
+        msgs = [str(x.message) for x in w]
+        self.assertTrue(
+            any("capture-count mismatch" in m for m in msgs),
+            f"expected capture-count warning, got {msgs}",
+        )
+
+    def test_capture_counts_drains_on_pop(self):
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+        a = torch.randn(3, 4, requires_grad=True)
+        b = a * 1.0
+        _install_augment_hook(b, key, cache, expected_captures=1)
+        cached = b.detach()
+        cached.requires_grad_(True)
+        cap = _LocalCacheCapture.apply(cached, key, cache)
+        ((b * 1.0).sum() + cap.sum()).backward()
+        self.assertNotIn(key, cache._captured_grads)
+        self.assertNotIn(key, cache._capture_counts)
+
+    def test_expected_same_rank_captures_canonical(self):
+        """Canonical Interleaved1F1B: P=4, V=2, N=8, one block per stage.
+        Every v=0 producer has exactly one same-rank v=1 consumer; no
+        v=1 producer has any later same-rank consumer.
+        """
+        layout = BlockLayoutTables(
+            pp_size=4, virtual_stages_per_rank=2, num_blocks=8,
+            n_layers=8, layers_per_block=1,
+        )
+        for producer_stage in range(4):
+            self.assertEqual(
+                layout.expected_same_rank_captures(producer_stage, 0), 1,
+                f"producer_stage={producer_stage}",
+            )
+        for producer_stage in range(4, 8):
+            self.assertEqual(
+                layout.expected_same_rank_captures(producer_stage, 0), 0,
+                f"producer_stage={producer_stage}",
+            )
+
+    def test_expected_same_rank_captures_v3(self):
+        """V=3: producer at v=0 has 2 same-rank consumers (v=1, v=2);
+        producer at v=1 has 1 (v=2); producer at v=2 has 0.
+        """
+        layout = BlockLayoutTables(
+            pp_size=2, virtual_stages_per_rank=3, num_blocks=6,
+            n_layers=6, layers_per_block=1,
+        )
+        # v=0 producers: stages 0, 1
+        for s in (0, 1):
+            self.assertEqual(layout.expected_same_rank_captures(s, 0), 2)
+        # v=1 producers: stages 2, 3
+        for s in (2, 3):
+            self.assertEqual(layout.expected_same_rank_captures(s, 0), 1)
+        # v=2 producers: stages 4, 5
+        for s in (4, 5):
+            self.assertEqual(layout.expected_same_rank_captures(s, 0), 0)
+
+    def test_expected_same_rank_captures_bounds(self):
+        layout = BlockLayoutTables(
+            pp_size=2, virtual_stages_per_rank=2, num_blocks=4,
+            n_layers=4, layers_per_block=1,
+        )
+        self.assertEqual(layout.expected_same_rank_captures(0, 5), 0)
+        self.assertEqual(layout.expected_same_rank_captures(99, 0), 0)
+        self.assertEqual(layout.expected_same_rank_captures(0, -1), 0)
+
+
+class TestCaptureGradCloneSemantics(unittest.TestCase):
+    """Validates the defensive ``.detach().clone()`` in ``capture_grad``.
+
+    Before the clone was added, ``_captured_grads[key]`` aliased the
+    backward-produced grad tensor. If a downstream framework (FSDP2
+    post-backward pipeline, future torch.compile'd backward) were to
+    reuse or mutate that storage between deposit and pop, the slot
+    would silently corrupt. Test: mutate the original grad after
+    deposit and verify the slot is unaffected.
+    """
+
+    def setUp(self) -> None:
+        _reset_rank_caches_for_testing()
+
+    def test_capture_grad_decouples_from_input_storage(self):
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+        grad = torch.full((2, 3), 7.0)
+        cache.capture_grad(key, grad)
+        # Mutate original grad in place; slot must NOT observe the change.
+        grad.fill_(999.0)
+        stored = cache._captured_grads[key]
+        self.assertTrue(
+            torch.allclose(stored, torch.full_like(stored, 7.0)),
+            f"slot leaked mutation: stored={stored}",
+        )
+        # pop_grad returns (grad, count) under the new API.
+        popped, count = cache.pop_grad(key)
+        self.assertEqual(count, 1)
+        self.assertTrue(torch.allclose(popped, torch.full_like(popped, 7.0)))
+
+    def test_capture_grad_accumulates_deposits(self):
+        cache = RankLocalCache()
+        key = (0, 0, 0)
+        cache.capture_grad(key, torch.full((2, 3), 1.0))
+        cache.capture_grad(key, torch.full((2, 3), 2.0))
+        cache.capture_grad(key, torch.full((2, 3), 4.0))
+        popped, count = cache.pop_grad(key)
+        self.assertEqual(count, 3)
+        self.assertTrue(torch.allclose(popped, torch.full_like(popped, 7.0)))
+        # pop drains both slot and counter
+        popped2, count2 = cache.pop_grad(key)
+        self.assertIsNone(popped2)
+        self.assertEqual(count2, 0)
+
+
+# ----- DTensor smoke test ------------------------------------------------- #
+# Only importable when torch.distributed.tensor is available. This test
+# does NOT exercise real sharding; it verifies that register_hook,
+# detach, Capture.apply, and grad+captured arithmetic all behave
+# correctly when the operand happens to be a DTensor (the common case
+# under FSDP2 + torchtitan). A 1-rank Replicate mesh is the minimal
+# surface area that still hits the DTensor code paths.
+
+try:
+    import torch.distributed as _dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    _DTENSOR_IMPORTABLE = True
+except (ImportError, RuntimeError):
+    _DTENSOR_IMPORTABLE = False
+
+
+@unittest.skipUnless(
+    _DTENSOR_IMPORTABLE, "torch.distributed.tensor not importable"
+)
+class TestHookWithDTensor(unittest.TestCase):
+    """Smoke test: the hook+detach+Capture bridge on DTensor operands.
+
+    Under real FSDP2 the producer block output can be a DTensor (plain
+    Replicate over the FSDP mesh, or Shard over TP mesh). This test
+    pins down that the bridge produces param grads identical to the
+    plain-tensor baseline when the top-level inputs are DTensor.
+    """
+
+    _owns_pg = False
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _DTENSOR_IMPORTABLE:
+            return
+        if not _dist.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", "29599")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("RANK", "0")
+            try:
+                _dist.init_process_group(backend="gloo", rank=0, world_size=1)
+                cls._owns_pg = True
+            except Exception as e:  # pragma: no cover — test env specific
+                raise unittest.SkipTest(f"gloo PG init failed: {e!r}")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._owns_pg and _dist.is_initialized():
+            _dist.destroy_process_group()
+
+    def setUp(self) -> None:
+        _reset_rank_caches_for_testing()
+
+    def tearDown(self) -> None:
+        _reset_rank_caches_for_testing()
+
+    def test_hook_and_capture_on_dtensor_match_plain_path(self):
+        mesh = init_device_mesh("cpu", (1,))
+
+        torch.manual_seed(47)
+        w_p_init = torch.randn(4, 4)
+        w_delta_init = torch.randn(4, 4)
+        w_c_init = torch.randn(4, 4)
+        tokens_init = torch.randn(2, 4)
+
+        def _run(use_dtensor: bool):
+            cache = RankLocalCache()
+            key = (0, 0, 0)
+            if use_dtensor:
+                # Under real FSDP2 every operand that meets the producer
+                # graph is a DTensor (params via FSDP wrap, activations
+                # via DTensor redistribute). Wrap all three here so the
+                # first matmul is DTensor @ DTensor.
+                tokens = DTensor.from_local(
+                    tokens_init.clone(), mesh, [Replicate()]
+                )
+                w_p = nn.Parameter(
+                    DTensor.from_local(w_p_init.clone(), mesh, [Replicate()])
+                )
+                w_delta = nn.Parameter(
+                    DTensor.from_local(w_delta_init.clone(), mesh, [Replicate()])
+                )
+                w_c = nn.Parameter(
+                    DTensor.from_local(w_c_init.clone(), mesh, [Replicate()])
+                )
+            else:
+                tokens = tokens_init.clone()
+                w_p = nn.Parameter(w_p_init.clone())
+                w_delta = nn.Parameter(w_delta_init.clone())
+                w_c = nn.Parameter(w_c_init.clone())
+
+            block = tokens @ w_p
+            if use_dtensor:
+                self.assertIsInstance(
+                    block, DTensor, "producer emission should be DTensor"
+                )
+            _install_augment_hook(block, key, cache, expected_captures=1)
+
+            # outgoing-delta analogue
+            delta_loss = (block @ w_delta).sum()
+
+            # cached-read analogue (same-rank consumer)
+            cached = block.detach()
+            if use_dtensor:
+                self.assertIsInstance(
+                    cached, DTensor, "detach should preserve DTensor type"
+                )
+            cached.requires_grad_(True)
+            cached_read = _LocalCacheCapture.apply(cached, key, cache)
+            if use_dtensor:
+                self.assertIsInstance(
+                    cached_read, DTensor,
+                    "Capture.forward output should preserve DTensor type",
+                )
+            consumer_loss = (cached_read @ w_c + cached_read * 0.3).sum()
+
+            (delta_loss + consumer_loss).backward()
+
+            # Slot drained, counter drained.
+            self.assertNotIn(key, cache._captured_grads)
+            self.assertNotIn(key, cache._capture_counts)
+
+            def _local(t: torch.Tensor) -> torch.Tensor:
+                return t.to_local() if isinstance(t, DTensor) else t
+
+            return (
+                _local(w_p.grad).detach().clone(),
+                _local(w_delta.grad).detach().clone(),
+                _local(w_c.grad).detach().clone(),
+            )
+
+        plain_grads = _run(use_dtensor=False)
+        dt_grads = _run(use_dtensor=True)
+
+        for plain, dt, name in zip(
+            plain_grads, dt_grads, ("w_p", "w_delta", "w_c")
+        ):
+            self.assertTrue(
+                torch.allclose(plain, dt, atol=1e-5),
+                f"{name} grad diverges between plain and DTensor paths:\n"
+                f"plain={plain}\ndt={dt}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
