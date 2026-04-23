@@ -192,8 +192,10 @@ class KimiLinearAttnResModel(KimiLinearModel):
         self.layers_per_block = n_layers // num_blocks
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [KimiAttnResDecoderLayer(config, i) for i in range(n_layers)]
+        # ModuleDict for pipeline_module_split compatibility — see
+        # KimiLinearModel.__init__ for the same pattern.
+        self.layers = nn.ModuleDict(
+            {str(i): KimiAttnResDecoderLayer(config, i) for i in range(n_layers)}
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
@@ -258,7 +260,10 @@ class KimiLinearAttnResModel(KimiLinearModel):
         partial_block = h
 
         # 3) Thread blocks + partial through this stage's layer slice.
-        for layer_idx, layer in enumerate(self.layers):
+        # ModuleDict keys are original layer indices (preserved across
+        # pipeline_module_split); int() them to drive block-start detection.
+        for layer_key, layer in self.layers.items():
+            layer_idx = int(layer_key)
             is_block_start = (layer_idx % self.layers_per_block == 0)
             block_list, partial_block = layer(
                 block_list, partial_block, is_block_start
@@ -290,16 +295,27 @@ class KimiLinearAttnResModel(KimiLinearModel):
             h_final = self.norm(h_final)
         return self.lm_head(h_final)
 
-    def init_weights(self, init_range: float | None = None) -> None:
+    def init_weights(
+        self, init_range: float | None = None, **kwargs,
+    ) -> None:
         """Normal init + mandatory zero-init of every pseudo-query.
 
         Paper §5 requires ``w_l`` zero-init so initial softmax weights
         are uniform (equivalent to standard residuals at t=0, avoids
         training volatility).
+
+        ``**kwargs`` forwards trainer-supplied args (e.g. ``buffer_device``)
+        to :meth:`KimiLinearModel.init_weights`.
         """
-        super().init_weights(init_range)
+        super().init_weights(init_range, **kwargs)
         # Zero-init every AttnRes pseudo-query (paper requirement).
-        for layer in self.layers:
-            nn.init.zeros_(layer.attn_res_proj.weight)
-            nn.init.zeros_(layer.mlp_res_proj.weight)
-        nn.init.zeros_(self.final_attn_res_proj.weight)
+        # Guard against PP-split stages that dropped some modules
+        # (pipeline_module_split replaces non-owned modules with None
+        # or Identity).
+        for layer in self.layers.values():
+            if hasattr(layer, "attn_res_proj") and layer.attn_res_proj is not None:
+                nn.init.zeros_(layer.attn_res_proj.weight)
+            if hasattr(layer, "mlp_res_proj") and layer.mlp_res_proj is not None:
+                nn.init.zeros_(layer.mlp_res_proj.weight)
+        if self.final_attn_res_proj is not None:
+            nn.init.zeros_(self.final_attn_res_proj.weight)

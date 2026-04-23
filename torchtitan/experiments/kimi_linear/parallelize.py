@@ -190,7 +190,9 @@ def apply_fsdp(
 
     # Shard every decoder layer independently so each layer's forward
     # all-gather / backward reduce-scatter is overlapped with compute.
-    for layer in model.layers:
+    # model.layers is a ModuleDict (str→layer); iterate .values() to
+    # grab the layer modules.
+    for layer in model.layers.values():
         fully_shard(
             layer,
             **fsdp_config,

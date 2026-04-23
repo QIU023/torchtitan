@@ -111,7 +111,7 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
         self.assertEqual(model.layers_per_block, 1)
         # Pseudo-queries init to zero per paper.
         model.init_weights()
-        for layer in model.layers:
+        for layer in model.layers.values():
             self.assertTrue(torch.all(layer.attn_res_proj.weight == 0))
             self.assertTrue(torch.all(layer.mlp_res_proj.weight == 0))
         self.assertTrue(torch.all(model.final_attn_res_proj.weight == 0))

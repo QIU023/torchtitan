@@ -636,8 +636,12 @@ class KimiLinearModel(nn.Module):
         self.config = config
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [KimiDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        # ModuleDict (not ModuleList) so pipeline_module_split preserves
+        # layer-id string keys and the adapter's layer_to_stage discovery
+        # works unchanged. Matches the attn_res/ experiment's pattern.
+        self.layers = nn.ModuleDict(
+            {str(i): KimiDecoderLayer(config, i)
+             for i in range(config.num_hidden_layers)}
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
@@ -668,7 +672,7 @@ class KimiLinearModel(nn.Module):
             * Last stage / non-PP: ``[B, T, vocab_size]`` logits.
         """
         h = self.embed_tokens(tokens) if self.embed_tokens is not None else tokens
-        for layer in self.layers:
+        for layer in self.layers.values():
             h = layer(h)
         if self.norm is not None:
             h = self.norm(h)
@@ -789,3 +793,25 @@ class KimiLinearSpec:
             ),
         }
         return out
+
+    @property
+    def layers(self) -> list[None]:
+        """Fake list of length ``num_hidden_layers`` for torchtitan
+        pipeline_llm's ``num_layers = len(model_config.layers)`` check.
+
+        Kimi Linear's per-layer config is not a standalone dataclass
+        (KDA/MLA/MoE types vary per layer), so we don't expose a real
+        list of per-layer Config objects. This property gives
+        pipeline_llm the count it needs. Downstream consumers that
+        iterate layers should use the built model's ``model.layers``
+        (nn.ModuleList) directly.
+        """
+        return [None] * self.kimi_config.num_hidden_layers
+
+    @property
+    def num_hidden_layers(self) -> int:
+        """Expose num_hidden_layers at the spec level so adapter code
+        (pipeline_adapter._inject_kimi_linear_fqns) can get layer count
+        without reaching into kimi_config.
+        """
+        return self.kimi_config.num_hidden_layers

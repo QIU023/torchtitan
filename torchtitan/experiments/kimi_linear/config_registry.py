@@ -396,3 +396,115 @@ def kimi_linear_528m_block_attn_res() -> Trainer.Config:
 
 def kimi_linear_528m_full_attn_res() -> Trainer.Config:
     return _flavor_trainer_config("528m", "full_attn_res")
+
+
+# ----- PP=4 V=2 lps=2 compatibility variant -------------------------------- #
+# Paper's 528M has n_layers=17 (prime), which doesn't divide the 8 virtual
+# stages needed by Interleaved1F1B PP=4 V=2 with lps=2. Drop to n_layers=16
+# (one fewer layer) so the PP cache adapter layout tables build cleanly.
+# All other 528M paper hyperparameters retained (d=1264, d_ff=560,
+# lr=2.02e-3, batch=432). The KDA/MLA 3:1 alternation is re-derived for
+# L=16 so 4 MLA layers land at the same relative positions.
+
+def _build_528m_l16_config():
+    """528M-like Kimi Linear config with n_layers=16 for PP=4 V=2 lps=2
+    divisibility. d_model / d_ff / num_heads / LR all match paper's 528M.
+    """
+    cfg = build_kimi_linear_config("528m")
+    cfg.num_hidden_layers = 16
+    # Re-derive KDA:MLA = 3:1 pattern for 16 layers
+    # (1-indexed). Period 4 → MLA at {4, 8, 12, 16}, KDA at the rest.
+    period = 4
+    cfg.kda_layers = [i for i in range(1, 17) if i % period != 0]
+    cfg.full_attn_layers = [i for i in range(1, 17) if i % period == 0]
+    return cfg
+
+
+def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
+    """528M-scale Kimi Linear AttnRes with n_layers=16, Block AttnRes N=8.
+
+    PP=4 V=2 lps=2 compatible (8 virtual stages on 4 ranks, 2 layers per
+    stage). Every stage is a block boundary → cross-stage cache adapter
+    exercised at every stage transition. Paper 528M d/d_ff/heads/LR
+    retained; only depth reduced by 1 to satisfy the Interleaved1F1B
+    divisibility requirement.
+    """
+    from torchtitan.experiments.kimi_linear import (
+        parallelize_kimi_linear, KimiLinearSpec,
+    )
+    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+    from torchtitan.components.loss import build_cross_entropy_loss
+    from torchtitan.protocols.model_spec import ModelSpec
+
+    kcfg = _build_528m_l16_config()
+    spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=8)
+    cfg = _base_trainer_config("528m")  # paper 528M lr / batch template
+    cfg.model_spec = ModelSpec(
+        name="kimi_linear",
+        flavor="kimi_linear_528m_l16_block_attn_res",
+        model=spec,
+        parallelize_fn=parallelize_kimi_linear,
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        build_loss_fn=build_cross_entropy_loss,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=None,
+    )
+    return cfg
+
+
+def kimi_linear_528m_l16_full_attn_res() -> Trainer.Config:
+    """528M-scale Kimi Linear Full AttnRes (num_blocks = n_layers = 16)."""
+    from torchtitan.experiments.kimi_linear import (
+        parallelize_kimi_linear, KimiLinearSpec,
+    )
+    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+    from torchtitan.components.loss import build_cross_entropy_loss
+    from torchtitan.protocols.model_spec import ModelSpec
+
+    kcfg = _build_528m_l16_config()
+    spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=16)
+    cfg = _base_trainer_config("528m")
+    cfg.model_spec = ModelSpec(
+        name="kimi_linear",
+        flavor="kimi_linear_528m_l16_full_attn_res",
+        model=spec,
+        parallelize_fn=parallelize_kimi_linear,
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        build_loss_fn=build_cross_entropy_loss,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=None,
+    )
+    return cfg
+
+
+def kimi_linear_528m_l16_baseline() -> Trainer.Config:
+    """528M-scale Kimi Linear baseline (no AttnRes) with n_layers=16.
+    Paired control for the two AttnRes variants above.
+    """
+    from torchtitan.experiments.kimi_linear import (
+        parallelize_kimi_linear, KimiLinearSpec,
+    )
+    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+    from torchtitan.components.loss import build_cross_entropy_loss
+    from torchtitan.protocols.model_spec import ModelSpec
+
+    kcfg = _build_528m_l16_config()
+    spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=None)
+    cfg = _base_trainer_config("528m")
+    cfg.model_spec = ModelSpec(
+        name="kimi_linear",
+        flavor="kimi_linear_528m_l16_baseline",
+        model=spec,
+        parallelize_fn=parallelize_kimi_linear,
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        build_loss_fn=build_cross_entropy_loss,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=None,
+    )
+    return cfg
