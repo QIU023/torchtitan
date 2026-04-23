@@ -652,30 +652,29 @@ class KimiLinearModel(nn.Module):
         # Hook for AttnRes subclass + PP adapter.
         self._return_only_new_blocks: bool = False
 
-    def forward(
-        self, input_ids: torch.Tensor | None = None, *, inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Forward pass. Returns logits of shape ``[B, T, vocab_size]``.
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Forward pass with PP-split awareness.
 
-        Either ``input_ids`` ``[B, T]`` or ``inputs_embeds`` ``[B, T, D]``
-        must be supplied. The inputs_embeds path is used by PP stages
-        after stage 0 (where stage 0 does the embedding and passes the
-        hidden state downstream).
+        Args:
+            tokens: Either ``[B, T]`` int64 token ids (stage 0 / non-PP)
+                OR ``[B, T, D]`` hidden state from upstream PP stage
+                (middle / last). Dispatch is decided by presence of
+                ``self.embed_tokens`` (pipeline_module_split strips it
+                off non-first stages).
+
+        Returns:
+            * Non-last PP stage: ``[B, T, D]`` hidden state to forward
+              to the next stage.
+            * Last stage / non-PP: ``[B, T, vocab_size]`` logits.
         """
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("Provide either input_ids or inputs_embeds.")
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("Provide only one of input_ids / inputs_embeds.")
-
-        h = (
-            self.embed_tokens(input_ids)
-            if inputs_embeds is None
-            else inputs_embeds
-        )
+        h = self.embed_tokens(tokens) if self.embed_tokens is not None else tokens
         for layer in self.layers:
             h = layer(h)
-        h = self.norm(h)
-        return self.lm_head(h)
+        if self.norm is not None:
+            h = self.norm(h)
+        if self.lm_head is not None:
+            return self.lm_head(h)
+        return h  # middle PP stage: ship hidden state downstream
 
     def verify_module_protocol(self) -> None:
         """No-op: our internals are plain nn.Module (not the torchtitan

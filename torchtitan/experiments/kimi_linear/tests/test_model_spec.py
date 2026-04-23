@@ -67,8 +67,9 @@ class TestModelRegistry(unittest.TestCase):
             self.assertIsInstance(spec, ModelSpec)
             self.assertEqual(spec.name, "kimi_linear")
             self.assertEqual(spec.flavor, flavor)
-            # pipelining_fn is None for FSDP-only Phase 4c
-            self.assertIsNone(spec.pipelining_fn)
+            # pipelining_fn is wired as of Phase 4d (runtime-dispatches
+            # to cache adapter when AttnRes+Interleaved1F1B, else PP passthrough).
+            self.assertIsNotNone(spec.pipelining_fn)
             self.assertIsNotNone(spec.parallelize_fn)
             self.assertIsNotNone(spec.build_loss_fn)
 

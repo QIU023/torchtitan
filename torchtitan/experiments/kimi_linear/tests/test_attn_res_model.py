@@ -137,8 +137,8 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
         model.init_weights()
 
         B, T = 2, 8
-        input_ids = torch.randint(0, cfg.vocab_size, (B, T))
-        logits = model(input_ids=input_ids)
+        tokens = torch.randint(0, cfg.vocab_size, (B, T))
+        logits = model(tokens)
         self.assertEqual(logits.shape, (B, T, cfg.vocab_size))
         self.assertTrue(torch.isfinite(logits).all())
 
@@ -148,7 +148,7 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
 
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, cfg.vocab_size),
-            input_ids.view(-1),
+            tokens.view(-1),
         )
         self.assertTrue(torch.isfinite(loss).all())
         # Sanity: CE loss should be at most a few times log(vocab_size).

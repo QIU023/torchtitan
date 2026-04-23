@@ -42,6 +42,9 @@ from torchtitan.experiments.kimi_linear.model import (
     KimiMoE,
 )
 from torchtitan.experiments.kimi_linear.parallelize import parallelize_kimi_linear
+from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+    pipeline_kimi_linear_with_cache_adapter,
+)
 from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
@@ -98,12 +101,17 @@ def model_registry(flavor: str) -> ModelSpec:
         num_blocks=num_blocks,
     )
 
+    # PP + cache adapter wiring: always set, even for baseline. When
+    # pp=1 the pipelining_fn is never exercised. When pp>1 baseline, the
+    # adapter's detection logic sees no num_blocks attr and passes
+    # through without wrapping stages; PP still happens via core
+    # pipeline_llm, just no cross-stage cache optimization.
     return ModelSpec(
         name="kimi_linear",
         flavor=flavor,
         model=spec_config,
         parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=None,  # FSDP-only for Phase 4c; PP in 4d
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         build_loss_fn=build_cross_entropy_loss,
         post_optimizer_build_fn=None,
         state_dict_adapter=None,

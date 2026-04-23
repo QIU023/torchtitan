@@ -218,34 +218,38 @@ class KimiLinearAttnResModel(KimiLinearModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
+        tokens: torch.Tensor,
         blocks: torch.Tensor | None = None,
-        *,
-        inputs_embeds: torch.Tensor | None = None,
     ):
-        """AttnRes forward with block threading.
+        """AttnRes forward with PP-split awareness + block threading.
+
+        The dispatch mirrors ``attn_res/model.py:AttnResModel.forward`` so
+        the Phase-3 ``CrossStageCacheAdapter`` can drive this class via
+        duck-typing on ``self.embed_tokens`` / ``self.lm_head`` /
+        ``self.norm`` presence (pipeline_module_split strips these off
+        non-first / non-last stages).
 
         Args:
-            input_ids: ``[B, T]`` token ids (stage 0 / single-GPU path).
-            blocks: ``[N, B, T, D]`` stacked blocks from upstream PP stage.
-                ``None`` on stage 0.
-            inputs_embeds: ``[B, T, D]`` pre-embedded hidden state (PP
-                middle/last-stage path where stage 0 did the embedding).
+            tokens: On stage 0 / non-PP: ``[B, T]`` int64 token ids. On
+                PP middle / last stages: ``[B, T, D]`` hidden state from
+                upstream stage's ``partial_block``.
+            blocks: ``[N, B, T, D]`` stacked AttnRes blocks from upstream
+                PP stage. ``None`` on stage 0 / non-PP.
 
         Returns:
-            Stage 0 / PP middle (non-last): ``(partial_block, stacked_blocks)``.
-            Last stage / single-GPU: ``[B, T, vocab_size]`` logits.
-        """
-        # 1) Get initial hidden state
-        if inputs_embeds is not None:
-            h = inputs_embeds
-        elif input_ids is not None:
-            h = self.embed_tokens(input_ids)
-        else:
-            raise ValueError("Provide input_ids or inputs_embeds.")
+            * Non-last PP stage: ``(partial_block, stacked_blocks)`` —
+              PipelineStage sends both over P2P.
+            * Last stage / single-GPU: ``[B, T, vocab_size]`` logits.
 
-        # 2) Unstack incoming blocks (PP middle / last stage); empty list
-        #    for stage 0 / single-GPU.
+        The PP cache adapter toggles ``_return_only_new_blocks`` so
+        non-last middle stages emit only THIS stage's new block
+        commits rather than the full accumulated stack (constant per-hop
+        bytes regardless of depth).
+        """
+        # 1) Initial hidden: embed on stage 0, pass-through on middle/last.
+        h = self.embed_tokens(tokens) if self.embed_tokens is not None else tokens
+
+        # 2) Unstack incoming blocks; empty list on stage 0 / non-PP.
         if blocks is None:
             block_list: list[torch.Tensor] = []
         else:
@@ -253,39 +257,38 @@ class KimiLinearAttnResModel(KimiLinearModel):
         initial_num_blocks = len(block_list)
         partial_block = h
 
-        # 3) Thread blocks + partial through layer stack.
+        # 3) Thread blocks + partial through this stage's layer slice.
         for layer_idx, layer in enumerate(self.layers):
             is_block_start = (layer_idx % self.layers_per_block == 0)
             block_list, partial_block = layer(
                 block_list, partial_block, is_block_start
             )
 
-        # 4) PP non-last: return (partial, blocks-or-new-only).
-        #    Last-stage / single-GPU: run final aggregation + lm_head.
-        is_last_or_single = True  # default; PP subclassing overrides via kwargs
-        # For FSDP-only training we always take the last-stage branch below.
-        # The PP adapter uses a stripped-down version of this forward in
-        # the wrapped model; see pipeline_adapter.py for that path.
+        is_last_stage = self.lm_head is not None
 
-        if is_last_or_single:
-            # Final cross-block aggregation + norm + lm_head
-            h_final = block_attn_res(
-                block_list,
-                partial_block,
-                self.final_attn_res_proj,
-                self.final_attn_res_norm,
-            )
+        if not is_last_stage:
+            # PP middle stage: ship (partial_block, stacked_blocks) downstream.
+            if self._return_only_new_blocks:
+                new_blocks = block_list[initial_num_blocks:]
+                if not new_blocks:
+                    # This stage span covers no block boundary — emit a
+                    # zero-first-dim tensor so the adapter's P2P handoff
+                    # preserves a static per-stage shape.
+                    empty = partial_block.new_zeros((0, *partial_block.shape))
+                    return partial_block, empty
+                return partial_block, stack_blocks(new_blocks)
+            return partial_block, stack_blocks(block_list)
+
+        # Last stage / single-GPU: final aggregation + norm + lm_head.
+        h_final = block_attn_res(
+            block_list,
+            partial_block,
+            self.final_attn_res_proj,
+            self.final_attn_res_norm,
+        )
+        if self.norm is not None:
             h_final = self.norm(h_final)
-            return self.lm_head(h_final)
-
-        # (Unreachable in FSDP-only mode; kept for future PP subclass.)
-        if self._return_only_new_blocks:
-            new_blocks = block_list[initial_num_blocks:]
-            if not new_blocks:
-                empty = partial_block.new_zeros((0, *partial_block.shape))
-                return partial_block, empty
-            return partial_block, stack_blocks(new_blocks)
-        return partial_block, stack_blocks(block_list)
+        return self.lm_head(h_final)
 
     def init_weights(self, init_range: float | None = None) -> None:
         """Normal init + mandatory zero-init of every pseudo-query.
