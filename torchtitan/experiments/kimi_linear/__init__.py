@@ -41,6 +41,11 @@ from torchtitan.experiments.kimi_linear.model import (
     KimiMLP,
     KimiMoE,
 )
+from torchtitan.experiments.kimi_linear.multimodal_model import (
+    KimiLinearMultimodalModel,
+    KimiMultimodalConfig,
+    KimiVisionProjector,
+)
 from torchtitan.experiments.kimi_linear.parallelize import parallelize_kimi_linear
 from torchtitan.experiments.kimi_linear.pipeline_adapter import (
     pipeline_kimi_linear_with_cache_adapter,
@@ -54,10 +59,13 @@ __all__ = [
     "KimiLinearAttnResModel",
     "KimiLinearConfig",
     "KimiLinearModel",
+    "KimiLinearMultimodalModel",
     "KimiLinearSpec",
     "KimiMLAAttention",
     "KimiMLP",
     "KimiMoE",
+    "KimiMultimodalConfig",
+    "KimiVisionProjector",
     "build_kimi_linear_config",
     "flavor_names",
     "model_registry",
