@@ -23,7 +23,6 @@ from torchtitan.experiments.kimi_linear.model import (
     KimiMLAAttention,
     KimiMLP,
     KimiMoE,
-    KimiRMSNorm,
 )
 
 __all__ = [
@@ -34,5 +33,4 @@ __all__ = [
     "KimiMLAAttention",
     "KimiMLP",
     "KimiMoE",
-    "KimiRMSNorm",
 ]

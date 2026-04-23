@@ -146,24 +146,12 @@ class KimiLinearConfig:
 
 
 # ----- RMSNorm ------------------------------------------------------------- #
-
-class KimiRMSNorm(nn.Module):
-    """RMSNorm in fp32 internally, cast back to input dtype.
-
-    Faithful to ``reference/modeling_kimi.py:KimiRMSNorm``.
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x32 = x.to(torch.float32)
-        variance = x32.pow(2).mean(-1, keepdim=True)
-        x32 = x32 * torch.rsqrt(variance + self.eps)
-        return (self.weight * x32).to(in_dtype)
+# Use torch's ``nn.RMSNorm`` directly. Faithful to HF reference's
+# ``KimiRMSNorm`` (same math: fp32 variance, cast back to input dtype).
+# ``torchtitan.models.common.rmsnorm.RMSNorm`` is a Module-protocol
+# wrapper around ``nn.RMSNorm``; we don't need the Config plumbing here
+# since we're not going through the torchtitan Config.build() chain for
+# the ported Kimi Linear backbone.
 
 
 # ----- Dense SwiGLU MLP --------------------------------------------------- #
@@ -252,7 +240,7 @@ class KimiMLAAttention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = KimiRMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -613,10 +601,10 @@ class KimiDecoderLayer(nn.Module):
             )
             self.is_moe = False
 
-        self.input_layernorm = KimiRMSNorm(
+        self.input_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = KimiRMSNorm(
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -658,7 +646,7 @@ class KimiLinearModel(nn.Module):
         self.layers = nn.ModuleList(
             [KimiDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
             config.hidden_size, config.vocab_size, bias=False
         )

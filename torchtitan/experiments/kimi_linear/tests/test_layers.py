@@ -34,7 +34,6 @@ from torchtitan.experiments.kimi_linear.model import (
     KimiLinearConfig,
     KimiMLAAttention,
     KimiMLP,
-    KimiRMSNorm,
 )
 
 
@@ -73,21 +72,6 @@ def _tiny_config(num_hidden_layers: int = 2) -> KimiLinearConfig:
         hidden_act="silu",
         initializer_range=0.02,
     )
-
-
-class TestKimiRMSNorm(unittest.TestCase):
-    def test_forward_shape_and_dtype_preservation(self):
-        norm = KimiRMSNorm(hidden_size=128, eps=1e-5)
-        x = torch.randn(2, 7, 128, dtype=torch.float32)
-        out = norm(x)
-        self.assertEqual(out.shape, x.shape)
-        self.assertEqual(out.dtype, torch.float32)
-
-    def test_zero_input_handled_by_eps(self):
-        norm = KimiRMSNorm(hidden_size=16, eps=1e-5)
-        x = torch.zeros(2, 3, 16)
-        out = norm(x)
-        self.assertTrue(torch.isfinite(out).all())
 
 
 class TestKimiMLP(unittest.TestCase):
