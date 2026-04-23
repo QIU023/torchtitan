@@ -691,21 +691,64 @@ class KimiLinearModel(nn.Module):
         return None
 
     def init_weights(self, init_range: float | None = None, **kwargs) -> None:
-        """Normal init with std=initializer_range. Embedding + Linear
-        layers; norms stay at default ones. Called by torchtitan
-        trainer after device placement.
+        """Initialize *all* parameters and buffers from scratch.
 
-        Accepts ``**kwargs`` (e.g. ``buffer_device``) for compatibility
-        with torchtitan's BaseModel.init_weights contract.
+        This must be exhaustive because torchtitan's trainer flow is
+        ``meta-build → parallelize_fn (FSDP wrap) → to_empty(device=cuda)
+        → init_weights``. ``to_empty`` discards every value set inside
+        ``__init__`` (including RMSNorm.weight=1 defaults, KDA's A_log,
+        dt_bias, ShortConvolution kernels, MoE expert weights, and
+        load-balance buffers). Anything we forget here stays at whatever
+        garbage ``torch.empty`` left on the device — which silently
+        zeroes RMSNorm scales and produces near-uniform logits with no
+        learning signal.
         """
         std = init_range if init_range is not None else self.config.initializer_range
+
+        # Pass 1: leaf modules with well-typed init contracts.
         for m in self.modules():
+            cls_name = type(m).__name__
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0.0, std=std)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, mean=0.0, std=std)
+            elif isinstance(m, nn.RMSNorm):
+                nn.init.ones_(m.weight)
+                if getattr(m, "bias", None) is not None:
+                    nn.init.zeros_(m.bias)
+            elif cls_name in ("ShortConvolution", "FusedRMSNormGated"):
+                # fla-core modules ship reset_parameters()
+                m.reset_parameters()
+
+        # Pass 2: KDA per-layer raw Parameters (A_log, dt_bias) that
+        # don't belong to any nn.Module subclass we can dispatch on.
+        for layer in self.layers.values():
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            if hasattr(attn, "A_log"):
+                # Match KimiDeltaAttention.__init__: log(uniform(1, 16))
+                attn.A_log.data.uniform_(1.0, 16.0).log_()
+            if hasattr(attn, "dt_bias"):
+                nn.init.zeros_(attn.dt_bias)
+
+        # Pass 3: torchtitan MoE — GroupedExperts holds raw [E, ...]
+        # parameter tensors (not nn.Linear), and MoE/router carry
+        # auxiliary-loss-free load-balance buffers that must start at 0.
+        for m in self.modules():
+            cls_name = type(m).__name__
+            if cls_name == "GroupedExperts":
+                for name in ("w1", "w2", "w3"):
+                    p = getattr(m, name, None)
+                    if isinstance(p, nn.Parameter):
+                        nn.init.normal_(p, mean=0.0, std=std)
+            elif cls_name == "MoE":
+                for buf_name in ("expert_bias", "tokens_per_expert"):
+                    buf = getattr(m, buf_name, None)
+                    if buf is not None:
+                        buf.zero_()
 
 
 # ----- ModelSpec shim: BaseModel.Config wrapper --------------------------- #
