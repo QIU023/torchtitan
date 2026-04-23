@@ -261,3 +261,138 @@ def flavor_names() -> list[str]:
         for v in ("baseline", "block_attn_res", "full_attn_res"):
             out.append(f"kimi_linear_{s.name}_{v}")
     return out
+
+
+# ----- Trainer.Config factories ------------------------------------------ #
+# One function per flavor, hand-rolled so the torchtitan ConfigManager
+# can import them by name. Pattern matches attn_res/config_registry.py.
+
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.validate import Validator
+from torchtitan.config import ActivationCheckpointConfig, TrainingConfig
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.tools.profiling import ProfilingConfig
+from torchtitan.trainer import Trainer
+
+
+def _base_trainer_config(size_name: str) -> Trainer.Config:
+    """Shared Trainer.Config template for a given paper Table-2 size.
+
+    The peak LR + batch-size come from the paper; other knobs match
+    torchtitan common defaults (warmup=500, cosine decay_ratio=0.8,
+    min_lr_factor=0.1, FSDP full shard). ``model_spec`` is set by the
+    per-flavor wrappers below.
+    """
+    if size_name not in _BY_NAME:
+        raise ValueError(f"Unknown size '{size_name}'")
+    spec = _BY_NAME[size_name]
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/Llama-3.1-8B",
+        profiling=ProfilingConfig(enable_profiling=False),
+        metrics=MetricsProcessor.Config(
+            enable_tensorboard=True, log_freq=10,
+        ),
+        model_spec=None,  # filled in by the per-flavor wrapper
+        optimizer=OptimizersContainer.Config(lr=spec.lr),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=500,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=max(1, spec.batch_size // 8),  # default 8 DP ranks
+            seq_len=8192,  # paper uses 8192 context
+            steps=20000,   # placeholder; caller overrides via --training.steps
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        checkpoint=CheckpointManager.Config(
+            enable=True,
+            interval=1000,
+            keep_latest_k=3,
+            last_save_model_only=False,
+        ),
+        # AC off — kimi_linear/parallelize.py Phase 4c doesn't implement it.
+        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
+        validator=Validator.Config(freq=500, steps=50),
+    )
+
+
+def _flavor_trainer_config(size: str, variant: Variant) -> Trainer.Config:
+    """Return a Trainer.Config for the requested size+variant with
+    ``model_spec`` wired to :func:`model_registry` (imported late to
+    avoid a circular import).
+    """
+    # Late import: model_registry lives in __init__.py which imports
+    # from this module. Circular if eager-imported at module top.
+    from torchtitan.experiments.kimi_linear import model_registry
+
+    cfg = _base_trainer_config(size)
+    flavor = f"kimi_linear_{size}_{variant}"
+    cfg.model_spec = model_registry(flavor)
+    return cfg
+
+
+# ----- Explicit per-flavor entry points (tyro discovers these) ----------- #
+
+def kimi_linear_194m_baseline() -> Trainer.Config:
+    return _flavor_trainer_config("194m", "baseline")
+
+
+def kimi_linear_194m_block_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("194m", "block_attn_res")
+
+
+def kimi_linear_194m_full_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("194m", "full_attn_res")
+
+
+def kimi_linear_241m_baseline() -> Trainer.Config:
+    return _flavor_trainer_config("241m", "baseline")
+
+
+def kimi_linear_241m_block_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("241m", "block_attn_res")
+
+
+def kimi_linear_241m_full_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("241m", "full_attn_res")
+
+
+def kimi_linear_296m_baseline() -> Trainer.Config:
+    return _flavor_trainer_config("296m", "baseline")
+
+
+def kimi_linear_296m_block_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("296m", "block_attn_res")
+
+
+def kimi_linear_296m_full_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("296m", "full_attn_res")
+
+
+def kimi_linear_436m_baseline() -> Trainer.Config:
+    return _flavor_trainer_config("436m", "baseline")
+
+
+def kimi_linear_436m_block_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("436m", "block_attn_res")
+
+
+def kimi_linear_436m_full_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("436m", "full_attn_res")
+
+
+def kimi_linear_528m_baseline() -> Trainer.Config:
+    return _flavor_trainer_config("528m", "baseline")
+
+
+def kimi_linear_528m_block_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("528m", "block_attn_res")
+
+
+def kimi_linear_528m_full_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("528m", "full_attn_res")

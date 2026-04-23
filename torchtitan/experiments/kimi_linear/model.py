@@ -55,7 +55,7 @@ except ImportError as err:  # pragma: no cover - import-time guard
 
 # ----- Config -------------------------------------------------------------- #
 
-@dataclass(slots=True)
+@dataclass(kw_only=True, slots=True)
 class KimiLinearConfig:
     """Torchtitan-flavored config for Kimi Linear.
 
@@ -68,6 +68,11 @@ class KimiLinearConfig:
     The 1-indexed ``kda_layers`` / ``full_attn_layers`` convention is
     preserved from the HF config.json (so literal copy-paste from HF
     works).
+
+    This class carries the Kimi model hyperparameters only. The
+    torchtitan ``BaseModel.Config`` shim — ``KimiLinearSpec`` — lives
+    in this module below and wraps one of these for ModelSpec
+    registration.
     """
 
     # ---- vocabulary / embedding ----
@@ -467,22 +472,27 @@ class KimiMoE(nn.Module):
 
     def __init__(self, config: KimiLinearConfig) -> None:
         super().__init__()
-        from torchtitan.models.common import Linear
+        # Full reuse: torchtitan.models.common.moe.MoE already wires
+        # router + TokenReorderer + GroupedExperts + shared_experts +
+        # expert_bias buffer + auxiliary-loss-free load balancing. We
+        # just translate Kimi's config knobs into MoE.Config.
+        from torchtitan.models.common.feed_forward import FeedForward
+        from torchtitan.models.common.linear import Linear
         from torchtitan.models.common.moe import (
             GroupedExperts,
+            MoE,
             TokenChoiceTopKRouter,
         )
 
         assert config.num_experts is not None and config.num_experts > 0
 
-        gate_cfg = Linear.Config(
-            in_features=config.hidden_size,
-            out_features=config.num_experts,
-            bias=False,
-        )
         router_cfg = TokenChoiceTopKRouter.Config(
             num_experts=config.num_experts,
-            gate=gate_cfg,
+            gate=Linear.Config(
+                in_features=config.hidden_size,
+                out_features=config.num_experts,
+                bias=False,
+            ),
             num_expert_groups=(
                 config.num_expert_group if config.num_expert_group > 1 else None
             ),
@@ -498,63 +508,46 @@ class KimiMoE(nn.Module):
             dim=config.hidden_size,
             hidden_dim=config.moe_intermediate_size,
             num_experts=config.num_experts,
+            use_grouped_mm=False,  # for-loop fallback works on GPU w/o grouped_mm
         )
 
-        self.router = router_cfg.build()
-        self.experts = experts_cfg.build()
-        # expert_bias buffer for auxiliary-loss-free load balancing
-        self.register_buffer(
-            "expert_bias",
-            torch.zeros(config.num_experts, dtype=torch.float32),
-            persistent=True,
-        )
-
-        # Shared experts: treat as one bigger MLP with intermediate =
-        # moe_intermediate_size * num_shared_experts (Kimi reference
-        # `shared_experts = KimiMLP(intermediate_size=moe_int * num_shared)`).
+        # Shared experts — Kimi's reference uses KimiMLP at
+        # intermediate = moe_int * num_shared_experts. We swap to
+        # torchtitan's FeedForward for consistency with MoE.Config;
+        # the SwiGLU math is identical.
+        shared_cfg = None
         if config.num_shared_experts > 0:
-            self.shared_experts = KimiMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=(
-                    config.moe_intermediate_size * config.num_shared_experts
+            shared_dim = config.moe_intermediate_size * config.num_shared_experts
+            shared_cfg = FeedForward.Config(
+                w1=Linear.Config(
+                    in_features=config.hidden_size,
+                    out_features=shared_dim,
+                    bias=False,
                 ),
-                hidden_act=config.hidden_act,
+                w2=Linear.Config(
+                    in_features=shared_dim,
+                    out_features=config.hidden_size,
+                    bias=False,
+                ),
+                w3=Linear.Config(
+                    in_features=config.hidden_size,
+                    out_features=shared_dim,
+                    bias=False,
+                ),
             )
-        else:
-            self.shared_experts = None
+
+        moe_cfg = MoE.Config(
+            num_experts=config.num_experts,
+            experts=experts_cfg,
+            router=router_cfg,
+            score_before_experts=True,
+            load_balance_coeff=1e-3,
+            shared_experts=shared_cfg,
+        )
+        self._moe = moe_cfg.build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: ``[B, T, D]``.
-        Returns:
-            ``[B, T, D]`` MoE output (routed + shared).
-        """
-        B, T, D = x.shape
-        x_flat = x.view(-1, D)
-
-        # Router: produces top-k routing + per-expert token counts
-        top_scores, selected_experts, num_tokens_per_expert = self.router(
-            x_flat, expert_bias=self.expert_bias
-        )
-
-        # Experts forward: torchtitan's GroupedExperts expects
-        # (selected_experts, top_scores, num_tokens_per_expert, x_flat)
-        # and produces an aggregated per-token output. The exact
-        # GroupedExperts.forward signature is called by torchtitan's
-        # MoE module; here we call it directly for simplicity.
-        expert_out = self.experts(
-            x=x_flat,
-            selected_experts_indices=selected_experts,
-            top_scores=top_scores,
-            num_tokens_per_expert=num_tokens_per_expert,
-        )
-        expert_out = expert_out.view(B, T, D)
-
-        if self.shared_experts is not None:
-            expert_out = expert_out + self.shared_experts(x)
-
-        return expert_out
+        return self._moe(x)
 
 
 # ----- Decoder layer ------------------------------------------------------- #
@@ -684,10 +677,23 @@ class KimiLinearModel(nn.Module):
         h = self.norm(h)
         return self.lm_head(h)
 
-    def init_weights(self, init_range: float | None = None) -> None:
+    def verify_module_protocol(self) -> None:
+        """No-op: our internals are plain nn.Module (not the torchtitan
+        ``Module`` protocol), since KimiLinearModel ports the HF
+        reference layer-by-layer rather than going through the Config
+        chain. Trainer calls this post-build; overriding as no-op keeps
+        the FSDP + loss + optimizer paths intact without requiring every
+        sub-module to register as a ``Module.Config``-built instance.
+        """
+        return None
+
+    def init_weights(self, init_range: float | None = None, **kwargs) -> None:
         """Normal init with std=initializer_range. Embedding + Linear
         layers; norms stay at default ones. Called by torchtitan
         trainer after device placement.
+
+        Accepts ``**kwargs`` (e.g. ``buffer_device``) for compatibility
+        with torchtitan's BaseModel.init_weights contract.
         """
         std = init_range if init_range is not None else self.config.initializer_range
         for m in self.modules():
@@ -697,3 +703,90 @@ class KimiLinearModel(nn.Module):
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, mean=0.0, std=std)
+
+
+# ----- ModelSpec shim: BaseModel.Config wrapper --------------------------- #
+
+# Imports at module bottom to keep the KimiLinear* classes usable as plain
+# nn.Modules without dragging the torchtitan.protocols.model chain in
+# when used from the CPU tests.
+
+
+@dataclass(kw_only=True, slots=True)
+class KimiLinearSpec:
+    """``BaseModel.Config``-compatible shim that wraps a
+    :class:`KimiLinearConfig` and an optional ``num_blocks`` (None =
+    plain :class:`KimiLinearModel`; integer N = :class:`KimiLinearAttnResModel`
+    with ``num_blocks=N``).
+
+    Methods implemented for torchtitan integration:
+
+    * :meth:`build` — returns the constructed model instance (either
+      :class:`KimiLinearModel` or :class:`KimiLinearAttnResModel`).
+    * :meth:`update_from_config` — no-op for Kimi Linear: MLA uses
+      NoPE (``mla_use_nope=True``) so no RoPE max_seq_len to propagate,
+      and KDA is seq-len-agnostic (short conv + recurrent state).
+    * :meth:`get_nparams_and_flops` — trainer uses this for MFU
+      reporting. Returns (n_params, forward+backward FLOPs per step).
+
+    Deliberately NOT inheriting from ``BaseModel.Config`` at class
+    definition to keep the module importable in CPU tests without
+    pulling in the ``torchtitan.protocols`` dependency chain. The
+    trainer only needs duck-typing on ``build`` /
+    ``update_from_config`` / ``get_nparams_and_flops``.
+    """
+
+    kimi_config: KimiLinearConfig
+    num_blocks: int | None = None
+    param_init: dict | None = None  # torchtitan BaseModel.Config contract
+
+    def build(self, **kwargs):
+        # Local import to defer the attn_res_model dep chain.
+        from torchtitan.experiments.kimi_linear.attn_res_model import (
+            KimiLinearAttnResModel,
+        )
+        if self.num_blocks is None:
+            return KimiLinearModel(self.kimi_config)
+        return KimiLinearAttnResModel(
+            self.kimi_config, num_blocks=self.num_blocks
+        )
+
+    def update_from_config(self, *, trainer_config, **kwargs) -> None:
+        """No-op: Kimi Linear's NoPE-MLA + KDA are seq-len-agnostic.
+
+        (If a future variant adds RoPE'd MLA, propagate ``training.seq_len``
+        into ``self.kimi_config.rope_theta`` or per-layer rope knobs here.)
+        """
+        return None
+
+    def get_nparams_and_flops(
+        self, model: nn.Module, seq_len: int,
+    ) -> tuple[int, int]:
+        """Rough (n_params, flops_per_step) estimate for MFU reporting.
+
+        Activated-param estimate via ``model.parameters()`` count. FLOPs
+        ≈ 6 × n_params × seq_len (forward + backward, dense + expert);
+        tight enough for MFU % bar chart, not meant for training budget
+        prediction.
+        """
+        n_params = sum(p.numel() for p in model.parameters())
+        return n_params, 6 * n_params * seq_len
+
+    def to_dict(self) -> dict:
+        """Serialize to a plain dict for logging / checkpoint metadata.
+
+        Trainer calls this on the model_config to pretty-print the
+        configuration before building. We flatten the wrapped
+        :class:`KimiLinearConfig` dataclass into this dict so the log
+        shows the actual Kimi hyperparameters (not just a reference).
+        """
+        import dataclasses
+        out = dataclasses.asdict(self.kimi_config)
+        out["__spec__"] = {
+            "num_blocks": self.num_blocks,
+            "model_class": (
+                "KimiLinearAttnResModel" if self.num_blocks is not None
+                else "KimiLinearModel"
+            ),
+        }
+        return out

@@ -17,5 +17,6 @@ _supported_experiments = frozenset(
         "ft.llama3",
         "rl",
         "attn_res",
+        "kimi_linear",
     ]
 )
