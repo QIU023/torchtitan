@@ -386,6 +386,47 @@ def kimi_linear_436m_full_attn_res() -> Trainer.Config:
     return _flavor_trainer_config("436m", "full_attn_res")
 
 
+def kimi_linear_436m_block_attn_res_n4() -> Trainer.Config:
+    """436M Block AttnRes with N=4 (instead of paper-default N=8).
+
+    Paper Fig 6 (S ablation on the 16-layer model from Table 2)
+    shows S=2/4/8 — i.e., N=8/4/2 for L=16 — all converging to
+    ~1.746 vs baseline 1.766 on validation loss. The choice of
+    N is essentially indistinguishable across that range.
+
+    We use N=4 here (S=4 hf_layers/block) instead of paper-canonical
+    N=8 (S=2 hf_layers/block) for one purely operational reason:
+    halving the per-rank block-cache memory (~3 GiB savings on the
+    436M shape) so the AttnRes A/B can run at LOCAL_BS=3 SEQ=2048
+    on 4× RTX 5090 32GB without sustained 97% memory utilization +
+    CUDA allocation retries that ate ~30% of throughput in the N=8
+    variant. On bigger memory boxes (H100/H200/B200) we'd revert to
+    paper's canonical N=8.
+    """
+    from torchtitan.experiments.kimi_linear import (
+        KimiLinearSpec,
+        parallelize_kimi_linear,
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+    from torchtitan.components.loss import build_cross_entropy_loss
+    from torchtitan.protocols.model_spec import ModelSpec
+
+    cfg = _base_trainer_config("436m")
+    kimi_config = build_kimi_linear_config("436m")
+    spec_config = KimiLinearSpec(kimi_config=kimi_config, num_blocks=4)
+    cfg.model_spec = ModelSpec(
+        name="kimi_linear",
+        flavor="kimi_linear_436m_block_attn_res_n4",
+        model=spec_config,
+        parallelize_fn=parallelize_kimi_linear,
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        build_loss_fn=build_cross_entropy_loss,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=None,
+    )
+    return cfg
+
+
 def kimi_linear_528m_baseline() -> Trainer.Config:
     return _flavor_trainer_config("528m", "baseline")
 
