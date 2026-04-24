@@ -158,29 +158,36 @@ def apply_fsdp(
         reshard_after_forward_policy, pp_enabled
     )
 
-    # Collect the "output tail" modules (norm + lm_head + any AttnRes
-    # final projection). We shard these together to reduce comm.
-    tail_modules: list[nn.Module] = []
+    # Collect the "output tail" modules. norm + lm_head ALWAYS run
+    # together every forward, so they share an FSDP unit — that
+    # amortizes a single all-gather over both. final_attn_res_proj
+    # and final_attn_res_norm are AttnRes-only and only fire at the
+    # very end of forward (block_attn_res(...) accumulates into
+    # h_final), so they get their OWN FSDP unit; bundling them with
+    # norm/lm_head triggers FSDP2's "module did not run forward
+    # before backward" warning because dynamo / autograd sees the
+    # AttnRes call timing as separate from the lm_head pass.
+    head_tail: list[nn.Module] = []
     if getattr(model, "norm", None) is not None:
-        tail_modules.append(model.norm)
+        head_tail.append(model.norm)
     if getattr(model, "lm_head", None) is not None:
-        tail_modules.append(model.lm_head)
+        head_tail.append(model.lm_head)
+
+    attn_res_tail: list[nn.Module] = []
     if getattr(model, "final_attn_res_proj", None) is not None:
-        tail_modules.append(model.final_attn_res_proj)
+        attn_res_tail.append(model.final_attn_res_proj)
     if getattr(model, "final_attn_res_norm", None) is not None:
-        tail_modules.append(model.final_attn_res_norm)
+        attn_res_tail.append(model.final_attn_res_norm)
 
     tied = bool(getattr(model, "config", None)) and getattr(
         model.config, "tie_word_embeddings", False
     )
 
     if tied:
-        # When tied, embed shares storage with lm_head — bundle all
-        # non-layer modules into one FSDP unit to dodge duplicate
-        # all-gathers of the shared embedding.
-        bundle = [model.embed_tokens, *tail_modules]
+        # When tied, embed shares storage with lm_head — bundle them
+        # so the shared weight isn't all-gathered twice.
         fully_shard(
-            bundle,
+            [model.embed_tokens, *head_tail],
             **fsdp_config,
             reshard_after_forward=(reshard_after_forward_policy == "always"),
         )
@@ -191,7 +198,14 @@ def apply_fsdp(
             reshard_after_forward=reshard_after_forward,
         )
         fully_shard(
-            tail_modules,
+            head_tail,
+            **fsdp_config,
+            reshard_after_forward=(reshard_after_forward_policy == "always"),
+        )
+
+    if attn_res_tail:
+        fully_shard(
+            attn_res_tail,
             **fsdp_config,
             reshard_after_forward=(reshard_after_forward_policy == "always"),
         )
@@ -229,25 +243,40 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
       ``apply_compile_sparse``.
 
     The fla carve-outs are applied as ``torch.compiler.disable`` shims
-    on the call sites so the surrounding nn.Linear / RMSNorm /
-    elementwise compute still gets compiled.
+    with ``recursive=True`` so dynamo treats the entire subtree as
+    opaque (otherwise the backward pass re-enters dynamo at e.g.
+    ``cuda_utils.get_device_properties`` and emits warnings).
+
+    Recompile-limit handling: KimiDecoderLayer alternates between
+    KDA and MLA attention (3:1 by layer index). Default dynamo
+    recompile_limit=8 is too small — the type check on
+    ``self_attn`` triggers a recompile per attention class, and once
+    the limit is hit dynamo silently falls back to eager for
+    affected frames. We bump recompile_limit + cache_size_limit so
+    each layer-flavor compiles cleanly on first hit and stays cached.
     """
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
     from fla.ops.kda.gate import fused_kda_gate
 
-    # Mark triton ops as opaque to dynamo. Compile sees a black box and
-    # graph-breaks at the call site rather than crashing on unsupported
-    # Triton IR.
+    # Mark triton ops as opaque to dynamo. recursive=True so dynamo
+    # also stays out on re-entry from autograd backward (otherwise
+    # fla's backward kernels trip on cuda_utils.get_device_properties
+    # and lru_cache decorators inside fused_norm_gate).
     for op in (chunk_kda, fused_recurrent_kda, fused_kda_gate):
-        torch.compiler.disable(op, recursive=False)
+        torch.compiler.disable(op, recursive=True)
     for cls in (ShortConvolution, FusedRMSNormGated):
-        cls.forward = torch.compiler.disable(cls.forward, recursive=False)
+        cls.forward = torch.compiler.disable(cls.forward, recursive=True)
 
     # Allow MoE token-choice routing's data-dependent control flow.
     torch._dynamo.config.capture_scalar_outputs = True
     # Eager AC <-> compile divergence acceptance (matches upstream).
     torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
+    # KDA + MLA layers each compile separately; we have up to L layer
+    # flavors plus permutations. 64 leaves comfortable headroom for
+    # all per-layer specializations without thrashing.
+    torch._dynamo.config.recompile_limit = 64
+    torch._dynamo.config.cache_size_limit = 64
 
     for _, layer in model.layers.named_children():
         layer.compile(backend=compile_config.backend, fullgraph=False)
