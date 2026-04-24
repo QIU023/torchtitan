@@ -508,7 +508,13 @@ class KimiMoE(nn.Module):
             dim=config.hidden_size,
             hidden_dim=config.moe_intermediate_size,
             num_experts=config.num_experts,
-            use_grouped_mm=False,  # for-loop fallback works on GPU w/o grouped_mm
+            # torch._grouped_mm fuses all expert GEMMs into one batched call.
+            # For-loop path (use_grouped_mm=False) launches one GEMM per
+            # expert per layer, which hurts tensor core utilization badly
+            # on small per-expert batches (typical at LOCAL_BS<=8). Requires
+            # PyTorch ≥ 2.5 with grouped_mm support; works on Hopper / Ada /
+            # Blackwell; CPU path raises so MoE forward is GPU-only.
+            use_grouped_mm=True,
         )
 
         # Shared experts — Kimi's reference uses KimiMLP at

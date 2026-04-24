@@ -78,10 +78,18 @@ def parallelize_kimi_linear(
             "skips AC. Set mode=none to silence this warning.",
             ac_config.mode,
         )
+    # torch.compile applied per-decoder-layer BEFORE FSDP wrap (so each
+    # FSDP unit wraps a compiled subgraph). MoE for-loop expert path
+    # is NOT compiled (torchtitan upstream has the same carve-out: see
+    # apply_compile_sparse comment about unbacked symints in for-loop
+    # fallback). fla-core ops (chunk_kda, ShortConvolution,
+    # FusedRMSNormGated) are wrapped with torch.compiler.disable since
+    # they're triton kernels that dynamo can't trace through.
     if compile_config.enable:
-        logger.warning(
-            "compile.enable=True ignored — Kimi Linear Phase 4c skips "
-            "torch.compile. Set compile.enable=false to silence this warning."
+        _apply_compile_kimi_linear(model, compile_config)
+        logger.info(
+            "Compiled each KimiDecoderLayer with torch.compile (backend=%s).",
+            compile_config.backend,
         )
 
     if parallel_dims.dp_shard_enabled or parallel_dims.dp_replicate_enabled:
@@ -207,3 +215,39 @@ def apply_fsdp(
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
+
+
+def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) -> None:
+    """Wrap each KimiDecoderLayer with torch.compile.
+
+    Carve-outs (must NOT be compiled):
+    * fla-core triton kernels (chunk_kda, ShortConvolution,
+      FusedRMSNormGated, fused_kda_gate) — dynamo cannot trace through
+      arbitrary Triton, and these are already optimized.
+    * MoE for-loop expert path (when ``use_grouped_mm=False``) — same
+      unbacked-symint issue torchtitan upstream documents in
+      ``apply_compile_sparse``.
+
+    The fla carve-outs are applied as ``torch.compiler.disable`` shims
+    on the call sites so the surrounding nn.Linear / RMSNorm /
+    elementwise compute still gets compiled.
+    """
+    from fla.modules import FusedRMSNormGated, ShortConvolution
+    from fla.ops.kda import chunk_kda, fused_recurrent_kda
+    from fla.ops.kda.gate import fused_kda_gate
+
+    # Mark triton ops as opaque to dynamo. Compile sees a black box and
+    # graph-breaks at the call site rather than crashing on unsupported
+    # Triton IR.
+    for op in (chunk_kda, fused_recurrent_kda, fused_kda_gate):
+        torch.compiler.disable(op, recursive=False)
+    for cls in (ShortConvolution, FusedRMSNormGated):
+        cls.forward = torch.compiler.disable(cls.forward, recursive=False)
+
+    # Allow MoE token-choice routing's data-dependent control flow.
+    torch._dynamo.config.capture_scalar_outputs = True
+    # Eager AC <-> compile divergence acceptance (matches upstream).
+    torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
+
+    for _, layer in model.layers.named_children():
+        layer.compile(backend=compile_config.backend, fullgraph=False)
