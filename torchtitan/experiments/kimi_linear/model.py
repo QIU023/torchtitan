@@ -296,11 +296,29 @@ class KimiMLAAttention(nn.Module):
         q_full = torch.cat((q_pass, q_rot), dim=-1)
         k_full = torch.cat((k_pass_expanded, k_rot), dim=-1)
 
-        # Standard scaled-dot-product attention with causal mask
-        # torch SDPA handles causal efficiently on CUDA; fall back to manual on CPU.
-        attn_out = F.scaled_dot_product_attention(
-            q_full, k_full, v, is_causal=True, scale=self.scaling,
-        )  # (B, H, T, v_head_dim)
+        # Kimi MLA has asymmetric head_dim (Q/K = qk_nope+qk_rope = 192,
+        # V = v_head_dim = 128). PyTorch's flash attention CUDA kernel
+        # requires Q/K/V same head_dim and silently falls back to the
+        # math backend for asymmetric MLA shapes — math backend runs
+        # eager softmax + matmul, ~2-4x slower than flash on the same
+        # attention block, and Inductor splits the softmax reduction
+        # (the "Online softmax disabled" warning) which kills compile
+        # fusion. cuDNN's attention backend (CUDNN_ATTENTION) supports
+        # asymmetric Q/K vs V head_dim and routes through cuDNN's flash-
+        # style fused kernel, restoring expected MLA throughput.
+        # Falls back to math on CPU (cuDNN not present) automatically.
+        if q_full.is_cuda:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            with sdpa_kernel(
+                [SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH]
+            ):
+                attn_out = F.scaled_dot_product_attention(
+                    q_full, k_full, v, is_causal=True, scale=self.scaling,
+                )  # (B, H, T, v_head_dim)
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q_full, k_full, v, is_causal=True, scale=self.scaling,
+            )  # (B, H, T, v_head_dim)
 
         attn_out = attn_out.transpose(1, 2).reshape(B, T, -1)
         return self.o_proj(attn_out)
