@@ -54,8 +54,14 @@ class TestKimiLinearSpec(unittest.TestCase):
         spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=None)
         model = spec.build()
         n_params, flops = spec.get_nparams_and_flops(model, seq_len=8192)
-        self.assertGreater(n_params, 100_000_000)  # ~580M total
-        self.assertEqual(flops, 6 * n_params * 8192)
+        self.assertGreater(n_params, 100_000_000)  # ~580M total MoE params
+        # flops is per-TOKEN (not per-step). At 194M activated with
+        # MLA attn term, expect ~0.5-5 GFLOPs per token for this size.
+        self.assertGreater(flops, 1_000_000)
+        self.assertLess(flops, 100_000_000_000)
+        # Sanity: must NOT match the old over-counting formula
+        # (which was 6 * total_params * seq_len ~= 28e12 for this size).
+        self.assertLess(flops, 6 * n_params * 8192 // 10)
 
 
 class TestModelRegistry(unittest.TestCase):

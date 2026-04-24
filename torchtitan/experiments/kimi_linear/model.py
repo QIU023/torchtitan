@@ -824,32 +824,69 @@ class KimiLinearSpec:
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int,
     ) -> tuple[int, int]:
-        """(activated_n_params, flops_per_step) for MFU reporting.
+        """(total_n_params, flops_per_TOKEN) for MFU reporting.
 
-        Counts only **activated** params per token, not total MoE params:
-        routed-expert weights are scaled by top_k / num_experts; shared
-        experts + dense layers count fully. Using total params over-
-        reports FLOPs by ~3x at 32 experts top-8, giving the nonsensical
-        >1000% MFU reading seen in earlier runs. FLOPs = 6 * activated *
-        seq_len (forward + backward).
+        Matches torchtitan's MoE convention in
+        ``torchtitan.models.utils.get_moe_model_nparams_and_flops``:
+
+            flops_per_token = 6 * activated_non_embedding
+                            + 6 * n_mla_layers * n_heads * head_dims * seq_len
+
+        — a ``6 * W`` constant per-token linear term plus an attention
+        term that's linear in seq_len (the O(N²) MLA softmax, counted
+        per-token as O(N)). KDA layers have linear-attention FLOPs in
+        seq_len, negligible relative to MLA here; we omit them.
+
+        Activated params: dense + shared_expert + router + routed*top_k/num_experts.
+
+        Embedding excluded from the linear term (FLOPs-free lookup).
         """
-        total = 0
-        routed_expert = 0
+        nparams_total = 0
+        nparams_embedding = 0
+        nparams_dense = 0
+        nparams_router = 0
+        nparams_shared = 0
+        nparams_routed = 0
         for name, p in model.named_parameters():
-            total += p.numel()
-            # Routed experts live at ``.moe.experts.{w1,w2,w3}`` with
-            # the leading dim = num_experts. Shared-expert params
-            # (``.moe.shared_experts.``) are always active and counted
-            # in full via ``total``.
-            if ".experts." in name and ".shared_experts." not in name:
-                routed_expert += p.numel()
+            nparams_total += p.numel()
+            if "embed_tokens" in name or "lm_head" in name:
+                # lm_head is tied to embeddings in Kimi scaling-law configs,
+                # but not always — only exclude embed_tokens.
+                if "embed_tokens" in name:
+                    nparams_embedding += p.numel()
+                # Treat both as dense for non-attention FLOPs; embedding
+                # lookup is free, lm_head is a real projection.
+                nparams_dense += p.numel()
+            elif ".moe.shared_experts" in name:
+                nparams_shared += p.numel()
+            elif ".moe.router" in name or ".moe.gate" in name:
+                nparams_router += p.numel()
+            elif ".moe.experts" in name:
+                nparams_routed += p.numel()
+            else:
+                nparams_dense += p.numel()
+
         cfg = self.kimi_config
-        if cfg.num_experts and routed_expert:
-            inactive_fraction = 1.0 - cfg.num_experts_per_token / cfg.num_experts
-            activated = total - int(inactive_fraction * routed_expert)
-        else:
-            activated = total
-        return activated, 6 * activated * seq_len
+        top_k = cfg.num_experts_per_token
+        n_experts = cfg.num_experts or 1
+        nparams_active_linear = (
+            nparams_dense - nparams_embedding
+            + nparams_shared + nparams_router
+            + nparams_routed * top_k // n_experts
+        )
+
+        # MLA attention FLOPs: only full_attn_layers (MLA), KDA has linear
+        # attention we approximate as zero in this term.
+        n_mla_layers = len(cfg.full_attn_layers) if cfg.full_attn_layers else 0
+        head_dims_attn = (
+            cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim
+        )
+        attn_flops_per_token = (
+            6 * n_mla_layers * cfg.num_attention_heads * head_dims_attn * seq_len
+        )
+
+        flops_per_token = 6 * nparams_active_linear + attn_flops_per_token
+        return nparams_total, flops_per_token
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict for logging / checkpoint metadata.
