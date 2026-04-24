@@ -296,29 +296,21 @@ class KimiMLAAttention(nn.Module):
         q_full = torch.cat((q_pass, q_rot), dim=-1)
         k_full = torch.cat((k_pass_expanded, k_rot), dim=-1)
 
-        # Kimi MLA has asymmetric head_dim (Q/K = qk_nope+qk_rope = 192,
-        # V = v_head_dim = 128). PyTorch's flash attention CUDA kernel
-        # requires Q/K/V same head_dim and silently falls back to the
-        # math backend for asymmetric MLA shapes — math backend runs
-        # eager softmax + matmul, ~2-4x slower than flash on the same
-        # attention block, and Inductor splits the softmax reduction
-        # (the "Online softmax disabled" warning) which kills compile
-        # fusion. cuDNN's attention backend (CUDNN_ATTENTION) supports
-        # asymmetric Q/K vs V head_dim and routes through cuDNN's flash-
-        # style fused kernel, restoring expected MLA throughput.
-        # Falls back to math on CPU (cuDNN not present) automatically.
-        if q_full.is_cuda:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-            with sdpa_kernel(
-                [SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH]
-            ):
-                attn_out = F.scaled_dot_product_attention(
-                    q_full, k_full, v, is_causal=True, scale=self.scaling,
-                )  # (B, H, T, v_head_dim)
-        else:
-            attn_out = F.scaled_dot_product_attention(
-                q_full, k_full, v, is_causal=True, scale=self.scaling,
-            )  # (B, H, T, v_head_dim)
+        # Standard scaled-dot-product attention with causal mask.
+        # PyTorch's default SDPA backend selection picks the right
+        # kernel here: for Kimi MLA's asymmetric head_dim (Q/K=192,
+        # V=128), flash-attention rejects (requires Q/K/V same dim)
+        # and cuDNN attention is runtime-disabled in PyTorch 2.11,
+        # so the *mem-efficient cutlass kernel* (fmha_cutlassF_bf16,
+        # flash-style fused) is selected by default. We previously
+        # tried wrapping in sdpa_kernel([CUDNN, MATH]) thinking it
+        # would force cuDNN, but cuDNN gets rejected and the wrap
+        # falls through to the slower math backend — so removed.
+        # Verified via /tmp/sdpa_verify.py: default selects cutlass,
+        # explicit MATH wrap selects math (~1-2% tps regression).
+        attn_out = F.scaled_dot_product_attention(
+            q_full, k_full, v, is_causal=True, scale=self.scaling,
+        )  # (B, H, T, v_head_dim)
 
         attn_out = attn_out.transpose(1, 2).reshape(B, T, -1)
         return self.o_proj(attn_out)
