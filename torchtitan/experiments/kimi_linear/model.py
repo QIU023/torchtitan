@@ -824,15 +824,32 @@ class KimiLinearSpec:
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int,
     ) -> tuple[int, int]:
-        """Rough (n_params, flops_per_step) estimate for MFU reporting.
+        """(activated_n_params, flops_per_step) for MFU reporting.
 
-        Activated-param estimate via ``model.parameters()`` count. FLOPs
-        ≈ 6 × n_params × seq_len (forward + backward, dense + expert);
-        tight enough for MFU % bar chart, not meant for training budget
-        prediction.
+        Counts only **activated** params per token, not total MoE params:
+        routed-expert weights are scaled by top_k / num_experts; shared
+        experts + dense layers count fully. Using total params over-
+        reports FLOPs by ~3x at 32 experts top-8, giving the nonsensical
+        >1000% MFU reading seen in earlier runs. FLOPs = 6 * activated *
+        seq_len (forward + backward).
         """
-        n_params = sum(p.numel() for p in model.parameters())
-        return n_params, 6 * n_params * seq_len
+        total = 0
+        routed_expert = 0
+        for name, p in model.named_parameters():
+            total += p.numel()
+            # Routed experts live at ``.moe.experts.{w1,w2,w3}`` with
+            # the leading dim = num_experts. Shared-expert params
+            # (``.moe.shared_experts.``) are always active and counted
+            # in full via ``total``.
+            if ".experts." in name and ".shared_experts." not in name:
+                routed_expert += p.numel()
+        cfg = self.kimi_config
+        if cfg.num_experts and routed_expert:
+            inactive_fraction = 1.0 - cfg.num_experts_per_token / cfg.num_experts
+            activated = total - int(inactive_fraction * routed_expert)
+        else:
+            activated = total
+        return activated, 6 * activated * seq_len
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict for logging / checkpoint metadata.
