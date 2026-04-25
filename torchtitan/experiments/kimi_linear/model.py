@@ -672,7 +672,7 @@ class KimiLinearModel(nn.Module):
         # Hook for AttnRes subclass + PP adapter.
         self._return_only_new_blocks: bool = False
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, **kwargs) -> torch.Tensor:
         """Forward pass with PP-split awareness.
 
         Args:
@@ -681,6 +681,11 @@ class KimiLinearModel(nn.Module):
                 (middle / last). Dispatch is decided by presence of
                 ``self.embed_tokens`` (pipeline_module_split strips it
                 off non-first stages).
+            **kwargs: Ignored. Accepts ``attention_masks=None`` and
+                ``positions=...`` that torchtitan's Trainer / Validator
+                may inject for FlexAttention / CP paths — Kimi Linear
+                uses plain SDPA + KDA Triton kernels and doesn't need
+                them.
 
         Returns:
             * Non-last PP stage: ``[B, T, D]`` hidden state to forward
@@ -703,6 +708,22 @@ class KimiLinearModel(nn.Module):
         chain. Trainer calls this post-build; overriding as no-op keeps
         the FSDP + loss + optimizer paths intact without requiring every
         sub-module to register as a ``Module.Config``-built instance.
+        """
+        return None
+
+    def get_attention_masks(self, *args, **kwargs):
+        """Return ``None`` — KDA + MLA both use plain SDPA / Triton paths
+        and don't take an external ``attention_masks`` kwarg through
+        ``forward``. torchtitan's Validator and Trainer call this to
+        precompute attention masks for FlexAttention/VarlenAttention
+        models; for our SDPA-style stack the right answer is no mask
+        passthrough.
+
+        Defined as method (not raise NotImplementedError) so the trainer
+        and validator paths don't crash on AttributeError. Returning
+        ``None`` causes ``extra_kwargs["attention_masks"] = None`` and
+        our forward signature ``(tokens)`` simply ignores extra kwargs
+        the trainer might try to pass.
         """
         return None
 

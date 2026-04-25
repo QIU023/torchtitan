@@ -222,6 +222,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
         self,
         tokens: torch.Tensor,
         blocks: torch.Tensor | None = None,
+        **kwargs,
     ):
         """AttnRes forward with PP-split awareness + block threading.
 
