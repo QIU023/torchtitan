@@ -327,7 +327,15 @@ def _install_augment_hook(
     own backward. No Function layer is interposed, so the consumer's
     backward can not reach ``block_tensor.grad_fn`` at all (the consumer
     only ever sees the detached cache entry — see ``_append_own_commit``).
+
+    Eval / no_grad path: when this is called inside a no_grad / eval
+    context (e.g. ``pp_schedule.eval()`` in torchtitan's Validator),
+    ``block_tensor.requires_grad`` is False and ``register_hook``
+    raises. There is no backward in eval, so the augment-on-backward
+    semantics are vacuous — silently skip hook installation.
     """
+    if not block_tensor.requires_grad:
+        return
     def _hook(grad: torch.Tensor) -> torch.Tensor:
         captured, count = rank_cache.pop_grad(slot_key)
         _dbg(
@@ -652,9 +660,16 @@ class CrossStageCacheAdapter(nn.Module):
             layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta
         ]
         earlier_blocks: list[torch.Tensor] = []
+        # Eval / no_grad path: skip the Capture wrapping. With no
+        # backward to run, there is nothing to capture into a slot, and
+        # ``requires_grad_(True)`` + ``autograd.Function.apply`` both
+        # fail under ``torch.no_grad()`` (which the torchtitan Validator
+        # uses via ``pp_schedule.eval()``). Use the cached block tensors
+        # raw — fwd math is identical.
+        grad_active = torch.is_grad_enabled()
         for blk, meta in zip(earlier_blocks_raw, earlier_meta):
             producer_rank, producer_stage, block_idx_in_producer = meta
-            if producer_rank == self.pp_rank:
+            if producer_rank == self.pp_rank and grad_active:
                 slot_key = (mb, producer_stage, block_idx_in_producer)
                 if not blk.requires_grad:
                     blk.requires_grad_(True)
