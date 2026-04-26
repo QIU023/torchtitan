@@ -138,19 +138,32 @@ What is **not** yet shown:
 These are the natural next experiments — gated on multi-node access, not on the
 algorithm or adapter.
 
-### 3. MoE + MLA + AttnRes (DSv3-shape) — early scaffolding, superseded
+### 3. MoE + MLA + AttnRes — two shapes, two roles
 
-The DSv3-shape flavors here (`dsv3_*_attn_res`) were the first MoE+MLA+AttnRes
-integration pass: CPU forward+backward tests pass on the debug flavor, and the
-flavors register cleanly through `parallelize_deepseekv3`. Track 3 was always a
-stepping-stone toward the Kimi-production-aligned shape.
+There are two MoE+MLA+AttnRes integrations in this fork, on purpose:
 
-**The actual end-to-end MoE+MLA+AttnRes results live in the sibling
-[`../kimi_linear/`](../kimi_linear/) experiment** — KDA + MLA + sigmoid-gated
-MoE + AttnRes wrapper, with the cross-stage cache adapter wired through.
-Phase 4 ran a 436M FSDP overnight baseline + a PP=4 cache-adapter overnight
-run (both 12,500 steps). For Kimi-K3-shape work, start there; the DSv3-shape
-flavors here remain useful as the minimal MoE smoke target.
+**3a. DSv3-shape (`dsv3_*_attn_res`, this folder) — minimal MoE smoke target.**
+The first MoE+MLA+AttnRes integration pass: CPU forward+backward tests pass on
+the debug flavor, and the flavors register cleanly through
+`parallelize_deepseekv3`. Reuses torchtitan's stock MoE module
+(`torchtitan.models.common.moe.MoE`) and DSv3's stock MLA verbatim, so it is
+the smallest possible "MoE + AttnRes runs end-to-end" target — no `fla-core`,
+no KDA, no sigmoid-gated grouped-topk routing. Useful as a regression smoke
+when changing the AttnRes primitive or the cache adapter. Has not been GPU-
+trained; the PP adapter + MoE + EP combo on this shape is still untested.
+
+**3b. Kimi-Linear-shape (sibling [`../kimi_linear/`](../kimi_linear/)) —
+end-to-end production-aligned run.**
+KDA + MLA + sigmoid-gated grouped-topk MoE + AttnRes wrapper, with the
+cross-stage cache adapter wired through. Phase 4 ran a 436M FSDP overnight
+baseline + a PP=4 cache-adapter overnight run (both 12,500 steps). This is
+the shape Kimi K3 will almost certainly ship with — the actual evidence that
+MoE + MLA + AttnRes + PP cache adapter trains end-to-end on this hardware
+lives there.
+
+**For Kimi-K3-shape work, start at [`../kimi_linear/`](../kimi_linear/).**
+For minimal MoE+AttnRes smoke regression on the AttnRes primitive itself,
+keep using the `dsv3_*_attn_res` flavors in this folder.
 
 ## Why this lives here as a "reference implementation"
 
@@ -159,8 +172,8 @@ flavors here remain useful as the minimal MoE smoke target.
 - The PP adapter (Track 2) is an integration story that's hard to reconstruct
   from the paper alone — the cache lifecycle and the second-order backward fix
   are non-obvious.
-- The MoE+MLA scaffolding (Track 3) is the production-aligned shape Kimi will
-  almost certainly ship with K3.
+- Track 3 (DSv3-shape smoke + Kimi-Linear-shape end-to-end) is the
+  production-aligned shape Kimi will almost certainly ship with K3.
 
 Reviewers on RFC [#3029](https://github.com/pytorch/torchtitan/issues/3029)
 asked to defer upstream merge until K3 lands. Until then, anyone who wants
