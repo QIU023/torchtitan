@@ -672,7 +672,11 @@ class KimiLinearModel(nn.Module):
         # Hook for AttnRes subclass + PP adapter.
         self._return_only_new_blocks: bool = False
 
-    def forward(self, tokens: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, *,
+                inputs_embeds: torch.Tensor | None = None,
+                vision_embeds: torch.Tensor | None = None,
+                image_mask: torch.Tensor | None = None,
+                **kwargs) -> torch.Tensor:
         """Forward pass with PP-split awareness.
 
         Args:
@@ -681,6 +685,13 @@ class KimiLinearModel(nn.Module):
                 (middle / last). Dispatch is decided by presence of
                 ``self.embed_tokens`` (pipeline_module_split strips it
                 off non-first stages).
+            inputs_embeds: Optional ``[B, T, D]`` pre-computed
+                embeddings. When provided, ``embed_tokens`` is skipped
+                entirely (`tokens` is ignored as long as it's a valid
+                placeholder dispatch on the right device). Used by
+                multimodal training where image-token positions are
+                replaced with vision-projector outputs before the LM
+                forward — keeps the call as a single FSDP-root forward.
             **kwargs: Ignored. Accepts ``attention_masks=None`` and
                 ``positions=...`` that torchtitan's Trainer / Validator
                 may inject for FlexAttention / CP paths — Kimi Linear
@@ -692,7 +703,19 @@ class KimiLinearModel(nn.Module):
               to the next stage.
             * Last stage / non-PP: ``[B, T, vocab_size]`` logits.
         """
-        h = self.embed_tokens(tokens) if self.embed_tokens is not None else tokens
+        if inputs_embeds is not None:
+            h = inputs_embeds
+        elif self.embed_tokens is not None:
+            h = self.embed_tokens(tokens)
+            # Multimodal scatter: replace embed positions for image tokens
+            # with externally-supplied vision_embeds. Done INSIDE this
+            # forward so FSDP sees a single root call (calling
+            # embed_tokens externally would split the root).
+            if vision_embeds is not None and image_mask is not None:
+                h = h.clone()
+                h[image_mask] = vision_embeds.reshape(-1, vision_embeds.size(-1)).to(h.dtype)
+        else:
+            h = tokens  # middle/last PP stage: tokens IS the hidden state
         for layer in self.layers.values():
             h = layer(h)
         if self.norm is not None:

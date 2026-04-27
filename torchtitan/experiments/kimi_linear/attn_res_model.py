@@ -222,6 +222,10 @@ class KimiLinearAttnResModel(KimiLinearModel):
         self,
         tokens: torch.Tensor,
         blocks: torch.Tensor | None = None,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        vision_embeds: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
         **kwargs,
     ):
         """AttnRes forward with PP-split awareness + block threading.
@@ -249,8 +253,20 @@ class KimiLinearAttnResModel(KimiLinearModel):
         commits rather than the full accumulated stack (constant per-hop
         bytes regardless of depth).
         """
-        # 1) Initial hidden: embed on stage 0, pass-through on middle/last.
-        h = self.embed_tokens(tokens) if self.embed_tokens is not None else tokens
+        # 1) Initial hidden: pre-computed embeds (multimodal), embed on stage 0,
+        #    pass-through on middle/last PP stages.
+        if inputs_embeds is not None:
+            h = inputs_embeds
+        elif self.embed_tokens is not None:
+            h = self.embed_tokens(tokens)
+            # Multimodal scatter: replace embed positions for image tokens
+            # with externally-supplied vision_embeds. Done INSIDE this
+            # forward so FSDP sees a single root call.
+            if vision_embeds is not None and image_mask is not None:
+                h = h.clone()
+                h[image_mask] = vision_embeds.reshape(-1, vision_embeds.size(-1)).to(h.dtype)
+        else:
+            h = tokens
 
         # 2) Unstack incoming blocks; empty list on stage 0 / non-PP.
         if blocks is None:
