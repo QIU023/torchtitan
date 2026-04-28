@@ -218,6 +218,12 @@ class KimiLinearAttnResModel(KimiLinearModel):
         # PP cache adapter hook — FSDP-only training leaves this False.
         self._return_only_new_blocks: bool = False
 
+    # Default sentinel token id used to mark image-token positions in input_ids
+    # when ``image_mask`` is not supplied alongside ``vision_embeds``. Phase 5
+    # multimodal pretraining picks 32000 (a Llama-3.1 reserved special token);
+    # any caller can override by passing ``image_token_id`` as a kwarg.
+    _DEFAULT_IMAGE_TOKEN_ID = 32_000
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -226,6 +232,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
         inputs_embeds: torch.Tensor | None = None,
         vision_embeds: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        image_token_id: int | None = None,
         **kwargs,
     ):
         """AttnRes forward with PP-split awareness + block threading.
@@ -261,10 +268,37 @@ class KimiLinearAttnResModel(KimiLinearModel):
             h = self.embed_tokens(tokens)
             # Multimodal scatter: replace embed positions for image tokens
             # with externally-supplied vision_embeds. Done INSIDE this
-            # forward so FSDP sees a single root call.
-            if vision_embeds is not None and image_mask is not None:
-                h = h.clone()
-                h[image_mask] = vision_embeds.reshape(-1, vision_embeds.size(-1)).to(h.dtype)
+            # forward so FSDP sees a single root call. Under PP, only stage 0
+            # has ``embed_tokens``, so this branch fires there exclusively.
+            # ``image_mask`` is recomputed from ``tokens`` when not supplied
+            # so callers don't have to plumb a bool mask through PP P2P
+            # (which would chunk it as a separate kwarg without semantic
+            # benefit — the mask is a deterministic function of input_ids).
+            #
+            # Implementation note: ``masked_scatter`` is used instead of
+            # ``h[image_mask] = vision_embeds.reshape(-1, D)`` so the
+            # operation is safe under PP shape inference, where the
+            # scheduler runs forward once with zero-filled token tensors
+            # to determine activation shapes — image_mask is then all
+            # False and advanced-indexing assignment would crash with
+            # "shape mismatch". masked_scatter copies as many elements
+            # as the mask requires (zero in shape-inference, B*N_vision
+            # in regular forward) and is autograd-friendly so the
+            # downstream PP backward path still reaches vision_embeds.
+            if vision_embeds is not None:
+                if image_mask is None:
+                    sentinel = (
+                        image_token_id
+                        if image_token_id is not None
+                        else self._DEFAULT_IMAGE_TOKEN_ID
+                    )
+                    image_mask = (tokens == sentinel)
+                source = vision_embeds.reshape(
+                    -1, vision_embeds.size(-1)
+                ).to(h.dtype)
+                h = h.masked_scatter(
+                    image_mask.unsqueeze(-1).expand_as(h), source
+                )
         else:
             h = tokens
 
