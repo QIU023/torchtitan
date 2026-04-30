@@ -189,25 +189,35 @@ def apply_fsdp(
         model.config, "tie_word_embeddings", False
     )
 
+    # Under PP, ``embed_tokens`` is stripped on non-first stages and
+    # ``lm_head`` (in head_tail) is stripped on non-last stages; both
+    # become None on PP-stripped ranks. Filter Nones before passing to
+    # fully_shard so the wrap iterates only over real modules.
+    embed = getattr(model, "embed_tokens", None)
     if tied:
         # When tied, embed shares storage with lm_head — bundle them
-        # so the shared weight isn't all-gathered twice.
-        fully_shard(
-            [model.embed_tokens, *head_tail],
-            **fsdp_config,
-            reshard_after_forward=(reshard_after_forward_policy == "always"),
-        )
+        # so the shared weight isn't all-gathered twice. Skip the bundle
+        # entirely if no embed module is present on this rank.
+        bundle = [m for m in [embed, *head_tail] if m is not None]
+        if bundle:
+            fully_shard(
+                bundle,
+                **fsdp_config,
+                reshard_after_forward=(reshard_after_forward_policy == "always"),
+            )
     else:
-        fully_shard(
-            model.embed_tokens,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
-        fully_shard(
-            head_tail,
-            **fsdp_config,
-            reshard_after_forward=(reshard_after_forward_policy == "always"),
-        )
+        if embed is not None:
+            fully_shard(
+                embed,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        if head_tail:
+            fully_shard(
+                head_tail,
+                **fsdp_config,
+                reshard_after_forward=(reshard_after_forward_policy == "always"),
+            )
 
     if attn_res_tail:
         fully_shard(
