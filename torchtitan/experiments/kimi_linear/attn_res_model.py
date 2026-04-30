@@ -293,9 +293,27 @@ class KimiLinearAttnResModel(KimiLinearModel):
                         else self._DEFAULT_IMAGE_TOKEN_ID
                     )
                     image_mask = (tokens == sentinel)
-                source = vision_embeds.reshape(
-                    -1, vision_embeds.size(-1)
-                ).to(h.dtype)
+                # Variable image count per row support (B1): the original
+                # ``vision_embeds.reshape(-1, D)`` assumes every row has
+                # exactly ``vision_embeds.size(1)`` image tokens — which
+                # holds for LLaVA-Pretrain (1 img × 196 tokens) but breaks
+                # the moment data has zero-image rows (text-only mixed in)
+                # or multi-image rows. Filter ``vision_embeds`` to the
+                # leading ``n_image_per_row[i]`` slots of each row before
+                # flattening so ``masked_scatter`` consumes the correct
+                # row-major sequence of embeds.
+                #
+                # Under PP shape inference (zero-filled tokens, image_mask
+                # all False), n_image_per_row=0 → valid all False →
+                # source has shape (0, D), masked_scatter is a no-op.
+                # Under uniform-image data (all rows == n_vis_max), valid
+                # is all True → source equals the original reshape, so
+                # this is a strict superset of the previous behavior.
+                n_per_row = image_mask.sum(dim=1)
+                n_vis_max = vision_embeds.size(1)
+                arange = torch.arange(n_vis_max, device=image_mask.device)
+                valid = arange.unsqueeze(0) < n_per_row.unsqueeze(1)
+                source = vision_embeds[valid].to(h.dtype)
                 h = h.masked_scatter(
                     image_mask.unsqueeze(-1).expand_as(h), source
                 )
