@@ -42,6 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.distributed.tensor import DTensor
 
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
@@ -191,6 +192,32 @@ class KimiMLP(nn.Module):
 
 # ----- MLA (NoPE variant) -------------------------------------------------- #
 
+
+class KimiMLAInnerAttention(nn.Module):
+    """SDPA-only inner attention module for KimiMLAAttention.
+
+    Mirrors the DSv3 ``inner_attention`` pattern: pulls
+    :func:`F.scaled_dot_product_attention` into a separate (parameter-free)
+    submodule so the TP plan can wrap it with ``PrepareModuleInput(...,
+    use_local_output=True)``. Under TP, the q/k/v projections produce DTensors
+    sharded along the head axis; ``use_local_output=True`` converts them to
+    plain Tensors before SDPA's internal kernel-selection dispatcher runs,
+    avoiding the "aten.bmm got mixed Tensor and DTensor" failure inside the
+    mem-efficient cutlass kernel path.
+    """
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=scale,
+        )
+
+
 class KimiMLAAttention(nn.Module):
     """Multi-head Latent Attention, Kimi NoPE variant.
 
@@ -255,6 +282,10 @@ class KimiMLAAttention(nn.Module):
             self.num_heads * self.v_head_dim, self.hidden_size, bias=False
         )
 
+        # SDPA-only sub-module so the TP plan can wrap it with
+        # use_local_output=True (DSv3 pattern). Has no parameters.
+        self.inner_attention = KimiMLAInnerAttention()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward with causal mask; no KV cache.
 
@@ -302,14 +333,17 @@ class KimiMLAAttention(nn.Module):
         # V=128), flash-attention rejects (requires Q/K/V same dim)
         # and cuDNN attention is runtime-disabled in PyTorch 2.11,
         # so the *mem-efficient cutlass kernel* (fmha_cutlassF_bf16,
-        # flash-style fused) is selected by default. We previously
-        # tried wrapping in sdpa_kernel([CUDNN, MATH]) thinking it
-        # would force cuDNN, but cuDNN gets rejected and the wrap
-        # falls through to the slower math backend — so removed.
-        # Verified via /tmp/sdpa_verify.py: default selects cutlass,
-        # explicit MATH wrap selects math (~1-2% tps regression).
-        attn_out = F.scaled_dot_product_attention(
-            q_full, k_full, v, is_causal=True, scale=self.scaling,
+        # flash-style fused) is selected by default.
+        #
+        # Routing through ``self.inner_attention`` (a parameterless
+        # submodule) is the DSv3 pattern: it lets ``apply_tp_kimi_linear``
+        # wrap this call with ``PrepareModuleInput(use_local_output=True)``
+        # so q/k/v are converted from DTensor (sharded on the head axis)
+        # to plain Tensors before SDPA's mem-efficient cutlass kernel
+        # path sees them — avoiding "aten.bmm got mixed Tensor and
+        # DTensor" inside SDPA's internal dispatcher.
+        attn_out = self.inner_attention(
+            q_full, k_full, v, scale=self.scaling,
         )  # (B, H, T, v_head_dim)
 
         attn_out = attn_out.transpose(1, 2).reshape(B, T, -1)
@@ -317,6 +351,46 @@ class KimiMLAAttention(nn.Module):
 
 
 # ----- KDA (Kimi Delta-rule Attention) ------------------------------------ #
+
+
+def _to_local_if_dtensor(t):
+    """Strip DTensor wrapping for fla-core triton kernels.
+
+    fla-core's chunk_kda / fused_kda_gate / ShortConvolution are Triton
+    kernels that don't dispatch through DTensor. Under TP, KDA's
+    self_attn is NoParallel-wrapped (params become DTensor(Replicate)
+    on tp_mesh) and incoming x is also DTensor at the parent's
+    boundary. KDA forward stashes the DTensor mesh+placements, strips
+    DTensor from x and from each weight at the kernel call site, runs
+    the kernels on plain tensors (each rank computes redundantly under
+    Replicate), and re-DTensors at the end so the parent NoParallel
+    output hook composes correctly.
+
+    isinstance(t, DTensor) is the safe check that dynamo's fake-tensor
+    mode honors (``hasattr(t, "to_local")`` is unreliable: dynamo's
+    type tracking can elide attribute lookups on DTensor parameters).
+    """
+    if isinstance(t, DTensor):
+        return t.to_local()
+    return t
+
+
+def _local_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """Apply ``linear`` with both weight and (optional) bias unwrapped to local.
+
+    Used by :class:`KimiDeltaAttention.forward` so each projection can
+    operate in plain-Tensor land alongside the fla-core triton kernels,
+    even when the parent NoParallel(self_attn) wrap makes ``linear.weight``
+    a DTensor(Replicate) on tp_mesh.
+    """
+    weight = _to_local_if_dtensor(linear.weight)
+    bias = (
+        _to_local_if_dtensor(linear.bias)
+        if linear.bias is not None
+        else None
+    )
+    return F.linear(x, weight, bias)
+
 
 class KimiDeltaAttention(nn.Module):
     """Kimi Delta Attention — linear-attention variant using
@@ -399,6 +473,23 @@ class KimiDeltaAttention(nn.Module):
         Returns:
             ``[B, T, D]`` KDA output.
         """
+        # Under TP, the parent KimiDecoderLayer's NoParallel(self_attn)
+        # wraps this forward: x arrives as DTensor(Replicate) on tp_mesh,
+        # and all child params (q/k/v projections, conv1d weights,
+        # A_log, dt_bias, FusedRMSNormGated) are DTensors on the same
+        # mesh. The standard nn.Linear ops (DTensor x × DTensor weight)
+        # dispatch correctly through DTensor's op set; the fla-core
+        # triton kernels (causal_conv1d in ShortConvolution,
+        # fused_kda_gate, chunk_kda, FusedRMSNormGated) do not. We
+        # stash the input's DTensor metadata, run the body in plain-
+        # tensor land, and re-DTensor at the end so the parent
+        # NoParallel hook's prepare_output sees a DTensor.
+        in_mesh = None
+        in_placements = None
+        if isinstance(x, DTensor):
+            in_mesh = x.device_mesh
+            in_placements = x.placements
+        x = _to_local_if_dtensor(x)
         _, T, _ = x.shape
         # mode selection matches reference: chunk for long, recurrent for short
         # training gate: chunk required (ref asserts this)
@@ -406,21 +497,35 @@ class KimiDeltaAttention(nn.Module):
         if self.training:
             assert mode == "chunk", "KDA training requires chunk mode (T > 64)"
 
-        # 1) Q/K/V projection + short causal conv with silu
-        q, _ = self.q_conv1d(x=self.q_proj(x), cache=None, output_final_state=False)
-        k, _ = self.k_conv1d(x=self.k_proj(x), cache=None, output_final_state=False)
-        v, _ = self.v_conv1d(x=self.v_proj(x), cache=None, output_final_state=False)
+        # 1) Q/K/V projection + short causal conv with silu.
+        # _local_linear unwraps DTensor weight to local before F.linear.
+        # ShortConvolution.forward is patched at TP-init time to handle
+        # DTensor input/weight by to_local + re-DTensor; we feed plain
+        # x here so the patch is a no-op when x is already plain.
+        q, _ = self.q_conv1d(
+            x=_local_linear(self.q_proj, x), cache=None, output_final_state=False,
+        )
+        k, _ = self.k_conv1d(
+            x=_local_linear(self.k_proj, x), cache=None, output_final_state=False,
+        )
+        v, _ = self.v_conv1d(
+            x=_local_linear(self.v_proj, x), cache=None, output_final_state=False,
+        )
 
         # 2) Forget-gate g: (B,T,D) low-rank via f_a/f_b, reshape to
         #    (B, T, H, K) for fla-core 0.5.0's fused_kda_gate API:
         #      fused_kda_gate(g: [..., H, K], A_log: [H], dt_bias: [H*K])
         #      → [..., H, K] log-decay
-        g_raw = self.f_b_proj(self.f_a_proj(x))
+        g_raw = _local_linear(self.f_b_proj, _local_linear(self.f_a_proj, x))
         g_raw = rearrange(g_raw, "... (h d) -> ... h d", d=self.head_dim)
-        g = fused_kda_gate(g_raw, self.A_log, dt_bias=self.dt_bias)
+        g = fused_kda_gate(
+            g_raw,
+            _to_local_if_dtensor(self.A_log),
+            dt_bias=_to_local_if_dtensor(self.dt_bias),
+        )
 
         # 3) Beta: per-head, per-token learning-rate (delta-rule)
-        beta = self.b_proj(x).float().sigmoid()
+        beta = _local_linear(self.b_proj, x).float().sigmoid()
 
         # 4) Reshape to (..., H, D) for KDA kernel
         q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
@@ -442,13 +547,25 @@ class KimiDeltaAttention(nn.Module):
         )
 
         # 6) Output gate + norm
-        g_out = self.g_b_proj(self.g_a_proj(x))
+        g_out = _local_linear(self.g_b_proj, _local_linear(self.g_a_proj, x))
         g_out = rearrange(g_out, "... (h d) -> ... h d", d=self.head_dim)
-        o = self.o_norm(o, g_out)  # FusedRMSNormGated: o * sigmoid(g_out), normed
+        # FusedRMSNormGated.forward is patched at TP-init time too, so
+        # it handles DTensor weight transparently. We pass plain o + g_out
+        # here (both are plain after the to_local+linear chain).
+        o = self.o_norm(o, g_out)  # o * sigmoid(g_out), normed
 
         # 7) Reshape back and project
         o = rearrange(o, "b t h d -> b t (h d)")
-        return self.o_proj(o)
+        out = _local_linear(self.o_proj, o)
+
+        # Re-wrap the output as DTensor so the parent NoParallel hook
+        # gets the type it expects. Replicate placement matches the
+        # incoming x's placement (input_layernorm output).
+        if in_mesh is not None and in_placements is not None:
+            out = DTensor.from_local(
+                out, in_mesh, in_placements, run_check=False,
+            )
+        return out
 
 
 # ----- MoE (training-capable via torchtitan.models.common.moe) ------------ #

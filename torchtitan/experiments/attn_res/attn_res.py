@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
 
 from torchtitan.protocols.module import Module
@@ -67,7 +68,16 @@ def block_attn_res(
     V = torch.stack(blocks + [partial_block], dim=0)  # [N+1, B, T, D]
     K = norm(V)
     # proj.weight is [1, D]; squeeze to [D] and contract with K's channel dim.
-    query = proj.weight.squeeze(0)
+    # Under TP, proj is wrapped with NoParallel, which makes proj.weight a
+    # DTensor(Replicate). The downstream einsum mixes ``query`` with the
+    # plain Tensor ``K``, which would raise "mixed Tensor and DTensor". We
+    # strip the DTensor wrapping here at the use-site (every TP rank has
+    # the full local copy under Replicate placement, so to_local is a
+    # no-op data-wise but unwraps the DTensor for the einsum dispatcher).
+    weight = proj.weight
+    if isinstance(weight, DTensor):
+        weight = weight.to_local()
+    query = weight.squeeze(0)
     logits = torch.einsum("d,nbtd->nbt", query, K)
     weights = F.softmax(logits, dim=0)
     h = torch.einsum("nbt,nbtd->btd", weights, V)
