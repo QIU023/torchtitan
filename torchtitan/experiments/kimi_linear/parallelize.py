@@ -25,10 +25,16 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     fully_shard,
     MixedPrecisionPolicy,
+)
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    parallelize_module,
+    RowwiseParallel,
 )
 
 from torchtitan.config import (
@@ -69,14 +75,67 @@ def parallelize_kimi_linear(
     torch.set_float32_matmul_precision("high")
 
     if parallel_dims.tp_enabled:
-        raise NotImplementedError(
-            "TP not supported for Kimi Linear in Phase 4c. "
-            "Use parallelism.tensor_parallel_degree=1."
+        # Phase 6 A3: minimum-viable TP plan covering dense MLP layers
+        # only. KDA layers stay replicated under TP because fla-core
+        # triton kernels (chunk_kda, ShortConvolution, FusedRMSNormGated)
+        # are not validated for sharded heads in this codebase. MLA
+        # stays replicated because its asymmetric Q/K/V dim split
+        # complicates ColwiseParallel registration. AttnResProjection
+        # is Linear(d -> 1) so out_features cannot be meaningfully
+        # sharded — kept replicated. This is enough to demonstrate the
+        # TP plan exists for kimi_linear and to fire all-reduce
+        # collectives in MLP forwards (Phase 7 trace).
+        tp_mesh = parallel_dims.get_mesh("tp")
+        apply_tp_kimi_linear(model, tp_mesh)
+        logger.info(
+            "Applied minimum-viable TP plan (dense MLP only) tp_degree=%d.",
+            parallel_dims.tp,
         )
     if parallel_dims.cp_enabled:
+        # Phase 6 CP: blocked on fla-core. The kimi_linear backbone
+        # alternates KDA (3:1 ratio) and MLA layers. KDA's forward
+        # path uses fla-core's chunk_kda triton kernel, which runs a
+        # causal recurrence over the seq dim. CP shards the seq dim
+        # across ranks; chunk_kda would see only seq_len/cp tokens
+        # per rank and the recurrence state across rank boundaries
+        # would be lost. Making KDA CP-correct requires a ring-
+        # recurrence variant of chunk_kda that exchanges state between
+        # adjacent CP ranks at the chunk boundary — which lives in
+        # fla-core upstream (https://github.com/fla-org/flash-linear-attention),
+        # not in torchtitan or this experiment.
+        #
+        # MLA + dense MLP would compose with CP via the standard
+        # torchtitan path (apply_cp_to_attention_module + SDPA
+        # dispatcher), but applying CP only to MLA while replicating
+        # the seq across KDA layers requires a per-layer all-gather
+        # at the KDA boundary — a non-trivial wrapper that is out of
+        # scope here.
+        #
+        # Status: CP is documented as out-of-scope until fla-core
+        # ships ring-attention KDA. Non-AttnRes / MLA-only flavors
+        # would compose with CP cleanly.
         raise NotImplementedError(
-            "CP not supported for Kimi Linear in Phase 4c. "
-            "Use parallelism.context_parallel_degree=1."
+            "CP is not currently supported for kimi_linear "
+            "(KDA layers' fla-core chunk_kda kernel does not "
+            "implement ring-recurrence over CP shards). "
+            "Track upstream fla-core for ring-KDA support; "
+            "until then, run with context_parallel_degree=1."
+        )
+    if parallel_dims.ep > 1:
+        # Phase 6 A6: Expert Parallel for Kimi MoE layers. The
+        # KimiMoE module wraps torchtitan.models.common.moe.MoE as
+        # self._moe; the expert ModuleList is at self._moe.experts.
+        # Apply standard ExpertParallel() to that experts container,
+        # which fires all-to-all on the EP mesh for token dispatch +
+        # combine. Cache adapter delta accumulation interacts with
+        # MoE only at the block boundary (after FFN residual add),
+        # so EP routing within the FFN body is transparent to the
+        # AttnRes block-commit logic.
+        ep_mesh = parallel_dims.get_mesh("ep")
+        apply_ep_kimi_linear(model, ep_mesh)
+        logger.info(
+            "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
+            parallel_dims.ep,
         )
     if ac_config.mode not in ("none", "None", None):
         logger.warning(
@@ -127,6 +186,106 @@ def parallelize_kimi_linear(
             parallel_dims.dp_replicate,
         )
     return model
+
+
+def apply_tp_kimi_linear(model: nn.Module, tp_mesh: DeviceMesh) -> None:
+    """Phase 6 A3 minimum-viable TP plan for kimi_linear.
+
+    Wraps every dense MLP layer's three projections (gate / up / down)
+    so the FFN forward fires all-reduce at the down_proj boundary.
+    Other modules — KDA, MLA, MoE, AttnResProjection, layernorms,
+    embedding, lm_head — stay replicated.
+
+    Why so conservative:
+    - KDA: fla-core triton kernels (chunk_kda etc.) accept [..., H, K]
+      tensors. Sharding H would require Shard(0) on A_log + dt_bias
+      parameters and per-rank ShortConvolution channels. Not validated
+      here; treat as out-of-scope follow-up.
+    - MLA: Q is one projection [hidden -> H * (qk_nope+qk_rope)] split
+      along the last dim into nope/rot halves; KV is two-stage
+      (kv_a_proj_with_mqa then kv_b_proj) with kv_a_layernorm in
+      between operating on the kv_lora half only. Registering this
+      under ColwiseParallel without breaking the split semantics
+      requires more care than a shared TP plan can express. Keep
+      replicated.
+    - AttnResProjection: ``Linear(hidden -> 1)``, output features = 1
+      cannot be sharded — TP is meaningless. Replicated by default.
+    - Embedding / lm_head: kept replicated to keep this pass scope-
+      contained. SP + loss-parallel can be added in a follow-up PR.
+
+    The collective produced by this plan is one all-reduce per dense-MLP
+    layer per forward pass (`down_proj` RowwiseParallel) plus one per
+    backward pass. This is enough to demonstrate end-to-end TP wiring
+    and to populate Phase 7's tensor-parallel collective pattern slot.
+    """
+    for layer in model.layers.values():
+        is_moe = bool(getattr(layer, "is_moe", False))
+        ffn = getattr(layer, "ffn", None)
+        if ffn is None or is_moe:
+            # MoE layer's expert routing is handled via the EP plan
+            # (separate parallelism axis). Skip in TP plan.
+            continue
+        # Sanity: dense MLP module shape must have the three named
+        # projections. If a future flavor changes the FFN class, raise
+        # rather than silently skipping.
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            if not hasattr(ffn, name):
+                raise ValueError(
+                    f"layer {layer.layer_idx} dense ffn missing '{name}'; "
+                    "TP plan needs gate_proj / up_proj / down_proj."
+                )
+        plan = {
+            "ffn.gate_proj": ColwiseParallel(),
+            "ffn.up_proj": ColwiseParallel(),
+            "ffn.down_proj": RowwiseParallel(),
+        }
+        parallelize_module(
+            module=layer,
+            device_mesh=tp_mesh,
+            parallelize_plan=plan,
+        )
+
+
+def apply_ep_kimi_linear(model: nn.Module, ep_mesh: DeviceMesh) -> None:
+    """Phase 6 A6 Expert Parallel plan for kimi_linear MoE flavors.
+
+    Applies ``ExpertParallel()`` to every MoE layer's expert container.
+    The KimiMoE module wraps the torchtitan common MoE as ``self._moe``;
+    its ``experts`` field is the ModuleList that EP shards across the
+    EP mesh, with token dispatch + combine via all-to-all collectives
+    on that mesh.
+
+    Layers without MoE (``layer.is_moe == False``, i.e. dense MLP at
+    the first ``first_k_dense_replace`` indices) are skipped — they
+    have no experts to shard.
+    """
+    from torchtitan.distributed.expert_parallel import ExpertParallel
+
+    plan = ExpertParallel()
+    moe_layers_wrapped = 0
+    for layer in model.layers.values():
+        if not bool(getattr(layer, "is_moe", False)):
+            continue
+        ffn = getattr(layer, "ffn", None)
+        if ffn is None:
+            continue
+        # KimiMoE wraps the torchtitan common MoE as self._moe; its
+        # experts container is the ModuleList of per-expert MLPs.
+        moe = getattr(ffn, "_moe", None)
+        if moe is None or not hasattr(moe, "experts"):
+            raise ValueError(
+                f"layer {layer.layer_idx} MoE ffn missing _moe.experts; "
+                "EP plan needs the standard torchtitan MoE wrapping."
+            )
+        parallelize_module(
+            module=moe.experts,
+            device_mesh=ep_mesh,
+            parallelize_plan=plan,
+        )
+        moe_layers_wrapped += 1
+    logger.info(
+        "EP plan wrapped %d MoE layer experts.", moe_layers_wrapped
+    )
 
 
 def apply_fsdp(
