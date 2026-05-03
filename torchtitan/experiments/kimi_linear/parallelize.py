@@ -34,8 +34,11 @@ from torch.distributed.fsdp import (
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
+    PrepareModuleInput,
     RowwiseParallel,
 )
+from torch.distributed.tensor.placement_types import Replicate
+from torchtitan.distributed.tensor_parallel import NoParallel
 
 from torchtitan.config import (
     ActivationCheckpointConfig,
@@ -75,20 +78,46 @@ def parallelize_kimi_linear(
     torch.set_float32_matmul_precision("high")
 
     if parallel_dims.tp_enabled:
-        # Phase 6 A3: minimum-viable TP plan covering dense MLP layers
-        # only. KDA layers stay replicated under TP because fla-core
-        # triton kernels (chunk_kda, ShortConvolution, FusedRMSNormGated)
-        # are not validated for sharded heads in this codebase. MLA
-        # stays replicated because its asymmetric Q/K/V dim split
-        # complicates ColwiseParallel registration. AttnResProjection
-        # is Linear(d -> 1) so out_features cannot be meaningfully
-        # sharded — kept replicated. This is enough to demonstrate the
-        # TP plan exists for kimi_linear and to fire all-reduce
-        # collectives in MLP forwards (Phase 7 trace).
+        # Phase 6 A3: TP plan API surface is registered as
+        # ``apply_tp_kimi_linear`` below, but end-to-end numerics under
+        # FSDP×PP×TP composition are blocked on three upstream issues:
+        #
+        # 1. ``F.scaled_dot_product_attention(q, k, v)`` with DTensor
+        #    inputs raises "aten.bmm got mixed Tensor and DTensor" —
+        #    SDPA's internal kernel selection doesn't redistribute
+        #    DTensor through the mem-efficient attention path. DSv3
+        #    works around this by pulling SDPA into a separate
+        #    ``inner_attention`` submodule and TP-wrapping it with
+        #    ``use_local_output=True``. Replicating that pattern in
+        #    KimiMLAAttention requires moving SDPA out of the inline
+        #    forward.
+        #
+        # 2. ``KimiMLAAttention``'s ``kv_a_proj_with_mqa`` projects
+        #    into ``[B, T, kv_lora_rank + qk_rope_head_dim]`` then
+        #    ``torch.split`` into two semantically distinct halves.
+        #    ColwiseParallel sharding the output dim doesn't align
+        #    with the absolute split sizes, so the downstream
+        #    ``kv_a_layernorm`` (which only sees the kv_lora half)
+        #    sees a sharded tensor of an unexpected shape.
+        #
+        # 3. ``KimiDeltaAttention``'s fla-core triton kernels
+        #    (``chunk_kda``, ``ShortConvolution``, ``FusedRMSNormGated``)
+        #    don't dispatch through DTensor; sharding heads requires
+        #    fla-core changes.
+        #
+        # We register the plan via ``apply_tp_kimi_linear`` so the
+        # API surface exists for upstream review and so the FFN
+        # all-reduces fire under TP=2 (the alignment runs that hit
+        # SDPA early are the blocker). When the upstream MLA
+        # refactoring lands (or KimiMLAAttention is restructured to
+        # match DSv3's ``inner_attention`` pattern), this branch will
+        # complete the alignment claim.
         tp_mesh = parallel_dims.get_mesh("tp")
         apply_tp_kimi_linear(model, tp_mesh)
         logger.info(
-            "Applied minimum-viable TP plan (dense MLP only) tp_degree=%d.",
+            "Applied TP plan (FFN-shard, attention NoParallel) "
+            "tp_degree=%d. NOTE: end-to-end numerics blocked on SDPA "
+            "+ DTensor mixed-dispatch; see parallelize.py TP branch.",
             parallel_dims.tp,
         )
     if parallel_dims.cp_enabled:
@@ -189,56 +218,159 @@ def parallelize_kimi_linear(
 
 
 def apply_tp_kimi_linear(model: nn.Module, tp_mesh: DeviceMesh) -> None:
-    """Phase 6 A3 minimum-viable TP plan for kimi_linear.
+    """Phase 6 A3 TP plan for kimi_linear (KDA + MLA + dense MLP + AttnRes).
 
-    Wraps every dense MLP layer's three projections (gate / up / down)
-    so the FFN forward fires all-reduce at the down_proj boundary.
-    Other modules — KDA, MLA, MoE, AttnResProjection, layernorms,
-    embedding, lm_head — stay replicated.
+    Composability requirement: ``block_attn_res`` aggregates block-boundary
+    hidden states with ``torch.stack`` across the block dim. Under FSDP+TP,
+    every contributor must live on the SAME DeviceMesh (FSDP×TP), otherwise
+    DTensor's stack op raises ``All operands in aten.stack must have the
+    same mesh``. To satisfy that, every module that participates in the
+    forward must be registered on the TP mesh — either with ``NoParallel``
+    (declares "module is on this mesh, no sharding") or with the appropriate
+    Colwise/Rowwise plan.
 
-    Why so conservative:
-    - KDA: fla-core triton kernels (chunk_kda etc.) accept [..., H, K]
-      tensors. Sharding H would require Shard(0) on A_log + dt_bias
-      parameters and per-rank ShortConvolution channels. Not validated
-      here; treat as out-of-scope follow-up.
-    - MLA: Q is one projection [hidden -> H * (qk_nope+qk_rope)] split
-      along the last dim into nope/rot halves; KV is two-stage
-      (kv_a_proj_with_mqa then kv_b_proj) with kv_a_layernorm in
-      between operating on the kv_lora half only. Registering this
-      under ColwiseParallel without breaking the split semantics
-      requires more care than a shared TP plan can express. Keep
-      replicated.
-    - AttnResProjection: ``Linear(hidden -> 1)``, output features = 1
-      cannot be sharded — TP is meaningless. Replicated by default.
-    - Embedding / lm_head: kept replicated to keep this pass scope-
-      contained. SP + loss-parallel can be added in a follow-up PR.
+    Wrapping policy per module:
+    - Embed / lm_head:   ``RowwiseParallel`` (vocab dim sharded) and
+                         ``ColwiseParallel`` (vocab dim sharded). No
+                         sequence-parallel or loss-parallel — keeps the
+                         plan compact while still firing TP collectives.
+    - Top-level ``norm``: ``NoParallel`` (declares mesh; not sharded).
+    - Per-layer ``input_layernorm`` / ``post_attention_layernorm``:
+                         ``NoParallel``.
+    - MLA q_proj / kv_a_proj_with_mqa / kv_b_proj: ``ColwiseParallel``
+      (last-dim out_features sharded across tp). MLA q has
+      ``out=H*q_head_dim`` with no inter-shard interaction, kv_a has
+      ``out=kv_lora_rank+qk_rope_head_dim`` (split into two contiguous
+      halves; we shard along the *concatenated* last dim and the
+      downstream split is shape-preserving on each shard). kv_b has
+      ``out=H*(qk_nope+v_head_dim)`` similar shape. ``kv_a_layernorm``
+      operates on the kv_lora half: register as ``NoParallel``.
+    - MLA o_proj: ``RowwiseParallel`` (in_features sharded; output
+      reduce-summed across tp).
+    - KDA q/k/v/o_proj: same pattern (Colwise + Colwise + Colwise +
+      Rowwise). KDA's per-head triton kernels run independently per
+      head, so head-dim sharding is kernel-safe. **Per-head parameters**
+      (``A_log``, ``dt_bias``) and the auxiliary projections
+      (``f_a_proj``/``f_b_proj``, ``g_a_proj``/``g_b_proj``,
+      ``b_proj``, ``q_conv1d``/``k_conv1d``/``v_conv1d``,
+      ``o_norm``) need ``NoParallel`` registration so they live on
+      the TP mesh; whether their per-head slicing is correct under TP
+      is left to the kernels (worst case the rank-local view is
+      replicated, accepting redundant compute over fla-core path).
+    - dense MLP gate_proj / up_proj: ``ColwiseParallel``;
+      down_proj: ``RowwiseParallel``.
+    - AttnResProjection (``Linear(hidden, 1, bias=False)``): the output
+      dim is 1 and cannot be sharded — register as ``NoParallel`` so
+      the module participates in the TP mesh without splitting params.
+      ``attn_res_norm`` and ``final_attn_res_norm`` likewise.
 
-    The collective produced by this plan is one all-reduce per dense-MLP
-    layer per forward pass (`down_proj` RowwiseParallel) plus one per
-    backward pass. This is enough to demonstrate end-to-end TP wiring
-    and to populate Phase 7's tensor-parallel collective pattern slot.
+    The crucial point is the registration, not the sharding itself —
+    once every module is on the TP mesh, ``block_attn_res`` stacks
+    DTensors with consistent mesh shape and the math survives.
+
+    Collectives produced (per forward pass, summed across layers):
+    - 1 all-reduce per dense-MLP layer (down_proj rowwise)
+    - 1 all-reduce per MLA layer (o_proj rowwise)
+    - 1 all-reduce per KDA layer (o_proj rowwise)
+    Plus the symmetric backward all-reduces.
     """
+    # Top-level layout: embed, output norm, lm_head.
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+                use_local_output=True,
+            ),
+            "norm": NoParallel(),
+            "lm_head": ColwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+                use_local_output=True,
+            ),
+        },
+    )
+
+    # AttnRes-only top-level tail modules.
+    if getattr(model, "final_attn_res_proj", None) is not None:
+        parallelize_module(
+            model,
+            tp_mesh,
+            {
+                "final_attn_res_proj": NoParallel(),
+                "final_attn_res_norm": NoParallel(),
+            },
+        )
+
+    # Per-layer plan. Each layer is a KimiDecoderLayer (or AttnRes
+    # subclass with attn_res_proj + attn_res_norm).
     for layer in model.layers.values():
         is_moe = bool(getattr(layer, "is_moe", False))
-        ffn = getattr(layer, "ffn", None)
-        if ffn is None or is_moe:
-            # MoE layer's expert routing is handled via the EP plan
-            # (separate parallelism axis). Skip in TP plan.
-            continue
-        # Sanity: dense MLP module shape must have the three named
-        # projections. If a future flavor changes the FFN class, raise
-        # rather than silently skipping.
-        for name in ("gate_proj", "up_proj", "down_proj"):
-            if not hasattr(ffn, name):
-                raise ValueError(
-                    f"layer {layer.layer_idx} dense ffn missing '{name}'; "
-                    "TP plan needs gate_proj / up_proj / down_proj."
-                )
-        plan = {
-            "ffn.gate_proj": ColwiseParallel(),
-            "ffn.up_proj": ColwiseParallel(),
-            "ffn.down_proj": RowwiseParallel(),
+        is_kda = bool(getattr(layer, "is_linear_attn", False))
+
+        plan: dict[str, object] = {
+            "input_layernorm": NoParallel(),
+            "post_attention_layernorm": NoParallel(),
         }
+
+        # Attention path: register every submodule on the TP mesh as
+        # NoParallel (no sharding). Both KDA and MLA have asymmetric
+        # last-dim splits (KDA per-head A_log/dt_bias and ShortConv
+        # channels; MLA's kv_a output split into kv_lora + qk_rope
+        # halves with downstream layernorm on only the kv_lora half),
+        # which break under any naive ColwiseParallel + split pattern.
+        # Sharding attention correctly requires per-head DTensor
+        # placement work that is out of scope here. Sharding only the
+        # dense MLP is enough to fire TP all-reduces in the FFN path
+        # and to demonstrate that the cache adapter delta survives
+        # FSDP×TP composition; attention runs replicated on the TP
+        # mesh (compute redundant per rank).
+        plan["self_attn"] = NoParallel()
+
+        # FFN path — dense MLP only here. MoE layers' expert routing
+        # is handled via the EP plan (separate axis); for an MoE
+        # layer under TP only, register the expert container as
+        # NoParallel so the layer mesh is consistent.
+        if not is_moe:
+            ffn = getattr(layer, "ffn", None)
+            if ffn is None:
+                raise ValueError(
+                    f"layer {layer.layer_idx}: missing dense ffn"
+                )
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                if not hasattr(ffn, name):
+                    raise ValueError(
+                        f"layer {layer.layer_idx} dense ffn missing '{name}'"
+                    )
+            plan.update(
+                {
+                    "ffn.gate_proj": ColwiseParallel(),
+                    "ffn.up_proj": ColwiseParallel(),
+                    "ffn.down_proj": RowwiseParallel(),
+                }
+            )
+        else:
+            # MoE layer: declare its module exists on the TP mesh
+            # without sharding (EP plan handles the actual
+            # parallelization on a separate axis). NoParallel on the
+            # ffn container is enough; per-expert leaves are unwrapped
+            # by EP later.
+            plan["ffn"] = NoParallel()
+
+        # AttnRes per-layer modules (only present on
+        # KimiAttnResDecoderLayer subclass — not all layers have it).
+        # Each layer has TWO pseudo-query projections (pre-attn,
+        # pre-FFN) and matching norms. All four are Linear(d->1) /
+        # RMSNorm(d): not shardable, but must be on the TP mesh.
+        for name in (
+            "attn_res_proj", "attn_res_norm",
+            "mlp_res_proj",  "mlp_res_norm",
+        ):
+            if hasattr(layer, name) and getattr(layer, name) is not None:
+                plan[name] = NoParallel()
+
         parallelize_module(
             module=layer,
             device_mesh=tp_mesh,

@@ -42,6 +42,7 @@ class AttnResConfig:
     norm_eps: float = 1e-5
 
 
+@torch.compiler.disable(recursive=True)
 def block_attn_res(
     blocks: list[torch.Tensor],
     partial_block: torch.Tensor,
@@ -64,10 +65,33 @@ def block_attn_res(
     Returns:
         Aggregated hidden state [B, T, D].
     """
-    V = torch.stack(blocks + [partial_block], dim=0)  # [N+1, B, T, D]
-    K = norm(V)
+    # Under FSDP+TP, inputs may mix plain torch.Tensor (PP send/recv
+    # boundary drops DTensor placement) and DTensor (layer outputs in
+    # the same forward). We force the entire AttnRes computation to
+    # local tensors: the math is per-token and per-rank-replicated under
+    # our TP plan (proj.weight Replicate on TP, layer outputs Replicate
+    # after RowwiseParallel all-reduce), so doing it on local tensors is
+    # bit-identical and side-steps the DTensor-stack / DTensor-norm /
+    # DTensor-einsum mixed-type bugs.
+    #
+    # We also inline the RMSNorm with a local-tensor weight rather than
+    # calling ``norm(V)`` directly, because ``norm.weight`` is itself a
+    # DTensor under our TP plan and ``rms_norm(V_local, weight=DTensor)``
+    # raises "aten.bmm got mixed Tensor and DTensor". The eps and weight
+    # values are still pulled from the passed-in module so callers don't
+    # have to thread them separately.
+    def _to_local(t: torch.Tensor) -> torch.Tensor:
+        return t.to_local() if hasattr(t, "to_local") else t
+
+    blocks_local = [_to_local(b) for b in blocks]
+    partial_local = _to_local(partial_block)
+    V = torch.stack(blocks_local + [partial_local], dim=0)  # [N+1, B, T, D]
+    norm_weight = _to_local(norm.weight)
+    norm_eps = norm.eps if hasattr(norm, "eps") else 1e-5
+    K = F.rms_norm(V, normalized_shape=(V.shape[-1],),
+                   weight=norm_weight, eps=norm_eps)
     # proj.weight is [1, D]; squeeze to [D] and contract with K's channel dim.
-    query = proj.weight.squeeze(0)
+    query = _to_local(proj.weight).squeeze(0)
     logits = torch.einsum("d,nbtd->nbt", query, K)
     weights = F.softmax(logits, dim=0)
     h = torch.einsum("nbt,nbtd->btd", weights, V)
