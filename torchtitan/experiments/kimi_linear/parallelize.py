@@ -183,6 +183,19 @@ def parallelize_kimi_linear(
             dp_mesh = parallel_dims.get_mesh("fsdp")
         else:
             dp_mesh = parallel_dims.get_mesh("dp_replicate")
+        # Under EP, MoE expert parameters must shard via the *edp* mesh
+        # (= dp_shard with the EP rank dim factored out) so FSDP's
+        # mesh does not overlap EP's mesh on the same physical ranks.
+        # See ``apply_fsdp`` docstring for the rationale; mirrors the
+        # llama4 / deepseek_v3 path.
+        edp_mesh = None
+        if parallel_dims.ep_enabled:
+            edp_mesh_names = (
+                ["dp_replicate", "efsdp"]
+                if parallel_dims.dp_replicate_enabled
+                else ["efsdp"]
+            )
+            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
         param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
         reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
         apply_fsdp(
@@ -195,6 +208,8 @@ def parallelize_kimi_linear(
             reshard_after_forward_policy=(
                 parallelism.fsdp_reshard_after_forward
             ),
+            ep_degree=parallel_dims.ep,
+            edp_mesh=edp_mesh,
         )
         logger.info(
             "Applied FSDP2 to Kimi Linear model (dp_shard=%d, dp_replicate=%d).",
@@ -742,6 +757,8 @@ def apply_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    ep_degree: int = 1,
+    edp_mesh: DeviceMesh | None = None,
 ) -> None:
     """FSDP2 fully_shard application tuned for Kimi Linear's module layout.
 
@@ -755,6 +772,15 @@ def apply_fsdp(
     Sharding layout mirrors Llama3's apply_fsdp: group embed with
     {norm, lm_head} only when tied, else put embed alone and
     {norm, lm_head} together.
+
+    When ``ep_degree > 1``, MoE expert parameters shard via ``edp_mesh``
+    while non-expert parameters shard via ``dp_mesh`` — this matches
+    the llama4 / deepseek_v3 pattern and avoids the
+    "Cannot concatenate overlapping meshes" error that fires when a
+    single dp_mesh is used for both expert and non-expert params under
+    EP. ``edp_mesh`` is the dp_shard axis with the EP rank dimension
+    factored out (``parallel_dims.get_optional_mesh("efsdp")`` or
+    ``["dp_replicate", "efsdp"]``).
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -835,7 +861,47 @@ def apply_fsdp(
     # all-gather / backward reduce-scatter is overlapped with compute.
     # model.layers is a ModuleDict (str→layer); iterate .values() to
     # grab the layer modules.
+    #
+    # When EP > 1 and the layer is MoE, the expert ModuleList must
+    # shard via ``edp_mesh`` (the dp_shard axis with the EP dimension
+    # factored out). The pytorch version in this repo does NOT support
+    # per-param ``shard_placement_fn`` returning per-param meshes
+    # (signature is ``Callable[[nn.Parameter], Shard | None]`` only),
+    # so we use the nested-fully_shard pattern: wrap the experts
+    # container as its own FSDP unit on ``edp_mesh`` first, then wrap
+    # the surrounding layer on ``dp_mesh``. FSDP2 treats the inner
+    # unit as a sub-module and only shards the non-expert params at
+    # the layer level, which keeps the meshes orthogonal and avoids
+    # the "Cannot concatenate overlapping meshes" error.
+    use_nested_ep = ep_degree > 1 and edp_mesh is not None
+    edp_fsdp_config = None
+    if use_nested_ep:
+        edp_fsdp_config = {"mesh": edp_mesh, "mp_policy": mp_policy}
+        if cpu_offload:
+            edp_fsdp_config["offload_policy"] = CPUOffloadPolicy()
+
     for layer in model.layers.values():
+        layer_is_moe = bool(getattr(layer, "is_moe", False))
+        if use_nested_ep and layer_is_moe:
+            ffn = getattr(layer, "ffn", None)
+            assert (
+                ffn is not None
+                and getattr(ffn, "_moe", None) is not None
+                and hasattr(ffn._moe, "experts")
+            ), (
+                f"layer {getattr(layer, 'layer_idx', '?')} is_moe=True "
+                "but ffn._moe.experts missing; EP-aware FSDP needs the "
+                "standard KimiMoE wrapping."
+            )
+            # Inner unit: experts on edp_mesh.
+            fully_shard(
+                ffn._moe.experts,
+                **edp_fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        # Outer unit: the whole layer on dp_mesh. FSDP2 sees the
+        # already-wrapped experts as a nested unit and only shards
+        # non-expert params at this level.
         fully_shard(
             layer,
             **fsdp_config,
