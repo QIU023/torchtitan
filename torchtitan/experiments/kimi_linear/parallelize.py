@@ -97,7 +97,10 @@ def parallelize_kimi_linear(
         # boundary types plain so PP send/recv, AttnRes block stacking,
         # and triton kernels never see a mixed-mesh tensor.
         tp_mesh = parallel_dims.get_mesh("tp")
-        apply_tp_kimi_linear(model, tp_mesh)
+        apply_tp_kimi_linear(
+            model, tp_mesh,
+            skip_expert_params=parallel_dims.ep_enabled,
+        )
         # Stash the TP mesh on the model so AttnRes top-level forward
         # can DTensor-ify PP-received block tensors when they arrive
         # plain (PP P2P uses raw send/recv, so mid-stage receives
@@ -330,7 +333,11 @@ def _patch_fla_for_dtensor() -> None:
     _make_patch(FusedRMSNormGated)
 
 
-def apply_tp_kimi_linear(model: nn.Module, tp_mesh: DeviceMesh) -> None:
+def apply_tp_kimi_linear(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    skip_expert_params: bool = False,
+) -> None:
     """Phase 6 A3 TP plan for kimi_linear, modeled on
     ``deepseek_v3/parallelize.py``.
 
@@ -673,7 +680,14 @@ def apply_tp_kimi_linear(model: nn.Module, tp_mesh: DeviceMesh) -> None:
         # GroupedExperts.forward already to_local's its DTensor params
         # before the grouped_mm kernel; wrapping the module would cause
         # plain × plain mismatch (since the input x is plain too).
-        if is_moe:
+        #
+        # When ``skip_expert_params=True`` (caller has EP enabled), do
+        # NOT touch experts — leave them as plain Tensors so the EP
+        # path (apply_ep_kimi_linear) can DTensor-shard them on
+        # ``ep_mesh`` without hitting cross-mesh redistribute errors.
+        # This mirrors llama4's design: TP plan touches router.gate +
+        # shared_experts only; routed experts are EP/ETP territory.
+        if is_moe and not skip_expert_params:
             ffn = layer.ffn
             experts = ffn._moe.experts
             for name in ("w1", "w2", "w3"):
@@ -698,9 +712,27 @@ def apply_tp_kimi_linear(model: nn.Module, tp_mesh: DeviceMesh) -> None:
     # FSDP+TP all params live on the same (fsdp, tp) 2D mesh, satisfying
     # the cross-param mesh consistency check inside
     # ``clip_grad_norm_``'s ``torch.stack`` call.
+    #
+    # When ``skip_expert_params=True``, build a set of routed-expert
+    # param ids first and skip them — they belong to the EP mesh, not
+    # the TP mesh. The clip_grad_norm cross-mesh check still passes
+    # because EP-sharded params live on a clean ``ep_mesh`` and the
+    # rest live on ``tp_mesh``; both are 1D, so torch.stack handles
+    # them via the per-mesh path.
+    expert_param_ids: set[int] = set()
+    if skip_expert_params:
+        for layer in model.layers.values():
+            if not bool(getattr(layer, "is_moe", False)):
+                continue
+            ffn = getattr(layer, "ffn", None)
+            if ffn is None or getattr(ffn, "_moe", None) is None:
+                continue
+            for p in ffn._moe.experts.parameters():
+                expert_param_ids.add(id(p))
     for module in model.modules():
         for name, p in list(module._parameters.items()):
-            if p is not None and not isinstance(p, DTensor):
+            if p is not None and not isinstance(p, DTensor) \
+                    and id(p) not in expert_param_ids:
                 module._parameters[name] = nn.Parameter(
                     distribute_tensor(p.data, tp_mesh, [Replicate()]),
                     requires_grad=p.requires_grad,
