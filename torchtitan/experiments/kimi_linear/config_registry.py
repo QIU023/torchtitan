@@ -79,6 +79,14 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     _SweepSize("296m", 296, 62.1, 14, 14, 1024, 464, 2.50e-3, 320),
     _SweepSize("436m", 436, 87.9, 16, 16, 1168, 528, 2.20e-3, 384),
     _SweepSize("528m", 528, 119.0, 17, 17, 1264, 560, 2.02e-3, 432),
+    # Phase 11: SGLang-friendly aligned-dim variant of the 436M row.
+    # d=1024 (vs 1168) → head_dim=64 is multiple of 16; qk_rope=32, v=64,
+    # kv_lora=512 all 8/16/32-aligned; flashinfer / cublas / triton
+    # extend kernels accept this layout on SM 12.0 (RTX 5090). d_ff
+    # bumped 528 → 768 to keep activated-param count ~447M, roughly
+    # matching the original 436M row's compute budget.
+    # Re-uses 436M's lr / batch_size / token_count from the same row.
+    _SweepSize("447m_aligned", 447, 87.9, 16, 16, 1024, 768, 2.20e-3, 384),
 )
 
 _BY_NAME: dict[str, _SweepSize] = {s.name: s for s in SCALING_LAW_TABLE}
@@ -153,12 +161,22 @@ def build_kimi_linear_config(
     # qk_nope=128, qk_rope=64, v_head=128 at d=2304, num_heads=32, so each
     # head takes 128 (nope) + 64 (rope, broadcast) + 128 (v) units. We keep
     # qk_rope proportional to d/num_heads * 0.5 (half of nope).
-    head_dim_mla_nope = max(32, d // H)
-    head_dim_mla_rope = max(16, head_dim_mla_nope // 2)
-    head_dim_mla_v = head_dim_mla_nope
-    kda_head_dim = head_dim_mla_nope
-
-    kv_lora_rank = d // 2  # scale with model; 48B uses 512 at d=2304 ≈ d/4.5
+    if size.endswith("_aligned"):
+        # Phase 11: SGLang flashinfer / cuBLAS / triton extend kernels on
+        # SM 12.0 (RTX 5090) require head_dim multiple of 8 (16 preferred
+        # so qk_rope = head_dim/2 is also 8-aligned). Round head_dim down
+        # to multiple of 16, kv_lora_rank to multiple of 64.
+        head_dim_mla_nope = max(32, (d // H) & ~15)
+        head_dim_mla_rope = max(16, head_dim_mla_nope // 2)
+        head_dim_mla_v = head_dim_mla_nope
+        kda_head_dim = head_dim_mla_nope
+        kv_lora_rank = (d // 2) & ~63
+    else:
+        head_dim_mla_nope = max(32, d // H)
+        head_dim_mla_rope = max(16, head_dim_mla_nope // 2)
+        head_dim_mla_v = head_dim_mla_nope
+        kda_head_dim = head_dim_mla_nope
+        kv_lora_rank = d // 2  # scale with model; 48B uses 512 at d=2304 ≈ d/4.5
 
     kda_layers, full_attn_layers = _alternating_kda_mla_layers(
         spec.n_layers, kda_mla_ratio=kda_mla_ratio
@@ -417,6 +435,58 @@ def kimi_linear_436m_block_attn_res_n4() -> Trainer.Config:
     cfg.model_spec = ModelSpec(
         name="kimi_linear",
         flavor="kimi_linear_436m_block_attn_res_n4",
+        model=spec_config,
+        parallelize_fn=parallelize_kimi_linear,
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        build_loss_fn=build_cross_entropy_loss,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=None,
+    )
+    return cfg
+
+
+def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
+    """447M Block AttnRes with SGLang-friendly head dims (phase 11).
+
+    Same scale as ``kimi_linear_436m_block_attn_res_n4`` — 16 layers,
+    16 attention heads, 32 routed experts top-8, 1 shared expert,
+    AttnRes N=4 (S=4 layers/block) — but with d_model=1024 (vs 1168)
+    so head_dim=64 is divisible by 16. This unblocks SGLang inference
+    on SM 12.0 (RTX 5090): the original 436M's head_dim=73 fails
+    flashinfer's batch-prefill kernel + cuBLAS strided-batched bmm
+    + Triton extend kernel autotune (cudaErrorMisalignedAddress /
+    CUBLAS_STATUS_INTERNAL_ERROR / shared-memory OOM respectively).
+
+    All other dims aligned to 8/16 multiples:
+    * qk_nope=64, qk_rope=32, v_head=64
+    * kv_lora_rank=512 (multiple of 64)
+    * head_dim_qk = 96, head_dim_vo = 64 (both flashinfer-accepted)
+
+    intermediate_size / moe_intermediate_size bumped 528 → 768 to keep
+    the activated-param budget at ~447M, on par with the original
+    436M scaling-law row's compute cost. Same lr (2.20e-3), batch size
+    (384 sequences global), and total tokens budget (87.9B) inherited
+    from the 436M row in SCALING_LAW_TABLE.
+
+    Trains with the same launcher
+    (``phase4/launch_paperhparams_break3.sh``) by setting
+    ``CONFIG=kimi_linear_447m_aligned_block_attn_res_n4``. Runs through
+    the same parallelize_fn / pipelining_fn / loss_fn as 436M.
+    """
+    from torchtitan.experiments.kimi_linear import (
+        KimiLinearSpec,
+        parallelize_kimi_linear,
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+    from torchtitan.components.loss import build_cross_entropy_loss
+    from torchtitan.protocols.model_spec import ModelSpec
+
+    cfg = _base_trainer_config("447m_aligned")
+    kimi_config = build_kimi_linear_config("447m_aligned")
+    spec_config = KimiLinearSpec(kimi_config=kimi_config, num_blocks=4)
+    cfg.model_spec = ModelSpec(
+        name="kimi_linear",
+        flavor="kimi_linear_447m_aligned_block_attn_res_n4",
         model=spec_config,
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
