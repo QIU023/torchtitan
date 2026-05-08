@@ -182,4 +182,5 @@ the paper.
 
 ## Ownership
 
-- Owner: [@QIU023](https://github.com/QIU023) — yiqiao.lbj23@gmail.com
+- Owner: [@QIU023](https://github.com/QIU023) — open issues on the fork repo
+  for technical questions.
