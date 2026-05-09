@@ -201,8 +201,12 @@ class SGLangGenerator(Actor, Configurable):
         # ``architectures`` field in config.json to our wrapper class.
         register_model_to_sglang_model_registry(model_spec)
 
-        # Lazy-import sglang to keep the module import light.
-        import sglang as sgl
+        # Lazy-import sglang's Engine class. We import directly from
+        # ``sglang.srt.entrypoints.engine`` rather than via
+        # ``sglang.Engine`` because the latter is a ``LazyImport``
+        # populated by ``sglang/__init__.py`` only when imported from
+        # certain working directories on some installs.
+        from sglang.srt.entrypoints.engine import Engine
 
         engine_kwargs: dict[str, Any] = dict(
             model_path=model_path,
@@ -229,7 +233,7 @@ class SGLangGenerator(Actor, Configurable):
             engine_kwargs["ep_size"] = ep
 
         logger.info(f"Initializing SGLang Engine with kwargs: {engine_kwargs}")
-        self._engine = sgl.Engine(**engine_kwargs)
+        self._engine = Engine(**engine_kwargs)
         logger.info("SGLang rollout engine initialized")
 
         self.policy_version = 0

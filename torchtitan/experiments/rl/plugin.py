@@ -116,16 +116,13 @@ def register_model_to_sglang_model_registry(
     TorchTitanSGLangModelFromSpec.__name__ = SGLANG_MODEL_NAME
     TorchTitanSGLangModelFromSpec.__qualname__ = SGLANG_MODEL_NAME
 
-    # SGLang model registry: ``ModelRegistry.models`` is a dict in
-    # newer versions, the recommended path is ``register`` on the
-    # registry singleton.
-    try:
-        from sglang.srt.models.registry import ModelRegistry as SGLangModelRegistry
-        SGLangModelRegistry.register({SGLANG_MODEL_NAME: TorchTitanSGLangModelFromSpec})
-    except (ImportError, AttributeError):
-        # Older sglang exposes a dict directly.
-        from sglang.srt.models.registry import ModelRegistry as SGLangModelRegistry
-        SGLangModelRegistry.models[SGLANG_MODEL_NAME] = TorchTitanSGLangModelFromSpec
+    # SGLang's ``ModelRegistry.register()`` takes a package name and
+    # scans it for model classes. To register a single dynamically-
+    # built class, mutate the underlying ``models`` dict directly.
+    # (The registry instance itself is exposed as a module-level
+    # singleton in ``sglang.srt.models.registry``.)
+    from sglang.srt.models.registry import ModelRegistry as _SGLangModelRegistry
+    _SGLangModelRegistry.models[SGLANG_MODEL_NAME] = TorchTitanSGLangModelFromSpec
 
     logger.info(
         f"Registered {SGLANG_MODEL_NAME} with SGLang "
