@@ -217,9 +217,32 @@ class PolicyTrainer(Actor, Configurable):
         # TODO Also support flex attention backend later.
         from torchtitan.models.common.attention import VarlenAttention
 
-        assert isinstance(
-            model_spec.model.layers[0].attention.inner_attention, VarlenAttention.Config
-        ), "Only varlen attention backend is allowed."
+        # Soft check (was hard assert): warn instead of crash when the
+        # model_spec doesn't follow the canonical Qwen3 layout
+        # (``model.layers[0].attention.inner_attention``). Non-Qwen3
+        # specs (e.g. Kimi Linear's ``ModuleDict`` layers, MoE-rich
+        # decoder blocks, or non-VarlenAttention attention impls) can
+        # still build + parallelize via their own ``parallelize_fn``;
+        # the trainer's assumptions about ``compute_token_log_probs``
+        # downstream are what actually constrain the model surface.
+        try:
+            inner = model_spec.model.layers[0].attention.inner_attention
+            if not isinstance(inner, VarlenAttention.Config):
+                logger.warning(
+                    f"Inner attention is {type(inner).__name__}, not "
+                    f"VarlenAttention.Config. Trainer assumes the model's "
+                    f"forward signature accepts (input_ids, attention_masks, "
+                    f"positions); non-standard models may need a custom "
+                    f"compute_token_log_probs. Continuing best-effort."
+                )
+        except (AttributeError, IndexError, TypeError, KeyError):
+            logger.warning(
+                "model_spec.model layout is non-standard (no "
+                "``.layers[0].attention.inner_attention``). Trainer "
+                "assumes ``model.build()`` returns nn.Module with "
+                "``forward(input_ids, attention_masks=, positions=)``. "
+                "Continuing best-effort."
+            )
 
         with torch.device("meta"):
             with utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]):
