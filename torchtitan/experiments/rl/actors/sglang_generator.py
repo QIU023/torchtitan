@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -208,6 +209,30 @@ class SGLangGenerator(Actor, Configurable):
         # certain working directories on some installs.
         from sglang.srt.entrypoints.engine import Engine
 
+        # Resolve which physical GPUs to use. When this actor runs
+        # under Monarch with ``CUDA_VISIBLE_DEVICES`` set by the
+        # provisioner bootstrap, torch.cuda already sees only those
+        # devices as logical 0..N-1. SGLang's ``base_gpu_id`` is the
+        # logical (post-CVD) device offset; default 0 is correct.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+        import torch as _torch_check
+        n_visible = _torch_check.cuda.device_count()
+        # Per-rank free mem so we can see if trainer mesh is leaking
+        # onto our GPUs.
+        free_per = []
+        for i in range(min(n_visible, 8)):
+            free_b, total_b = _torch_check.cuda.mem_get_info(i)
+            free_per.append(f"GPU{i}={free_b/1e9:.1f}GB/{total_b/1e9:.1f}GB")
+        # Print to stderr so it survives Monarch's logging redirection
+        # (which routes the actor process's stdout to its own buffer).
+        sys.stderr.write(
+            f"[SGLangGenerator pid={os.getpid()}] "
+            f"CUDA_VISIBLE_DEVICES={cvd}  torch.cuda.device_count()={n_visible}\n"
+            f"[SGLangGenerator pid={os.getpid()}] "
+            f"free mem: {' '.join(free_per)}\n"
+        )
+        sys.stderr.flush()
+
         engine_kwargs: dict[str, Any] = dict(
             model_path=model_path,
             skip_tokenizer_init=True,
@@ -219,6 +244,10 @@ class SGLangGenerator(Actor, Configurable):
             disable_cuda_graph=not config.compile.cuda_graph,
             disable_piecewise_cuda_graph=not config.compile.piecewise_cuda_graph,
             log_level="error",
+            # base_gpu_id is in the post-CVD logical device space; 0
+            # is correct because Monarch+bootstrap already restricted
+            # torch.cuda to the generator's GPU subset.
+            base_gpu_id=0,
         )
         if config.debug.seed is not None:
             engine_kwargs["random_seed"] = config.debug.seed
