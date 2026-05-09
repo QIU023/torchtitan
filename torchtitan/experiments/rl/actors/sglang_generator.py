@@ -193,6 +193,27 @@ class SGLangGenerator(Actor, Configurable):
         self.model_spec = model_spec
         self.model_path = model_path
 
+        # Lead-vs-follower pattern: SGLang's Engine spawns its own
+        # TP-N inner worker subprocesses, so it needs to be the *only*
+        # process holding the inference state on the generator mesh.
+        # Monarch's ``per_host={"gpus": N}`` spawn creates N actor
+        # processes; we make rank 0 the "lead" that owns the Engine
+        # and ranks > 0 are no-ops. The provisioner's ``shared`` mode
+        # exposes all N GPUs to every actor so the lead's TP=N can
+        # use them, while followers stay idle and don't allocate any
+        # GPU memory.
+        self._rank = int(os.environ.get("RANK", "0"))
+        self._is_lead = self._rank == 0
+        if not self._is_lead:
+            sys.stderr.write(
+                f"[SGLangGenerator pid={os.getpid()} rank={self._rank}] "
+                f"non-lead actor — Engine lives on rank 0 only; idling.\n"
+            )
+            sys.stderr.flush()
+            self._engine = None
+            self.policy_version = 0
+            return
+
         # Apply determinism settings first (matches VLLMGenerator).
         set_batch_invariance(config.debug.batch_invariant)
         self._set_determinism(config.debug)
@@ -235,7 +256,10 @@ class SGLangGenerator(Actor, Configurable):
 
         engine_kwargs: dict[str, Any] = dict(
             model_path=model_path,
-            skip_tokenizer_init=True,
+            # Keep the tokenizer enabled so we can pass text prompts
+            # directly. RL caller can still pre-tokenize and pass
+            # ``input_ids=`` if it needs custom prompt prep.
+            skip_tokenizer_init=False,
             tp_size=config.parallelism.tensor_parallel_degree,
             dtype=config.model_dtype,
             mem_fraction_static=config.gpu_memory_limit,
@@ -306,6 +330,11 @@ class SGLangGenerator(Actor, Configurable):
             Flat list of Episodes (``len(prompt_texts) ×
             num_samples_per_prompt``); same shape as VLLMGenerator.
         """
+        # Followers return empty so Monarch's call-mesh aggregator
+        # doesn't get None entries. The caller deduplicates by
+        # iterating over a flattened ValueMesh result.
+        if not self._is_lead:
+            return []
         cfg = self.config
         sampling_params = {
             "temperature": cfg.sampling.temperature,
@@ -329,43 +358,75 @@ class SGLangGenerator(Actor, Configurable):
         if images is not None:
             request["image_data"] = images
 
-        outputs = self._engine.generate(**request)
+        # ``Engine.generate`` is a sync wrapper that does
+        # ``self.loop.run_until_complete`` internally, which fails
+        # when called from inside Monarch's running endpoint loop
+        # (RuntimeError: This event loop is already running). Use
+        # the async variant directly.
+        outputs = await self._engine.async_generate(**request)
+
+        # Pre-tokenize the prompts ourselves so each Episode carries
+        # its own ``prompt_token_ids``. SGLang's output meta only
+        # reports the prompt token COUNT, not the IDs; the trainer's
+        # logprob recompute requires the actual ids to concat with
+        # the generated tokens.
+        try:
+            tok_mgr = self._engine.tokenizer_manager
+            tok = getattr(tok_mgr, "tokenizer", None)
+        except Exception:
+            tok = None
+        if tok is not None:
+            prompt_token_ids_per_prompt = [
+                tok.encode(p, add_special_tokens=False) for p in prompt_texts
+            ]
+        else:
+            prompt_token_ids_per_prompt = [[] for _ in prompt_texts]
 
         # Build flat list of Episodes; assign group_id per prompt.
-        # group_id is GRPO/group-baseline-specific; downstream
-        # algorithms that don't need it can ignore.
+        # SGLang's async_generate flattens (prompt × n_samples) into
+        # a single list of length ``len(prompts) × n``; samples for
+        # the same prompt are contiguous. group_id ties together a
+        # group for GRPO advantage computation.
+        n_prompts = len(prompt_texts)
+        n_samples = max(1, cfg.num_samples_per_prompt)
+        if len(outputs) != n_prompts * n_samples:
+            logger.warning(
+                f"SGLang returned {len(outputs)} outputs for "
+                f"{n_prompts} prompts × {n_samples} samples = "
+                f"{n_prompts * n_samples} expected"
+            )
+
         episodes: list[Episode] = []
-        for prompt_idx, output in enumerate(outputs):
-            # SGLang collapses ``n`` samples into a single response
-            # under the "outputs" key when n > 1; older versions
-            # return a flat list. Handle both.
-            samples = output.get("outputs", [output])
-            for sample_idx, sample in enumerate(samples):
-                gid = f"{os.getpid()}_{self.policy_version}_{prompt_idx}"
-                token_ids = sample.get("output_ids") or sample.get("token_ids", [])
-                token_log_probs = [
-                    lp for (lp, _tok, _) in sample.get("output_token_logprobs", [])
-                ] if "output_token_logprobs" in sample else []
-                prompt_token_ids = (
-                    output.get("prompt_token_ids")
-                    or sample.get("prompt_token_ids")
-                    or []
+        for flat_idx, output in enumerate(outputs):
+            prompt_idx = flat_idx // n_samples
+            gid = f"{os.getpid()}_{self.policy_version}_{prompt_idx}"
+            meta_info = output.get("meta_info", {}) if isinstance(output, dict) else {}
+            token_ids = (
+                output.get("output_ids")
+                or output.get("token_ids")
+                or meta_info.get("output_token_ids", [])
+            )
+            output_token_logprobs = meta_info.get("output_token_logprobs") or []
+            token_log_probs = [
+                (lp[0] if isinstance(lp, (list, tuple)) else lp)
+                for lp in output_token_logprobs
+            ]
+            prompt_token_ids = prompt_token_ids_per_prompt[prompt_idx]
+            episodes.append(
+                Episode(
+                    policy_version=self.policy_version,
+                    prompt_token_ids=prompt_token_ids,
+                    text=output.get("text", "") if isinstance(output, dict) else str(output),
+                    token_ids=token_ids,
+                    token_log_probs=token_log_probs,
+                    expected_answer=(
+                        expected_answers[prompt_idx]
+                        if expected_answers and prompt_idx < len(expected_answers)
+                        else ""
+                    ),
+                    group_id=gid,
                 )
-                episodes.append(
-                    Episode(
-                        policy_version=self.policy_version,
-                        prompt_token_ids=prompt_token_ids,
-                        text=sample.get("text", ""),
-                        token_ids=token_ids,
-                        token_log_probs=token_log_probs,
-                        expected_answer=(
-                            expected_answers[prompt_idx]
-                            if expected_answers
-                            else ""
-                        ),
-                        group_id=gid,
-                    )
-                )
+            )
 
         return episodes
 
@@ -382,6 +443,10 @@ class SGLangGenerator(Actor, Configurable):
             ``weight_sync_disk_path`` and signals via torchstore;
             SGLang reloads via ``Engine.update_weights_from_disk``.
         """
+        # Followers don't hold an Engine; nothing to update.
+        if not self._is_lead:
+            self.policy_version = version
+            return
         cfg = self.config
         if cfg.weight_sync_method == "torchstore":
             from monarch.rdma import is_rdma_available
@@ -399,7 +464,26 @@ class SGLangGenerator(Actor, Configurable):
         elif cfg.weight_sync_method == "disk":
             # Trainer is expected to have dumped HF safetensors at
             # weight_sync_disk_path; signal SGLang's engine to reload.
-            self._engine.update_weights_from_disk(cfg.weight_sync_disk_path)
+            # SGLang's ``update_weights_from_disk`` calls
+            # ``self.loop.run_until_complete`` on its own internal
+            # asyncio loop, which conflicts with the Monarch endpoint's
+            # running loop. Use the underlying async API directly.
+            from sglang.srt.managers.io_struct import (
+                UpdateWeightFromDiskReqInput,
+            )
+            disk_path = cfg.weight_sync_disk_path
+            if not disk_path or not os.path.isdir(disk_path) or not os.listdir(disk_path):
+                # No weights dumped yet (e.g. step 0 — trainer hasn't
+                # pushed). Skip silently.
+                logger.debug(
+                    f"weight_sync_disk_path empty/missing ({disk_path!r}); "
+                    f"skipping update at policy v{version}"
+                )
+            else:
+                await self._engine.tokenizer_manager.update_weights_from_disk(
+                    UpdateWeightFromDiskReqInput(model_path=disk_path),
+                    None,
+                )
         else:
             raise ValueError(
                 f"unknown weight_sync_method={cfg.weight_sync_method}"
@@ -435,10 +519,14 @@ class SGLangGenerator(Actor, Configurable):
         )
 
     def __del__(self):
-        if hasattr(self, "_engine"):
+        # Only the lead actor owns an Engine.
+        if getattr(self, "_engine", None) is not None:
             try:
                 self._engine.shutdown()
             except Exception:
                 pass
             del self._engine
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
