@@ -78,7 +78,16 @@ class PolicyTrainer(Actor, Configurable):
         hf_assets_path: str = "",
         transfer_dtype: str = "",
         kl_coef: float = 0.0,
+        dcp_initial_load_path: str = "",
     ):
+        # ``dcp_initial_load_path``: optional path to a torch DCP-format
+        # checkpoint to load instead of HF safetensors. Used when the
+        # model_spec has no ``state_dict_adapter`` (e.g. our Kimi AttnRes
+        # 447M, where the HF↔torchtitan key remap is large enough that
+        # we'd rather just round-trip torchtitan-native DCP). Mutually
+        # exclusive with ``hf_assets_path`` — if both are non-empty,
+        # DCP wins.
+        self._dcp_initial_load_path = dcp_initial_load_path
         self.config = config
         self.model_spec = model_spec
         self.kl_coef = kl_coef
@@ -217,9 +226,32 @@ class PolicyTrainer(Actor, Configurable):
         # TODO Also support flex attention backend later.
         from torchtitan.models.common.attention import VarlenAttention
 
-        assert isinstance(
-            model_spec.model.layers[0].attention.inner_attention, VarlenAttention.Config
-        ), "Only varlen attention backend is allowed."
+        # Soft check (was hard assert): warn instead of crash when the
+        # model_spec doesn't follow the canonical Qwen3 layout
+        # (``model.layers[0].attention.inner_attention``). Non-Qwen3
+        # specs (e.g. Kimi Linear's ``ModuleDict`` layers, MoE-rich
+        # decoder blocks, or non-VarlenAttention attention impls) can
+        # still build + parallelize via their own ``parallelize_fn``;
+        # the trainer's assumptions about ``compute_token_log_probs``
+        # downstream are what actually constrain the model surface.
+        try:
+            inner = model_spec.model.layers[0].attention.inner_attention
+            if not isinstance(inner, VarlenAttention.Config):
+                logger.warning(
+                    f"Inner attention is {type(inner).__name__}, not "
+                    f"VarlenAttention.Config. Trainer assumes the model's "
+                    f"forward signature accepts (input_ids, attention_masks, "
+                    f"positions); non-standard models may need a custom "
+                    f"compute_token_log_probs. Continuing best-effort."
+                )
+        except (AttributeError, IndexError, TypeError, KeyError):
+            logger.warning(
+                "model_spec.model layout is non-standard (no "
+                "``.layers[0].attention.inner_attention``). Trainer "
+                "assumes ``model.build()`` returns nn.Module with "
+                "``forward(input_ids, attention_masks=, positions=)``. "
+                "Continuing best-effort."
+            )
 
         with torch.device("meta"):
             with utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]):
@@ -236,10 +268,43 @@ class PolicyTrainer(Actor, Configurable):
         with torch.no_grad():
             model.init_weights(buffer_device=None)
 
-        # Load initial weights from HF
-        self._load_initial_hf_weights(model, hf_assets_path)
+        # Load initial weights. DCP path wins when set (skips
+        # HF↔torchtitan adapter remap entirely, useful for models
+        # that don't ship a ``state_dict_adapter``).
+        if self._dcp_initial_load_path:
+            self._load_initial_dcp_weights(model, self._dcp_initial_load_path)
+        else:
+            self._load_initial_hf_weights(model, hf_assets_path)
 
         return model
+
+    def _load_initial_dcp_weights(self, model, dcp_path: str) -> None:
+        """Load model weights from a torch DCP-format checkpoint.
+
+        Bypasses the HF state_dict_adapter pipeline. The trainer's
+        torchtitan-native state_dict layout must already match what
+        was saved (true when both sides use the same model_spec, which
+        is the case for our 447M AttnRes whose torchtitan training and
+        RL trainer use the same ``KimiLinearAttnResModel``).
+        """
+        if not os.path.isdir(dcp_path):
+            raise FileNotFoundError(
+                f"dcp_initial_load_path does not exist: {dcp_path}"
+            )
+        sd = model.state_dict()
+        logger.info(
+            f"loading torchtitan-native DCP from {dcp_path} "
+            f"({len(sd)} keys)"
+        )
+        dcp.load(sd, checkpoint_id=dcp_path)
+        # ``dcp.load`` populates ``sd`` in place; assign back so
+        # FSDP-wrapped params see the loaded weights.
+        set_model_state_dict(
+            model=model,
+            model_state_dict=sd,
+            options=StateDictOptions(strict=False),
+        )
+        logger.info(f"DCP weights loaded ({len(sd)} parameters)")
 
     @endpoint
     async def push_model_state_dict(self) -> None:
