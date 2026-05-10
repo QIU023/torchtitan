@@ -78,7 +78,16 @@ class PolicyTrainer(Actor, Configurable):
         hf_assets_path: str = "",
         transfer_dtype: str = "",
         kl_coef: float = 0.0,
+        dcp_initial_load_path: str = "",
     ):
+        # ``dcp_initial_load_path``: optional path to a torch DCP-format
+        # checkpoint to load instead of HF safetensors. Used when the
+        # model_spec has no ``state_dict_adapter`` (e.g. our Kimi AttnRes
+        # 447M, where the HF↔torchtitan key remap is large enough that
+        # we'd rather just round-trip torchtitan-native DCP). Mutually
+        # exclusive with ``hf_assets_path`` — if both are non-empty,
+        # DCP wins.
+        self._dcp_initial_load_path = dcp_initial_load_path
         self.config = config
         self.model_spec = model_spec
         self.kl_coef = kl_coef
@@ -259,10 +268,43 @@ class PolicyTrainer(Actor, Configurable):
         with torch.no_grad():
             model.init_weights(buffer_device=None)
 
-        # Load initial weights from HF
-        self._load_initial_hf_weights(model, hf_assets_path)
+        # Load initial weights. DCP path wins when set (skips
+        # HF↔torchtitan adapter remap entirely, useful for models
+        # that don't ship a ``state_dict_adapter``).
+        if self._dcp_initial_load_path:
+            self._load_initial_dcp_weights(model, self._dcp_initial_load_path)
+        else:
+            self._load_initial_hf_weights(model, hf_assets_path)
 
         return model
+
+    def _load_initial_dcp_weights(self, model, dcp_path: str) -> None:
+        """Load model weights from a torch DCP-format checkpoint.
+
+        Bypasses the HF state_dict_adapter pipeline. The trainer's
+        torchtitan-native state_dict layout must already match what
+        was saved (true when both sides use the same model_spec, which
+        is the case for our 447M AttnRes whose torchtitan training and
+        RL trainer use the same ``KimiLinearAttnResModel``).
+        """
+        if not os.path.isdir(dcp_path):
+            raise FileNotFoundError(
+                f"dcp_initial_load_path does not exist: {dcp_path}"
+            )
+        sd = model.state_dict()
+        logger.info(
+            f"loading torchtitan-native DCP from {dcp_path} "
+            f"({len(sd)} keys)"
+        )
+        dcp.load(sd, checkpoint_id=dcp_path)
+        # ``dcp.load`` populates ``sd`` in place; assign back so
+        # FSDP-wrapped params see the loaded weights.
+        set_model_state_dict(
+            model=model,
+            model_state_dict=sd,
+            options=StateDictOptions(strict=False),
+        )
+        logger.info(f"DCP weights loaded ({len(sd)} parameters)")
 
     @endpoint
     async def push_model_state_dict(self) -> None:
