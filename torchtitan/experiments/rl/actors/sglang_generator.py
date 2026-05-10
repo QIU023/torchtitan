@@ -375,12 +375,38 @@ class SGLangGenerator(Actor, Configurable):
             tok = getattr(tok_mgr, "tokenizer", None)
         except Exception:
             tok = None
-        if tok is not None:
-            prompt_token_ids_per_prompt = [
-                tok.encode(p, add_special_tokens=False) for p in prompt_texts
-            ]
-        else:
-            prompt_token_ids_per_prompt = [[] for _ in prompt_texts]
+        # For VLM prompts, the multimodal processor may splice
+        # ``[image_token_id] * num_vision_tokens`` at each ``<image>``
+        # position. The plain tokenizer doesn't know about that. We
+        # try the multimodal processor first (yielding the same
+        # input_ids the generator's LM actually saw), then fall back
+        # to plain text tokenization for non-VLM rollouts.
+        prompt_token_ids_per_prompt: list[list[int]] = []
+        mm_processor = getattr(tok_mgr, "mm_processor", None) if tok else None
+        for i, p in enumerate(prompt_texts):
+            mm_input_ids: list[int] | None = None
+            if images is not None and mm_processor is not None and i < len(images):
+                try:
+                    mm_out = await mm_processor.process_mm_data_async(
+                        image_data=[images[i]],
+                        input_text=p,
+                        request_obj=None,
+                    )
+                    mm_input_ids = list(getattr(mm_out, "input_ids", []) or [])
+                except Exception as e:
+                    logger.warning(
+                        f"mm_processor failed for prompt {i}: {e}; "
+                        "falling back to plain tokenizer"
+                    )
+                    mm_input_ids = None
+            if mm_input_ids is not None and mm_input_ids:
+                prompt_token_ids_per_prompt.append(mm_input_ids)
+            elif tok is not None:
+                prompt_token_ids_per_prompt.append(
+                    tok.encode(p, add_special_tokens=False)
+                )
+            else:
+                prompt_token_ids_per_prompt.append([])
 
         # Build flat list of Episodes; assign group_id per prompt.
         # SGLang's async_generate flattens (prompt × n_samples) into
@@ -412,6 +438,14 @@ class SGLangGenerator(Actor, Configurable):
                 for lp in output_token_logprobs
             ]
             prompt_token_ids = prompt_token_ids_per_prompt[prompt_idx]
+            # Carry the corresponding image path forward so a
+            # vision-aware trainer can re-encode at compute_token_log_probs
+            # time. None for text-only rollouts.
+            ep_image: Any = None
+            if images is not None and prompt_idx < len(images):
+                cand = images[prompt_idx]
+                if isinstance(cand, str):
+                    ep_image = cand
             episodes.append(
                 Episode(
                     policy_version=self.policy_version,
@@ -425,6 +459,7 @@ class SGLangGenerator(Actor, Configurable):
                         else ""
                     ),
                     group_id=gid,
+                    image_path=ep_image,
                 )
             )
 
