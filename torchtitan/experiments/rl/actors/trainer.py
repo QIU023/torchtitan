@@ -79,6 +79,9 @@ class PolicyTrainer(Actor, Configurable):
         transfer_dtype: str = "",
         kl_coef: float = 0.0,
         dcp_initial_load_path: str = "",
+        vision_tower_path: str = "",
+        projector_dcp_path: str = "",
+        image_token_id: int = 32000,
     ):
         # ``dcp_initial_load_path``: optional path to a torch DCP-format
         # checkpoint to load instead of HF safetensors. Used when the
@@ -88,6 +91,20 @@ class PolicyTrainer(Actor, Configurable):
         # exclusive with ``hf_assets_path`` — if both are non-empty,
         # DCP wins.
         self._dcp_initial_load_path = dcp_initial_load_path
+        # Optional VLM hooks: when ``vision_tower_path`` and
+        # ``projector_dcp_path`` are set, compute_token_log_probs
+        # injects vision features at image-token positions, matching
+        # what the generator's LM saw. ``vision_tower_path`` is an HF
+        # id (e.g. ``google/siglip-base-patch16-224``);
+        # ``projector_dcp_path`` is the torchtitan-native DCP dir whose
+        # top-level ``mm_projector.projector.{fc1,fc2}.{weight,bias}``
+        # keys are loaded into a freshly-built 2-layer MLP (typically
+        # the same dir as ``dcp_initial_load_path``).
+        self._vision_tower_path = vision_tower_path
+        self._projector_dcp_path = projector_dcp_path
+        self._image_token_id = image_token_id
+        self._vision_tower = None
+        self._projector = None
         self.config = config
         self.model_spec = model_spec
         self.kl_coef = kl_coef
@@ -156,6 +173,12 @@ class PolicyTrainer(Actor, Configurable):
             optimizers=self.optimizers,
             training_steps=config.training.steps,
         )
+
+        # Optional vision tower + projector for VLM logprob recompute.
+        # Loaded once at __init__; used by ``step`` to inject vision
+        # features into the LM forward at image-token positions.
+        if self._vision_tower_path and self._projector_dcp_path:
+            self._load_vision_components(device_type)
 
         self.policy_version = 0
         self.generator: Any | None = None
@@ -306,6 +329,90 @@ class PolicyTrainer(Actor, Configurable):
         )
         logger.info(f"DCP weights loaded ({len(sd)} parameters)")
 
+    def _load_vision_components(self, device_type: str) -> None:
+        """Build a frozen SigLIP vision tower and a 2-layer MLP projector
+        for VLM logprob recompute.
+
+        Vision tower: HF SigLIP via ``transformers.SiglipVisionModel``.
+        Projector: 2-layer MLP matching ``phase5/multimodal_model.py``'s
+        ``Projector`` (fc1 vision_d->llm_d with bias, GELU, fc2 llm_d->llm_d
+        with bias). Weights loaded from
+        ``mm_projector.projector.{fc1,fc2}.{weight,bias}`` in the DCP
+        ckpt at ``self._projector_dcp_path``.
+        """
+        try:
+            from transformers import SiglipVisionModel
+        except ImportError as e:
+            logger.warning(
+                f"transformers.SiglipVisionModel not available ({e}); "
+                "skipping vision-tower load. VLM logprob match will diverge."
+            )
+            return
+
+        logger.info(f"loading vision tower from {self._vision_tower_path}")
+        vt = SiglipVisionModel.from_pretrained(self._vision_tower_path)
+        for p in vt.parameters():
+            p.requires_grad = False
+        vt.eval()
+        vt = vt.to(self.device)
+        self._vision_tower = vt
+
+        # Build the projector. fc1 vision_hidden -> llm_hidden, fc2
+        # llm_hidden -> llm_hidden, both with bias. Match the trained
+        # geometry from phase5/multimodal_model.py:Projector.
+        vision_hidden = vt.config.hidden_size
+        # Probe the LM hidden size from the model's embed_tokens.
+        try:
+            llm_hidden = self.model.embed_tokens.weight.shape[1]
+        except AttributeError:
+            llm_hidden = self.model.tok_embeddings.weight.shape[1]
+        proj = torch.nn.Sequential()  # placeholder; build proper module below
+        # Use a small custom module to match the saved keys
+        # (mm_projector.projector.fc1/.fc2).
+        class _Projector(torch.nn.Module):
+            def __init__(self, vd, ld):
+                super().__init__()
+                self.fc1 = torch.nn.Linear(vd, ld, bias=True)
+                self.fc2 = torch.nn.Linear(ld, ld, bias=True)
+            def forward(self, x):
+                import torch.nn.functional as F
+                return self.fc2(F.gelu(self.fc1(x)))
+        proj_dtype = TORCH_DTYPE_MAP[self.config.training.dtype]
+        with torch.device(device_type):
+            with utils.set_default_dtype(proj_dtype):
+                proj = _Projector(vision_hidden, llm_hidden)
+
+        # Load mm_projector keys from DCP. The DCP saved them under
+        # mm_projector.projector.fc1.{weight,bias} etc.
+        sd = {
+            f"mm_projector.projector.{k}": v
+            for k, v in proj.state_dict().items()
+        }
+        try:
+            dcp.load(sd, checkpoint_id=self._projector_dcp_path)
+        except Exception as e:
+            logger.warning(
+                f"projector DCP load failed ({e}); leaving projector at random "
+                "init — VLM logprob recompute will be ungrounded."
+            )
+            self._projector = None
+            return
+        # Strip the prefix back out and load into the module.
+        proj_sd = {
+            k[len("mm_projector.projector."):]: v
+            for k, v in sd.items()
+            if k.startswith("mm_projector.projector.")
+        }
+        proj.load_state_dict(proj_sd, strict=True)
+        for p in proj.parameters():
+            p.requires_grad = False
+        proj.eval()
+        self._projector = proj.to(self.device)
+        logger.info(
+            f"VLM components loaded: vision_tower {vision_hidden}-d, "
+            f"projector {vision_hidden}->{llm_hidden}-d (frozen)"
+        )
+
     @endpoint
     async def push_model_state_dict(self) -> None:
         """Publish model weights for generator consumption via TorchStore.
@@ -360,6 +467,9 @@ class PolicyTrainer(Actor, Configurable):
         all_token_ids: list[list[int]] = [ep.token_ids for ep in episodes]
         all_prompt_token_ids: list[list[int]] = [ep.prompt_token_ids for ep in episodes]
         all_token_log_probs: list[list[float]] = [ep.token_log_probs for ep in episodes]
+        all_image_paths: list[str | None] = [
+            getattr(ep, "image_path", None) for ep in episodes
+        ]
 
         all_rewards_tensor = torch.tensor([ep.reward for ep in episodes])
 
@@ -370,6 +480,7 @@ class PolicyTrainer(Actor, Configurable):
         my_token_ids = [all_token_ids[i] for i in my_indices]
         my_prompt_token_ids = [all_prompt_token_ids[i] for i in my_indices]
         my_token_log_probs = [all_token_log_probs[i] for i in my_indices]
+        my_image_paths = [all_image_paths[i] for i in my_indices]
         my_advantages = advantages[my_indices]
 
         # Compute reference model log probs if KL penalty is enabled
@@ -377,9 +488,15 @@ class PolicyTrainer(Actor, Configurable):
         if self.ref_model is not None:
             ref_token_log_probs = []
             with torch.no_grad():
-                for prompt_toks, gen_toks in zip(my_prompt_token_ids, my_token_ids):
+                for prompt_toks, gen_toks, img_path in zip(
+                    my_prompt_token_ids, my_token_ids, my_image_paths,
+                ):
                     ref_lps = compute_token_log_probs(
-                        self.ref_model, prompt_toks, gen_toks, self.device
+                        self.ref_model, prompt_toks, gen_toks, self.device,
+                        vision_tower=self._vision_tower,
+                        projector=self._projector,
+                        image_path=img_path,
+                        image_token_id=self._image_token_id,
                     )
                     ref_token_log_probs.append(ref_lps)
 
@@ -390,6 +507,10 @@ class PolicyTrainer(Actor, Configurable):
             my_advantages,
             ref_token_log_probs=ref_token_log_probs,
             kl_coef=self.kl_coef,
+            vision_tower=self._vision_tower,
+            projector=self._projector,
+            image_paths=my_image_paths,
+            image_token_id=self._image_token_id,
         )
 
         # Verify logprob identity (local shard)

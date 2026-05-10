@@ -35,6 +35,11 @@ def compute_token_log_probs(
     prompt_ids: list[int],
     gen_ids: list[int],
     device: torch.device,
+    *,
+    vision_tower: torch.nn.Module | None = None,
+    projector: torch.nn.Module | None = None,
+    image_path: str | None = None,
+    image_token_id: int = 32000,
 ) -> torch.Tensor:
     """
     Compute per-token log probabilities for generated tokens.
@@ -42,9 +47,25 @@ def compute_token_log_probs(
 
     Args:
         model: The model to use for computing logits
-        prompt_ids: Prompt token IDs
+        prompt_ids: Prompt token IDs (for VLM rollouts these already
+            include ``[image_token_id] * num_vision_tokens`` spliced
+            at each ``<image>`` placeholder by the generator's
+            multimodal processor).
         gen_ids: Generated token IDs
         device: Device to run computation on
+        vision_tower: Optional frozen vision encoder (HF SigLIP-style).
+            When provided alongside ``projector`` and ``image_path``,
+            vision features are injected at image-token positions to
+            match what the generator's LM saw. Without these, the LM
+            sees the literal-text embedding for ``image_token_id``,
+            which diverges from the generator's logits.
+        projector: Optional 2-layer MLP that maps vision features to
+            ``llm_hidden_size``. Must be paired with ``vision_tower``.
+        image_path: Optional path to the image associated with this
+            prompt (e.g. from ``Episode.image_path``).
+        image_token_id: Sentinel id marking image-feature positions in
+            ``token_ids`` (32000 = Llama-3.1 reserved special token,
+            phase5/multimodal_dataset.py convention).
 
     Returns:
         Per-token log probabilities for the generated tokens
@@ -63,7 +84,36 @@ def compute_token_log_probs(
     seq_len = full_tensor.shape[1]
     positions = torch.arange(seq_len, device=device).unsqueeze(0)
 
-    logits = model(full_tensor, attention_masks=attention_masks, positions=positions)
+    # Vision injection: if a vision tower + projector + image are all
+    # supplied, run them and call the LM with vision_embeds= and
+    # image_mask= kwargs. Models that support these kwargs (e.g.
+    # KimiLinearAttnResModel via phase5/multimodal_model.py) will
+    # replace embed_tokens(image_token_id) with the projected vision
+    # features at image positions. Models that don't recognise the
+    # kwargs ignore them and use literal-text embedding (logprobs at
+    # image positions then diverge from the generator's).
+    if (
+        vision_tower is not None
+        and projector is not None
+        and image_path is not None
+    ):
+        vision_embeds, image_mask = _encode_image_for_logprob(
+            vision_tower=vision_tower,
+            projector=projector,
+            image_path=image_path,
+            input_ids=full_tensor,
+            image_token_id=image_token_id,
+            device=device,
+        )
+        logits = model(
+            full_tensor,
+            attention_masks=attention_masks,
+            positions=positions,
+            vision_embeds=vision_embeds,
+            image_mask=image_mask,
+        )
+    else:
+        logits = model(full_tensor, attention_masks=attention_masks, positions=positions)
 
     # Convert to float32 for numerical stability
     logits_f32 = logits[:, :-1, :].to(torch.float32)
@@ -83,6 +133,63 @@ def compute_token_log_probs(
     return token_lps
 
 
+def _encode_image_for_logprob(
+    vision_tower: torch.nn.Module,
+    projector: torch.nn.Module,
+    image_path: str,
+    input_ids: torch.Tensor,
+    image_token_id: int,
+    device: torch.device,
+):
+    """Run the vision tower + projector for a single image, return
+    ``(vision_embeds, image_mask)`` shaped to match
+    ``KimiLinearAttnResModel.forward``'s expectations.
+
+    Output shapes:
+      * vision_embeds: ``[B=1, num_images=1, N_vision, llm_hidden_size]``
+      * image_mask:    ``[B=1, T]`` boolean
+
+    The caller's ``prompt_token_ids`` already include
+    ``[image_token_id] * num_vision_tokens`` at the image position,
+    so the LM forward replaces those positions' text-embeddings with
+    the projected vision features.
+    """
+    from PIL import Image
+    pil = Image.open(image_path).convert("RGB")
+
+    # Run the SigLIP image processor to get the standard normalised
+    # 224x224 tensor. We import lazily — most callers will already
+    # have transformers available, but this only matters when
+    # vision_tower is supplied.
+    try:
+        from transformers import AutoImageProcessor
+        proc = AutoImageProcessor.from_pretrained(
+            getattr(vision_tower.config, "_name_or_path",
+                    "google/siglip-base-patch16-224")
+        )
+    except Exception:
+        from transformers import SiglipImageProcessor
+        proc = SiglipImageProcessor.from_pretrained(
+            "google/siglip-base-patch16-224"
+        )
+    px = proc(images=pil, return_tensors="pt").pixel_values.to(device)
+
+    with torch.no_grad():
+        vt_out = vision_tower(pixel_values=px)
+        vision_features = vt_out.last_hidden_state  # [1, N_vis, D_vis]
+
+    # Cast to projector's dtype (vision tower is fp32 by default,
+    # projector + LM are bf16 in our setup).
+    proj_dtype = next(projector.parameters()).dtype
+    vision_features = vision_features.to(proj_dtype)
+    projected = projector(vision_features)  # [1, N_vis, D_llm]
+
+    # Multimodal model expects [B, num_images, N_vis, D_llm].
+    vision_embeds = projected.unsqueeze(1)  # [1, 1, N_vis, D_llm]
+    image_mask = (input_ids == image_token_id)  # [1, T]
+    return vision_embeds, image_mask
+
+
 def compute_policy_gradient_loss(
     model: torch.nn.Module,
     vllm_token_ids: list[list[int]],
@@ -92,6 +199,11 @@ def compute_policy_gradient_loss(
     kl_coef: float = 0.0,
     ppo_clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
+    *,
+    vision_tower: torch.nn.Module | None = None,
+    projector: torch.nn.Module | None = None,
+    image_paths: list[str | None] | None = None,
+    image_token_id: int = 32000,
 ) -> tuple[torch.Tensor, dict, list[torch.Tensor]]:
     """
     Compute GRPO policy gradient loss with entropy bonus.
@@ -124,12 +236,19 @@ def compute_policy_gradient_loss(
     # Compute per-token log probs under current policy (WITH GRADIENTS)
     batch_token_log_probs = []
 
-    for prompt_toks, gen_toks in zip(prompt_token_ids, vllm_token_ids):
+    for i, (prompt_toks, gen_toks) in enumerate(
+        zip(prompt_token_ids, vllm_token_ids)
+    ):
+        ip = image_paths[i] if image_paths is not None and i < len(image_paths) else None
         token_lps = compute_token_log_probs(
             model,
             prompt_toks,
             gen_toks,
             device,
+            vision_tower=vision_tower,
+            projector=projector,
+            image_path=ip,
+            image_token_id=image_token_id,
         )
         batch_token_log_probs.append(token_lps)
 
