@@ -908,13 +908,22 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
     orig_fwd = stage.forward_one_chunk
     orig_bwd = stage.backward_one_chunk
 
+    # ``save_forward_output`` was added to ``_PipelineStageBase.forward_one_chunk``
+    # in torch nightly (>=2.10). On torch 2.9 stable the kwarg doesn't
+    # exist, so passing it raises TypeError. Detect once and dispatch.
+    import inspect as _inspect
+    _orig_fwd_sig = _inspect.signature(orig_fwd)
+    _has_save_kw = "save_forward_output" in _orig_fwd_sig.parameters
+
     def patched_fwd(fwd_chunk_id, args, kwargs=None, save_forward_output=True):
         _set_mb_index(adapter_key, fwd_chunk_id)
         try:
-            return orig_fwd(
-                fwd_chunk_id, args, kwargs,
-                save_forward_output=save_forward_output,
-            )
+            if _has_save_kw:
+                return orig_fwd(
+                    fwd_chunk_id, args, kwargs,
+                    save_forward_output=save_forward_output,
+                )
+            return orig_fwd(fwd_chunk_id, args, kwargs)
         finally:
             _set_mb_index(adapter_key, None)
 
