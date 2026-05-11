@@ -229,7 +229,11 @@ def apply_ac(
     #
     # Also see: https://github.com/pytorch/pytorch/issues/166926
     # pyrefly: ignore [missing-attribute]
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
+    # NOTE: _set_lru_cache is only present in torch 2.10+ nightly; on
+    # torch 2.9 stable the LRU-cache-miss-after-dynamic-shapes bug doesn't
+    # apply because the SAC HOP path differs. Skip silently if missing.
+    if hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
 
     if ac_config.mode == "memory_budget":
         assert model_compile_enabled, "Memory budget mode requires model to be compiled"
