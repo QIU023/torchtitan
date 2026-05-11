@@ -364,6 +364,33 @@ def llama3_175m_attn_res_L16_n8() -> Trainer.Config:
     return _llama3_175m_attn_res_variant("175M_attn_res_L16_n8")
 
 
+def llama3_175m_attn_res_L32_n8() -> Trainer.Config:
+    """32-layer / N=8 (4 layers/block) carrier for aggressive PP×VP sweeps.
+
+    Used by phase3/run_pp_pressure_test.sh for the PP=8 × VP=4 stress
+    test (needs num_layers >= PP * VP = 32 to satisfy Interleaved1F1B's
+    one-chunk-per-stage minimum). Also supports PP=4 × VP=8 (same 32
+    chunks total but more aggressive VP).
+
+    Same hyperparameters (dim=768, n_heads=12, n_kv_heads=4, FFN hidden
+    via Llama3 SwiGLU formula) as the L16 variant — depth is the only
+    delta — so adapter-vs-naive numerics comparison stays apples-to-
+    apples within the deeper-carrier family.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L32_n8")
+
+
+def llama3_175m_attn_res_L48_n8() -> Trainer.Config:
+    """48-layer / N=8 (6 layers/block) carrier — deepest pressure-test
+    carrier supported, for PP=8 × VP=6 or PP=4 × VP=12.
+
+    Approaches Llama 3.1 8B's 32-layer depth × 2.4 (or matches 70B's
+    80-layer depth × 0.6). Closer to prod-realistic depth than the L16
+    toy.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L48_n8")
+
+
 # ------------------------------------------------------------------------- #
 # DSv3-shaped MoE + MLA + AttnRes Trainer configs.
 #

@@ -587,6 +587,19 @@ attn_res_configs = {
     "175M_attn_res_L16_n8": partial(
         _175m_attn_res, num_blocks=8, n_layers=16, enable_weight_tying=False
     ),
+    # Deeper carriers for the PP × VP pressure-test sweep.
+    # n_layers must be a multiple of PP * VP for Interleaved1F1B:
+    #   L32 supports PP=8 × VP=4 (32 / 32 = 1 layer/chunk)
+    #   L32 supports PP=4 × VP=8 (same 32 chunks total)
+    #   L48 supports PP=8 × VP=6 (48 / 48 = 1)
+    # Same hyperparameters (dim=768, heads=12, kv=4) as the L16 variant
+    # so the only delta is depth — apples-to-apples vs the L16 baseline.
+    "175M_attn_res_L32_n8": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False
+    ),
+    "175M_attn_res_L48_n8": partial(
+        _175m_attn_res, num_blocks=8, n_layers=48, enable_weight_tying=False
+    ),
     # DSv3-shaped MoE + MLA + AttnRes flavors. Architecturally closest
     # open match to Kimi's production design. See _build_dsv3_attn_res_layers.
     "dsv3_debugmodel_attn_res": _dsv3_debugmodel_attn_res,
