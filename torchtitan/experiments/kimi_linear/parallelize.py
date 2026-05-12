@@ -1026,7 +1026,9 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
     # Allow MoE token-choice routing's data-dependent control flow.
     torch._dynamo.config.capture_scalar_outputs = True
     # Eager AC <-> compile divergence acceptance (matches upstream).
-    torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
+    # Only available in torch nightly; skip silently on stable builds.
+    if hasattr(torch._dynamo.config, "skip_fwd_side_effects_in_bwd_under_checkpoint"):
+        torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
     # KDA + MLA layers each compile separately; we have up to L layer
     # flavors plus permutations. 64 leaves comfortable headroom for
     # all per-layer specializations without thrashing.

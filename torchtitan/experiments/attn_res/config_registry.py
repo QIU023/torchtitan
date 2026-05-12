@@ -282,10 +282,10 @@ def llama3_175m_baseline() -> Trainer.Config:
         checkpoint=CheckpointManager.Config(
             # Enable so a mid-run crash (e.g. HF datasets httpx
             # disconnect during C4 streaming) doesn't force a full restart.
-            # keep_latest_k=3 bounds disk use at ~3x the model size.
+            # keep_latest_k=2 bounds disk use at ~2x the model size.
             enable=True,
             interval=1000,
-            keep_latest_k=3,
+            keep_latest_k=2,
             last_save_model_only=False,
         ),
         activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
@@ -362,6 +362,110 @@ def llama3_175m_attn_res_L16_n8() -> Trainer.Config:
     sweep stays apples-to-apples when compared to Phase 2.
     """
     return _llama3_175m_attn_res_variant("175M_attn_res_L16_n8")
+
+
+def llama3_175m_attn_res_L32_n8() -> Trainer.Config:
+    """32-layer / N=8 (4 layers/block) carrier for aggressive PP×VP sweeps.
+
+    Used by phase3/run_pp_pressure_test.sh for the PP=8 × VP=4 stress
+    test (needs num_layers >= PP * VP = 32 to satisfy Interleaved1F1B's
+    one-chunk-per-stage minimum). Also supports PP=4 × VP=8 (same 32
+    chunks total but more aggressive VP).
+
+    Same hyperparameters (dim=768, n_heads=12, n_kv_heads=4, FFN hidden
+    via Llama3 SwiGLU formula) as the L16 variant — depth is the only
+    delta — so adapter-vs-naive numerics comparison stays apples-to-
+    apples within the deeper-carrier family.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L32_n8")
+
+
+def llama3_175m_attn_res_L16_n16() -> Trainer.Config:
+    """L=16 Full AttnRes (N = n_layers). Every transformer-block is
+    its own AttnRes-block. Apples-to-apples vs L16_n8 (Block AttnRes,
+    2 layers/AttnRes-block) — only the AttnRes geometry differs.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L16_n16")
+
+
+def llama3_175m_attn_res_L24_n4() -> Trainer.Config:
+    """L=24 Block AttnRes with N=4 (6 transformer-blocks per AttnRes-block).
+
+    Scale-up step between the stable L16_n8 (2 t-blocks/AttnRes-block)
+    and PP=8 × VP=4-requiring depths (L≥32). At L=24 we can run
+    PP=8 × VP=3 = 24 chunks, 1 layer/chunk. dim stays at 768.
+
+    Note: 6 t-blocks per AttnRes-block is 2× paper's sweet spot (3
+    t-blocks / 6 paper-layers per AttnRes-block at Kimi 48B's N=9
+    over 27 t-blocks). The 6-layer intra-block standard residual chain
+    is unstable at dim=768 (smoked 2026-05-12: inf-grad from step 1).
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L24_n4")
+
+
+# Widen-dim carriers for L=32 N=8 Block AttnRes — finding the dim
+# threshold where random-init forward stays bf16-finite. All four share
+# n_layers=32 num_blocks=8 (4 t-blocks/AttnRes-block, paper sweet spot
+# × 1.33), only dim differs.
+
+def llama3_attn_res_L32_n8_d1024() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("attn_res_L32_n8_d1024")
+
+
+def llama3_attn_res_L32_n8_d1280() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("attn_res_L32_n8_d1280")
+
+
+def llama3_attn_res_L32_n8_d1536() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("attn_res_L32_n8_d1536")
+
+
+def llama3_attn_res_L32_n8_d2048() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("attn_res_L32_n8_d2048")
+
+
+def llama3_175m_attn_res_L32_n16() -> Trainer.Config:
+    """L=32 N=16 = 2 transformer-blocks per AttnRes-block.
+
+    Same intra-block residual-chain length as proven-stable L16_n8.
+    Tests hypothesis that t-blocks/AttnRes-block is the stability
+    driver. Allows PP=8 × VP=4 = 32 chunks at dim=768.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L32_n16")
+
+
+def llama3_attn_res_L32_n8_d2048_uniform() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("attn_res_L32_n8_d2048_uniform")
+
+
+def llama3_attn_res_L32_n8_d1280_uniform() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("attn_res_L32_n8_d1280_uniform")
+
+
+def llama3_175m_attn_res_L32_n32() -> Trainer.Config:
+    """L=32 Full AttnRes (N = n_layers). Canonical pair for PP=8 × VP=4
+    pressure: 32 chunks × 1 transformer-block per chunk, one AttnRes
+    emit per chunk. Worst-case wire bytes for naive (stack grows to
+    33 sources at deepest stage), best-case adapter savings.
+
+    Stability: at L=32 standard residual is unstable in bf16 (see L32_n8
+    inf-grad notes). Full AttnRes replaces every accumulation with a
+    softmax mean over preceding sources; at zero-init pseudo-queries,
+    softmax is uniform, output is bounded by max-source-magnitude.
+    Expected to remove the L≥32 inf-grad failure mode.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L32_n32")
+
+
+def llama3_175m_attn_res_L48_n8() -> Trainer.Config:
+    """48-layer / N=8 (6 layers/block) carrier — deepest pressure-test
+    carrier supported, for PP=8 × VP=6 or PP=4 × VP=12.
+
+    Approaches Llama 3.1 8B's 32-layer depth × 2.4 (or matches 70B's
+    80-layer depth × 0.6). Closer to prod-realistic depth than the L16
+    toy.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L48_n8")
 
 
 # ------------------------------------------------------------------------- #

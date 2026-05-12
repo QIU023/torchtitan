@@ -420,7 +420,12 @@ class AttnResModel(Decoder):
         blocks: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        return_outputs: bool = False,
     ):
+        # ``return_outputs`` is passed by newer torchtitan trainer (post
+        # 2026-04 trunk) for SAC memory-budget instrumentation. We don't
+        # use it in the AttnRes forward but must accept the kwarg.
+        del return_outputs  # noqa: F841
         """AttnRes forward. Threads block representations through layers.
 
         First / non-PP stage: ``blocks`` is None; start with an empty

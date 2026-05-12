@@ -125,9 +125,24 @@ def _build_attn_res_layers(
     n_heads: int,
     hidden_dim: int,
     n_kv_heads: int | None = None,
+    init_scheme: str = "depth_scaled",
 ) -> list[AttnResTransformerBlock.Config]:
+    """``init_scheme`` controls the wo / w2w3 (residual-output) init:
+    ``"depth_scaled"`` (torchtitan Llama3 default, ``0.02/sqrt(2*(layer_id+1))``)
+    or ``"uniform"`` (Kimi Linear paper's ``initializer_range=0.02``).
+    """
+    if init_scheme not in ("depth_scaled", "uniform"):
+        raise ValueError(
+            f"init_scheme={init_scheme!r} must be 'depth_scaled' or 'uniform'"
+        )
     layers: list[AttnResTransformerBlock.Config] = []
     for layer_id in range(n_layers):
+        if init_scheme == "depth_scaled":
+            wo_init = _depth_init(layer_id)
+            w2w3_init = _depth_init(layer_id)
+        else:  # uniform
+            wo_init = _LINEAR_INIT
+            w2w3_init = _LINEAR_INIT
         layers.append(
             AttnResTransformerBlock.Config(
                 attention_norm=RMSNorm.Config(
@@ -139,7 +154,7 @@ def _build_attn_res_layers(
                     n_heads=n_heads,
                     n_kv_heads=n_kv_heads,
                     wqkv_param_init=_LINEAR_INIT,
-                    wo_param_init=_depth_init(layer_id),
+                    wo_param_init=wo_init,
                     inner_attention=ScaledDotProductAttention.Config(),
                     mask_type="causal",
                     rope_backend="complex",
@@ -148,7 +163,7 @@ def _build_attn_res_layers(
                     dim=dim,
                     hidden_dim=hidden_dim,
                     w1_param_init=_LINEAR_INIT,
-                    w2w3_param_init=_depth_init(layer_id),
+                    w2w3_param_init=w2w3_init,
                 ),
                 attn_res_proj=AttnResProjection.Config(
                     dim=dim, param_init=_ATTN_RES_PROJ_INIT
@@ -214,30 +229,41 @@ def _175m_attn_res(
     num_blocks: int = 6,
     n_layers: int = _175M_N_LAYERS,
     enable_weight_tying: bool = True,
+    *,
+    dim: int = 768,
+    n_heads: int = 12,
+    n_kv_heads: int = 4,
+    init_scheme: str = "depth_scaled",
 ) -> AttnResModel.Config:
-    """~175M dense AttnRes-native model with Block AttnRes enabled.
+    """Dense AttnRes-native model with Block AttnRes enabled.
 
-    Parameter count: 174,017,280 total (tied embedding counted once) /
-    75,555,072 as reported by torchtitan's size-log under the tied-
-    embedding convention (excludes the 98.5M shared embed/output).
+    Default shape (~175M): dim=768, n_heads=12, n_kv_heads=4 GQA, vocab=128256.
+    Wider variants for PP×VP pressure tests pass dim/n_heads kwargs through.
+
+    Parameter count at defaults: 174,017,280 total (tied embedding counted
+    once) / 75,555,072 as reported by torchtitan's size-log under the
+    tied-embedding convention (excludes the 98.5M shared embed/output).
 
     Args:
         num_blocks: Number of attention-residual blocks. Must divide
-            ``n_layers``. Paper sweet spot is ``N=8``; default is 6
-            (closest divisor below 8 for n_layers=12). N=1 is equivalent
-            to standard residuals and is disallowed.
-        n_layers: Total transformer layers. Default 12 (original 175M
-            shape). Pass 16 to align with the Phase-3 8-GPU PP layout
-            (PP=8, layers_per_stage=1 -> 16 virtual stages, 2 chunks
-            per rank under Interleaved1F1B).
+            ``n_layers``. Paper sweet spot is ``N=8`` (Kimi 48B uses N=9
+            over 27 transformer-blocks = 3 t-blocks/AttnRes-block); default
+            is 6 (closest divisor below 8 for n_layers=12). N=1 is
+            equivalent to standard residuals and is disallowed.
+        n_layers: Total transformer-blocks (= ``num_hidden_layers`` in
+            HF parlance). Default 12 (original 175M shape).
         enable_weight_tying: Tie input embedding with output projection.
             Must be False under Pipeline Parallel — torchtitan's
             parallelize_llama explicitly raises on tying + PP.
+        dim: Model hidden width. Default 768 (175M scale). Wider carriers
+            for PP=8 × VP=4 pressure tests pass dim 1024/1280/1536/2048.
+        n_heads: Attention heads. Default 12 (head_dim=64 at dim=768).
+        n_kv_heads: GQA KV heads. Default 4 (3:1 GQA ratio).
 
     All per-layer and final pseudo-queries are zero-initialized so
     training begins numerically equivalent to standard residuals (uniform
-    softmax over sources). Uses GQA (n_kv_heads=4) and tied embeddings to
-    keep parameter count mostly in the transformer stack.
+    softmax over sources). Uses GQA and tied embeddings to keep parameter
+    count mostly in the transformer stack.
     """
     if num_blocks < 2 or n_layers % num_blocks != 0:
         raise ValueError(
@@ -245,9 +271,8 @@ def _175m_attn_res(
             f"n_layers={n_layers}. Valid: "
             f"{sorted(d for d in range(2, n_layers + 1) if n_layers % d == 0)}"
         )
-    dim = 768
-    n_heads = 12
-    n_kv_heads = 4
+    if dim % n_heads != 0:
+        raise ValueError(f"dim={dim} must be divisible by n_heads={n_heads}")
     vocab_size = 128256
     return AttnResModel.Config(
         dim=dim,
@@ -279,6 +304,7 @@ def _175m_attn_res(
             hidden_dim=compute_ffn_hidden_dim(
                 dim, multiple_of=256, ffn_dim_multiplier=1.0
             ),
+            init_scheme=init_scheme,
         ),
         attn_res=AttnResConfig(enabled=True, num_blocks=num_blocks),
         final_attn_res_proj=AttnResProjection.Config(
@@ -586,6 +612,88 @@ attn_res_configs = {
     # invariant is exercised at half the stage transitions.
     "175M_attn_res_L16_n8": partial(
         _175m_attn_res, num_blocks=8, n_layers=16, enable_weight_tying=False
+    ),
+    # Deeper carriers for the PP × VP pressure-test sweep.
+    # n_layers must be a multiple of PP * VP for Interleaved1F1B:
+    #   L32 supports PP=8 × VP=4 (32 / 32 = 1 layer/chunk)
+    #   L32 supports PP=4 × VP=8 (same 32 chunks total)
+    #   L48 supports PP=8 × VP=6 (48 / 48 = 1)
+    # Same hyperparameters (dim=768, heads=12, kv=4) as the L16 variant
+    # so the only delta is depth — apples-to-apples vs the L16 baseline.
+    "175M_attn_res_L32_n8": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False
+    ),
+    "175M_attn_res_L48_n8": partial(
+        _175m_attn_res, num_blocks=8, n_layers=48, enable_weight_tying=False
+    ),
+    # Full AttnRes variants (N = n_layers): every transformer-block is its
+    # own AttnRes-block. Each layer's residual is a softmax over ALL
+    # preceding layer outputs instead of a standard add. Two motivations:
+    #   1. Stability at depth — standard residual in Block AttnRes's
+    #      intra-block layers accumulates without bound; Full AttnRes
+    #      replaces every accumulation with a bounded softmax mean
+    #      (at zero-init pseudo-query, output = uniform mean of sources).
+    #   2. Stress the PP cache adapter — naive wire bytes scale O(L)
+    #      per hop, adapter stays O(1) per hop. Max savings ratio here.
+    # PP=8 × VP=4 needs n_layers >= 32 → L32_n32 is the canonical pair.
+    "175M_attn_res_L16_n16": partial(
+        _175m_attn_res, num_blocks=16, n_layers=16, enable_weight_tying=False
+    ),
+    "175M_attn_res_L32_n32": partial(
+        _175m_attn_res, num_blocks=32, n_layers=32, enable_weight_tying=False
+    ),
+    # Block AttnRes scale-up path (stay below Full AttnRes). Goal: find
+    # the deepest Block AttnRes (N < L) that's still stable at dim=768
+    # for from-scratch training, so PP=8 × VP=3 / VP=4 pressure tests
+    # use the production architecture not the Full-AttnRes fallback.
+    # 24 layers / 4 blocks = 6 transformer-blocks per AttnRes-block.
+    # That's 12 paper-layers per AttnRes-block — 2x paper's sweet spot
+    # (3 t-blocks / 6 paper-layers). Tests whether dim=768 can tolerate
+    # the deeper intra-block standard residual chain.
+    "175M_attn_res_L24_n4": partial(
+        _175m_attn_res, num_blocks=4, n_layers=24, enable_weight_tying=False
+    ),
+    # Widen-dim sweep at L=32 N=8 Block AttnRes (4 t-blocks/AttnRes-block,
+    # paper sweet spot × 1.33). Goal: find smallest dim where the
+    # L=32 random-init forward stays bf16-finite, enabling PP=8 × VP=4 =
+    # 32 chunks (and PP=4 × VP=8 = 32 chunks) pressure tests on the
+    # Block AttnRes path (not the Full-AttnRes fallback). aspect ratio
+    # n_layers/dim references: paper 48B = 27/2304 ≈ 1/85, Llama 8B =
+    # 32/4096 = 1/128, paper 436M = 16/1168 ≈ 1/73.
+    "attn_res_L32_n8_d1024": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False,
+        dim=1024, n_heads=16,
+    ),
+    "attn_res_L32_n8_d1280": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False,
+        dim=1280, n_heads=16,
+    ),
+    "attn_res_L32_n8_d1536": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False,
+        dim=1536, n_heads=16,
+    ),
+    "attn_res_L32_n8_d2048": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False,
+        dim=2048, n_heads=16,
+    ),
+    # Uniform init variants — paper Kimi Linear uses initializer_range=0.02
+    # uniform (not torchtitan's depth-scaled-by-layer_id). Smoking whether
+    # init scheme is the missing piece for Block AttnRes L=32 stability.
+    "attn_res_L32_n8_d2048_uniform": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False,
+        dim=2048, n_heads=16, init_scheme="uniform",
+    ),
+    "attn_res_L32_n8_d1280_uniform": partial(
+        _175m_attn_res, num_blocks=8, n_layers=32, enable_weight_tying=False,
+        dim=1280, n_heads=16, init_scheme="uniform",
+    ),
+    # L=32 N=16: 2 transformer-blocks per AttnRes-block — same ratio
+    # as the proven-stable 175M_attn_res_L16_n8 (16/8 = 2). Tests the
+    # hypothesis that the intra-block standard residual chain length
+    # (= t-blocks per AttnRes-block) is the stability driver, not
+    # depth alone. Allows PP=8 × VP=4 = 32 chunks at dim=768.
+    "175M_attn_res_L32_n16": partial(
+        _175m_attn_res, num_blocks=16, n_layers=32, enable_weight_tying=False,
     ),
     # DSv3-shaped MoE + MLA + AttnRes flavors. Architecturally closest
     # open match to Kimi's production design. See _build_dsv3_attn_res_layers.

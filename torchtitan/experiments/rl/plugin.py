@@ -5,11 +5,25 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-vLLM plugin for TorchTitan models.
+Inference-engine plugins for TorchTitan models.
+
+Both vLLM and SGLang share the model-spec convention: the trainer's
+``ModelSpec`` is registered with the engine under a stable name so the
+engine can construct a wrapped model that matches the trainer's
+parameter layout for weight sync.
 
 Usage:
-    from torchtitan.experiments.rl.plugin import register_model_to_vllm_model_registry
+    # vLLM
+    from torchtitan.experiments.rl.plugin import (
+        register_model_to_vllm_model_registry,
+    )
     register_model_to_vllm_model_registry(model_spec)
+
+    # SGLang
+    from torchtitan.experiments.rl.plugin import (
+        register_model_to_sglang_model_registry,
+    )
+    register_model_to_sglang_model_registry(model_spec)
 """
 
 from torchtitan.protocols.model_spec import ModelSpec
@@ -17,6 +31,11 @@ from torchtitan.protocols.model_spec import ModelSpec
 # Model-agnostic name used for vLLM model registration.
 # Must match the hf_overrides["architectures"] value passed to EngineArgs.
 VLLM_MODEL_NAME = "TorchTitanCausalLM"
+
+# Model-agnostic name used for SGLang model registration. SGLang reads
+# from the HF config's ``architectures`` field; the wrapper class is
+# registered into ``sglang.srt.models.registry`` under this name.
+SGLANG_MODEL_NAME = "TorchTitanCausalLM"
 
 
 def register_model_to_vllm_model_registry(
@@ -55,5 +74,57 @@ def register_model_to_vllm_model_registry(
 
     logger.info(
         f"Registered {VLLM_MODEL_NAME} with vLLM "
+        f"(model={model_spec.name}, flavor={model_spec.flavor})"
+    )
+
+
+def register_model_to_sglang_model_registry(
+    model_spec: ModelSpec,
+) -> None:
+    """Register a TorchTitan model with SGLang's model registry.
+
+    Mirrors :func:`register_model_to_vllm_model_registry` for the
+    SGLang engine. SGLang's model-class loader reads from
+    ``HF config['architectures']``; setting that to ``SGLANG_MODEL_NAME``
+    and registering our wrapper here lets SGLang construct the model
+    with the same parameter layout the trainer uses.
+
+    Must be called before constructing an :class:`SGLangGenerator`.
+
+    Args:
+        model_spec: TorchTitan ModelSpec containing model config and
+            components.
+    """
+    import logging
+
+    from torchtitan.experiments.rl.models.sglang_wrapper import (
+        TorchTitanSGLangModelWrapper,
+    )
+
+    logger = logging.getLogger(__name__)
+
+    # Create dynamic model class capturing ModelSpec in the closure.
+    class TorchTitanSGLangModelFromSpec(TorchTitanSGLangModelWrapper):
+        def __init__(self, *, config, quant_config=None, prefix=""):
+            super().__init__(
+                model_spec=model_spec,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+
+    TorchTitanSGLangModelFromSpec.__name__ = SGLANG_MODEL_NAME
+    TorchTitanSGLangModelFromSpec.__qualname__ = SGLANG_MODEL_NAME
+
+    # SGLang's ``ModelRegistry.register()`` takes a package name and
+    # scans it for model classes. To register a single dynamically-
+    # built class, mutate the underlying ``models`` dict directly.
+    # (The registry instance itself is exposed as a module-level
+    # singleton in ``sglang.srt.models.registry``.)
+    from sglang.srt.models.registry import ModelRegistry as _SGLangModelRegistry
+    _SGLangModelRegistry.models[SGLANG_MODEL_NAME] = TorchTitanSGLangModelFromSpec
+
+    logger.info(
+        f"Registered {SGLANG_MODEL_NAME} with SGLang "
         f"(model={model_spec.name}, flavor={model_spec.flavor})"
     )

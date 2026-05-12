@@ -10,13 +10,37 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._attention import (
-    _context_parallel_shard,
-    _ContextParallel,
-    _enable_context_parallel_dispatcher,
-    _HeadTailLoadBalancer,
-    _PTRRLoadBalancer,
-)
+try:
+    from torch.distributed.tensor.experimental._attention import (
+        _context_parallel_shard,
+        _ContextParallel,
+        _enable_context_parallel_dispatcher,
+        _HeadTailLoadBalancer,
+        _PTRRLoadBalancer,
+    )
+except ImportError:
+    # PyTorch 2.9 stable doesn't expose these private CP APIs (renamed or
+    # added in nightly). On configs with CP=1 (which is our case for the
+    # 8x RTX 5090 box) ``apply_cp_to_attention_module`` is never called,
+    # so we stub them. If the runtime path actually invokes these, raise
+    # at call time rather than import time.
+    def _context_parallel_shard(*a, **k):
+        raise NotImplementedError("CP not supported on this torch build")
+
+    class _ContextParallel:
+        def __init__(self, *a, **k):
+            raise NotImplementedError("CP not supported on this torch build")
+
+    def _enable_context_parallel_dispatcher(*a, **k):
+        raise NotImplementedError("CP not supported on this torch build")
+
+    class _HeadTailLoadBalancer:
+        def __init__(self, *a, **k):
+            raise NotImplementedError("CP not supported on this torch build")
+
+    class _PTRRLoadBalancer:
+        def __init__(self, *a, **k):
+            raise NotImplementedError("CP not supported on this torch build")
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.attention.flex_attention import BlockMask
 

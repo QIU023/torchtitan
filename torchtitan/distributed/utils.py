@@ -396,12 +396,17 @@ def init_distributed(
         dist_config.use_torchcomms = True
         device_id = torch.device(device_type, int(os.environ["LOCAL_RANK"]))
 
-    torch.distributed.init_process_group(
+    # torch 2.9 stable doesn't accept ``_ranks`` (nightly-only); pass it
+    # only when the runtime supports it.
+    init_kwargs = dict(
         backend=_get_distributed_backend(enable_cpu_backend),
         timeout=timedelta(seconds=comm_config.init_timeout_seconds),
-        _ranks=ranks if ranks is not None else [],
         device_id=device_id,
     )
+    import inspect
+    if "_ranks" in inspect.signature(torch.distributed.init_process_group).parameters:
+        init_kwargs["_ranks"] = ranks if ranks is not None else []
+    torch.distributed.init_process_group(**init_kwargs)
 
     return torch.distributed.get_world_size()
 

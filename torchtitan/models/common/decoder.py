@@ -126,7 +126,13 @@ class Decoder(BaseModel):
         tokens: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        return_outputs: bool = False,
     ):
+        # ``return_outputs`` is passed by newer torchtitan trainer
+        # (post-2026-04 trunk) for SAC memory-budget instrumentation.
+        # Accept and ignore: this Decoder doesn't expose intermediate
+        # activations through this hook.
+        del return_outputs  # noqa: F841
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
