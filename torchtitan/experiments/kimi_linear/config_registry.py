@@ -588,6 +588,155 @@ def kimi_linear_48b_full_attn_res() -> Trainer.Config:
     return _flavor_trainer_config("48b", "full_attn_res")
 
 
+# ----- 48B downscale variants (single-node feasibility sweep) ------------ #
+# Paper 48B (256 experts × dim=2304) doesn't fit 8×32 GiB. These variants
+# reduce num_experts (and optionally dim) while keeping n_layers=27 and
+# N=9 (paper sweet spot, 3 t-blocks per AttnRes-block). Used to find the
+# largest single-node-feasible carrier with paper-aligned architecture.
+
+
+def _kimi_linear_48b_attnres_downscale(
+    *,
+    num_experts: int,
+    dim: int | None = None,
+    n_layers: int | None = None,
+    num_blocks: int | None = None,
+) -> Trainer.Config:
+    """48B Block AttnRes with overridden num_experts (and optionally dim,
+    n_layers, num_blocks).
+
+    Defaults: n_layers=27, num_blocks=9 (paper sweet spot 3 t-blocks per
+    AttnRes-block), seq_len=4096 (paper). Pass n_layers / num_blocks to
+    deviate (e.g. n_layers=24, num_blocks=8 keeps the paper 3:1 ratio
+    while making the depth divisible by PP=8 × VP=3 = 24 chunks).
+    """
+    from torchtitan.experiments.kimi_linear import (
+        parallelize_kimi_linear, KimiLinearSpec,
+    )
+    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+    from torchtitan.components.loss import build_cross_entropy_loss
+    from torchtitan.protocols.model_spec import ModelSpec
+
+    kwargs = {"num_experts": num_experts}
+    kcfg = build_kimi_linear_config("48b", **kwargs)
+    if dim is not None:
+        kcfg.hidden_size = dim
+        H = kcfg.num_attention_heads
+        head_dim_aligned = max(32, (dim // H) & ~15)
+        kcfg.qk_nope_head_dim = head_dim_aligned
+        kcfg.qk_rope_head_dim = max(16, head_dim_aligned // 2)
+        kcfg.v_head_dim = head_dim_aligned
+        kcfg.kda_head_dim = head_dim_aligned
+        kcfg.kv_lora_rank = (dim // 2) & ~63
+        # Paper 48B dense FFN intermediate (layer 0 only) = 4 × dim.
+        kcfg.intermediate_size = 4 * dim
+    if n_layers is not None:
+        kcfg.num_hidden_layers = n_layers
+        # Re-derive KDA/MLA pattern with 3:1 ratio.
+        kda_layers, full_attn_layers = _alternating_kda_mla_layers(
+            n_layers, kda_mla_ratio=3,
+        )
+        kcfg.kda_layers = kda_layers
+        kcfg.full_attn_layers = full_attn_layers
+
+    final_num_blocks = num_blocks if num_blocks is not None else 9
+    if n_layers is not None and n_layers % final_num_blocks != 0:
+        raise ValueError(
+            f"num_blocks={final_num_blocks} must divide n_layers={n_layers}"
+        )
+    spec_config = KimiLinearSpec(kimi_config=kcfg, num_blocks=final_num_blocks)
+    cfg = _base_trainer_config("48b")
+    cfg.training.seq_len = 4096
+    cfg.training.local_batch_size = 1  # single-node aggressive
+    flavor_name = f"kimi_linear_48b_attnres_e{num_experts}"
+    if dim is not None:
+        flavor_name += f"_d{dim}"
+    if n_layers is not None:
+        flavor_name += f"_L{n_layers}"
+    if num_blocks is not None:
+        flavor_name += f"_N{num_blocks}"
+    cfg.model_spec = ModelSpec(
+        name="kimi_linear",
+        flavor=flavor_name,
+        model=spec_config,
+        parallelize_fn=parallelize_kimi_linear,
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        build_loss_fn=build_cross_entropy_loss,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=None,
+    )
+    return cfg
+
+
+def kimi_linear_48b_block_attn_res_e32() -> Trainer.Config:
+    """48B carrier, paper dim=2304, num_experts=32 (vs paper 256).
+    First feasibility step.
+    """
+    return _kimi_linear_48b_attnres_downscale(num_experts=32)
+
+
+def kimi_linear_48b_block_attn_res_e16() -> Trainer.Config:
+    return _kimi_linear_48b_attnres_downscale(num_experts=16)
+
+
+def kimi_linear_48b_block_attn_res_e8() -> Trainer.Config:
+    return _kimi_linear_48b_attnres_downscale(num_experts=8)
+
+
+def kimi_linear_48b_block_attn_res_d1280_e32() -> Trainer.Config:
+    """48B layout (L=27, N=9) at narrower dim=1280, num_experts=32.
+    Fallback if paper-dim variants don't fit.
+    """
+    return _kimi_linear_48b_attnres_downscale(num_experts=32, dim=1280)
+
+
+def kimi_linear_48b_block_attn_res_d1280_e16() -> Trainer.Config:
+    return _kimi_linear_48b_attnres_downscale(num_experts=16, dim=1280)
+
+
+def kimi_linear_48b_block_attn_res_d1024_e32() -> Trainer.Config:
+    return _kimi_linear_48b_attnres_downscale(num_experts=32, dim=1024)
+
+
+def kimi_linear_48b_block_attn_res_d1024_e16() -> Trainer.Config:
+    return _kimi_linear_48b_attnres_downscale(num_experts=16, dim=1024)
+
+
+def kimi_linear_48b_block_attn_res_d1280_e32_L24_N8() -> Trainer.Config:
+    """48B-layout carrier shrunk to L=24 (vs paper 27) so PP=8 × VP=3 = 24
+    chunks divides cleanly. N=8 keeps paper sweet spot 3 transformer-blocks
+    per AttnRes-block (24/8 = 3). dim=1280, num_experts=32. seq=2048.
+    """
+    return _kimi_linear_48b_attnres_downscale(
+        num_experts=32, dim=1280, n_layers=24, num_blocks=8,
+    )
+
+
+def kimi_linear_48b_block_attn_res_d1280_e32_L32_N8() -> Trainer.Config:
+    """48B-layout at L=32 N=8 (4 transformer-blocks per AttnRes-block,
+    1.33× paper sweet spot). Allows PP=8 × VP=4 = 32 chunks × 1 layer.
+    dim=1280, num_experts=32.
+
+    NOTE: OOM at step 2 on 8×32 GiB (rank 7 hit 31.34 GiB after cache
+    accumulation). Use the e16 variant below instead.
+    """
+    return _kimi_linear_48b_attnres_downscale(
+        num_experts=32, dim=1280, n_layers=32, num_blocks=8,
+    )
+
+
+def kimi_linear_48b_block_attn_res_d1280_e16_L32_N8() -> Trainer.Config:
+    """L=32 N=8 carrier with num_experts=16 (vs e32 OOM). Fits PP=8 ×
+    VP=4 = 32 chunks paper-aligned, paper-sweet-spot t-blocks/AttnRes-block
+    ratio off by 1.33×.
+    """
+    return _kimi_linear_48b_attnres_downscale(
+        num_experts=16, dim=1280, n_layers=32, num_blocks=8,
+    )
+
+
 # ----- PP=4 V=2 lps=2 compatibility variant -------------------------------- #
 # Paper's 528M has n_layers=17 (prime), which doesn't divide the 8 virtual
 # stages needed by Interleaved1F1B PP=4 V=2 with lps=2. Drop to n_layers=16

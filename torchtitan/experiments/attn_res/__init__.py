@@ -650,8 +650,31 @@ attn_res_configs = {
     # That's 12 paper-layers per AttnRes-block — 2x paper's sweet spot
     # (3 t-blocks / 6 paper-layers). Tests whether dim=768 can tolerate
     # the deeper intra-block standard residual chain.
+    "175M_attn_res_L24_n2": partial(
+        _175m_attn_res, num_blocks=2, n_layers=24, enable_weight_tying=False
+    ),
+    "175M_attn_res_L24_n3": partial(
+        _175m_attn_res, num_blocks=3, n_layers=24, enable_weight_tying=False
+    ),
     "175M_attn_res_L24_n4": partial(
         _175m_attn_res, num_blocks=4, n_layers=24, enable_weight_tying=False
+    ),
+    "175M_attn_res_L24_n6": partial(
+        _175m_attn_res, num_blocks=6, n_layers=24, enable_weight_tying=False
+    ),
+    # paper sweet spot: 24 / 8 = 3 t-blocks per AttnRes-block (matches
+    # Kimi 48B's 27 / 9 = 3 t-blocks per AttnRes-block).
+    "175M_attn_res_L24_n8": partial(
+        _175m_attn_res, num_blocks=8, n_layers=24, enable_weight_tying=False
+    ),
+    # Same intra-block residual-chain length (2 t-blocks/AttnRes-block)
+    # as proven-stable L16_n8.
+    "175M_attn_res_L24_n12": partial(
+        _175m_attn_res, num_blocks=12, n_layers=24, enable_weight_tying=False
+    ),
+    # Full AttnRes (N = n_layers).
+    "175M_attn_res_L24_n24": partial(
+        _175m_attn_res, num_blocks=24, n_layers=24, enable_weight_tying=False
     ),
     # Widen-dim sweep at L=32 N=8 Block AttnRes (4 t-blocks/AttnRes-block,
     # paper sweet spot × 1.33). Goal: find smallest dim where the

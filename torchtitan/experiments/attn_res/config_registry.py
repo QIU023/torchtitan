@@ -388,19 +388,49 @@ def llama3_175m_attn_res_L16_n16() -> Trainer.Config:
     return _llama3_175m_attn_res_variant("175M_attn_res_L16_n16")
 
 
+def llama3_175m_attn_res_L24_n2() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("175M_attn_res_L24_n2")
+
+
+def llama3_175m_attn_res_L24_n3() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("175M_attn_res_L24_n3")
+
+
 def llama3_175m_attn_res_L24_n4() -> Trainer.Config:
     """L=24 Block AttnRes with N=4 (6 transformer-blocks per AttnRes-block).
 
-    Scale-up step between the stable L16_n8 (2 t-blocks/AttnRes-block)
-    and PP=8 × VP=4-requiring depths (L≥32). At L=24 we can run
-    PP=8 × VP=3 = 24 chunks, 1 layer/chunk. dim stays at 768.
-
-    Note: 6 t-blocks per AttnRes-block is 2× paper's sweet spot (3
-    t-blocks / 6 paper-layers per AttnRes-block at Kimi 48B's N=9
-    over 27 t-blocks). The 6-layer intra-block standard residual chain
-    is unstable at dim=768 (smoked 2026-05-12: inf-grad from step 1).
+    First L=24 variant tested. dim=768 smoke 50 steps showed inf-grad
+    from step 1 (intra-block residual chain S=6 too deep). Sweep at L=24
+    N ∈ {2,3,4,6,8,12,24} explores the stability threshold against
+    block-size S = L/N — see phase3/PRESSURE_TEST_REPORT_2026-05-12.md.
     """
     return _llama3_175m_attn_res_variant("175M_attn_res_L24_n4")
+
+
+def llama3_175m_attn_res_L24_n6() -> Trainer.Config:
+    return _llama3_175m_attn_res_variant("175M_attn_res_L24_n6")
+
+
+def llama3_175m_attn_res_L24_n8() -> Trainer.Config:
+    """L=24 N=8: 3 transformer-blocks per AttnRes-block — paper sweet
+    spot (matches Kimi 48B's 27/9 = 3 t-blocks/AttnRes-block ratio).
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L24_n8")
+
+
+def llama3_175m_attn_res_L24_n12() -> Trainer.Config:
+    """L=24 N=12: 2 transformer-blocks per AttnRes-block — same ratio
+    as proven-stable L16_n8.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L24_n12")
+
+
+def llama3_175m_attn_res_L24_n24() -> Trainer.Config:
+    """L=24 Full AttnRes (N = n_layers, 1 t-block per AttnRes-block).
+    Stability upper bound: every layer's residual is a bounded softmax
+    mean over preceding sources.
+    """
+    return _llama3_175m_attn_res_variant("175M_attn_res_L24_n24")
 
 
 # Widen-dim carriers for L=32 N=8 Block AttnRes — finding the dim
