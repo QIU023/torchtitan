@@ -555,6 +555,50 @@ def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
+    """447M Block AttnRes with FP8 rowwise training.
+
+    Wraps :func:`kimi_linear_447m_aligned_block_attn_res_n4` and adds a
+    Float8LinearConverter with the ``rowwise_with_gw_hp`` recipe (weights
+    + activations in FP8, grad-output stays high-precision). KDA-specific
+    low-dim projections (``kda.*``), MLA LoRA projections, and the
+    vocab/router heads are excluded via ``filter_fqns`` — those layers
+    have either non-16-aligned shapes or numerical sensitivity that
+    regresses under rowwise FP8.
+
+    MoE experts (grouped_mm) stay bf16 — Float8GroupedMMConverter is a
+    perf-prototype upstream and not in the dispatch path here.
+
+    Expected speedup on RTX 5090 (SM 12.0): 1.3-1.5× over bf16 for the
+    dense MLA / projector / output paths; smaller win at the model level
+    because KDA Triton + MoE grouped_mm dominate the per-step compute.
+    """
+    from torchtitan.components.quantization.float8 import (
+        Float8LinearConverter,
+    )
+    from torchtitan.protocols.model_converter import (
+        ModelConvertersContainer,
+    )
+
+    cfg = kimi_linear_447m_aligned_block_attn_res_n4()
+    cfg.model_converters = ModelConvertersContainer.Config(
+        converters=[
+            Float8LinearConverter.Config(
+                recipe_name="rowwise",
+                filter_fqns=[
+                    "output",
+                    "lm_head",
+                    "router.gate",
+                    "kda",
+                    "mla.q_lora_proj",
+                    "mla.k_lora_proj",
+                ],
+            ),
+        ],
+    )
+    return cfg
+
+
 def kimi_linear_528m_baseline() -> Trainer.Config:
     return _flavor_trainer_config("528m", "baseline")
 
