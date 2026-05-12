@@ -44,6 +44,30 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.tensor import DTensor
 
+from torchtitan.models.common.linear import Linear as _TTLinear
+
+
+class Linear(_TTLinear):
+    """Module-protocol-compliant Linear with ``nn.Linear``-style constructor.
+
+    Inherits from ``torchtitan.models.common.linear.Linear`` (= ``nn.Linear
+    + Module``) so instances satisfy
+    ``Float8LinearConverter.verify_module_protocol`` (see
+    torchtitan/components/quantization/float8.py:185, which checks for
+    exactly that ``Linear`` class). Overrides ``__init__`` to accept
+    ``nn.Linear``-style positional args instead of the parent's
+    ``Config``-based constructor, avoiding a global rewrite of all 18
+    call sites in this experiment.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+    ) -> None:
+        nn.Linear.__init__(self, in_features, out_features, bias=bias)
+
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
@@ -176,9 +200,9 @@ class KimiMLP(nn.Module):
         hidden_act: Literal["silu", "gelu"] = "silu",
     ) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
         if hidden_act == "silu":
             self.act_fn = F.silu
         elif hidden_act == "gelu":
@@ -264,21 +288,21 @@ class KimiMLAAttention(nn.Module):
             "config). RoPE-on-MLA is not ported."
         )
 
-        self.q_proj = nn.Linear(
+        self.q_proj = Linear(
             self.hidden_size, self.num_heads * self.q_head_dim, bias=False
         )
-        self.kv_a_proj_with_mqa = nn.Linear(
+        self.kv_a_proj_with_mqa = Linear(
             self.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = nn.Linear(
+        self.kv_b_proj = Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
-        self.o_proj = nn.Linear(
+        self.o_proj = Linear(
             self.num_heads * self.v_head_dim, self.hidden_size, bias=False
         )
 
@@ -413,9 +437,9 @@ class KimiDeltaAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         projection_k_size = projection_size  # k heads == v heads for Kimi
 
-        self.q_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        self.q_proj = Linear(self.hidden_size, projection_k_size, bias=False)
+        self.k_proj = Linear(self.hidden_size, projection_k_size, bias=False)
+        self.v_proj = Linear(self.hidden_size, projection_size, bias=False)
 
         # Short causal convolutions with silu activation on q/k/v
         self.q_conv1d = ShortConvolution(
@@ -451,19 +475,19 @@ class KimiDeltaAttention(nn.Module):
         )
 
         # Low-rank forget-gate and output-gate projections
-        self.f_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.f_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
-        self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
+        self.f_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
+        self.f_b_proj = Linear(self.head_dim, projection_size, bias=False)
+        self.g_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
+        self.g_b_proj = Linear(self.head_dim, projection_size, bias=False)
 
         # Beta: per-head, per-token scalar (delta-rule learning rate)
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+        self.b_proj = Linear(self.hidden_size, self.num_heads, bias=False)
 
         # Output RMSNorm with sigmoid-gated modulation from g, then o_proj
         self.o_norm = FusedRMSNormGated(
             self.head_dim, eps=config.rms_norm_eps, activation="sigmoid",
         )
-        self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+        self.o_proj = Linear(projection_size, self.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward without KV cache, fixed seq_len.
@@ -777,7 +801,7 @@ class KimiLinearModel(nn.Module):
              for i in range(config.num_hidden_layers)}
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(
+        self.lm_head = Linear(
             config.hidden_size, config.vocab_size, bias=False
         )
 

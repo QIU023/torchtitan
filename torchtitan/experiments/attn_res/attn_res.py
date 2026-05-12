@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
 
+from torchtitan.models.common.linear import Linear as _TTLinear
 from torchtitan.protocols.module import Module
 
 
@@ -84,12 +85,19 @@ def block_attn_res(
     return h
 
 
-class AttnResProjection(nn.Linear, Module):
+class AttnResProjection(_TTLinear):
     """Pseudo-query projection for AttnRes (D -> 1, no bias).
 
-    Thin Linear subclass that plugs into torchtitan's Module protocol.
-    Its weight IS the per-layer pseudo-query vector ``w_l`` from the paper.
+    Inherits from ``torchtitan.models.common.linear.Linear`` (which is
+    ``nn.Linear + Module``) so instances satisfy
+    ``Float8LinearConverter.verify_module_protocol``. The weight IS the
+    per-layer pseudo-query vector ``w_l`` from the paper.
     ``param_init`` must zero-initialize the weight for training stability.
+
+    NOTE: filter via ``filter_fqns`` to keep AttnRes pseudo-queries in
+    high precision — the zero-init carrier story relies on small
+    deltas accumulating, which rowwise FP8 quantization noise would
+    destroy.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -97,7 +105,7 @@ class AttnResProjection(nn.Linear, Module):
         dim: int
 
     def __init__(self, config: Config):
-        super().__init__(config.dim, 1, bias=False)
+        nn.Linear.__init__(self, config.dim, 1, bias=False)
 
 
 def stack_blocks(blocks: list[torch.Tensor]) -> torch.Tensor:

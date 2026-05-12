@@ -59,6 +59,7 @@ from torchtitan.experiments.kimi_linear.model import (
     KimiDecoderLayer,
     KimiLinearConfig,
     KimiLinearModel,
+    Linear,
 )
 
 
@@ -198,7 +199,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
             {str(i): KimiAttnResDecoderLayer(config, i) for i in range(n_layers)}
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(
+        self.lm_head = Linear(
             config.hidden_size, config.vocab_size, bias=False
         )
 
