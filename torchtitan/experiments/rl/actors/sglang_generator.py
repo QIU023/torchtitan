@@ -490,11 +490,11 @@ class SGLangGenerator(Actor, Configurable):
             # the trainer's because both register via the same
             # ModelSpec).
             engine_sd = self._engine_state_dict()
+            # NOTE: vendored torchstore 0.1.2 — drop direct_rdma kwarg.
             await ts.get_state_dict(
                 "model_state_dict",
                 user_state_dict=engine_sd,
                 strict=False,
-                direct_rdma=is_rdma_available(),
             )
         elif cfg.weight_sync_method == "disk":
             # Trainer is expected to have dumped HF safetensors at

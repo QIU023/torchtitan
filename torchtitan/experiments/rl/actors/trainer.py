@@ -428,13 +428,12 @@ class PolicyTrainer(Actor, Configurable):
         means "skip StorageVolumes and let the destination read directly
         from the source's GPU memory".
         """
-        from monarch.rdma import is_rdma_available
-
+        # NOTE: pinned to vendored torchstore 0.1.2 API (state_dict, key,
+        # store_name). direct_rdma / transfer_dtype kwargs existed only in
+        # newer torchstore (not on PyPI as of 2026-05-12).
         await ts.put_state_dict(
             self.model.state_dict(),
             "model_state_dict",
-            direct_rdma=is_rdma_available(),
-            transfer_dtype=self._transfer_dtype,
         )
 
     @endpoint
