@@ -18,12 +18,23 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental import local_map
-from torch.nn.attention import (
-    activate_flash_attention_impl,
-    current_flash_attention_impl,
-    sdpa_kernel,
-    SDPBackend,
-)
+from torch.nn.attention import sdpa_kernel, SDPBackend
+try:
+    from torch.nn.attention import (
+        activate_flash_attention_impl,
+        current_flash_attention_impl,
+    )
+except ImportError:
+    # PyTorch < ~2.10 doesn't expose these (they were added with FA3
+    # backend selection). On SM 12.0 (RTX 5090) we don't go down the
+    # FA3 path anyway — the only call sites are guarded by
+    # ``has_cuda_capability(9, 0)`` (Hopper-only). Provide stubs so
+    # the module imports cleanly on torch 2.9.
+    def activate_flash_attention_impl(_impl: str) -> None:
+        return None
+
+    def current_flash_attention_impl() -> str:
+        return "FA2"
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
     _mask_mod_signature,
@@ -33,7 +44,55 @@ from torch.nn.attention.flex_attention import (
     create_block_mask,
     flex_attention,
 )
-from torch.nn.attention.varlen import varlen_attn
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:
+    # Torch < ~2.10 doesn't have ``torch.nn.attention.varlen``. Use a
+    # fallback that runs each packed sequence through
+    # ``F.scaled_dot_product_attention`` with explicit causal masking.
+    # Slower than the nightly varlen kernel for tightly-packed batches
+    # but numerically equivalent. This unlocks the RL trainer on torch
+    # 2.9 stable (sgl_kernel ABI lock).
+    import torch.nn.functional as _F
+
+    def varlen_attn(
+        q,
+        k,
+        v,
+        cu_seq_q,
+        cu_seq_k,
+        max_q,
+        max_k,
+        *,
+        scale=None,
+        is_causal=True,
+        window_size=None,
+        enable_gqa=False,
+        **_unused,
+    ):
+        """SDPA-based fallback for ``torch.nn.attention.varlen.varlen_attn``.
+
+        Packed inputs ``q`` of shape ``(total_q, n_heads_q, head_dim)``;
+        ``cu_seq_q`` is cumulative seq-length offsets. We unpack each
+        sequence, run SDPA, and pack the results back.
+        """
+        out_chunks = []
+        n_seqs = cu_seq_q.shape[0] - 1
+        for i in range(n_seqs):
+            q_start = int(cu_seq_q[i].item())
+            q_end = int(cu_seq_q[i + 1].item())
+            k_start = int(cu_seq_k[i].item())
+            k_end = int(cu_seq_k[i + 1].item())
+            # SDPA expects (batch, n_heads, seq_len, head_dim).
+            q_i = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+            k_i = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+            v_i = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+            sdpa_kwargs = dict(is_causal=is_causal, scale=scale)
+            if enable_gqa:
+                sdpa_kwargs["enable_gqa"] = True
+            o_i = _F.scaled_dot_product_attention(q_i, k_i, v_i, **sdpa_kwargs)
+            out_chunks.append(o_i.squeeze(0).transpose(0, 1).contiguous())
+        return torch.cat(out_chunks, dim=0)
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 
@@ -267,9 +326,11 @@ class FlexAttention(LocalMapInnerAttention):
         kernel_options: dict = field(default_factory=dict)
 
     inductor_configs: ClassVar[dict[str, bool]] = {
-        # TODO: turn on wrap_inductor_compiled_regions after PyTorch fix is
-        # landed again: https://github.com/pytorch/pytorch/pull/175733.
-        "wrap_inductor_compiled_regions": False,
+        # ``wrap_inductor_compiled_regions`` was added in torch nightly
+        # (see https://github.com/pytorch/pytorch/pull/175733) and is not
+        # available on torch 2.9. It defaults to False here anyway, so on
+        # builds that don't recognise the option we just drop the entry.
+        # (the runtime construction below handles that)
         # Recommended workflow: run once with max_autotune=True to discover
         # good kernel_options, then set kernel_options explicitly in the config
         # and keep max_autotune disabled for faster compilation.

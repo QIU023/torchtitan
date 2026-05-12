@@ -134,20 +134,27 @@ class ParallelDims:
         ):
             """Unflatten the world mesh to create the required mesh dimensions.
 
-            Uses fake backend for dimensions with degree 1 or for 'batch' dimension
-            to avoid unnecessary process group creation.
+            torch 2.9 stable doesn't have ``DeviceMesh._unflatten``; fall back
+            to the standard ``init_device_mesh`` which produces an
+            equivalent multi-dim mesh from the same world ranks. We lose
+            the ``backend_override={"name": "fake"}`` optimisation (which
+            skips PG creation for degree-1 dims) — slight startup overhead,
+            no semantic change.
             """
-            backend_override = {}
-            for name, degree in zip(dim_names, dim_degrees, strict=True):
-                if not self._mesh_exist(name, degree):
-                    backend_override[name] = "fake"
-
-            return world_mesh._unflatten(
-                0,
-                dim_degrees,
-                dim_names,
-                # pyrefly: ignore [bad-argument-type]
-                backend_override=backend_override,
+            if hasattr(world_mesh, "_unflatten"):
+                backend_override = {}
+                for name, degree in zip(dim_names, dim_degrees, strict=True):
+                    if not self._mesh_exist(name, degree):
+                        backend_override[name] = "fake"
+                return world_mesh._unflatten(
+                    0,
+                    dim_degrees,
+                    dim_names,
+                    backend_override=backend_override,
+                )
+            # Fallback: re-init the mesh in the desired shape.
+            return init_device_mesh(
+                device_type, dim_degrees, mesh_dim_names=dim_names,
             )
 
         logger.info(
