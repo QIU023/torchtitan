@@ -87,6 +87,19 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     # matching the original 436M row's compute budget.
     # Re-uses 436M's lr / batch_size / token_count from the same row.
     _SweepSize("447m_aligned", 447, 87.9, 16, 16, 1024, 768, 2.20e-3, 384),
+    # Full Kimi Linear 48B-A3B target. From paper §"Training recipe":
+    # "27 Transformer blocks (54 layers)" with Block AttnRes N=9
+    # (6 paper-layers per AttnRes-block = 3 transformer-blocks per
+    # AttnRes-block). d_ff here is the MoE-per-expert intermediate
+    # size (1024 in HF config); the dense FFN at layer 0 uses
+    # intermediate_size=9216 (set in build_kimi_linear_48b_a3b_config
+    # via the override path, not from this row).
+    # NOTE: 48B requires multi-node; this row exists for carrier
+    # construction + config-correctness checks, not single-node training.
+    # tokens/lr/batch from paper §Training recipe (1T pretrain +
+    # 400B mid-train; "global batch size of 8M tokens" → 8M/4096
+    # context = 1953 seqs ≈ 2048).
+    _SweepSize("48b", 3000, 1400.0, 27, 32, 2304, 1024, 1.0e-3, 2048),
 )
 
 _BY_NAME: dict[str, _SweepSize] = {s.name: s for s in SCALING_LAW_TABLE}
@@ -124,27 +137,35 @@ def _alternating_kda_mla_layers(
 def build_kimi_linear_config(
     size: str,
     *,
-    num_experts: int = 32,
+    num_experts: int | None = None,
     vocab_size: int = 163840,
-    tie_word_embeddings: bool = True,
+    tie_word_embeddings: bool | None = None,
     kda_mla_ratio: int = 3,
     rope_theta: float = 10000.0,
     rms_norm_eps: float = 1e-5,
+    dense_intermediate_size: int | None = None,
+    use_grouped_topk: bool | None = None,
 ) -> KimiLinearConfig:
     """Construct a :class:`KimiLinearConfig` for one scaling-law size.
 
     Args:
-        size: One of ``{"194m","241m","296m","436m","528m"}``.
-        num_experts: Total MoE experts (token-choice top-k). Default 32 is
-            a tractable choice for scaling-law experiments; 48B-A3B uses 256.
+        size: One of ``{"194m","241m","296m","436m","528m","48b"}``.
+        num_experts: Total MoE experts (token-choice top-k). Default 32
+            for scaling-law sizes; 256 for the full 48B-A3B target.
         vocab_size: Token vocabulary. Default 163840 (Kimi tokenizer).
         tie_word_embeddings: Tie input/output embedding. Default True
-            for scaling-law (smaller model, more param-efficient); 48B-A3B
-            uses False.
+            for scaling-law (smaller model, more param-efficient); False
+            for 48B-A3B (matches HF config.json).
         kda_mla_ratio: KDA:MLA layer ratio. Default 3 matches paper + 48B.
         rope_theta: RoPE base (unused when ``mla_use_nope=True``, which is
             the Kimi default).
         rms_norm_eps: RMSNorm epsilon.
+        dense_intermediate_size: Dense FFN intermediate size used by
+            layer 0 only (when ``first_k_dense_replace=1``). Defaults to
+            ``spec.d_ff`` (= MoE per-expert intermediate). 48B-A3B
+            overrides: dense=9216 while moe-per-expert=1024.
+        use_grouped_topk: MoE router grouped-topk gate. Default False
+            (simplified); 48B-A3B uses True (matches HF config.json).
     """
     if size not in _BY_NAME:
         raise ValueError(
@@ -154,6 +175,27 @@ def build_kimi_linear_config(
     d = spec.d_model
     H = spec.num_heads
 
+    # Size-specific defaults that differ between scaling-law sweep and
+    # full 48B-A3B. Each is overridable from the kwargs above.
+    if size == "48b":
+        num_experts_default = 256
+        tie_default = False
+        dense_d_ff_default = 9216  # HF config.json:intermediate_size
+        use_grouped_topk_default = True  # HF config.json
+    else:
+        num_experts_default = 32
+        tie_default = True
+        dense_d_ff_default = spec.d_ff
+        use_grouped_topk_default = False
+    if num_experts is None:
+        num_experts = num_experts_default
+    if tie_word_embeddings is None:
+        tie_word_embeddings = tie_default
+    if dense_intermediate_size is None:
+        dense_intermediate_size = dense_d_ff_default
+    if use_grouped_topk is None:
+        use_grouped_topk = use_grouped_topk_default
+
     # Head dims — scaled to fit d_model/H, following 48B-A3B where
     # num_heads * head_dim = hidden_size (Kimi has no d_head < hidden/head_count).
     # For KDA: head_dim = d_model / num_heads (round to pow-2 via max(32, ...))
@@ -161,7 +203,14 @@ def build_kimi_linear_config(
     # qk_nope=128, qk_rope=64, v_head=128 at d=2304, num_heads=32, so each
     # head takes 128 (nope) + 64 (rope, broadcast) + 128 (v) units. We keep
     # qk_rope proportional to d/num_heads * 0.5 (half of nope).
-    if size.endswith("_aligned"):
+    if size == "48b":
+        # Match HF config.json/moonshotai/Kimi-Linear-48B-A3B-Base verbatim.
+        head_dim_mla_nope = 128
+        head_dim_mla_rope = 64
+        head_dim_mla_v = 128
+        kda_head_dim = 128
+        kv_lora_rank = 512
+    elif size.endswith("_aligned"):
         # Phase 11: SGLang flashinfer / cuBLAS / triton extend kernels on
         # SM 12.0 (RTX 5090) require head_dim multiple of 8 (16 preferred
         # so qk_rope = head_dim/2 is also 8-aligned). Round head_dim down
@@ -178,9 +227,18 @@ def build_kimi_linear_config(
         kda_head_dim = head_dim_mla_nope
         kv_lora_rank = d // 2  # scale with model; 48B uses 512 at d=2304 ≈ d/4.5
 
-    kda_layers, full_attn_layers = _alternating_kda_mla_layers(
-        spec.n_layers, kda_mla_ratio=kda_mla_ratio
-    )
+    if size == "48b":
+        # HF config.json has 7 MLA layers (full_attn) at indices 4,8,12,16,
+        # 20,24,27 (1-indexed) and 20 KDA layers everywhere else. The pattern
+        # is "every 4th layer is MLA, plus the last layer 27". Hand-emit this
+        # exact split instead of going through _alternating_kda_mla_layers
+        # (which would miss layer 27 because 27 % 4 != 0).
+        full_attn_layers = [4, 8, 12, 16, 20, 24, 27]
+        kda_layers = [i for i in range(1, spec.n_layers + 1) if i not in full_attn_layers]
+    else:
+        kda_layers, full_attn_layers = _alternating_kda_mla_layers(
+            spec.n_layers, kda_mla_ratio=kda_mla_ratio
+        )
 
     return KimiLinearConfig(
         # Vocabulary / embedding
@@ -189,7 +247,7 @@ def build_kimi_linear_config(
         tie_word_embeddings=tie_word_embeddings,
         # Depth / width
         num_hidden_layers=spec.n_layers,
-        intermediate_size=spec.d_ff,  # dense MLP intermediate (layer 0 only)
+        intermediate_size=dense_intermediate_size,  # dense FFN (layer 0)
         # MLA
         num_attention_heads=H,
         num_key_value_heads=H,  # no GQA
@@ -216,7 +274,7 @@ def build_kimi_linear_config(
         routed_scaling_factor=2.446,
         first_k_dense_replace=1,
         moe_layer_freq=1,
-        use_grouped_topk=False,  # simplified; 48B uses True
+        use_grouped_topk=use_grouped_topk,
         num_expert_group=1,
         topk_group=1,
         # Norm / init
@@ -330,7 +388,7 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
         checkpoint=CheckpointManager.Config(
             enable=True,
             interval=1000,
-            keep_latest_k=3,
+            keep_latest_k=2,  # disk-discipline: at most 2x model size
             last_save_model_only=False,
         ),
         # AC off — kimi_linear/parallelize.py Phase 4c doesn't implement it.
@@ -507,6 +565,27 @@ def kimi_linear_528m_block_attn_res() -> Trainer.Config:
 
 def kimi_linear_528m_full_attn_res() -> Trainer.Config:
     return _flavor_trainer_config("528m", "full_attn_res")
+
+
+# ----- Full Kimi Linear 48B-A3B carriers ---------------------------------- #
+# Paper §"Training recipe": 27 transformer-blocks = 54 paper-layers,
+# Block AttnRes N=9 (= 6 paper-layers per AttnRes-block = 3
+# transformer-blocks per AttnRes-block). 48B total / 3B activated.
+# Construction-only: requires multi-node + EP to actually train.
+# Single-node use case is meta-device build / param-count sanity / PP
+# layout planning, NOT actual gradient steps.
+
+
+def kimi_linear_48b_baseline() -> Trainer.Config:
+    return _flavor_trainer_config("48b", "baseline")
+
+
+def kimi_linear_48b_block_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("48b", "block_attn_res")
+
+
+def kimi_linear_48b_full_attn_res() -> Trainer.Config:
+    return _flavor_trainer_config("48b", "full_attn_res")
 
 
 # ----- PP=4 V=2 lps=2 compatibility variant -------------------------------- #
