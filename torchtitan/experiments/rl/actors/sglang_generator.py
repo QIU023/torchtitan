@@ -113,6 +113,20 @@ class SGLangBackendConfig:
     attention_backend: str = "flashinfer"
     linear_attn_backend: str = "triton"
 
+    decode_attention_backend: str | None = None
+    """Optional separate attention backend for the decode phase.
+
+    Defaults to ``None`` (decode reuses ``attention_backend``). Set to
+    ``"torch_native"`` for the Block AttnRes overlay on Blackwell
+    (SM 12.0): flashinfer_mla's bf16 internals NaN on the deep AttnRes
+    MLA layers at decode because the AttnRes residual stream grows
+    unboundedly with depth (see phase11/VISION_INJECTION_BUG_RCA.md).
+    The ``ATTNRES_MLA_FP32_FALLBACK=1`` env knob only covers the
+    prefill path; eager-SDPA decode keeps the decode-mode MLA finite.
+    ``torch_native`` has no CUDA-graph support, so pair it with
+    ``compile.cuda_graph = False``.
+    """
+
 
 class SGLangGenerator(Actor, Configurable):
     """RLHF rollout generator backed by SGLang's inference engine.
@@ -266,6 +280,11 @@ class SGLangGenerator(Actor, Configurable):
             attention_backend=config.backend.attention_backend,
             linear_attn_backend=config.backend.linear_attn_backend,
             disable_cuda_graph=not config.compile.cuda_graph,
+            **(
+                {"decode_attention_backend": config.backend.decode_attention_backend}
+                if config.backend.decode_attention_backend is not None
+                else {}
+            ),
             disable_piecewise_cuda_graph=not config.compile.piecewise_cuda_graph,
             log_level="error",
             # base_gpu_id is in the post-CVD logical device space; 0
