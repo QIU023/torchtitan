@@ -6,19 +6,34 @@
 
 """Parallelism application for Kimi Linear models.
 
-Phase 4c scope: FSDP2 full-shard only (no TP, no CP, no PP, no AC,
-no compile). Targets single-node training where PP is an anti-pattern
-(NVLink-class interconnects make FSDP the throughput winner — see
-``phase4/launch_fsdp_small.sh`` header).
+Supported parallelism dimensions (as of Phase 6):
 
-Adapted from ``torchtitan.models.llama3.parallelize.apply_fsdp`` to
-Kimi's module names (``embed_tokens``, ``norm``, ``lm_head``,
-``layers`` as ``nn.ModuleList``). The FSDP2 API itself (``fully_shard``
-+ ``MixedPrecisionPolicy``) is identical; only the module-layout
-traversal differs.
+* **FSDP2 full-shard** — primary path, modeled on
+  ``torchtitan.models.llama3.parallelize.apply_fsdp``. Adapted to Kimi's
+  module names (``embed_tokens``, ``norm``, ``lm_head``, ``layers`` as
+  ``nn.ModuleList``).
+* **TP** (Phase 6 A3) — DSv3-style plan in ``apply_tp_kimi_linear``,
+  matched to Kimi's MLA + KDA + MoE layout. All boundary tensors
+  use_local_output so PP send/recv, AttnRes stacking, and fla-core
+  triton kernels see plain tensors.
+* **EP** (Phase 6 A6) — Expert Parallel for KimiMoE via
+  ``apply_ep_kimi_linear``; all-to-all dispatch/combine on the EP mesh.
+* **PP** — via the Phase 3 cache adapter in ``pipeline_adapter.py``;
+  PP rank assignment is in torchtitan core, scheduling in the
+  ``pipeline_kimi_linear_with_cache_adapter`` wrapper.
+* **torch.compile** (Phase 4 onwards) — per-decoder-layer compile via
+  ``_apply_compile_kimi_linear``; MoE for-loop and fla-core triton ops
+  are carved out.
+* **Activation checkpointing** — applied via shared
+  ``torchtitan.distributed.activation_checkpoint.apply_ac`` since the
+  Kimi decoder layer registry matches the llama3 ``model.layers``
+  iteration pattern. Honors all upstream modes (``selective``,
+  ``full``, ``memory_budget``, ``none``).
 
-Phase 4d / later may add TP or AC once the decoder layer's sub-module
-names are stable and sharded.
+**Not supported**:
+
+* **CP** — blocked on fla-core's ``chunk_kda`` triton kernel lacking
+  ring-recurrence over CP shards; see comment near the CP guard below.
 """
 
 from __future__ import annotations
@@ -49,6 +64,7 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
@@ -65,12 +81,15 @@ def parallelize_kimi_linear(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ) -> nn.Module:
-    """Apply FSDP2 to a Kimi Linear model.
+    """Apply the configured parallelism plan to a Kimi Linear model.
 
-    Only Data Parallel Sharding is wired here. Tensor Parallel,
-    Context Parallel, activation checkpoint, and torch.compile are
-    unsupported in Phase 4c — they'd require per-module layout
-    decisions that this minimal port skips. Raise on unsupported knobs.
+    Wires (in order, before FSDP wrap): TP → CP (raises) → EP → AC →
+    compile → FSDP/HSDP. AC is applied before compile so the compiled
+    subgraph is the checkpointed unit (matches upstream llama3/qwen3
+    ordering).
+
+    CP raises ``NotImplementedError`` — see the inline comment near the
+    CP guard for the fla-core ``chunk_kda`` ring-recurrence blocker.
     """
     # Enable TF32 tensor cores for fp32 matmuls (loss aggregation,
     # optimizer master weight updates, fp32 RoPE etc.). bf16 path is
@@ -156,10 +175,28 @@ def parallelize_kimi_linear(
             "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
             parallel_dims.ep,
         )
-    if ac_config.mode not in ("none", "None", None):
-        logger.warning(
-            "activation_checkpoint.mode=%s ignored — Kimi Linear Phase 4c "
-            "skips AC. Set mode=none to silence this warning.",
+    if ac_config.mode != "none":
+        # Kimi's decoder layers live at ``model.layers`` as ``nn.ModuleList``,
+        # matching llama3's iteration pattern, so the shared apply_ac
+        # implementation works without a per-module specialization.
+        #
+        # Caveat for KDA layers: ``selective`` mode recomputes ops not
+        # marked MUST_SAVE during backward. fla-core's chunk_kda triton
+        # kernel is recomputed (it's not in the SAVE set). This works
+        # but increases the kernel's invocation count by ~2x — if you're
+        # hitting the device-side assert in
+        # ``fla/modules/fused_norm_gate.py`` (KDA crash, see phase5
+        # task #46), AC will trigger it more often. ``full`` mode is
+        # safer if you can spare the extra recompute, since it saves
+        # only the layer-input and recomputes the whole block linearly.
+        apply_ac(
+            model,
+            ac_config,
+            model_compile_enabled=compile_config.enable,
+            base_folder=dump_folder,
+        )
+        logger.info(
+            "Applied activation checkpointing mode=%s to KimiDecoderLayer stack.",
             ac_config.mode,
         )
     # torch.compile applied per-decoder-layer BEFORE FSDP wrap (so each
