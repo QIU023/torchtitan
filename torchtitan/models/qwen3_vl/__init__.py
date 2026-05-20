@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 from collections.abc import Callable
 from functools import partial
 
@@ -27,6 +28,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .model import Qwen3VLModel
 from .parallelize import parallelize_qwen3_vl
 from .parallelize_pp import pipeline_qwen3_vl
+from .qformer_projector import Qwen3VLQFormerProjector
 from .state_dict_adapter import Qwen3VLStateDictAdapter
 from .vision_encoder import Qwen3VLVisionEncoder
 
@@ -34,6 +36,7 @@ __all__ = [
     "parallelize_qwen3_vl",
     "pipeline_qwen3_vl",
     "Qwen3VLModel",
+    "Qwen3VLQFormerProjector",
     "qwen3_vl_configs",
     "QWEN3_VL_SPECIAL_TOKENS",
 ]
@@ -135,6 +138,53 @@ def _vl_vision_encoder_config(
         merger_fc1=_vl_linear(merged_hidden_size, merged_hidden_size),
         merger_fc2=_vl_linear(merged_hidden_size, out_hidden_size),
         param_init=_POS_EMBED_INIT,
+    )
+
+
+_QFORMER_QUERY_INIT = {
+    "queries": partial(nn.init.trunc_normal_, mean=0.0, std=0.02)
+}
+
+
+def _vl_qformer_config(
+    *,
+    in_features: int,
+    lm_dim: int,
+    num_queries: int = 64,
+    num_layers: int = 6,
+    n_heads: int = 16,
+    ffn_mult: int = 4,
+) -> Qwen3VLQFormerProjector.Config:
+    """Build a fully-specified Q-Former projector config.
+
+    Args:
+        in_features: KV input dim. Set to ViT hidden dim (e.g. 1152 for
+            Qwen3-VL-8B) when bypassing the in-encoder spatial merger;
+            set to ``lm_dim`` (e.g. 4096) when consuming post-merger
+            features.
+        lm_dim: LM hidden dim (output dim). 4096 for Qwen3-VL-8B.
+        num_queries: Fixed-length output token count. 64 is the target
+            for TRT-friendly inference; ~26x compression over the stock
+            3-cam x 4-frame visual budget.
+        num_layers: Number of cross-attn + FFN blocks.
+        n_heads: Number of attention heads in cross-attn.
+        ffn_mult: FFN hidden-dim multiplier (FFN hidden = ffn_mult * lm_dim).
+    """
+    ffn_hidden = ffn_mult * lm_dim
+    return Qwen3VLQFormerProjector.Config(
+        in_features=in_features,
+        lm_dim=lm_dim,
+        num_queries=num_queries,
+        num_layers=num_layers,
+        n_heads=n_heads,
+        ffn_mult=ffn_mult,
+        q_proj=_vl_linear(lm_dim, lm_dim),
+        k_proj=_vl_linear(in_features, lm_dim),
+        v_proj=_vl_linear(in_features, lm_dim),
+        o_proj=_vl_linear(lm_dim, lm_dim),
+        ffn_fc1=_vl_linear(lm_dim, ffn_hidden),
+        ffn_fc2=_vl_linear(ffn_hidden, lm_dim),
+        param_init=_QFORMER_QUERY_INIT,
     )
 
 
@@ -429,6 +479,32 @@ def _8b() -> Qwen3VLModel.Config:
     )
 
 
+def _8b_qformer() -> Qwen3VLModel.Config:
+    """Qwen3-VL-8B variant with a Q-Former projector (64 queries, 6 layers).
+
+    Identical to ``_8b`` except for ``projector_type="qformer"`` and the
+    populated ``qformer`` field. The Q-Former's KV input dim is the LM
+    dim (4096) by default — i.e. the Q-Former consumes the *post-merger*
+    encoder output. See ``docs/upstream_prs/005_*.md`` for the open
+    question on switching to pre-merger features (``in_features=1152``)
+    to avoid the in-encoder 2x2 spatial-merge compression on top of
+    Q-Former's 26x token-budget compression.
+    """
+    base = _8b()
+    qformer_cfg = _vl_qformer_config(
+        in_features=base.vision_encoder.out_hidden_size,  # 4096 (post-merger)
+        lm_dim=base.dim,  # 4096
+        num_queries=64,
+        num_layers=6,
+        n_heads=16,
+    )
+    return dataclasses.replace(
+        base,
+        projector_type="qformer",
+        qformer=qformer_cfg,
+    )
+
+
 # Qwen3-VL MoE models
 
 
@@ -539,6 +615,7 @@ qwen3_vl_configs = {
     "debugmodel_moe": _debugmodel_moe,
     "2B": _2b,
     "8B": _8b,
+    "8B-qformer": _8b_qformer,
     "30B-A3B": _30b_a3b,
     "235B-A22B": _235b_a22b,
 }

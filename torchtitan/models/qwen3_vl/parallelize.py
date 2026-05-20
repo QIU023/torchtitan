@@ -370,6 +370,34 @@ def parallelize_qwen3_vl(
             pp_enabled=parallel_dims.pp_enabled,
         )
 
+    # FSDP the Q-Former projector (when enabled). We wrap it as its own
+    # unit on the same dp_mesh as the vision encoder — the Q-Former is
+    # logically part of the vision-encoder side of the pipeline (runs
+    # before the LM scatter) and its compute is small enough that a single
+    # AllGather per forward is the right granularity. We deliberately do
+    # NOT bundle it into the vision_encoder fully_shard call because the
+    # vision encoder ships with deepstack_visual_indices outputs that flow
+    # to the LM separately, while the Q-Former output is the *only* vision
+    # signal at the LM-input boundary; keeping them as siblings simplifies
+    # PP cuts later.
+    qformer_projector = getattr(model, "qformer_projector", None)
+    if qformer_projector is not None:
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        )
+        reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+            parallelism.fsdp_reshard_after_forward,
+            pp_enabled=parallel_dims.pp_enabled,
+        )
+        fully_shard(
+            qformer_projector,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=reshard_after_forward,
+        )
+        logger.info("Applied FSDP to the Q-Former projector")
+
     # FSDP the decoder with MoE-aware sharding
     apply_fsdp(
         model,

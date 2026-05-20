@@ -16,6 +16,7 @@ from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 
+from .qformer_projector import Qwen3VLQFormerProjector
 from .vision_encoder import Qwen3VLVisionEncoder
 
 
@@ -57,6 +58,20 @@ class Qwen3VLModel(Qwen3Model):
         # MRoPE section sizes for interleaved multi-dimensional RoPE
         # [temporal, height, width] - controls how position dimensions are interleaved
         mrope_section: list[int] = field(default_factory=lambda: [24, 20, 20])
+
+        # Switchable vision-to-LM projector. "linear" is the stock Qwen3-VL
+        # PatchMerger (inside ``vision_encoder``); "qformer" instantiates a
+        # BLIP-2-style Q-Former compressor that maps the encoder output to a
+        # fixed ``num_queries`` token budget at LM dim. This is a
+        # deployment-efficiency switch (TRT KV-cache friendly), NOT a
+        # fusion-mechanism research comparison; see qformer_projector.py.
+        projector_type: str = "linear"
+
+        # Q-Former config (used only when projector_type == "qformer").
+        # ``None`` keeps the model spec backward-compatible with stock
+        # Qwen3-VL builds; the ``__init__`` raises if "qformer" is requested
+        # without a populated config.
+        qformer: Qwen3VLQFormerProjector.Config | None = None
 
         def update_from_config(
             self,
@@ -118,6 +133,28 @@ class Qwen3VLModel(Qwen3Model):
 
         # Number of early LLM layers that receive DeepStack visual features
         self.num_deepstack_layers = len(config.vision_encoder.deepstack_visual_indices)
+
+        # Switchable projector. Default ("linear") = no-op here: the in-encoder
+        # PatchMerger already maps to LM dim. ("qformer") = build a 64-query
+        # cross-attn compressor; the calling forward must route raw ViT
+        # features into it (see open issue in
+        # docs/upstream_prs/005_torchtitan_qwen3_vl_qformer.md re: avoiding
+        # double-compression with the in-encoder spatial-merge 2x2).
+        self.projector_type = config.projector_type
+        if config.projector_type == "qformer":
+            if config.qformer is None:
+                raise ValueError(
+                    "projector_type='qformer' requires a populated "
+                    "Qwen3VLModel.Config.qformer; got None."
+                )
+            self.qformer_projector = config.qformer.build()
+        elif config.projector_type == "linear":
+            self.qformer_projector = None
+        else:
+            raise ValueError(
+                f"projector_type must be 'linear' or 'qformer', "
+                f"got {config.projector_type!r}"
+            )
 
     def _compute_mrope_freqs(
         self,
