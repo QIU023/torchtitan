@@ -71,12 +71,34 @@ class LRSchedulersContainer(Stateful, Configurable):
         This is known as the Warmup-Stable-Decay (WSD) schedule, as described in https://arxiv.org/abs/2404.06395.
         """
 
-        decay_type: Literal["linear", "sqrt", "cosine"] = "linear"
+        decay_type: Literal["linear", "sqrt", "cosine", "step"] = "linear"
         """
         Learning rate decay type to use during training:
         - 'linear': linearly decays learning rate from initial to final value
         - 'sqrt': decays learning rate following a 1 minus square root curve
         - 'cosine': smoothly decays learning rate following a cosine curve
+        - 'step': multiplies the learning rate by `decay_factor` every
+          `decay_freq` steps after warmup. Useful for AutoVLA-style
+          schedules (lr *= 0.98 every N steps) and other long-running
+          SFT / RL recipes where a smooth global decay is undesirable.
+          The `decay_ratio` config field is ignored under 'step' decay;
+          step-decay continues from the end of warmup through the final
+          training step. `min_lr_factor` is still respected as a floor.
+        """
+
+        decay_freq: int = 1
+        """
+        Steps between successive multiplicative LR drops for `decay_type='step'`.
+        Counted from the end of warmup (the first drop happens `decay_freq`
+        steps after warmup ends). Ignored for other decay types.
+        """
+
+        decay_factor: float = 0.98
+        """
+        Multiplicative factor applied to the learning rate at each step-decay
+        boundary when `decay_type='step'` (i.e. lr *= decay_factor every
+        `decay_freq` steps after warmup). Must be in (0, 1]. Ignored for
+        other decay types.
         """
 
         min_lr_factor: float = 0.0
@@ -110,6 +132,72 @@ class LRSchedulersContainer(Stateful, Configurable):
                     f"Adjusting warmup steps to {total_steps}."
                 )
                 warmup_steps = total_steps
+
+            # Step-decay schedule is handled as its own branch because it is
+            # not a smooth warmup-stable-decay curve. We still compose it with
+            # the existing linear warmup; `decay_ratio` is intentionally
+            # ignored here (step-decay runs from end-of-warmup to end-of-training).
+            if self.decay_type == "step":
+                if not (0.0 < self.decay_factor <= 1.0):
+                    raise ValueError(
+                        f"lr_scheduler.decay_factor must be in (0, 1], "
+                        f"got {self.decay_factor}"
+                    )
+                if self.decay_freq <= 0:
+                    raise ValueError(
+                        f"lr_scheduler.decay_freq must be a positive integer, "
+                        f"got {self.decay_freq}"
+                    )
+                if self.decay_ratio is not None:
+                    logger.warning(
+                        "lr_scheduler.decay_ratio is ignored when decay_type='step'; "
+                        "step-decay applies continuously from end-of-warmup."
+                    )
+
+                decay_freq = int(self.decay_freq)
+                decay_factor = float(self.decay_factor)
+                min_lr_factor = float(self.min_lr_factor)
+
+                def linear_warmup_step_decay(
+                    current_step: int,
+                    warmup_steps: int,
+                    decay_freq: int,
+                    decay_factor: float,
+                    min_lr_factor: float,
+                ):
+                    """
+                    Linear warmup followed by multiplicative step-decay.
+
+                    During warmup, the multiplicative factor ramps linearly
+                    from `1/warmup_steps` up to 1.0 (matching the WSD branch).
+
+                    After warmup, the factor is `decay_factor ** k` where
+                    `k = (current_step - warmup_steps) // decay_freq` is the
+                    number of completed decay intervals. The floor
+                    `min_lr_factor` is applied to the post-warmup factor.
+                    """
+                    if current_step < warmup_steps:
+                        # 0-indexed step, hence + 1 adjustments (match WSD path)
+                        current_step += 1
+                        assert (
+                            warmup_steps != 0
+                        ), "warmup_steps must not be zero to reach this branch"
+                        return float(current_step / warmup_steps)
+
+                    intervals = (current_step - warmup_steps) // decay_freq
+                    curr_adjustment = decay_factor**intervals
+                    if min_lr_factor > 0.0:
+                        curr_adjustment = max(curr_adjustment, min_lr_factor)
+                    return curr_adjustment
+
+                lr_lambda = functools.partial(
+                    linear_warmup_step_decay,
+                    warmup_steps=warmup_steps,
+                    decay_freq=decay_freq,
+                    decay_factor=decay_factor,
+                    min_lr_factor=min_lr_factor,
+                )
+                return LRSchedulersContainer(optimizers, lr_lambda)
 
             if self.decay_ratio is not None:
                 decay_steps = round(total_steps * self.decay_ratio)
