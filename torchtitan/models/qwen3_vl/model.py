@@ -16,6 +16,7 @@ from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 
+from .pixelshuffle_projector import Qwen3VLPixelShufflePlusLinearProjector
 from .qformer_projector import Qwen3VLQFormerProjector
 from .vision_encoder import Qwen3VLVisionEncoder
 
@@ -59,19 +60,27 @@ class Qwen3VLModel(Qwen3Model):
         # [temporal, height, width] - controls how position dimensions are interleaved
         mrope_section: list[int] = field(default_factory=lambda: [24, 20, 20])
 
-        # Switchable vision-to-LM projector. "linear" is the stock Qwen3-VL
         # PatchMerger (inside ``vision_encoder``); "qformer" instantiates a
         # BLIP-2-style Q-Former compressor that maps the encoder output to a
-        # fixed ``num_queries`` token budget at LM dim. This is a
-        # deployment-efficiency switch (TRT KV-cache friendly), NOT a
-        # fusion-mechanism research comparison; see qformer_projector.py.
+        # fixed ``num_queries`` token budget at LM dim (deployment-
+        # efficiency switch, TRT KV-cache friendly); "pixelshuffle" runs a
+        # deterministic LLaVA-NeXT-style space-to-depth + Linear compressor
+        # on top of the encoder output (fusion-mechanism school comparison,
+        # zero learnable query parameters). See qformer_projector.py and
+        # pixelshuffle_projector.py for the respective rationales.
         projector_type: str = "linear"
 
         # Q-Former config (used only when projector_type == "qformer").
         # ``None`` keeps the model spec backward-compatible with stock
-        # Qwen3-VL builds; the ``__init__`` raises if "qformer" is requested
+        # Qwen3-VL builds; ``__init__`` raises if "qformer" is requested
         # without a populated config.
         qformer: Qwen3VLQFormerProjector.Config | None = None
+
+        # PixelShuffle config (used only when projector_type == "pixelshuffle").
+        # ``None`` keeps the model spec backward-compatible with stock
+        # Qwen3-VL builds; ``__init__`` raises if "pixelshuffle" is
+        # requested without a populated config.
+        pixelshuffle: Qwen3VLPixelShufflePlusLinearProjector.Config | None = None
 
         def update_from_config(
             self,
@@ -134,12 +143,16 @@ class Qwen3VLModel(Qwen3Model):
         # Number of early LLM layers that receive DeepStack visual features
         self.num_deepstack_layers = len(config.vision_encoder.deepstack_visual_indices)
 
-        # Switchable projector. Default ("linear") = no-op here: the in-encoder
-        # PatchMerger already maps to LM dim. ("qformer") = build a 64-query
-        # cross-attn compressor; the calling forward must route raw ViT
-        # features into it (see open issue in
-        # docs/upstream_prs/005_torchtitan_qwen3_vl_qformer.md re: avoiding
-        # double-compression with the in-encoder spatial-merge 2x2).
+        # Switchable post-encoder projector. Default ("linear") = no-op
+        # here: the in-encoder PatchMerger already maps the encoder output
+        # to LM dim. ("qformer") = build a 64-query cross-attn compressor
+        # (see qformer_projector.py + PR 005). ("pixelshuffle") = build a
+        # LLaVA-NeXT-style 2x2 space-to-depth + Linear compressor that
+        # consumes the post-merger features and further compresses them by
+        # ``shuffle_ratio ** 2`` at the LM input boundary (see
+        # pixelshuffle_projector.py + PR 006). The "qformer" and
+        # "pixelshuffle" enum entries are mutually exclusive — at most one
+        # of ``qformer`` / ``pixelshuffle`` may be populated at a time.
         self.projector_type = config.projector_type
         if config.projector_type == "qformer":
             if config.qformer is None:
@@ -148,12 +161,22 @@ class Qwen3VLModel(Qwen3Model):
                     "Qwen3VLModel.Config.qformer; got None."
                 )
             self.qformer_projector = config.qformer.build()
+            self.pixelshuffle_projector = None
+        elif config.projector_type == "pixelshuffle":
+            if config.pixelshuffle is None:
+                raise ValueError(
+                    "projector_type='pixelshuffle' requires a populated "
+                    "Qwen3VLModel.Config.pixelshuffle; got None."
+                )
+            self.pixelshuffle_projector = config.pixelshuffle.build()
+            self.qformer_projector = None
         elif config.projector_type == "linear":
             self.qformer_projector = None
+            self.pixelshuffle_projector = None
         else:
             raise ValueError(
-                f"projector_type must be 'linear' or 'qformer', "
-                f"got {config.projector_type!r}"
+                f"projector_type must be 'linear', 'qformer', or "
+                f"'pixelshuffle', got {config.projector_type!r}"
             )
 
     def _compute_mrope_freqs(
@@ -402,6 +425,27 @@ class Qwen3VLModel(Qwen3Model):
         # valid_mask: (num_items, max_tokens) bool — True for non-padding tokens
         merge_unit = self.vision_encoder.spatial_merge_unit
         num_tokens_per_item = grid_thw.prod(-1) // merge_unit  # (num_items,)
+
+        # PixelShuffle path: further compress the post-merger features by
+        # shuffle_unit (typically 4 for shuffle_ratio=2). We rearrange the
+        # padded ``merged_embeds`` tensor and divide the per-item token
+        # counts (and padded length) by shuffle_unit; the deepstack
+        # features are NOT touched (they feed the early LLM layers as
+        # additive residuals at the original post-merger grid).
+        if self.pixelshuffle_projector is not None:
+            shuffle_unit = self.pixelshuffle_projector.shuffle_unit
+            spatial_merge_size = self.vision_encoder.spatial_merge_size
+            # Convert raw (t, h_raw, w_raw) to the post-merger grid
+            # (t, h_raw // merge_size, w_raw // merge_size) which is what
+            # the projector consumes.
+            post_merger_thw = grid_thw.clone()
+            post_merger_thw[:, 1] = post_merger_thw[:, 1] // spatial_merge_size
+            post_merger_thw[:, 2] = post_merger_thw[:, 2] // spatial_merge_size
+            merged_embeds = self.pixelshuffle_projector(
+                merged_embeds, grid_thw=post_merger_thw
+            )
+            num_tokens_per_item = num_tokens_per_item // shuffle_unit
+
         max_tokens = merged_embeds.shape[1]
         valid_mask = torch.arange(max_tokens, device=merged_embeds.device).unsqueeze(
             0
@@ -409,7 +453,32 @@ class Qwen3VLModel(Qwen3Model):
 
         # Flatten valid tokens: (num_items, max_tokens, dim) → (total_valid_tokens, dim)
         vision_embeds = merged_embeds[valid_mask]
-        deepstack_embeds = [ds_feat[valid_mask] for ds_feat in deepstack_features]
+
+        # DeepStack features stay at the post-merger grid (they additively
+        # combine into the LLM hidden states at the *original* vision
+        # token positions before PixelShuffle would compress them). The
+        # PixelShuffle compression at the LM-input boundary is therefore
+        # asymmetric — main vision stream is compressed, DeepStack is
+        # not. This is a deliberate design choice (DeepStack is the
+        # high-frequency residual; we want to keep its full resolution)
+        # and is the same trade Q-Former made when consuming post-merger
+        # features. If projector_type=='pixelshuffle' the deepstack mask
+        # below won't line up with the compressed vision token positions
+        # — see docs/upstream_prs/006_torchtitan_qwen3_vl_pixelshuffle.md
+        # for the open issue. The fix is either (a) compress DeepStack
+        # features the same way, or (b) drop DeepStack entirely for the
+        # pixelshuffle variant. We default to (a)-ready by emitting the
+        # compressed deepstack mask alongside; production wiring is the
+        # next-agent task.
+        if self.pixelshuffle_projector is not None:
+            # We *cannot* extract a sane DeepStack from the compressed
+            # vision stream because DeepStack's mask is computed at the
+            # raw post-merger grid. Return an empty list so the caller's
+            # downstream DeepStack injection becomes a no-op for now.
+            # See open issue above.
+            deepstack_embeds: list[torch.Tensor] = []
+        else:
+            deepstack_embeds = [ds_feat[valid_mask] for ds_feat in deepstack_features]
 
         return vision_embeds, deepstack_embeds
 

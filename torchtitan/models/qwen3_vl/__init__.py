@@ -28,6 +28,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .model import Qwen3VLModel
 from .parallelize import parallelize_qwen3_vl
 from .parallelize_pp import pipeline_qwen3_vl
+from .pixelshuffle_projector import Qwen3VLPixelShufflePlusLinearProjector
 from .qformer_projector import Qwen3VLQFormerProjector
 from .state_dict_adapter import Qwen3VLStateDictAdapter
 from .vision_encoder import Qwen3VLVisionEncoder
@@ -36,6 +37,7 @@ __all__ = [
     "parallelize_qwen3_vl",
     "pipeline_qwen3_vl",
     "Qwen3VLModel",
+    "Qwen3VLPixelShufflePlusLinearProjector",
     "Qwen3VLQFormerProjector",
     "qwen3_vl_configs",
     "QWEN3_VL_SPECIAL_TOKENS",
@@ -185,6 +187,38 @@ def _vl_qformer_config(
         ffn_fc1=_vl_linear(lm_dim, ffn_hidden),
         ffn_fc2=_vl_linear(ffn_hidden, lm_dim),
         param_init=_QFORMER_QUERY_INIT,
+    )
+
+
+def _vl_pixelshuffle_config(
+    *,
+    in_features: int,
+    lm_dim: int,
+    shuffle_ratio: int = 2,
+) -> Qwen3VLPixelShufflePlusLinearProjector.Config:
+    """Build a fully-specified PixelShuffle + Linear projector config.
+
+    Args:
+        in_features: Channel dim of the visual features fed into the
+            projector. Set to ``out_hidden_size`` (e.g. 4096 for
+            Qwen3-VL-8B) when the projector consumes the in-encoder
+            PatchMerger output (default / minimum-invasive wiring). Set to
+            ``vision_encoder.dim`` (e.g. 1152 for Qwen3-VL-8B) when
+            bypassing the in-encoder merger (pre-merger path; requires a
+            follow-up wiring change, see
+            ``docs/upstream_prs/006_torchtitan_qwen3_vl_pixelshuffle.md``).
+        lm_dim: LM hidden dim (output channel dim). 4096 for Qwen3-VL-8B.
+        shuffle_ratio: Spatial compression ratio. Default 2 (LLaVA-NeXT
+            standard).
+
+    The Linear sits at ``Linear(in_features * shuffle_ratio**2 -> lm_dim)``.
+    """
+    proj_in = in_features * (shuffle_ratio ** 2)
+    return Qwen3VLPixelShufflePlusLinearProjector.Config(
+        in_features=in_features,
+        lm_dim=lm_dim,
+        shuffle_ratio=shuffle_ratio,
+        proj=_vl_linear(proj_in, lm_dim),
     )
 
 
@@ -505,6 +539,42 @@ def _8b_qformer() -> Qwen3VLModel.Config:
     )
 
 
+def _8b_pixelshuffle() -> Qwen3VLModel.Config:
+    """Qwen3-VL-8B variant with a PixelShuffle 2x + Linear projector.
+
+    Identical to ``_8b`` except for ``projector_type="pixelshuffle"`` and
+    the populated ``pixelshuffle`` field.
+
+    The projector consumes the **post-merger** encoder output by default
+    (``in_features=4096``). With ``shuffle_ratio=2`` this gives a TOTAL
+    spatial compression of (in-encoder merger 2x2) * (PixelShuffle 2x2) =
+    16x raw ViT patches, NOT the 4x stated in the LLaVA-NeXT-style
+    deterministic-compression spec. Reaching the canonical 4x ratio
+    requires bypassing the in-encoder PatchMerger and feeding raw ViT
+    features into the projector (``in_features=1152``) — a follow-up
+    plumbing change tracked in
+    ``docs/upstream_prs/006_torchtitan_qwen3_vl_pixelshuffle.md``.
+
+    Param count (lm_dim=4096, in_features=4096, shuffle_ratio=2):
+    ``Linear(4 * 4096, 4096)`` ~ 67M params (bias-included).
+
+    Param count (lm_dim=4096, in_features=1152, shuffle_ratio=2) — i.e.
+    the pre-merger path the 17M target in the spec assumes:
+    ``Linear(4 * 1152, 4096)`` ~ 19M params.
+    """
+    base = _8b()
+    ps_cfg = _vl_pixelshuffle_config(
+        in_features=base.vision_encoder.out_hidden_size,  # 4096 (post-merger)
+        lm_dim=base.dim,  # 4096
+        shuffle_ratio=2,
+    )
+    return dataclasses.replace(
+        base,
+        projector_type="pixelshuffle",
+        pixelshuffle=ps_cfg,
+    )
+
+
 # Qwen3-VL MoE models
 
 
@@ -616,6 +686,7 @@ qwen3_vl_configs = {
     "2B": _2b,
     "8B": _8b,
     "8B-qformer": _8b_qformer,
+    "8B-pixelshuffle": _8b_pixelshuffle,
     "30B-A3B": _30b_a3b,
     "235B-A22B": _235b_a22b,
 }
