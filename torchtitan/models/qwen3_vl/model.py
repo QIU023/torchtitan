@@ -565,12 +565,16 @@ class Qwen3VLModel(Qwen3Model):
         grid_thw_videos: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
-        special_tokens: dict[str, int],
+        special_tokens: dict[str, int] | None = None,
     ):
         """Forward pass of Qwen3-VL.
 
         Args:
-            tokens: Input token IDs (batch_size, seq_len)
+            tokens: Input token IDs (batch_size, seq_len) on stage 0, OR the
+                hidden states (batch_size, seq_len, dim) received over the PP
+                channel on stages 1..N-1 / last stage. Stages without
+                ``tok_embeddings`` skip the embedding lookup; stages without
+                ``vision_encoder`` skip vision+DeepStack altogether.
             pixel_values: Flattened image patches (num_images, max_num_patches, patch_dim)
             pixel_values_videos: Flattened video patches (num_videos, max_num_patches, patch_dim)
             grid_thw: Grid dimensions for images (num_images, 3)
@@ -578,39 +582,79 @@ class Qwen3VLModel(Qwen3Model):
             attention_masks: Attention masks for block_causal / flex attention
             positions: Per-token position IDs (batch_size, seq_len) for packed sequences.
                 Each document's positions reset to 0. None means sequential positions.
-            special_tokens: Special token definitions
+            special_tokens: Special token definitions. Required on stage 0
+                when vision inputs are present; may be None on later stages
+                (vision processing already happened on stage 0).
 
         Returns:
-            Output logits (batch_size, seq_len, vocab_size)
-        """
-        (
-            inputs_embeds,
-            vision_pos_masks,
-            deepstack_vision_embeds,
-        ) = self._prepare_multimodal_embeds(
-            tokens,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            grid_thw=grid_thw,
-            grid_thw_videos=grid_thw_videos,
-            special_tokens=special_tokens,
-        )
+            Output logits (batch_size, seq_len, vocab_size) on the last stage,
+            or hidden states (batch_size, seq_len, dim) on intermediate stages.
 
-        # Compute MRoPE freqs when vision inputs are present
-        if grid_thw is not None or grid_thw_videos is not None:
-            # Per-position freqs_cis with 3D (T, H, W) positions baked in
-            freqs_cis = self._compute_mrope_freqs(
+        Notes:
+            On pipeline-parallel stages 1..N-1 (no ``vision_encoder``, no
+            ``tok_embeddings``), ``tokens`` is the cross-stage activation —
+            a float tensor of shape (batch, seq_len, dim). Vision-scatter
+            and DeepStack injection happen entirely on stage 0 BEFORE the
+            first PP send, so downstream stages just need to run pure
+            decoder-layer passes on the received hidden states.
+        """
+        # --- Stage 0 path: tokens → embeddings → vision scatter → DeepStack prep ---
+        # --- Stages 1..N-1 / last: tokens IS already the hidden state ---
+        has_vision_encoder = self.vision_encoder is not None
+        has_tok_embeddings = self.tok_embeddings is not None
+        is_first_stage = has_tok_embeddings  # convention: stage 0 owns tok_embeddings
+
+        if is_first_stage:
+            # Sanity: vision inputs should only be passed when the vision
+            # encoder is present (i.e., on stage 0). If a downstream caller
+            # accidentally forwards pixel_values to a later stage, raise.
+            if not has_vision_encoder and (
+                pixel_values is not None or pixel_values_videos is not None
+            ):
+                raise ValueError(
+                    "vision_encoder is None but pixel_values/pixel_values_videos "
+                    "were passed. Vision inputs must be processed on the PP "
+                    "stage that owns the vision encoder (stage 0)."
+                )
+
+            (
+                inputs_embeds,
+                vision_pos_masks,
+                deepstack_vision_embeds,
+            ) = self._prepare_multimodal_embeds(
                 tokens,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
                 grid_thw=grid_thw,
                 grid_thw_videos=grid_thw_videos,
-                special_tokens=special_tokens,
-                positions=positions,
+                special_tokens=special_tokens or {},
             )
+
+            # Compute MRoPE freqs when vision inputs are present
+            if grid_thw is not None or grid_thw_videos is not None:
+                # Per-position freqs_cis with 3D (T, H, W) positions baked in
+                freqs_cis = self._compute_mrope_freqs(
+                    tokens,
+                    grid_thw=grid_thw,
+                    grid_thw_videos=grid_thw_videos,
+                    special_tokens=special_tokens or {},
+                    positions=positions,
+                )
+            else:
+                # Standard freqs_cis indexed by positions in each layer
+                freqs_cis = self.freqs_cis
         else:
-            # Standard freqs_cis indexed by positions in each layer
+            # PP downstream stage: ``tokens`` is the activation tensor.
+            # Skip embedding lookup and vision processing entirely.
+            inputs_embeds = tokens
+            vision_pos_masks = None
+            deepstack_vision_embeds = None
             freqs_cis = self.freqs_cis
 
-        # Apply transformer layers with DeepStack
+        # --- Apply transformer layers with DeepStack ---
+        # On stage 0 the layer FQNs cover indices 0..max_deepstack so deepstack
+        # injection happens here. On downstream stages the layer FQNs are
+        # past max_deepstack and the conditional below is a no-op.
         hidden_states = inputs_embeds
         for layer_idx, layer in self.layers.items():
             hidden_states = layer(hidden_states, freqs_cis, attention_masks, positions)
