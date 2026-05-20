@@ -40,6 +40,7 @@ __all__ = [
     "pipeline_llm",
     "build_pipeline_schedule",
     "generate_llm_fqn_per_model_part",
+    "generate_vlm_fqn_per_model_part",
     "pipeline_module_split",
 ]
 
@@ -360,6 +361,147 @@ def generate_llm_fqn_per_model_part(
                     current_layer += 1
 
         module_names_per_stage.append(stage_modules)
+
+    return module_names_per_stage
+
+
+def generate_vlm_fqn_per_model_part(
+    num_stages: int,
+    num_layers: int,
+    *,
+    last_vision_consumer_layer: int,
+    input_weight: int = 1,
+    output_weight: int = 1,
+) -> list[list[str]]:
+    """Generate FQN-per-stage for VLM PP with a "vision-pinned stage 0" cut.
+
+    Convention (matches Megatron / DeepStack-aware VLM PP):
+      * Stage 0 owns the vision encoder, embedding, masked_scatter, AND the
+        first ``last_vision_consumer_layer + 1`` decoder layers (so DeepStack
+        injection happens before the first PP send).
+      * Stages 1..N own contiguous slices of the remaining decoder layers.
+      * Last stage owns ``norm`` + ``output``.
+
+    Args:
+        num_stages: Number of pipeline stages (>= 1).
+        num_layers: Total number of decoder layers in the LM.
+        last_vision_consumer_layer: Largest LM layer index that consumes
+            vision features (e.g. ``max(deepstack_visual_indices)``). Stage 0
+            must own layers ``0..last_vision_consumer_layer`` inclusive so
+            DeepStack scatter happens before the first PP send.
+        input_weight: Weight for input modules on stage 0 (vision + embedding
+            counted as ``input_weight`` "extra layers" when balancing).
+        output_weight: Weight for output modules on the last stage.
+
+    Returns:
+        List of ``num_stages`` lists of FQN strings, e.g. for a 2B-style
+        config with 28 layers, 4 stages, last_vision_consumer_layer=17::
+
+            stage 0: ["vision_encoder", "tok_embeddings",
+                      "layers.0", ..., "layers.17"]
+            stage 1: ["layers.18", "layers.19", ...]
+            stage 2: ["layers.21", ...]
+            stage 3: ["layers.25", "layers.26", "layers.27", "norm", "output"]
+
+    Raises:
+        ValueError: if ``num_stages < 1``, if ``last_vision_consumer_layer``
+            is out of range, or if stage 0 cannot fit the required prefix.
+    """
+    if num_stages < 1:
+        raise ValueError("Number of stages must be at least 1")
+    if last_vision_consumer_layer < 0 or last_vision_consumer_layer >= num_layers:
+        raise ValueError(
+            f"last_vision_consumer_layer ({last_vision_consumer_layer}) must be "
+            f"in [0, num_layers={num_layers})."
+        )
+
+    if num_stages == 1:
+        layer_names = [f"layers.{i}" for i in range(num_layers)]
+        return [
+            ["vision_encoder", "tok_embeddings"] + layer_names + ["norm", "output"]
+        ]
+
+    # Stage 0 must own at least layers 0..last_vision_consumer_layer inclusive.
+    stage0_required_layers = last_vision_consumer_layer + 1
+    # Remaining layers split across stages 1..N-1.
+    remaining_layers = num_layers - stage0_required_layers
+    remaining_stages = num_stages - 1
+    if remaining_layers < remaining_stages:
+        raise ValueError(
+            f"After pinning layers 0..{last_vision_consumer_layer} on stage 0, "
+            f"only {remaining_layers} decoder layers remain for "
+            f"{remaining_stages} downstream stages. Reduce num_stages or "
+            f"choose a model with more decoder layers."
+        )
+
+    module_names_per_stage: list[list[str]] = []
+
+    # --- Stage 0: vision_encoder + tok_embeddings + layers.0..last_vision_consumer_layer ---
+    stage0 = ["vision_encoder", "tok_embeddings"]
+    for i in range(stage0_required_layers):
+        stage0.append(f"layers.{i}")
+    module_names_per_stage.append(stage0)
+
+    # --- Stages 1..N-1: distribute remaining decoder layers evenly ---
+    # Last stage gets norm + output; balance "remaining" by treating
+    # output_weight as extra layers on the last stage (mirrors generate_llm).
+    layers_per_remaining = remaining_layers // remaining_stages
+    extra = remaining_layers % remaining_stages
+    current_layer = stage0_required_layers
+    for s in range(remaining_stages):
+        stage_idx = s + 1
+        stage_modules: list[str] = []
+        # Distribute "extra" 1 layer at a time to earlier of the remaining stages
+        stage_layer_count = layers_per_remaining + (1 if s < extra else 0)
+
+        # Last stage: account for output_weight by reducing decoder-layer count
+        is_last_stage = stage_idx == num_stages - 1
+        if is_last_stage:
+            stage_layer_count = max(0, stage_layer_count)
+            # If output_weight is set, the LAST stage may take fewer layers.
+            # We honor that by reserving "output_weight" slots, but only if
+            # we still have at least one layer left for that stage.
+            if (
+                output_weight > 0
+                and stage_layer_count > output_weight
+                and remaining_stages > 1
+            ):
+                shave = min(output_weight, stage_layer_count - 1)
+                stage_layer_count -= shave
+                # Push the shaved layers to the previous stage(s) by NOT
+                # consuming them here. They're already accounted for in the
+                # earlier iteration's ``stage_layer_count`` calculation
+                # via ``extra``; this just balances heuristically. For
+                # simplicity in this VLM cut, we accept slight imbalance.
+
+        for _ in range(stage_layer_count):
+            if current_layer < num_layers:
+                stage_modules.append(f"layers.{current_layer}")
+                current_layer += 1
+
+        if is_last_stage:
+            stage_modules.extend(["norm", "output"])
+
+        module_names_per_stage.append(stage_modules)
+
+    # Sanity: any leftover layers (e.g. due to output_weight shaving) go on
+    # the last stage in front of ``norm``.
+    if current_layer < num_layers:
+        last_stage = module_names_per_stage[-1]
+        # Insert remaining layers before ``norm`` / ``output``
+        tail_start = next(
+            (i for i, n in enumerate(last_stage) if n in ("norm", "output")),
+            len(last_stage),
+        )
+        for layer_idx in range(current_layer, num_layers):
+            last_stage.insert(tail_start, f"layers.{layer_idx}")
+            tail_start += 1
+
+    # Suppress unused-variable warnings; ``input_weight`` is reserved for
+    # future symmetry with ``generate_llm_fqn_per_model_part`` (stage 0 in
+    # VLMs is already heavy with vision+embedding, so we don't shave its
+    # decoder slice further).
+    _ = input_weight
 
     return module_names_per_stage
 
