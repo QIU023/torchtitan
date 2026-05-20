@@ -16,6 +16,7 @@ from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 
+from .perceiver_resampler_projector import Qwen3VLPerceiverResamplerProjector
 from .vision_encoder import Qwen3VLVisionEncoder
 
 
@@ -57,6 +58,22 @@ class Qwen3VLModel(Qwen3Model):
         # MRoPE section sizes for interleaved multi-dimensional RoPE
         # [temporal, height, width] - controls how position dimensions are interleaved
         mrope_section: list[int] = field(default_factory=lambda: [24, 20, 20])
+
+        # Switchable vision-to-LM projector. "linear" is the stock Qwen3-VL
+        # PatchMerger (inside ``vision_encoder``); "perceiver_resampler"
+        # instantiates a Flamingo-style temporal-aware Perceiver Resampler
+        # that maps the encoder output to a fixed ``num_latents`` token
+        # budget at LM dim. This is part of a fusion-mechanism school
+        # comparison (Q-Former vs Resampler vs PixelShuffle vs Linear);
+        # see perceiver_resampler_projector.py for the design.
+        projector_type: str = "linear"
+
+        # Perceiver Resampler config (used only when
+        # ``projector_type == "perceiver_resampler"``). ``None`` keeps the
+        # model spec backward-compatible with stock Qwen3-VL builds; the
+        # ``__init__`` raises if "perceiver_resampler" is requested
+        # without a populated config.
+        perceiver_resampler: Qwen3VLPerceiverResamplerProjector.Config | None = None
 
         def update_from_config(
             self,
@@ -118,6 +135,32 @@ class Qwen3VLModel(Qwen3Model):
 
         # Number of early LLM layers that receive DeepStack visual features
         self.num_deepstack_layers = len(config.vision_encoder.deepstack_visual_indices)
+
+        # Switchable projector. Default ("linear") = no-op here: the
+        # in-encoder PatchMerger already maps to LM dim.
+        # ("perceiver_resampler") = build a 64-latent Flamingo-style
+        # resampler with temporal positional encoding on the KV side.
+        # The calling forward routes the vision-encoder output through
+        # this resampler before scattering into the LM input. See
+        # docs/upstream_prs/007_torchtitan_qwen3_vl_resampler.md re: the
+        # open issue on double-compression (in-encoder spatial-merge 2x2
+        # + Resampler 26x).
+        self.projector_type = config.projector_type
+        if config.projector_type == "perceiver_resampler":
+            if config.perceiver_resampler is None:
+                raise ValueError(
+                    "projector_type='perceiver_resampler' requires a "
+                    "populated Qwen3VLModel.Config.perceiver_resampler; "
+                    "got None."
+                )
+            self.perceiver_resampler_projector = config.perceiver_resampler.build()
+        elif config.projector_type == "linear":
+            self.perceiver_resampler_projector = None
+        else:
+            raise ValueError(
+                f"projector_type must be 'linear' or 'perceiver_resampler', "
+                f"got {config.projector_type!r}"
+            )
 
     def _compute_mrope_freqs(
         self,

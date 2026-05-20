@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 from collections.abc import Callable
 from functools import partial
 
@@ -27,6 +28,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .model import Qwen3VLModel
 from .parallelize import parallelize_qwen3_vl
 from .parallelize_pp import pipeline_qwen3_vl
+from .perceiver_resampler_projector import Qwen3VLPerceiverResamplerProjector
 from .state_dict_adapter import Qwen3VLStateDictAdapter
 from .vision_encoder import Qwen3VLVisionEncoder
 
@@ -34,6 +36,7 @@ __all__ = [
     "parallelize_qwen3_vl",
     "pipeline_qwen3_vl",
     "Qwen3VLModel",
+    "Qwen3VLPerceiverResamplerProjector",
     "qwen3_vl_configs",
     "QWEN3_VL_SPECIAL_TOKENS",
 ]
@@ -135,6 +138,72 @@ def _vl_vision_encoder_config(
         merger_fc1=_vl_linear(merged_hidden_size, merged_hidden_size),
         merger_fc2=_vl_linear(merged_hidden_size, out_hidden_size),
         param_init=_POS_EMBED_INIT,
+    )
+
+
+_RESAMPLER_PARAM_INIT = {
+    # Latents init follows Flamingo's truncated-normal small-sigma
+    # convention (matches Q-Former queries init for sibling-projector
+    # parity).
+    "latents": partial(nn.init.trunc_normal_, mean=0.0, std=0.02),
+    # Temporal-pos table uses the standard 0.02 trunc-normal init too;
+    # see PR doc Open Issues re: scale choice.
+    "temporal_pos.weight": partial(nn.init.trunc_normal_, mean=0.0, std=0.02),
+}
+
+
+def _vl_resampler_config(
+    *,
+    in_features: int,
+    lm_dim: int,
+    num_latents: int = 64,
+    num_layers: int = 6,
+    n_heads: int = 16,
+    ffn_mult: int = 2,
+    t_max: int = 32,
+) -> Qwen3VLPerceiverResamplerProjector.Config:
+    """Build a fully-specified Perceiver Resampler projector config.
+
+    Args:
+        in_features: KV input dim. Set to ViT hidden dim (e.g. 1152 for
+            Qwen3-VL-8B) when bypassing the in-encoder spatial merger;
+            set to ``lm_dim`` (e.g. 4096) when consuming post-merger
+            features.
+        lm_dim: LM hidden dim (output dim). 4096 for Qwen3-VL-8B.
+        num_latents: Fixed-length output token count. 64 is the target
+            for sibling-projector parity (Q-Former-64); ~26x compression
+            over the stock 3-cam x 4-frame visual budget.
+        num_layers: Number of (self-attn + cross-attn + FFN) blocks.
+        n_heads: Number of attention heads in self/cross-attn.
+        ffn_mult: FFN hidden-dim multiplier (FFN hidden = ffn_mult * lm_dim).
+            Default 2 (smaller than Q-Former's 4) because the resampler
+            block also carries a self-attn sub-layer.
+        t_max: Temporal positional embedding table size. Larger frame
+            indices clamp to ``t_max - 1``.
+    """
+    ffn_hidden = ffn_mult * lm_dim
+    return Qwen3VLPerceiverResamplerProjector.Config(
+        in_features=in_features,
+        lm_dim=lm_dim,
+        num_latents=num_latents,
+        num_layers=num_layers,
+        n_heads=n_heads,
+        ffn_mult=ffn_mult,
+        t_max=t_max,
+        # Self-attn over latents: lm_dim -> lm_dim everywhere.
+        self_attn_q_proj=_vl_linear(lm_dim, lm_dim),
+        self_attn_k_proj=_vl_linear(lm_dim, lm_dim),
+        self_attn_v_proj=_vl_linear(lm_dim, lm_dim),
+        self_attn_o_proj=_vl_linear(lm_dim, lm_dim),
+        # Cross-attn: Q is lm_dim (latents), KV is in_features (vision).
+        cross_attn_q_proj=_vl_linear(lm_dim, lm_dim),
+        cross_attn_k_proj=_vl_linear(in_features, lm_dim),
+        cross_attn_v_proj=_vl_linear(in_features, lm_dim),
+        cross_attn_o_proj=_vl_linear(lm_dim, lm_dim),
+        # FFN over latents.
+        ffn_fc1=_vl_linear(lm_dim, ffn_hidden),
+        ffn_fc2=_vl_linear(ffn_hidden, lm_dim),
+        param_init=_RESAMPLER_PARAM_INIT,
     )
 
 
@@ -429,6 +498,38 @@ def _8b() -> Qwen3VLModel.Config:
     )
 
 
+def _8b_perceiver_resampler() -> Qwen3VLModel.Config:
+    """Qwen3-VL-8B variant with a Perceiver Resampler projector.
+
+    Flamingo-style temporal-aware resampler with 64 latents, 6 layers,
+    and a per-frame learnable temporal positional encoding (T_max=32).
+    Identical to ``_8b`` except for ``projector_type="perceiver_resampler"``
+    and the populated ``perceiver_resampler`` field.
+
+    The resampler's KV input dim defaults to the LM dim (4096) -- i.e.
+    the resampler consumes the *post-merger* encoder output. See
+    ``docs/upstream_prs/007_torchtitan_qwen3_vl_resampler.md`` for the
+    open question on switching to pre-merger features
+    (``in_features=1152``) to avoid the in-encoder 2x2 spatial-merge
+    compression on top of the resampler's ~26x token-budget compression.
+    """
+    base = _8b()
+    resampler_cfg = _vl_resampler_config(
+        in_features=base.vision_encoder.out_hidden_size,  # 4096 (post-merger)
+        lm_dim=base.dim,  # 4096
+        num_latents=64,
+        num_layers=6,
+        n_heads=16,
+        ffn_mult=2,
+        t_max=32,
+    )
+    return dataclasses.replace(
+        base,
+        projector_type="perceiver_resampler",
+        perceiver_resampler=resampler_cfg,
+    )
+
+
 # Qwen3-VL MoE models
 
 
@@ -539,6 +640,7 @@ qwen3_vl_configs = {
     "debugmodel_moe": _debugmodel_moe,
     "2B": _2b,
     "8B": _8b,
+    "8B-perceiver-resampler": _8b_perceiver_resampler,
     "30B-A3B": _30b_a3b,
     "235B-A22B": _235b_a22b,
 }
