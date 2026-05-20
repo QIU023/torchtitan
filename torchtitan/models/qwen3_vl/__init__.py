@@ -26,11 +26,13 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import Qwen3VLModel
 from .parallelize import parallelize_qwen3_vl
+from .parallelize_pp import pipeline_qwen3_vl
 from .state_dict_adapter import Qwen3VLStateDictAdapter
 from .vision_encoder import Qwen3VLVisionEncoder
 
 __all__ = [
     "parallelize_qwen3_vl",
+    "pipeline_qwen3_vl",
     "Qwen3VLModel",
     "qwen3_vl_configs",
     "QWEN3_VL_SPECIAL_TOKENS",
@@ -549,7 +551,7 @@ def model_registry(flavor: str) -> ModelSpec:
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_qwen3_vl,
-        pipelining_fn=None,
+        pipelining_fn=pipeline_qwen3_vl,
         build_loss_fn=build_cross_entropy_loss,
         post_optimizer_build_fn=None,
         state_dict_adapter=Qwen3VLStateDictAdapter,
