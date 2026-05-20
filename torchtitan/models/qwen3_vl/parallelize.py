@@ -37,6 +37,7 @@ from torchtitan.config import (
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.compile import apply_compile_dense, apply_compile_sparse
+from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.models.llama4.parallelize import apply_fsdp, apply_moe_ep_tp
@@ -256,8 +257,15 @@ def parallelize_qwen3_vl(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    if parallel_dims.cp_enabled:
-        raise NotImplementedError("Context Parallel is not yet supported for Qwen3-VL.")
+    # PP+CP combined for qwen3_vl is a follow-up; mirror Megatron's hard
+    # assertion. The vision scatter + DeepStack path interacts non-trivially
+    # with both PP stage cuts and CP sequence shards, so we require them to be
+    # validated separately first.
+    if parallel_dims.pp_enabled and parallel_dims.cp_enabled:
+        raise NotImplementedError(
+            "PP+CP combined for qwen3_vl is a follow-up; mirror Megatron's "
+            "hard assertion."
+        )
 
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
@@ -295,6 +303,23 @@ def parallelize_qwen3_vl(
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
             enable_sp=False,
+        )
+
+    # Apply Context Parallel to the decoder's inner attention modules.
+    # CP wraps only attention via `_ContextParallel`; vision scatter,
+    # DeepStack and MRoPE freq computation remain outside the CP-wrapped
+    # region. The trainer's `prepare_context_parallel_input` pre-shards
+    # `inputs`, `labels` and `positions` along the sequence dim using the
+    # appropriate load balancer (HeadTail for SDPA, PTRR for FlexAttention),
+    # so by the time `model.forward` runs, every rank has its local shard
+    # of tokens. The 3D MRoPE coords (T, H, W) are values (not table
+    # indices) so per-shard computation in `_compute_mrope_freqs` remains
+    # numerically correct as long as `positions` arrives sharded.
+    if parallel_dims.cp_enabled:
+        apply_cp_to_attention_module(
+            # pyrefly: ignore [missing-attribute, not-callable]
+            [block.attention.inner_attention for block in model.layers.values()],
+            parallel_dims.get_mesh("cp"),
         )
 
     # Apply activation checkpointing
