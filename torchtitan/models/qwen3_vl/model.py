@@ -384,8 +384,15 @@ class Qwen3VLModel(Qwen3Model):
             grid_thw: Grid dimensions (num_items, 3) for [t, h, w]
 
         Returns:
-            vision_embeds: (total_valid_tokens, dim) concatenated valid tokens
-            deepstack_embeds: List of (total_valid_tokens, dim) per intermediate layer
+            vision_embeds: (total_valid_tokens, dim) concatenated valid tokens.
+                When the Q-Former projector is active, ``total_valid_tokens``
+                equals ``num_items * num_queries`` (e.g. num_items * 64),
+                regardless of the per-item ViT token count — the Q-Former
+                compresses every visual item to a fixed-length token budget.
+            deepstack_embeds: List of (total_valid_tokens, dim) per
+                intermediate layer (DeepStack features, NOT routed through
+                the Q-Former because they encode spatial detail that the
+                64-query compression would discard).
         """
         # Cast pixel values (float32 from data pipeline) to match the vision
         # encoder's param_dtype set by FSDP2's MixedPrecisionPolicy
@@ -407,9 +414,31 @@ class Qwen3VLModel(Qwen3Model):
             0
         ) < num_tokens_per_item.unsqueeze(1)
 
-        # Flatten valid tokens: (num_items, max_tokens, dim) → (total_valid_tokens, dim)
-        vision_embeds = merged_embeds[valid_mask]
+        # DeepStack features keep their per-token shape regardless of
+        # projector choice — DeepStack injects intermediate ViT features at
+        # the original (post-merger) placeholder positions on the LM side.
+        # See docs/upstream_prs/005_*.md Open Issue #3 for the followup
+        # discussion of DeepStack + Q-Former interaction.
         deepstack_embeds = [ds_feat[valid_mask] for ds_feat in deepstack_features]
+
+        if self.qformer_projector is not None:
+            # Q-Former path: compress every visual item to a fixed
+            # ``num_queries`` token budget. SDPA-style key_padding_mask:
+            # True at PAD positions (= NOT valid).
+            key_padding_mask = ~valid_mask  # (num_items, max_tokens)
+            # (num_items, num_queries, lm_dim)
+            compressed = self.qformer_projector(
+                merged_embeds, key_padding_mask=key_padding_mask
+            )
+            num_items = compressed.shape[0]
+            num_queries = compressed.shape[1]
+            # Flatten to match the (total_vision_tokens, dim) contract that
+            # ``_scatter_vision_embeds`` expects. Total = num_items * Nq.
+            vision_embeds = compressed.reshape(num_items * num_queries, -1)
+        else:
+            # Linear (stock) path: flatten valid tokens
+            # (num_items, max_tokens, dim) → (total_valid_tokens, dim).
+            vision_embeds = merged_embeds[valid_mask]
 
         return vision_embeds, deepstack_embeds
 

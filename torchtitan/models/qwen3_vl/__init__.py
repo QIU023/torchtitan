@@ -150,9 +150,10 @@ def _vl_qformer_config(
     *,
     in_features: int,
     lm_dim: int,
+    internal_dim: int = 1024,
     num_queries: int = 64,
     num_layers: int = 6,
-    n_heads: int = 16,
+    n_heads: int = 8,
     ffn_mult: int = 4,
 ) -> Qwen3VLQFormerProjector.Config:
     """Build a fully-specified Q-Former projector config.
@@ -162,28 +163,36 @@ def _vl_qformer_config(
             Qwen3-VL-8B) when bypassing the in-encoder spatial merger;
             set to ``lm_dim`` (e.g. 4096) when consuming post-merger
             features.
-        lm_dim: LM hidden dim (output dim). 4096 for Qwen3-VL-8B.
+        lm_dim: LM hidden dim (FINAL output dim, reached via ``out_proj``).
+            4096 for Qwen3-VL-8B.
+        internal_dim: Q-Former internal width. Decoupled from ``lm_dim``
+            to bound param count to BLIP-2 scale (~80-120M) instead of
+            ~1.2B at lm_dim=4096. Default 1024 (BLIP-2-base uses 768).
         num_queries: Fixed-length output token count. 64 is the target
             for TRT-friendly inference; ~26x compression over the stock
             3-cam x 4-frame visual budget.
         num_layers: Number of cross-attn + FFN blocks.
-        n_heads: Number of attention heads in cross-attn.
-        ffn_mult: FFN hidden-dim multiplier (FFN hidden = ffn_mult * lm_dim).
+        n_heads: Number of attention heads in cross-attn (must divide
+            ``internal_dim``). Default 8 → head_dim=128 at internal_dim=1024.
+        ffn_mult: FFN hidden-dim multiplier (FFN hidden = ffn_mult *
+            internal_dim).
     """
-    ffn_hidden = ffn_mult * lm_dim
+    ffn_hidden = ffn_mult * internal_dim
     return Qwen3VLQFormerProjector.Config(
         in_features=in_features,
         lm_dim=lm_dim,
+        internal_dim=internal_dim,
         num_queries=num_queries,
         num_layers=num_layers,
         n_heads=n_heads,
         ffn_mult=ffn_mult,
-        q_proj=_vl_linear(lm_dim, lm_dim),
-        k_proj=_vl_linear(in_features, lm_dim),
-        v_proj=_vl_linear(in_features, lm_dim),
-        o_proj=_vl_linear(lm_dim, lm_dim),
-        ffn_fc1=_vl_linear(lm_dim, ffn_hidden),
-        ffn_fc2=_vl_linear(ffn_hidden, lm_dim),
+        q_proj=_vl_linear(internal_dim, internal_dim),
+        k_proj=_vl_linear(in_features, internal_dim),
+        v_proj=_vl_linear(in_features, internal_dim),
+        o_proj=_vl_linear(internal_dim, internal_dim),
+        ffn_fc1=_vl_linear(internal_dim, ffn_hidden),
+        ffn_fc2=_vl_linear(ffn_hidden, internal_dim),
+        out_proj=_vl_linear(internal_dim, lm_dim),
         param_init=_QFORMER_QUERY_INIT,
     )
 
@@ -489,14 +498,20 @@ def _8b_qformer() -> Qwen3VLModel.Config:
     question on switching to pre-merger features (``in_features=1152``)
     to avoid the in-encoder 2x2 spatial-merge compression on top of
     Q-Former's 26x token-budget compression.
+
+    Param budget: ~100M at the default config (internal_dim=1024,
+    num_layers=6, n_heads=8, ffn_mult=4) — matches BLIP-2 scale. See
+    ``tests/unit_tests/test_qformer_projector.py::test_param_count_guard``.
     """
     base = _8b()
     qformer_cfg = _vl_qformer_config(
         in_features=base.vision_encoder.out_hidden_size,  # 4096 (post-merger)
         lm_dim=base.dim,  # 4096
+        internal_dim=1024,
         num_queries=64,
         num_layers=6,
-        n_heads=16,
+        n_heads=8,
+        ffn_mult=4,
     )
     return dataclasses.replace(
         base,
