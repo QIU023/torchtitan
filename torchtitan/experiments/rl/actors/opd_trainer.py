@@ -174,7 +174,12 @@ class OPDTrainer(PolicyTrainer):
                     "policy_version": self.policy_version}
 
         self.optimizers.zero_grad()
-        loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+        # Per-episode backward (standard grad accumulation) so each
+        # episode's activation memory releases before the next forward.
+        # Initial implementation accumulated loss tensors and called
+        # backward() once — peak memory was sum(all episode activations)
+        # and OOM'd on a 32 GiB card at step 1 (Stage D, 2026-05-28).
+        loss_scalar_accum = 0.0
         n_resp_tokens = 0
 
         import re
@@ -241,21 +246,25 @@ class OPDTrainer(PolicyTrainer):
 
             # (4) Generalized JSD via injected loss fn. opd_loss handles
             #     vocab alignment (slice to shared 128256) and label mask.
-            #     Wrap in batch dim [1, T, V] / [1, T].
+            #     Wrap in batch dim [1, T, V] / [1, T]. Pre-divide by
+            #     episode count so the accumulated grad has the same
+            #     magnitude as a one-shot mean loss.
             loss = self._opd_loss_fn(
                 student_logits.unsqueeze(0),
                 teacher_logits.unsqueeze(0),
                 labels.unsqueeze(0),
-            )
-            loss_accum = loss_accum + loss
+            ) / float(len(my_episodes))
+
+            # Per-episode backward — releases activations + frees
+            # student_logits / teacher_logits before the next episode's
+            # forward. Avoids the OOM at step 1 (peak grew with N_eps).
+            loss.backward()
+            loss_scalar_accum += loss.item()
             n_resp_tokens += int(T)
 
-        # Average loss across episodes on this rank so the magnitude
-        # is independent of batch size (mirrors GRPO PG averaging).
-        if len(my_episodes) > 0:
-            loss_accum = loss_accum / float(len(my_episodes))
-
-        loss_accum.backward()
+            # Drop logit tensors before next iteration (~600 MiB each
+            # for response × vocab in fp32).
+            del student_logits, teacher_logits, loss
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
@@ -269,7 +278,7 @@ class OPDTrainer(PolicyTrainer):
         self.policy_version += 1
 
         metrics = {
-            "loss": loss_accum.item(),
+            "loss": loss_scalar_accum,
             "num_response_tokens": n_resp_tokens,
             "policy_version": self.policy_version,
             "sample_completion": episodes[0].text[:80],
