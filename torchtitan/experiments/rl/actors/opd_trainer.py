@@ -52,14 +52,15 @@ TeacherScoreFn = Callable[
 ]
 
 # Type alias for the loss function. Identical signature to the launcher-
-# side ``opd_loss(student_logits, teacher_logits, labels)``. Decoupled
-# from the trl dep so this file stays trl-free.
+# side ``opd_loss(student_logits, teacher_logits, labels, *, beta, temperature)``.
+# Decoupled from the trl dep so this file stays trl-free.
 #   args:    student_logits[B, T, V_s], teacher_logits[B, T, V_t],
-#            labels[B, T] (use -100 to ignore positions)
+#            labels[B, T] (use -100 to ignore positions),
+#            keyword-only beta + temperature (GKD hyperparameters).
 #   returns: scalar loss
-OPDLossFn = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
-]
+# Using Callable[..., Tensor] (rather than naming the kwargs) so the
+# type checker doesn't complain about kwarg names.
+OPDLossFn = Callable[..., torch.Tensor]
 
 
 class OPDTrainer(PolicyTrainer):
@@ -87,6 +88,11 @@ class OPDTrainer(PolicyTrainer):
         self._teacher_score_fn: TeacherScoreFn | None = None
         self._opd_loss_fn: OPDLossFn | None = None
         self._tokenizer: Any = None
+        # GKD hyperparameters (Agarwal et al. 2024). Set via
+        # set_opd_hyperparams. Defaults match TRL's
+        # generalized_jsd_loss defaults (β=0.5 symmetric JSD, T=1.0).
+        self._opd_beta: float = 0.5
+        self._opd_temperature: float = 1.0
         # OPDTrainer ignores reward / advantage; warn if a ref model
         # was built — it's wasted memory under distillation.
         if self.ref_model is not None:
@@ -95,6 +101,42 @@ class OPDTrainer(PolicyTrainer):
                 "distillation provides its own teacher KL, so the ref "
                 "model is unused. Consider kl_coef=0 to save memory."
             )
+
+    @endpoint
+    async def set_opd_hyperparams(self, beta: float, temperature: float) -> None:
+        """Set the GKD loss hyperparameters (Agarwal et al. 2024).
+
+        Args:
+            beta: 0.0 → reverse-KL (KL(student || teacher), mode-seeking),
+                1.0 → forward-KL (KL(teacher || student), mean-seeking
+                / classical KD), 0.5 → symmetric generalized JSD.
+            temperature: softmax temperature. 1.0 = no softening; 2.0
+                is the de-facto distillation standard (transfers more
+                "dark knowledge" from low-prob tail).
+        """
+        self._opd_beta = float(beta)
+        self._opd_temperature = float(temperature)
+        logger.info(
+            f"OPD hyperparams: beta={self._opd_beta} "
+            f"temperature={self._opd_temperature}"
+        )
+
+    @endpoint
+    async def save_dcp(self, save_dir: str, step: int) -> str:
+        """Save the student model as a DCP checkpoint under
+        ``{save_dir}/step-{step}/``.
+
+        Returns the full path written. No optimizer state — distillation
+        runs are typically short and we re-init optim on restart.
+        """
+        out_dir = os.path.join(save_dir, f"step-{step}")
+        os.makedirs(out_dir, exist_ok=True)
+        # Use the same DCP writer as torchtitan core checkpointing;
+        # save model.state_dict() directly (no optim state for OPD smokes).
+        import torch.distributed.checkpoint as _dcp
+        _dcp.save(self.model.state_dict(), checkpoint_id=out_dir)
+        logger.info(f"OPD ckpt saved: {out_dir} (step {step})")
+        return out_dir
 
     @endpoint
     async def set_teacher_scorer(self, scorer: Any) -> None:
@@ -253,6 +295,8 @@ class OPDTrainer(PolicyTrainer):
                 student_logits.unsqueeze(0),
                 teacher_logits.unsqueeze(0),
                 labels.unsqueeze(0),
+                beta=self._opd_beta,
+                temperature=self._opd_temperature,
             ) / float(len(my_episodes))
 
             # Per-episode backward — releases activations + frees
