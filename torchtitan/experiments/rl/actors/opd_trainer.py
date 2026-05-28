@@ -177,10 +177,23 @@ class OPDTrainer(PolicyTrainer):
         loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
         n_resp_tokens = 0
 
+        import re
         for ep in my_episodes:
             prompt_text = self._tokenizer.decode(
                 ep.prompt_token_ids, skip_special_tokens=True,
             )
+            # Extract just the user question. The launcher builds
+            # prompts as ``"...<image>\nUser: {q}\nAssistant:"``, and
+            # the round-trip decode strips ``<image>`` (special token)
+            # but leaves the User:/Assistant: markers. We extract the
+            # bare user question so the teacher_score_fn can wrap it
+            # with the TEACHER's own chat template (which puts the
+            # teacher's <image> placeholder in the right spot for
+            # LlavaNext's image-token splicing). Falls back to the
+            # full prompt if the marker isn't found (e.g. caller built
+            # prompts differently).
+            m = re.search(r"User:\s*(.*?)\s*Assistant:", prompt_text, re.DOTALL)
+            user_text = m.group(1).strip() if m else prompt_text.strip()
             response_text = self._tokenizer.decode(
                 ep.token_ids, skip_special_tokens=True,
             )
@@ -194,7 +207,7 @@ class OPDTrainer(PolicyTrainer):
             #     because the teacher's tokenizer re-tokenizes the response text.
             with torch.no_grad():
                 teacher_logits, teacher_ids = self._teacher_score_fn(
-                    ep.image_path, prompt_text, response_text,
+                    ep.image_path, user_text, response_text,
                 )
             teacher_logits = teacher_logits.to(self.device, torch.float32)
             teacher_ids = teacher_ids.to(self.device)
