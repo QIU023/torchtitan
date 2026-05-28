@@ -133,6 +133,105 @@ def compute_token_log_probs(
     return token_lps
 
 
+def compute_response_logits(
+    model: torch.nn.Module,
+    prompt_ids: list[int],
+    gen_ids: list[int],
+    device: torch.device,
+    *,
+    vision_tower: torch.nn.Module | None = None,
+    projector: torch.nn.Module | None = None,
+    image_path: str | None = None,
+    image_token_id: int = 32000,
+) -> torch.Tensor:
+    """Forward pass returning full-vocab logits at response positions.
+
+    Sibling to ``compute_token_log_probs``: shares the prompt+gen tensor
+    build, varlen metadata, explicit positions, and vision-tower /
+    projector / image-mask injection path. The only difference is the
+    return — ``[T_resp, V]`` float32 logits at response positions instead
+    of ``[T_resp]`` gathered-by-token-id log probabilities.
+
+    Intended consumer is on-policy distillation
+    (``OPDTrainer``, GKD / Agarwal et al. 2024) which feeds these
+    logits into a generalized-JSD loss against a frozen teacher's
+    logits at the same response positions. Caller is responsible for
+    enabling / disabling gradients on ``model`` parameters; this
+    function itself does NOT wrap the forward in ``torch.no_grad`` so
+    the student can be trained.
+
+    TODO Only batch size 1 is supported for now, matching
+    ``compute_token_log_probs``.
+
+    Args:
+        model: The student model to score at its own rollout positions.
+        prompt_ids: Prompt token IDs (already including image-token
+            placeholders for VLM rollouts; see ``compute_token_log_probs``
+            docstring).
+        gen_ids: Student-generated token IDs.
+        device: Device to run computation on.
+        vision_tower: Optional frozen vision encoder; see
+            ``compute_token_log_probs``.
+        projector: Optional 2-layer MLP paired with ``vision_tower``.
+        image_path: Optional path to the image associated with this
+            prompt.
+        image_token_id: Sentinel id marking image-feature positions.
+
+    Returns:
+        Per-response-token full-vocab logits, shape ``[T_resp, V]``
+        in float32 (matching the precision-stability convention used
+        by ``compute_token_log_probs`` before its log_softmax).
+    """
+    token_ids = torch.tensor(prompt_ids + gen_ids, dtype=torch.long, device=device)
+    prompt_len = len(prompt_ids)
+    gen_len = len(gen_ids)
+    attention_masks = build_varlen_metadata([(token_ids, prompt_len, gen_len)], device)
+
+    full_tensor = token_ids.unsqueeze(0)
+
+    # Explicit positions avoid the dynamic rope_cache[0:seqlen] slice that
+    # would break torch.compile with symbolic shapes (mirrors the
+    # rationale in compute_token_log_probs).
+    seq_len = full_tensor.shape[1]
+    positions = torch.arange(seq_len, device=device).unsqueeze(0)
+
+    if (
+        vision_tower is not None
+        and projector is not None
+        and image_path is not None
+    ):
+        vision_embeds, image_mask = _encode_image_for_logprob(
+            vision_tower=vision_tower,
+            projector=projector,
+            image_path=image_path,
+            input_ids=full_tensor,
+            image_token_id=image_token_id,
+            device=device,
+        )
+        logits = model(
+            full_tensor,
+            attention_masks=attention_masks,
+            positions=positions,
+            vision_embeds=vision_embeds,
+            image_mask=image_mask,
+        )
+    else:
+        logits = model(full_tensor, attention_masks=attention_masks, positions=positions)
+
+    # float32 for numerical stability (parity with compute_token_log_probs).
+    # The :-1 slice mirrors the next-token-prediction shift: position i's
+    # logits predict token i+1.
+    logits_f32 = logits[:, :-1, :].to(torch.float32)
+
+    # Same gen-window indexing as compute_token_log_probs:
+    #   gen_start_idx = prompt_len - 1  (first position whose target is gen_ids[0])
+    #   gen_end_idx   = gen_start_idx + gen_len
+    gen_start_idx = prompt_len - 1
+    gen_end_idx = gen_start_idx + gen_len
+
+    return logits_f32[0, gen_start_idx:gen_end_idx, :]
+
+
 def _encode_image_for_logprob(
     vision_tower: torch.nn.Module,
     projector: torch.nn.Module,
