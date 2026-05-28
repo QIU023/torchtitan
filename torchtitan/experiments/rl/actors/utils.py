@@ -254,7 +254,16 @@ def _encode_image_for_logprob(
     the projected vision features.
     """
     from PIL import Image
-    pil = Image.open(image_path).convert("RGB")
+    if isinstance(image_path, str) and image_path.startswith("data:image"):
+        # base64 data URL — what SGLang stores in Episode.image_path when
+        # the launcher passes images inline (the data-URL workaround
+        # for the SHM IPC race that was the v16 GRPO blocker).
+        import base64
+        import io
+        _, b64 = image_path.split(",", 1)
+        pil = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    else:
+        pil = Image.open(image_path).convert("RGB")
 
     # Run the SigLIP image processor to get the standard normalised
     # 224x224 tensor. We import lazily — most callers will already
