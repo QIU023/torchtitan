@@ -18,14 +18,14 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from torchtitan.experiments.attn_res import attn_res_configs
-from torchtitan.experiments.attn_res.attn_res import (
+from torchtitan.experiments.attention_residual import attn_res_configs
+from torchtitan.experiments.attention_residual.attn_res import (
     AttnResProjection,
     block_attn_res,
     stack_blocks,
     unstack_blocks,
 )
-from torchtitan.experiments.attn_res.model import AttnResTransformerBlock  # noqa: F401 -- imported for the direct block test below
+from torchtitan.experiments.attention_residual.model import AttnResTransformerBlock  # noqa: F401 -- imported for the direct block test below
 from torchtitan.models.common.rmsnorm import RMSNorm
 
 

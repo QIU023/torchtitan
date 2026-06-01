@@ -30,8 +30,8 @@ from unittest.mock import MagicMock
 import torch
 import torch.nn as nn
 
-from torchtitan.experiments.attn_res.attn_res import stack_blocks, unstack_blocks
-from torchtitan.experiments.attn_res.pipeline_adapter import (
+from torchtitan.experiments.attention_residual.attn_res import stack_blocks, unstack_blocks
+from torchtitan.experiments.attention_residual.pipeline_adapter import (
     _current_mb_index,
     _get_or_create_rank_cache,
     _install_augment_hook,
@@ -788,7 +788,7 @@ class TestScheduleGuardNonInterleaved(unittest.TestCase):
     """
 
     def test_schedule_guard_non_interleaved(self):
-        from torchtitan.experiments.attn_res import pipeline_adapter as pa
+        from torchtitan.experiments.attention_residual import pipeline_adapter as pa
 
         # Stand in for pp_schedule: anything that isn't an instance of
         # _INTERLEAVED_1F1B_CLASS triggers the guard.

@@ -4,9 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Trainer configs for the Block AttnRes experiment.
+"""Trainer configs for the Attention Residual experiment.
 
-Two flavor families are registered here:
+This is the single ``config_registry`` torchtitan's ``ConfigManager``
+imports for ``--module attention_residual``. It exposes three flavor
+families:
 
 1. Dense + GQA (Llama3-shape) — the single-GPU A/B reference:
    - ``llama3_175m_baseline``: plain ~175M Llama3 dense, standard residuals.
@@ -21,6 +23,16 @@ Two flavor families are registered here:
      block). The A/B baseline for this is upstream
      ``--module deepseek_v3 --config deepseek_v3_16b``; every hyperparameter
      matches that config so the only measured delta is AttnRes.
+
+3. Kimi Linear backbone (KDA + MLA + MoE) + AttnRes — the
+   scaling-law sweep and the production 447M lineage. These config
+   functions (e.g. ``kimi_linear_447m_aligned_block_attn_res_n4_fp8``)
+   live in the ``kimi_linear/`` subpackage and are re-exported here so
+   they remain reachable as ``--module attention_residual --config
+   kimi_linear_<...>``. The ``kimi_linear_`` config-name prefix is kept
+   verbatim for backward compatibility with the production launch
+   scripts; only the ``--module`` value changed (kimi_linear ->
+   attention_residual).
 """
 
 from collections.abc import Callable
@@ -41,7 +53,15 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.experiments.attn_res import model_registry as attn_res_model_registry
+from torchtitan.experiments.attention_residual import model_registry as attn_res_model_registry
+
+# Re-export every Kimi Linear + AttnRes trainer-config flavor so they are
+# discoverable via ``--module attention_residual --config kimi_linear_<...>``.
+# torchtitan's ConfigManager does ``getattr(config_registry, <config_name>)``,
+# so the kimi flavor functions must be module-level attributes here. The
+# ``kimi_linear_`` config-name prefix is preserved for backward compatibility
+# with production launch scripts (only the ``--module`` value changed).
+from torchtitan.experiments.attention_residual.kimi_linear.config_registry import *  # noqa: F401,F403
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common import (
     compute_ffn_hidden_dim,
@@ -168,7 +188,7 @@ def _llama3_175m_plain_L16_config() -> Llama3Model.Config:
     minus the AttnRes pseudo-queries and norms.
 
     Exists so the 4-GPU PP=4 V=2 + layers_per_stage=2 configuration can be
-    run as a no-AttnRes baseline under the same ``--module attn_res``
+    run as a no-AttnRes baseline under the same ``--module attention_residual``
     machinery (no per-model-family launcher duplication) and against the
     same PP slicing as the AttnRes variant. Every other architectural
     field (dim, heads, kv_heads, FFN hidden dim, RoPE, vocab, tying) is
@@ -504,7 +524,7 @@ def llama3_175m_attn_res_L48_n8() -> Trainer.Config:
 # Hyperparameters mirror upstream ``torchtitan.models.deepseek_v3.config_registry``
 # so the only training-level delta between ``deepseek_v3_16b`` (baseline,
 # run via --module deepseek_v3) and ``dsv3_attn_res_16b`` (our variant,
-# run via --module attn_res) is Block AttnRes itself.
+# run via --module attention_residual) is Block AttnRes itself.
 # ------------------------------------------------------------------------- #
 
 
@@ -547,7 +567,7 @@ def dsv3_attn_res_16b() -> Trainer.Config:
     verbatim; the only delta is Block AttnRes on every layer. For A/B
     comparison, run the baseline as
     ``--module deepseek_v3 --config deepseek_v3_16b`` and this as
-    ``--module attn_res --config dsv3_attn_res_16b`` with matching seed
+    ``--module attention_residual --config dsv3_attn_res_16b`` with matching seed
     and data order.
     """
     return Trainer.Config(

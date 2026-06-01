@@ -12,7 +12,7 @@ See ``README.md`` in this directory for scope, and
 
 Phase 4c: ModelSpec registration is live. Use the flavors below via::
 
-    torchrun ... --module kimi_linear --config <flavor>
+    torchrun ... --module attention_residual --config <flavor>
 
 where ``<flavor>`` is one of the 15 scaling-law flavors exported by
 :func:`model_registry` (5 sizes × 3 AttnRes variants). Trainer-level
@@ -21,17 +21,17 @@ configuration (optimizer, lr schedule, data) lives in
 """
 
 from torchtitan.components.loss import build_cross_entropy_loss
-from torchtitan.experiments.kimi_linear.attn_res_model import (
+from torchtitan.experiments.attention_residual.kimi_linear.attn_res_model import (
     KimiAttnResDecoderLayer,
     KimiLinearAttnResModel,
 )
-from torchtitan.experiments.kimi_linear.config_registry import (
+from torchtitan.experiments.attention_residual.kimi_linear.config_registry import (
     build_kimi_linear_config,
     flavor_names,
     resolve_num_blocks,
     SCALING_LAW_TABLE,
 )
-from torchtitan.experiments.kimi_linear.model import (
+from torchtitan.experiments.attention_residual.kimi_linear.model import (
     KimiDecoderLayer,
     KimiDeltaAttention,
     KimiLinearConfig,
@@ -41,13 +41,13 @@ from torchtitan.experiments.kimi_linear.model import (
     KimiMLP,
     KimiMoE,
 )
-from torchtitan.experiments.kimi_linear.multimodal_model import (
+from torchtitan.experiments.attention_residual.kimi_linear.multimodal_model import (
     KimiLinearMultimodalModel,
     KimiMultimodalConfig,
     KimiVisionProjector,
 )
-from torchtitan.experiments.kimi_linear.parallelize import parallelize_kimi_linear
-from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+from torchtitan.experiments.attention_residual.kimi_linear.parallelize import parallelize_kimi_linear
+from torchtitan.experiments.attention_residual.kimi_linear.pipeline_adapter import (
     pipeline_kimi_linear_with_cache_adapter,
 )
 from torchtitan.protocols.model_spec import ModelSpec

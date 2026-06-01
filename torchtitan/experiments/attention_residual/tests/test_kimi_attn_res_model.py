@@ -20,11 +20,11 @@ import unittest
 
 import torch
 
-from torchtitan.experiments.kimi_linear.attn_res_model import (
+from torchtitan.experiments.attention_residual.kimi_linear.attn_res_model import (
     KimiAttnResDecoderLayer,
     KimiLinearAttnResModel,
 )
-from torchtitan.experiments.kimi_linear.model import KimiLinearConfig
+from torchtitan.experiments.attention_residual.kimi_linear.model import KimiLinearConfig
 
 
 def _dense_mla_only_config(num_hidden_layers: int = 4) -> KimiLinearConfig:

@@ -7,7 +7,7 @@
 """Block Attention Residuals experiment (Kimi Team, 2026).
 
 Registers two families of AttnRes-native model flavors and exposes them
-through torchtitan's standard ``--module attn_res --config <name>`` path:
+through torchtitan's standard ``--module attention_residual --config <name>`` path:
 
 1. **Dense + GQA** (``175M_attn_res`` and ablation variants) — the
    single-GPU reference used for the RFC evidence runs.
@@ -43,12 +43,12 @@ _175M_N_LAYERS = 12
 
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.experiments.attn_res.attn_res import AttnResConfig, AttnResProjection
-from torchtitan.experiments.attn_res.model import (
+from torchtitan.experiments.attention_residual.attn_res import AttnResConfig, AttnResProjection
+from torchtitan.experiments.attention_residual.model import (
     AttnResModel,
     AttnResTransformerBlock,
 )
-from torchtitan.experiments.attn_res.pipeline_adapter import (
+from torchtitan.experiments.attention_residual.pipeline_adapter import (
     pipeline_llm_with_cache_adapter,
 )
 from torchtitan.models.common import (

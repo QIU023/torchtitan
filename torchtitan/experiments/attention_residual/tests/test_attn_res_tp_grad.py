@@ -21,7 +21,7 @@ with tp-rank-divergent K/V inputs and asserts the resulting weight gradient is
 identical across tp ranks (the all-reduce fired) and equals the reference
 sum-of-rank-contributions. Run via:
 
-    python -m torchtitan.experiments.attn_res.tests.test_attn_res_tp_grad
+    python -m torchtitan.experiments.attention_residual.tests.test_attn_res_tp_grad
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
-from torchtitan.experiments.attn_res.attn_res import block_attn_res
+from torchtitan.experiments.attention_residual.attn_res import block_attn_res
 from torchtitan.models.common.rmsnorm import RMSNorm
 
 

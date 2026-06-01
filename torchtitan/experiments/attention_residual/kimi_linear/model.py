@@ -989,7 +989,7 @@ class KimiLinearSpec:
 
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
-        from torchtitan.experiments.kimi_linear.attn_res_model import (
+        from torchtitan.experiments.attention_residual.kimi_linear.attn_res_model import (
             KimiLinearAttnResModel,
         )
         if self.num_blocks is None:

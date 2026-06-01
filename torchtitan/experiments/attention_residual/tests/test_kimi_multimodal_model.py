@@ -27,8 +27,8 @@ import unittest
 import torch
 import torch.nn as nn
 
-from torchtitan.experiments.kimi_linear.model import KimiLinearConfig
-from torchtitan.experiments.kimi_linear.multimodal_model import (
+from torchtitan.experiments.attention_residual.kimi_linear.model import KimiLinearConfig
+from torchtitan.experiments.attention_residual.kimi_linear.multimodal_model import (
     KimiLinearMultimodalModel,
     KimiMultimodalConfig,
     KimiVisionProjector,

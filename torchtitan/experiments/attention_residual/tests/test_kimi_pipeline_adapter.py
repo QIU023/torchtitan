@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import unittest
 
-from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+from torchtitan.experiments.attention_residual.kimi_linear.pipeline_adapter import (
     _KIMI_ATTN_RES_LAST_STAGE_FQNS,
     _kimi_llm_fqns,
 )
@@ -65,10 +65,10 @@ class TestPipeliningFnInModelSpec(unittest.TestCase):
         (baseline vs AttnRes) happens inside that function via
         ``num_blocks`` attr check, not at registration time.
         """
-        from torchtitan.experiments.kimi_linear import (
+        from torchtitan.experiments.attention_residual.kimi_linear import (
             flavor_names, model_registry,
         )
-        from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+        from torchtitan.experiments.attention_residual.kimi_linear.pipeline_adapter import (
             pipeline_kimi_linear_with_cache_adapter,
         )
         for flavor in flavor_names():

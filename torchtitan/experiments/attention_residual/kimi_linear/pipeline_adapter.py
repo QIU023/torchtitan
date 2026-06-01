@@ -6,7 +6,7 @@
 
 """Pipeline-parallel plumbing for Kimi Linear AttnRes.
 
-Reuses Phase 3's :class:`torchtitan.experiments.attn_res.pipeline_adapter.CrossStageCacheAdapter`
+Reuses Phase 3's :class:`torchtitan.experiments.attention_residual.pipeline_adapter.CrossStageCacheAdapter`
 verbatim (the adapter duck-types on ``wrapped.layers`` /
 ``wrapped._return_only_new_blocks`` / ``wrapped.forward(tokens, blocks)``
 and doesn't care whether the backbone is Llama3 or Kimi Linear).
@@ -42,10 +42,10 @@ import warnings
 import torch.nn as nn
 
 from torch.distributed.pipelining.schedules import PipelineScheduleSingle
-from torchtitan.experiments.attn_res.layout import (
+from torchtitan.experiments.attention_residual.layout import (
     _infer_block_layout_tables_from_stages,
 )
-from torchtitan.experiments.attn_res.pipeline_adapter import (
+from torchtitan.experiments.attention_residual.pipeline_adapter import (
     _INTERLEAVED_1F1B_CLASS,
     _install_mb_index_patch,
     _install_step_drop_patch,

@@ -20,8 +20,8 @@ import torch
 import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.experiments.attn_res import attn_res_configs, model_registry
-from torchtitan.experiments.attn_res.model import (
+from torchtitan.experiments.attention_residual import attn_res_configs, model_registry
+from torchtitan.experiments.attention_residual.model import (
     AttnResModel,
     AttnResTransformerBlock,
 )
@@ -202,7 +202,7 @@ class TestModelRegistryDispatch(unittest.TestCase):
         No forward runs here -- just verifies the config builders and
         registry plumbing are self-consistent.
         """
-        from torchtitan.experiments.attn_res import attn_res_configs
+        from torchtitan.experiments.attention_residual import attn_res_configs
 
         for flavor in attn_res_configs.keys():
             with self.subTest(flavor=flavor):

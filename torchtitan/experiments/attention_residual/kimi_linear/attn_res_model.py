@@ -9,7 +9,7 @@
 ``KimiLinearAttnResModel`` subclasses :class:`KimiLinearModel` and threads
 Block Attention Residuals through the decoder layer stack, reusing the
 paper's Figure 2 aggregation primitive
-:func:`torchtitan.experiments.attn_res.attn_res.block_attn_res`
+:func:`torchtitan.experiments.attention_residual.attn_res.block_attn_res`
 (shared with the existing ``AttnResLlama3Model`` / ``AttnResModel`` so
 that a single implementation is used across both experiments).
 
@@ -49,13 +49,13 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from torchtitan.experiments.attn_res.attn_res import (
+from torchtitan.experiments.attention_residual.attn_res import (
     AttnResProjection,
     block_attn_res,
     stack_blocks,
     unstack_blocks,
 )
-from torchtitan.experiments.kimi_linear.model import (
+from torchtitan.experiments.attention_residual.kimi_linear.model import (
     KimiDecoderLayer,
     KimiLinearConfig,
     KimiLinearModel,
@@ -166,7 +166,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
         ``partial_block = tok_embeddings(tokens)``.
       * Middle / last PP stage: ``forward(partial_in, blocks_in)`` —
         threads (partial, blocks) through the layer stack. PP adapter
-        (:mod:`torchtitan.experiments.attn_res.pipeline_adapter`) handles
+        (:mod:`torchtitan.experiments.attention_residual.pipeline_adapter`) handles
         the rebuild / delta.
 
     FSDP-only training (no PP) keeps ``_return_only_new_blocks=False``,

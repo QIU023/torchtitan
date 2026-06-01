@@ -19,7 +19,7 @@ import unittest
 
 import torch
 
-from torchtitan.experiments.kimi_linear import (
+from torchtitan.experiments.attention_residual.kimi_linear import (
     flavor_names,
     KimiLinearAttnResModel,
     KimiLinearConfig,
@@ -27,10 +27,11 @@ from torchtitan.experiments.kimi_linear import (
     KimiLinearSpec,
     model_registry,
 )
-from torchtitan.experiments.kimi_linear.config_registry import (
+from torchtitan.experiments.attention_residual.kimi_linear.config_registry import (
     kimi_linear_194m_baseline,
     kimi_linear_528m_block_attn_res,
     build_kimi_linear_config,
+    SCALING_LAW_TABLE,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -65,9 +66,12 @@ class TestKimiLinearSpec(unittest.TestCase):
 
 
 class TestModelRegistry(unittest.TestCase):
-    def test_fifteen_flavors(self):
+    def test_all_flavors_build(self):
         flavors = flavor_names()
-        self.assertEqual(len(flavors), 15)
+        # flavor_names() = every scaling-law size × 3 AttnRes variants
+        # (baseline / block_attn_res / full_attn_res). Derive the expected
+        # count from the table so adding a size row can't silently drift it.
+        self.assertEqual(len(flavors), len(SCALING_LAW_TABLE) * 3)
         for flavor in flavors:
             spec = model_registry(flavor)
             self.assertIsInstance(spec, ModelSpec)

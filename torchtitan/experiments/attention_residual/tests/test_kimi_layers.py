@@ -29,7 +29,7 @@ import unittest
 
 import torch
 
-from torchtitan.experiments.kimi_linear.model import (
+from torchtitan.experiments.attention_residual.kimi_linear.model import (
     KimiDeltaAttention,
     KimiLinearConfig,
     KimiMLAAttention,

@@ -43,10 +43,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.experiments.kimi_linear.attn_res_model import (
+from torchtitan.experiments.attention_residual.kimi_linear.attn_res_model import (
     KimiLinearAttnResModel,
 )
-from torchtitan.experiments.kimi_linear.model import (
+from torchtitan.experiments.attention_residual.kimi_linear.model import (
     KimiLinearConfig,
     KimiLinearModel,
 )

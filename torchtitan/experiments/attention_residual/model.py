@@ -48,7 +48,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from torchtitan.experiments.attn_res.attn_res import (
+from torchtitan.experiments.attention_residual.attn_res import (
     AttnResConfig,
     AttnResProjection,
     block_attn_res,

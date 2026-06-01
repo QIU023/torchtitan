@@ -50,7 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from torchtitan.experiments.kimi_linear.model import KimiLinearConfig
+from torchtitan.experiments.attention_residual.kimi_linear.model import KimiLinearConfig
 
 
 # ----- Paper Table 2 canonical sizes -------------------------------------- #
@@ -404,7 +404,7 @@ def _flavor_trainer_config(size: str, variant: Variant) -> Trainer.Config:
     """
     # Late import: model_registry lives in __init__.py which imports
     # from this module. Circular if eager-imported at module top.
-    from torchtitan.experiments.kimi_linear import model_registry
+    from torchtitan.experiments.attention_residual.kimi_linear import model_registry
 
     cfg = _base_trainer_config(size)
     flavor = f"kimi_linear_{size}_{variant}"
@@ -479,7 +479,7 @@ def kimi_linear_436m_block_attn_res_n4() -> Trainer.Config:
     variant. On bigger memory boxes (H100/H200/B200) we'd revert to
     paper's canonical N=8.
     """
-    from torchtitan.experiments.kimi_linear import (
+    from torchtitan.experiments.attention_residual.kimi_linear import (
         KimiLinearSpec,
         parallelize_kimi_linear,
         pipeline_kimi_linear_with_cache_adapter,
@@ -531,7 +531,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
     ``CONFIG=kimi_linear_447m_aligned_block_attn_res_n4``. Runs through
     the same parallelize_fn / pipelining_fn / loss_fn as 436M.
     """
-    from torchtitan.experiments.kimi_linear import (
+    from torchtitan.experiments.attention_residual.kimi_linear import (
         KimiLinearSpec,
         parallelize_kimi_linear,
         pipeline_kimi_linear_with_cache_adapter,
@@ -657,10 +657,10 @@ def _kimi_linear_48b_attnres_downscale(
     deviate (e.g. n_layers=24, num_blocks=8 keeps the paper 3:1 ratio
     while making the depth divisible by PP=8 × VP=3 = 24 chunks).
     """
-    from torchtitan.experiments.kimi_linear import (
+    from torchtitan.experiments.attention_residual.kimi_linear import (
         parallelize_kimi_linear, KimiLinearSpec,
     )
-    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+    from torchtitan.experiments.attention_residual.kimi_linear.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )
     from torchtitan.components.loss import build_cross_entropy_loss
@@ -815,10 +815,10 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
     retained; only depth reduced by 1 to satisfy the Interleaved1F1B
     divisibility requirement.
     """
-    from torchtitan.experiments.kimi_linear import (
+    from torchtitan.experiments.attention_residual.kimi_linear import (
         parallelize_kimi_linear, KimiLinearSpec,
     )
-    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+    from torchtitan.experiments.attention_residual.kimi_linear.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )
     from torchtitan.components.loss import build_cross_entropy_loss
@@ -842,10 +842,10 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
 
 def kimi_linear_528m_l16_full_attn_res() -> Trainer.Config:
     """528M-scale Kimi Linear Full AttnRes (num_blocks = n_layers = 16)."""
-    from torchtitan.experiments.kimi_linear import (
+    from torchtitan.experiments.attention_residual.kimi_linear import (
         parallelize_kimi_linear, KimiLinearSpec,
     )
-    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+    from torchtitan.experiments.attention_residual.kimi_linear.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )
     from torchtitan.components.loss import build_cross_entropy_loss
@@ -871,10 +871,10 @@ def kimi_linear_528m_l16_baseline() -> Trainer.Config:
     """528M-scale Kimi Linear baseline (no AttnRes) with n_layers=16.
     Paired control for the two AttnRes variants above.
     """
-    from torchtitan.experiments.kimi_linear import (
+    from torchtitan.experiments.attention_residual.kimi_linear import (
         parallelize_kimi_linear, KimiLinearSpec,
     )
-    from torchtitan.experiments.kimi_linear.pipeline_adapter import (
+    from torchtitan.experiments.attention_residual.kimi_linear.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )
     from torchtitan.components.loss import build_cross_entropy_loss

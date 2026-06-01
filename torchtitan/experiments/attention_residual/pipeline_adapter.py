@@ -79,8 +79,8 @@ try:
 except Exception:  # pragma: no cover - fallback for older torch
     _INTERLEAVED_1F1B_CLASS = None
 
-from torchtitan.experiments.attn_res.attn_res import unstack_blocks
-from torchtitan.experiments.attn_res.layout import (
+from torchtitan.experiments.attention_residual.attn_res import unstack_blocks
+from torchtitan.experiments.attention_residual.layout import (
     _infer_block_layout_tables_from_stages,
     BlockLayoutTables,
 )
