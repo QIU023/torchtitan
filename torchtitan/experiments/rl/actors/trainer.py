@@ -414,6 +414,23 @@ class PolicyTrainer(Actor, Configurable):
         )
 
     @endpoint
+    async def save_dcp(self, save_dir: str, step: int) -> str:
+        """Save the policy model as a DCP checkpoint under
+        ``{save_dir}/step-{step}/`` and return the path written.
+
+        Model weights only (no optimizer state) — RL fine-tunes are short
+        and re-init optim on restart; the saved DCP is a resume point for
+        --dcp-load-path and the deliverable policy. Mirrors
+        ``OPDTrainer.save_dcp`` so the GRPO path (PolicyTrainer, no OPD
+        subclass) can also checkpoint.
+        """
+        out_dir = os.path.join(save_dir, f"step-{step}")
+        os.makedirs(out_dir, exist_ok=True)
+        dcp.save(self.model.state_dict(), checkpoint_id=out_dir)
+        logger.info(f"policy ckpt saved: {out_dir} (step {step})")
+        return out_dir
+
+    @endpoint
     async def push_model_state_dict(self) -> None:
         """Publish model weights for generator consumption via TorchStore.
 

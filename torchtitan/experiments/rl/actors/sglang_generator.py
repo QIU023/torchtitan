@@ -113,6 +113,15 @@ class SGLangBackendConfig:
     attention_backend: str = "flashinfer"
     linear_attn_backend: str = "triton"
 
+    disable_radix_cache: bool = False
+    """Disable SGLang's radix prefix cache. REQUIRED for KDA/linear-attn +
+    multimodal models (e.g. the Block-AttnRes VLM): the radix cache reuses
+    token-id prefixes and drops/mismatches the spliced ``<image>`` vision
+    embeddings → image-blind generation. Verified deterministically: radix ON
+    → fluent but image-unrelated rambling (GQA reward ~3%); radix OFF →
+    short grounded answers (~45%). Leave False for plain text models where
+    radix prefix reuse is a throughput win."""
+
     decode_attention_backend: str | None = None
     """Optional separate attention backend for the decode phase.
 
@@ -279,6 +288,7 @@ class SGLangGenerator(Actor, Configurable):
             mem_fraction_static=config.gpu_memory_limit,
             attention_backend=config.backend.attention_backend,
             linear_attn_backend=config.backend.linear_attn_backend,
+            disable_radix_cache=config.backend.disable_radix_cache,
             disable_cuda_graph=not config.compile.cuda_graph,
             **(
                 {"decode_attention_backend": config.backend.decode_attention_backend}
