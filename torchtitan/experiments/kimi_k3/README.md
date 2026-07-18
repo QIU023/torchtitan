@@ -31,12 +31,18 @@ compute at matched param count, with PP-friendly `N ≈ 8`.
 | File | Role |
 | --- | --- |
 | [`attn_res.py`](./attn_res.py) | `block_attn_res()` primitive, `AttnResConfig`, `AttnResProjection` (pseudo-query, zero-initialized), `stack_blocks` / `unstack_blocks` |
-| [`model.py`](./model.py) | `AttnResTransformerBlock` and `AttnResModel` — standalone classes inheriting only from the shared `torchtitan.models.common.decoder` bases (no Llama3 coupling); supports both dense GQA FFN and per-layer MoE-MLA via the DSv3 pattern |
-| [`__init__.py`](./__init__.py) | Flavor registry. Dense flavors → GQA + `parallelize_llama`; MoE flavors → MLA + `parallelize_deepseekv3`. Routing is automatic from the flavor name. |
-| [`config_registry.py`](./config_registry.py) | Trainer configs (shared hyperparameters per family, only flavor name differs) |
-| [`pipeline_adapter.py`](./pipeline_adapter.py) | Cross-stage caching adapter + custom `pipelining_fn`. Activates on any flavor when `TORCHTITAN_ATTNRES_CACHE=1`. |
+| [`model.py`](./model.py) | Kimi K3 backbone: `KimiDeltaAttention` (KDA via `fla-core`), `KimiMLAAttention`, `KimiMoE`, `KimiDecoderLayer`, `KimiLinearModel` |
+| [`attn_res_model.py`](./attn_res_model.py) | `KimiLinearAttnResModel`: AttnRes weave over the Kimi backbone (per-block-start RMSNorm + zero-init pseudo-queries) |
+| [`multimodal_model.py`](./multimodal_model.py) | `KimiLinearMultimodalModel` + `KimiVisionProjector` (SigLIP-splice scaffold) |
+| [`parallelize.py`](./parallelize.py) | `parallelize_kimi_linear`: FSDP2/HSDP + TP + EP for the Kimi backbone (CP blocked on fla-core) |
+| [`dense_model.py`](./dense_model.py) | Dense GQA / DSv3-MoE AttnRes carrier (`AttnResModel`): the unit-test and PP-pressure-test bed |
+| [`model_configs.py`](./model_configs.py) | Architecture-side builders: scaling-law table (194M..528M, 447M-aligned, 48B), `build_kimi_linear_config` |
+| [`config_registry.py`](./config_registry.py) | Trainer configs for all flavor families (dense llama3_*, dsv3_*, kimi_linear_*) |
+| [`__init__.py`](./__init__.py) | Flavor registry + unified `model_registry` dispatch (`kimi_linear_*` -> Kimi backbone; else dense/DSv3 carrier) |
+| [`pipeline_adapter.py`](./pipeline_adapter.py) | Cross-stage caching adapter + `pipelining_fn`s (generic + Kimi wiring). Activates when `TORCHTITAN_ATTNRES_CACHE=1`. |
 | [`layout.py`](./layout.py) | Static block-delta layout tables consumed by the PP adapter |
-| [`tests/`](./tests/) | CPU unit tests: primitive / projection / stack-unstack / dense model / DSv3 MoE model / model-registry dispatch |
+| [`reference/`](./reference/) | Verbatim HF blueprint (`modeling_kimi.py`, `configuration_kimi.py`) -- not imported |
+| [`tests/`](./tests/) | CPU unit tests. `test_kimi_*` need `fla-core` (GPU box); DSv3 forward tests need CUDA (FlexAttention has no CPU backward). |
 
 ### Flavor families
 
@@ -155,7 +161,7 @@ no KDA, no sigmoid-gated grouped-topk routing. Useful as a regression smoke
 when changing the AttnRes primitive or the cache adapter. Has not been GPU-
 trained; the PP adapter + MoE + EP combo on this shape is still untested.
 
-**3b. Kimi-Linear-shape (sibling [`../kimi_linear/`](../kimi_linear/)) —
+**3b. Kimi-Linear-shape (sibling the Kimi model files in this folder) —
 end-to-end production-aligned run.**
 KDA + MLA + sigmoid-gated grouped-topk MoE + AttnRes wrapper, with the
 cross-stage cache adapter wired through. Phase 4 ran a 436M FSDP overnight
@@ -164,7 +170,7 @@ the shape Kimi K3 will almost certainly ship with — the actual evidence that
 MoE + MLA + AttnRes + PP cache adapter trains end-to-end on this hardware
 lives there.
 
-**For Kimi-K3-shape work, start at [`../kimi_linear/`](../kimi_linear/).**
+**For Kimi-K3-shape work, start at `model.py` / `attn_res_model.py`.**
 For minimal MoE+AttnRes smoke regression on the AttnRes primitive itself,
 keep using the `dsv3_*_attn_res` flavors in this folder.
 

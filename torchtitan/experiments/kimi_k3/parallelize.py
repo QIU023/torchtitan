@@ -1038,8 +1038,8 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
     # ``from .attn_res import block_attn_res`` creates an independent
     # binding that wouldn't be touched by patching the source module.
     from torchtitan.experiments.kimi_k3 import attn_res as _src
-    from torchtitan.experiments.kimi_k3 import model as _llama_attn_res_mod
-    from torchtitan.experiments.kimi_k3.kimi_linear import attn_res_model as _kimi_attn_res_mod
+    from torchtitan.experiments.kimi_k3 import dense_model as _llama_attn_res_mod
+    from torchtitan.experiments.kimi_k3 import attn_res_model as _kimi_attn_res_mod
     disabled = torch.compiler.disable(_src.block_attn_res, recursive=True)
     _src.block_attn_res = disabled
     _llama_attn_res_mod.block_attn_res = disabled
@@ -1055,7 +1055,7 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
     # KDA forward eagerly runs the to_local + the linears, which is
     # negligible compute cost on top of the already-eager triton
     # kernels.
-    from torchtitan.experiments.kimi_k3.kimi_linear.model import KimiDeltaAttention
+    from torchtitan.experiments.kimi_k3.model import KimiDeltaAttention
     KimiDeltaAttention.forward = torch.compiler.disable(
         KimiDeltaAttention.forward, recursive=True,
     )

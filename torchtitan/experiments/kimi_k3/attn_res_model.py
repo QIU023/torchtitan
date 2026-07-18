@@ -55,7 +55,7 @@ from torchtitan.experiments.kimi_k3.attn_res import (
     stack_blocks,
     unstack_blocks,
 )
-from torchtitan.experiments.kimi_k3.kimi_linear.model import (
+from torchtitan.experiments.kimi_k3.model import (
     KimiDecoderLayer,
     KimiLinearConfig,
     KimiLinearModel,

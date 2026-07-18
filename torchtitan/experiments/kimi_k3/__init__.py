@@ -41,10 +41,9 @@ import torch.nn as nn
 # as 75.5M non-embedding.
 _175M_N_LAYERS = 12
 
-from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.experiments.kimi_k3.attn_res import AttnResConfig, AttnResProjection
-from torchtitan.experiments.kimi_k3.model import (
+from torchtitan.experiments.kimi_k3.dense_model import (
     AttnResModel,
     AttnResTransformerBlock,
 )
@@ -52,6 +51,7 @@ from torchtitan.experiments.kimi_k3.pipeline_adapter import (
     pipeline_llm_with_cache_adapter,
 )
 from torchtitan.models.common import (
+    ComplexRoPE,
     compute_ffn_hidden_dim,
     Embedding,
     Linear,
@@ -60,7 +60,7 @@ from torchtitan.models.common import (
 )
 from torchtitan.models.common.attention import FlexAttention, ScaledDotProductAttention
 from torchtitan.models.common.config_utils import (
-    make_experts_config,
+    make_routed_experts_config,
     make_ffn_config,
     make_gqa_config,
     make_moe_config,
@@ -124,6 +124,7 @@ def _build_attn_res_layers(
     dim: int,
     n_heads: int,
     hidden_dim: int,
+    rope: RoPE.Config,
     n_kv_heads: int | None = None,
     init_scheme: str = "depth_scaled",
 ) -> list[AttnResTransformerBlock.Config]:
@@ -156,8 +157,7 @@ def _build_attn_res_layers(
                     wqkv_param_init=_LINEAR_INIT,
                     wo_param_init=wo_init,
                     inner_attention=ScaledDotProductAttention.Config(),
-                    mask_type="causal",
-                    rope_backend="complex",
+                    rope=rope,
                 ),
                 feed_forward=make_ffn_config(
                     dim=dim,
@@ -199,21 +199,20 @@ def _debugmodel_attn_res() -> AttnResModel.Config:
             num_embeddings=2048, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim, out_features=2048, param_init=_output_linear_init(dim)
-        ),
-        rope=RoPE.Config(
-            dim=dim // n_heads,
-            max_seq_len=131072,
-            theta=500000,
-            backend="complex",
-            scaling="llama",
         ),
         layers=_build_attn_res_layers(
             n_layers=n_layers,
             dim=dim,
             n_heads=n_heads,
             hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
+            rope=ComplexRoPE.Config(
+                dim=dim // n_heads,
+                max_seq_len=131072,
+                theta=500000,
+                scaling="llama",
+            ),
         ),
         attn_res=AttnResConfig(enabled=True, num_blocks=num_blocks),
         final_attn_res_proj=AttnResProjection.Config(
@@ -284,17 +283,10 @@ def _175m_attn_res(
             param_init=_EMBEDDING_SKIP_INIT,
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=dim // n_heads,
-            max_seq_len=8192,
-            theta=500000,
-            backend="complex",
-            scaling="llama",
         ),
         layers=_build_attn_res_layers(
             n_layers=n_layers,
@@ -305,6 +297,12 @@ def _175m_attn_res(
                 dim, multiple_of=256, ffn_dim_multiplier=1.0
             ),
             init_scheme=init_scheme,
+            rope=ComplexRoPE.Config(
+                dim=dim // n_heads,
+                max_seq_len=8192,
+                theta=500000,
+                scaling="llama",
+            ),
         ),
         attn_res=AttnResConfig(enabled=True, num_blocks=num_blocks),
         final_attn_res_proj=AttnResProjection.Config(
@@ -319,9 +317,9 @@ def _175m_attn_res(
 def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
     """DSv3 depth-scaled init for GroupedExperts w1/w2/w3 weights."""
     return {
-        "w1": partial(nn.init.trunc_normal_, std=0.02),
-        "w2": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
-        "w3": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
+        "w2_EDF": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "w3_EFD": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
     }
 
 
@@ -348,8 +346,8 @@ def _build_dsv3_attn_res_layers(
     router_route_scale: float = 1.0,
     router_route_norm: bool = False,
     score_before_experts: bool = False,
-    inner_attention=None,
-    mask_type: str = "causal",
+    rope: RoPE.Config,
+    attn_backend: str = "flex",
 ) -> list[AttnResTransformerBlock.Config]:
     """Build DSv3-shaped layers (MLA attention + mixed dense/MoE FFN)
     with AttnRes wiring on every layer.
@@ -379,8 +377,8 @@ def _build_dsv3_attn_res_layers(
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
             mscale=mscale,
-            inner_attention=inner_attention,
-            mask_type=mask_type,
+            rope=rope,
+            attn_backend=attn_backend,
         )
 
         if layer_id < n_dense_layers:
@@ -395,7 +393,6 @@ def _build_dsv3_attn_res_layers(
             ffn_cfg = None
             moe_cfg = make_moe_config(
                 num_experts=num_experts,
-                score_before_experts=score_before_experts,
                 router=make_router_config(
                     dim=dim,
                     num_experts=num_experts,
@@ -407,11 +404,13 @@ def _build_dsv3_attn_res_layers(
                     route_scale=router_route_scale,
                     route_norm=router_route_norm,
                 ),
-                experts=make_experts_config(
+                routed_experts=make_routed_experts_config(
                     dim=dim,
                     hidden_dim=moe_hidden_dim,
                     num_experts=num_experts,
+                    top_k=router_top_k,
                     param_init=_depth_experts_init(layer_id),
+                    comm_backend="standard",
                 ),
                 shared_experts=make_ffn_config(
                     dim=dim,
@@ -480,6 +479,17 @@ def _dsv3_debugmodel_attn_res() -> AttnResModel.Config:
         router_top_k=3,
         router_score_func="softmax",
         score_before_experts=False,
+        rope=ComplexRoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096 * 4,
+            theta=10000.0,
+            scaling="yarn",
+            rope_factor=40.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        attn_backend="flex",
     )
     return AttnResModel.Config(
         vocab_size=vocab_size,
@@ -488,21 +498,10 @@ def _dsv3_debugmodel_attn_res() -> AttnResModel.Config:
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=rope_dim,
-            max_seq_len=4096 * 4,
-            theta=10000.0,
-            backend="complex",
-            scaling="yarn",
-            rope_factor=40.0,
-            beta_fast=32.0,
-            beta_slow=1.0,
-            original_seq_len=4096,
         ),
         layers=layers,
         attn_res=AttnResConfig(enabled=True, num_blocks=num_blocks),
@@ -553,8 +552,17 @@ def _dsv3_16b_attn_res(num_blocks: int = 9) -> AttnResModel.Config:
         router_top_k=6,
         router_score_func="softmax",
         score_before_experts=False,
-        inner_attention=FlexAttention.Config(),
-        mask_type="block_causal",
+        rope=ComplexRoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096 * 4,
+            theta=10000.0,
+            scaling="yarn",
+            rope_factor=40.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        attn_backend="flex",
     )
     return AttnResModel.Config(
         vocab_size=vocab_size,
@@ -563,21 +571,10 @@ def _dsv3_16b_attn_res(num_blocks: int = 9) -> AttnResModel.Config:
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=rope_dim,
-            max_seq_len=4096 * 4,
-            theta=10000.0,
-            backend="complex",
-            scaling="yarn",
-            rope_factor=40.0,
-            beta_fast=32.0,
-            beta_slow=1.0,
-            original_seq_len=4096,
         ),
         layers=layers,
         attn_res=AttnResConfig(enabled=True, num_blocks=num_blocks),
@@ -727,7 +724,7 @@ attn_res_configs = {
 }
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def _dense_model_registry(flavor: str) -> ModelSpec:
     """Build a ``ModelSpec`` for ``flavor``.
 
     Parallelize / post-optimizer / state-dict-adapter are chosen from the
@@ -763,7 +760,92 @@ def model_registry(flavor: str) -> ModelSpec:
         # When the flag is unset, this is a thin passthrough over
         # torchtitan.distributed.pipeline_parallel.pipeline_llm.
         pipelining_fn=pipeline_llm_with_cache_adapter,
-        build_loss_fn=build_cross_entropy_loss,
         post_optimizer_build_fn=post_optimizer_build_fn,
         state_dict_adapter=state_dict_adapter,
     )
+
+
+# ----- Kimi Linear / K3 backbone (merged from kimi_linear/) --------------- #
+# fla-core (triton) is required by the KDA path; guard so environments
+# without it (e.g. CPU-only dev boxes) can still use the dense carrier.
+try:
+    from torchtitan.experiments.kimi_k3.attn_res_model import (
+        KimiAttnResDecoderLayer,
+        KimiLinearAttnResModel,
+    )
+    from torchtitan.experiments.kimi_k3.model import (
+        KimiDecoderLayer,
+        KimiDeltaAttention,
+        KimiLinearConfig,
+        KimiLinearModel,
+        KimiLinearSpec,
+        KimiMLAAttention,
+        KimiMLP,
+        KimiMoE,
+    )
+    from torchtitan.experiments.kimi_k3.model_configs import (
+        build_kimi_linear_config,
+        flavor_names,
+        resolve_num_blocks,
+        SCALING_LAW_TABLE,
+    )
+    from torchtitan.experiments.kimi_k3.multimodal_model import (
+        KimiLinearMultimodalModel,
+        KimiMultimodalConfig,
+        KimiVisionProjector,
+    )
+    from torchtitan.experiments.kimi_k3.parallelize import parallelize_kimi_linear
+    from torchtitan.experiments.kimi_k3.pipeline_adapter import (
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+
+    _KIMI_IMPORT_ERROR: ImportError | None = None
+except ImportError as _err:
+    _KIMI_IMPORT_ERROR = _err
+
+
+def _parse_flavor(flavor: str) -> tuple[str, str]:
+    """Parse ``kimi_linear_<size>_<variant>`` -> (size, variant)."""
+    if not flavor.startswith("kimi_linear_"):
+        raise ValueError(
+            f"Expected flavor starting with 'kimi_linear_'; got '{flavor}'"
+        )
+    rest = flavor[len("kimi_linear_"):]
+    for variant in ("baseline", "block_attn_res", "full_attn_res"):
+        suffix = f"_{variant}"
+        if rest.endswith(suffix):
+            size = rest[: -len(suffix)]
+            return size, variant
+    raise ValueError(f"Unknown flavor '{flavor}'.")
+
+
+def _kimi_model_registry(flavor: str) -> ModelSpec:
+    """ModelSpec for ``kimi_linear_<size>_<variant>`` flavors."""
+    if _KIMI_IMPORT_ERROR is not None:
+        raise ImportError(
+            "Kimi K3 backbone flavors require fla-core (KDA kernels)."
+        ) from _KIMI_IMPORT_ERROR
+    size, variant = _parse_flavor(flavor)
+    kimi_config = build_kimi_linear_config(size)
+    num_blocks = resolve_num_blocks(size, variant)
+    spec_config = KimiLinearSpec(
+        kimi_config=kimi_config,
+        num_blocks=num_blocks,
+    )
+    return ModelSpec(
+        name="kimi_linear",
+        flavor=flavor,
+        model=spec_config,
+        parallelize_fn=parallelize_kimi_linear,
+        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=None,
+    )
+
+
+def model_registry(flavor: str) -> ModelSpec:
+    """Unified flavor dispatch: ``kimi_linear_*`` -> K3 backbone specs;
+    everything else -> the dense / DSv3 AttnRes carrier specs."""
+    if flavor.startswith("kimi_linear_"):
+        return _kimi_model_registry(flavor)
+    return _dense_model_registry(flavor)

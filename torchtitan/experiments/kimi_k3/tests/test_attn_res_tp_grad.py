@@ -37,7 +37,7 @@ from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
 from torchtitan.experiments.kimi_k3.attn_res import block_attn_res
-from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.models.common.nn_modules import RMSNorm
 
 
 def _unit_norm(dim: int) -> RMSNorm:

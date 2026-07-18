@@ -25,8 +25,8 @@ from torchtitan.experiments.kimi_k3.attn_res import (
     stack_blocks,
     unstack_blocks,
 )
-from torchtitan.experiments.kimi_k3.model import AttnResTransformerBlock  # noqa: F401 -- imported for the direct block test below
-from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.experiments.kimi_k3.dense_model import AttnResTransformerBlock  # noqa: F401 -- imported for the direct block test below
+from torchtitan.models.common.nn_modules import RMSNorm
 
 
 def _zero_proj(dim: int) -> AttnResProjection:
@@ -230,7 +230,7 @@ class TestAttnResModel(unittest.TestCase):
         # Simulate a PP middle stage by stripping embedding/output/norm.
         model.tok_embeddings = None
         model.norm = None
-        model.output = None
+        model.lm_head = None
 
         B, T, D = 2, 8, config.dim
         partial = torch.randn(B, T, D)
@@ -262,7 +262,7 @@ class TestAttnResModel(unittest.TestCase):
         # layer (layer_id=1: 1 % 2 != 0, so no commit).
         model.tok_embeddings = None
         model.norm = None
-        model.output = None
+        model.lm_head = None
         model.layers = nn.ModuleDict({"1": model.layers["1"]})
         model._return_only_new_blocks = True
 
@@ -285,7 +285,7 @@ class TestAttnResTransformerBlockDirect(unittest.TestCase):
     through ``AttnResModel``).
 
     Since the Llama3-subclass refactor, the block has exactly ONE forward
-    path — ``(blocks, partial_block, is_block_start, freqs_cis, ...)
+    path — ``(blocks, partial_block, is_block_start, ...)
     -> (blocks, partial_block)``. No fallback-to-standard-residual mode
     remains. These tests pin that contract so a regression that
     accidentally re-introduces positional-argument ambiguity is caught.
@@ -296,10 +296,10 @@ class TestAttnResTransformerBlockDirect(unittest.TestCase):
         model = config.build()
         model.init_states()
         layer = model.layers["0"]
-        return layer, model.freqs_cis, config.dim
+        return layer, config.dim
 
     def test_direct_forward_returns_blocks_and_partial(self):
-        layer, freqs_cis, D = self._first_layer()
+        layer, D = self._first_layer()
         B, T = 2, 4
         partial = torch.randn(B, T, D)
         # Layer 0 is a block start in debugmodel (layers_per_block=2).
@@ -307,7 +307,6 @@ class TestAttnResTransformerBlockDirect(unittest.TestCase):
             [],
             partial,
             True,  # is_block_start
-            freqs_cis,
             None,  # attention_masks
             None,  # positions
         )
@@ -318,7 +317,7 @@ class TestAttnResTransformerBlockDirect(unittest.TestCase):
         self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
 
     def test_direct_forward_non_block_start_keeps_blocks(self):
-        layer, freqs_cis, D = self._first_layer()
+        layer, D = self._first_layer()
         B, T = 2, 4
         b0 = torch.randn(B, T, D)
         partial = torch.randn(B, T, D)
@@ -326,7 +325,6 @@ class TestAttnResTransformerBlockDirect(unittest.TestCase):
             [b0],
             partial,
             False,  # NOT a block start
-            freqs_cis,
             None,
             None,
         )

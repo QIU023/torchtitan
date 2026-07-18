@@ -21,7 +21,7 @@ import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.experiments.kimi_k3 import attn_res_configs, model_registry
-from torchtitan.experiments.kimi_k3.model import (
+from torchtitan.experiments.kimi_k3.dense_model import (
     AttnResModel,
     AttnResTransformerBlock,
 )
@@ -31,6 +31,14 @@ from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
+
+def _causal_masks(B: int, T: int):
+    from torchtitan.models.common.attention import (
+        create_attention_mask,
+        get_causal_mask_mod,
+    )
+    return create_attention_mask(get_causal_mask_mod(), B, None, T, T)
+
 
 
 class TestDSv3AttnResLayers(unittest.TestCase):
@@ -81,6 +89,10 @@ class TestDSv3AttnResLayers(unittest.TestCase):
         self.assertIsNotNone(self.config.final_attn_res_norm)
 
 
+@unittest.skipIf(
+    not torch.cuda.is_available(),
+    "FlexAttention has no CPU backward; DSv3 flavors are flex-backed upstream",
+)
 class TestDSv3AttnResModel(unittest.TestCase):
     """Build + forward + backward smoke on the DSv3 AttnRes debug model."""
 
@@ -126,20 +138,20 @@ class TestDSv3AttnResModel(unittest.TestCase):
     def test_forward_shape(self):
         B, T = 2, 8
         tokens = torch.randint(0, self.config.vocab_size, (B, T))
-        logits = self.model(tokens)
+        logits = self.model(tokens, attention_masks=_causal_masks(*tokens.shape))
         self.assertEqual(logits.shape, torch.Size([B, T, self.config.vocab_size]))
 
     def test_forward_finite(self):
         """MoE + MLA + AttnRes composition does not NaN on step 0."""
         B, T = 2, 8
         tokens = torch.randint(0, self.config.vocab_size, (B, T))
-        logits = self.model(tokens)
+        logits = self.model(tokens, attention_masks=_causal_masks(*tokens.shape))
         self.assertTrue(torch.isfinite(logits).all())
 
     def test_forward_backward_grads_reach_attn_res_params(self):
         B, T = 2, 8
         tokens = torch.randint(0, self.config.vocab_size, (B, T))
-        logits = self.model(tokens)
+        logits = self.model(tokens, attention_masks=_causal_masks(*tokens.shape))
         loss = logits.sum()
         loss.backward()
         # AttnRes params on every layer receive a grad (sources differ
@@ -159,7 +171,7 @@ class TestDSv3AttnResModel(unittest.TestCase):
         """Backward reaches the router gate on at least one MoE layer."""
         B, T = 2, 8
         tokens = torch.randint(0, self.config.vocab_size, (B, T))
-        logits = self.model(tokens)
+        logits = self.model(tokens, attention_masks=_causal_masks(*tokens.shape))
         logits.sum().backward()
         # Layers 1..5 are MoE; pick one and check its router.
         moe_layer = self.model.layers["1"]
