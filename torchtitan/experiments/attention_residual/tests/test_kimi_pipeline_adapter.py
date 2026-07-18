@@ -9,7 +9,7 @@
 Focused on the parts that are Kimi-specific (FQN name remapping +
 AttnRes-presence detection via ``num_blocks`` attr). The heavy lift —
 ``CrossStageCacheAdapter`` / ``RankLocalCache`` / the hook+detach
-bridge — is tested in ``torchtitan/experiments/attn_res/tests/`` and
+bridge — is tested in ``torchtitan/experiments/attention_residual/tests/`` and
 reused verbatim.
 """
 

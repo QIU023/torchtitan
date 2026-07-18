@@ -4,10 +4,13 @@ Reference implementation of **Block Attention Residuals** from
 [*Attention Residuals* (Kimi Team, 2026), arXiv:2603.15031](https://arxiv.org/abs/2603.15031),
 inside torchtitan.
 
-> **Status (2026-04-26).** RFC [pytorch/torchtitan#3029](https://github.com/pytorch/torchtitan/issues/3029)
-> filed; reviewers asked to gate upstream merge on the **Kimi K3** release. Until
-> then this fork is the canonical reference implementation. The dense Llama3 A/B
-> evidence (paper Table 1 reproduction) and the cross-stage caching adapter for
+> **Status (2026-07-17).** RFC [pytorch/torchtitan#3029](https://github.com/pytorch/torchtitan/issues/3029)
+> was gated by reviewers on the **Kimi K3** release -- that gate is now met:
+> K3 shipped 2026-07-16 with AttnRes + KDA confirmed as core architecture
+> components (weights + tech report due 2026-07-27). A follow-up RFC proposing
+> `experiments/kimi_k3/` is in preparation; until it lands, this fork is the
+> canonical reference implementation. The dense Llama3 A/B evidence (paper
+> Table 1 reproduction) and the cross-stage caching adapter for
 > `Interleaved1F1B` PP (paper §4.1) are both functional and tested here.
 
 ## Motivation
@@ -56,7 +59,7 @@ model-family-specific class.
 
 ```bash
 # Unit tests (all flavors, CPU)
-pytest torchtitan/experiments/attn_res/tests/ -v
+pytest torchtitan/experiments/attention_residual/tests/ -v
 
 # Dense single-GPU: A/B baseline vs AttnRes at matched shape.
 bash run_train.sh --module attention_residual --config llama3_175m_baseline \
