@@ -22,11 +22,13 @@ concurrency:
 
 jobs:
   docker-build:
+    # Skip scheduled runs on forks, where they would only fail and email the fork owner
+    if: github.repository_owner == 'pytorch' || github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - docker-image-name: torchtitan-ubuntu-20.04-clang12
+          - docker-image-name: torchtitan-ubuntu-22.04-clang12
             runner: [self-hosted, linux.2xlarge]
           - docker-image-name: torchtitan-rocm-ubuntu-22.04-clang12
             runner: [linux.2xlarge]
@@ -48,7 +50,7 @@ jobs:
           github-secret: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout the repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Linux
         uses: pytorch/test-infra/.github/actions/setup-linux@main

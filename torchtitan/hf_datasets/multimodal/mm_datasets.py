@@ -152,7 +152,6 @@ def _process_mm_sample(
                 )
                 processed_images.append(processed_img)
                 num_image_tokens.append(num_tokens)
-                # pyrefly: ignore [unsupported-operation]
                 texts[idx] = None
 
     if len(processed_images) != len([_ for _ in images if _ is not None]):
@@ -246,9 +245,7 @@ def _process_cc12_wd_sample(
     images = [image, None]
 
     return _process_mm_sample(
-        # pyrefly: ignore [bad-argument-type]
         texts=texts,
-        # pyrefly: ignore [bad-argument-type]
         images=images,
         tokenizer=tokenizer,
         patch_size=patch_size,
@@ -534,6 +531,11 @@ class MMDataLoader(ParallelAwareDataloader):
         video_max_frames: int = 768
         """Maximum number of frames to sample from a video."""
 
+        # Other loading configs
+        build_mrope_positions: bool = False
+        """Build 3D MRoPE position IDs (``mrope_positions``) for models that use
+        multi-dimensional RoPE"""
+
     def __init__(
         self,
         config: Config,
@@ -577,6 +579,7 @@ class MMDataLoader(ParallelAwareDataloader):
             temporal_patch_size=config.temporal_patch_size,
             spatial_merge_size=config.spatial_merge_size,
             tokenizer=tokenizer,
+            build_mrope_positions=config.build_mrope_positions,
         )
 
         dataloader_kwargs = {

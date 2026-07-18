@@ -7,7 +7,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, cast, Literal
 
 import torch
 import tyro
@@ -20,6 +20,7 @@ from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.hf_datasets import DatasetConfig
+from torchtitan.hf_datasets.interleaved import InterleavedDataset
 from torchtitan.tools.logging import logger
 
 
@@ -89,7 +90,10 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         ds = dataset_loader(path)
 
         self.dataset_name = dataset_name
-        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+        # Keep an unshuffled reference so map-style datasets can be re-shuffled
+        # deterministically on re-loop and on checkpoint resume.
+        self._original_data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+        self._data = self._original_data
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
@@ -163,17 +167,23 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
             if not self.infinite:
                 logger.warning(f"Dataset {self.dataset_name} has run out of data")
                 break
-            else:
-                # Reset offset for the next iteration
-                self._sample_idx = 0
-                self._epoch += 1
-                logger.warning(f"Dataset {self.dataset_name} is being re-looped")
-                # Ensures re-looping a dataset loaded from a checkpoint works correctly
-                if not isinstance(self._data, Dataset):
-                    if hasattr(self._data, "set_epoch") and hasattr(
-                        self._data, "epoch"
-                    ):
-                        self._data.set_epoch(self._data.epoch + 1)
+            self.reloop()
+
+    def reloop(self) -> None:
+        """Advance to the next epoch in place: reset the read position and
+        reshuffle.
+        """
+        self._sample_idx = 0
+        self._epoch += 1
+        if isinstance(self._data, Dataset):
+            self._data = cast(
+                Dataset, self._original_data.shuffle(seed=42 + self._epoch)
+            )
+        elif hasattr(self._data, "set_epoch") and hasattr(self._data, "epoch"):
+            self._data.set_epoch(self._data.epoch + 1)
+        logger.warning(
+            f"Dataset {self.dataset_name} is being re-looped (epoch {self._epoch})"
+        )
 
     def load_state_dict(self, state_dict):
         self._inputs_buffer = state_dict["inputs_buffer"]
@@ -183,12 +193,27 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                 "RoPE positions may be incorrect with block_causal attention."
             )
         self._positions_buffer = state_dict.get("positions_buffer", [])
+        # Older checkpoints predate per-epoch shuffle on re-loop; default to 0
+        # so resuming those runs stays numerically identical (epoch 0 is never
+        # shuffled).
+        self._epoch = state_dict.get("epoch", 0)
 
         if isinstance(self._data, Dataset):
             self._sample_idx = state_dict["sample_idx"]
+            # Replay the same per-epoch shuffle so _data matches the order
+            # observed at checkpoint time. Epoch 0 stays unshuffled, which
+            # preserves bit-identical resume for single-epoch training runs.
+            if self._epoch > 0:
+                self._data = cast(
+                    Dataset, self._original_data.shuffle(seed=42 + self._epoch)
+                )
         else:
             assert "data" in state_dict
-            self._data.load_state_dict(state_dict["data"])
+            data_state = state_dict["data"]
+            # HuggingFace IterableDataset sync epoch
+            saved_epoch = data_state.get("epoch", 0)
+            self._data.set_epoch(saved_epoch)
+            self._data.load_state_dict(data_state)
 
     def state_dict(self):
         _state_dict: dict[str, Any] = {
@@ -231,6 +256,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         tokenizer: BaseTokenizer,
         seq_len: int,
         local_batch_size: int,
+        snapshot_every_n_steps: int | None = 1,
         **kwargs,
     ):
         hf_ds = HuggingFaceTextDataset(
@@ -248,11 +274,95 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             "persistent_workers": config.persistent_workers,
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
+            "snapshot_every_n_steps": snapshot_every_n_steps,
             "batch_size": local_batch_size,
         }
 
         super().__init__(
             hf_ds,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            **dataloader_kwargs,
+        )
+
+
+@dataclass(kw_only=True, slots=True)
+class HFDataSource(HuggingFaceTextDataLoader.Config):
+    """Represent one dataset source and its sampling weight"""
+
+    weight: float = 1
+    """Data Source sampling weight"""
+
+
+class InterleavedHuggingFaceTextDataLoader(ParallelAwareDataloader):
+    """Configurable text dataloader that wraps multiple HuggingFaceTextDataset."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(ParallelAwareDataloader.Config):
+        sources: list[HFDataSource] = field(default_factory=lambda: [HFDataSource()])
+        """List of datasources to interleave"""
+
+        seed: int = 42
+        """Interleaving seed"""
+
+        stopping_strategy: Literal[
+            "on_first_exhausted", "all_exhausted"
+        ] = "on_first_exhausted"
+        """When to stop iteration: 'on_first_exhausted' or 'all_exhausted'"""
+
+        def __post_init__(self) -> None:
+            if not self.sources:
+                raise ValueError("At least one source should be defined.")
+            infinite_values = [source.infinite for source in self.sources]
+            if len(set(infinite_values)) > 1:
+                raise ValueError(
+                    f"All data sources must have the same 'infinite' setting, "
+                    f"got: {[(s.dataset, s.infinite) for s in self.sources]}"
+                )
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        dp_world_size: int,
+        dp_rank: int,
+        tokenizer: BaseTokenizer,
+        seq_len: int,
+        local_batch_size: int,
+        snapshot_every_n_steps: int | None = 1,
+        **kwargs,
+    ):
+        # output from each source is already packed
+        # making interleaved weights a token mixture ratio
+        ds = InterleavedDataset(
+            datasets=[
+                HuggingFaceTextDataset(
+                    dataset_name=source.dataset,
+                    dataset_path=source.dataset_path,
+                    tokenizer=tokenizer,
+                    seq_len=seq_len,
+                    dp_rank=dp_rank,
+                    dp_world_size=dp_world_size,
+                    infinite=source.infinite,
+                )
+                for source in config.sources
+            ],
+            weights=[source.weight for source in config.sources],
+            seed=config.seed,
+            stopping_strategy=config.stopping_strategy,
+        )
+
+        dataloader_kwargs = {
+            "num_workers": config.num_workers,
+            "persistent_workers": config.persistent_workers,
+            "pin_memory": config.pin_memory,
+            "prefetch_factor": config.prefetch_factor,
+            "snapshot_every_n_steps": snapshot_every_n_steps,
+            "batch_size": local_batch_size,
+        }
+
+        super().__init__(
+            ds,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             **dataloader_kwargs,
@@ -283,7 +393,12 @@ class ChatDataset(IterableDataset, Stateful):
                 "ChatDataset requires a tokenizer with a valid EOS token."
             )
 
-        self._original_data = split_dataset_by_node(dataset, dp_rank, dp_world_size)
+        # Shuffle the initial data to promote an even distribution across nodes. For map-style
+        # datasets, split_dataset_by_node assigns contiguous data chunks to consecutive nodes, which
+        # can lead to token imbalances, causing some nodes' epoch_idx to run ahead of others.
+        self._original_data = split_dataset_by_node(
+            cast(Dataset, dataset.shuffle(seed=42)), dp_rank, dp_world_size
+        )
         self._data = self._original_data
         self._tokenizer = tokenizer
         self._eos_id = tokenizer.eos_id
@@ -299,6 +414,8 @@ class ChatDataset(IterableDataset, Stateful):
         self._inputs_buffer: list[int] = []
         self._labels_buffer: list[int] = []
         self._positions_buffer: list[int] = []
+        self._pending_input_ids: list[int] = []
+        self._pending_label_ids: list[int] = []
 
         self._logged_first_sample = False
 
@@ -389,6 +506,18 @@ class ChatDataset(IterableDataset, Stateful):
         The model's flex/varlen attention mask uses these EOS positions to
         prevent cross-document attention.
         """
+        # resume from ckpt edge case
+        if self._pending_input_ids:
+            input_ids = self._pending_input_ids
+            label_ids = self._pending_label_ids
+            self._pending_input_ids = []
+            self._pending_label_ids = []
+            self._inputs_buffer.extend(input_ids)
+            self._labels_buffer.extend(label_ids)
+            self._positions_buffer.extend(range(len(input_ids)))
+            self._sample_idx += 1
+            if len(self._inputs_buffer) == self.seq_len:
+                yield self._flush_buffers()
         while True:
             for sample in self._get_data_iter():
                 # pyrefly: ignore [bad-argument-type]
@@ -406,8 +535,14 @@ class ChatDataset(IterableDataset, Stateful):
                     self._inputs_buffer.extend([self._eos_id] * pad_len)
                     self._labels_buffer.extend([IGNORE_INDEX] * pad_len)
                     self._positions_buffer.extend(range(pad_len))
-
+                    self._pending_input_ids = input_ids
+                    self._pending_label_ids = label_ids
                     yield self._flush_buffers()
+                    # resumed generator continues here or fresh generator handles pending at top (resume path)
+                    input_ids = self._pending_input_ids
+                    label_ids = self._pending_label_ids
+                    self._pending_input_ids = []
+                    self._pending_label_ids = []
 
                 # Add example to buffer with positions resetting to 0
                 self._inputs_buffer.extend(input_ids)
@@ -431,19 +566,23 @@ class ChatDataset(IterableDataset, Stateful):
             if not self.infinite:
                 logger.warning(f"Chat dataset '{self._dataset_id}' has run out of data")
                 break
-            else:
-                self._sample_idx = 0
-                self._epoch += 1
-                if isinstance(self._data, Dataset):
-                    self._data = cast(
-                        Dataset, self._original_data.shuffle(seed=42 + self._epoch)
-                    )
-                elif hasattr(self._data, "set_epoch"):
-                    self._data.set_epoch(self._epoch)
-                logger.warning(
-                    f"Chat dataset '{self._dataset_id}' is being re-looped "
-                    f"(epoch {self._epoch})"
-                )
+            self.reloop()
+
+    def reloop(self) -> None:
+        """Advance to the next epoch in place: reset position and reshuffle."""
+        self._sample_idx = 0
+        self._epoch += 1
+        if isinstance(self._data, Dataset):
+            self._data = cast(
+                Dataset,
+                self._original_data.shuffle(seed=42 + self._epoch),
+            )
+        elif hasattr(self._data, "set_epoch"):
+            self._data.set_epoch(self._epoch)
+        logger.warning(
+            f"Chat dataset '{self._dataset_id}' is being re-looped "
+            f"(epoch {self._epoch})"
+        )
 
     def _flush_buffers(self):
         """Convert buffers to tensors, clear them, and return the batch."""
@@ -461,6 +600,8 @@ class ChatDataset(IterableDataset, Stateful):
             "inputs_buffer": self._inputs_buffer,
             "labels_buffer": self._labels_buffer,
             "positions_buffer": self._positions_buffer,
+            "pending_input_ids": self._pending_input_ids,
+            "pending_label_ids": self._pending_label_ids,
         }
 
         if isinstance(self._data, Dataset):
@@ -475,6 +616,8 @@ class ChatDataset(IterableDataset, Stateful):
         self._inputs_buffer = state_dict["inputs_buffer"]
         self._labels_buffer = state_dict["labels_buffer"]
         self._positions_buffer = state_dict["positions_buffer"]
+        self._pending_input_ids = state_dict["pending_input_ids"]
+        self._pending_label_ids = state_dict["pending_label_ids"]
 
         if isinstance(self._data, Dataset):
             self._sample_idx = state_dict["sample_idx"]
@@ -485,7 +628,11 @@ class ChatDataset(IterableDataset, Stateful):
                 )
         else:
             assert "data" in state_dict
-            self._data.load_state_dict(state_dict["data"])
+            data_state = state_dict["data"]
+            # HuggingFace IterableDataset sync epoch
+            saved_epoch = data_state.get("epoch", 0)
+            self._data.set_epoch(saved_epoch)
+            self._data.load_state_dict(data_state)
 
 
 class ChatDataLoader(ParallelAwareDataloader):
@@ -505,6 +652,13 @@ class ChatDataLoader(ParallelAwareDataloader):
         infinite: bool = True
         """Whether to loop the dataset infinitely. Might hang on multi-GPU."""
 
+        def __post_init__(self) -> None:
+            if not self.dataset_path:
+                raise ValueError(
+                    "Config requires dataset_path to be set "
+                    "(e.g., 'openai/gsm8k' or 'json')."
+                )
+
     def __init__(
         self,
         config: Config,
@@ -514,18 +668,13 @@ class ChatDataLoader(ParallelAwareDataloader):
         tokenizer: BaseTokenizer,
         seq_len: int,
         local_batch_size: int,
+        snapshot_every_n_steps: int | None = 1,
         **kwargs,
     ):
-        if not config.dataset_path:
-            raise ValueError(
-                "ChatDataLoader requires dataset_path to be set "
-                "(e.g., 'openai/gsm8k' or 'json')."
-            )
-
-        dataset = load_dataset(config.dataset_path, **config.load_dataset_kwargs)
+        dataset = load_dataset(config.dataset_path, **config.load_dataset_kwargs)  # type: ignore[arg-type]
 
         chat_ds = ChatDataset(
-            dataset=dataset,  # pyrefly: ignore [bad-argument-type]
+            dataset=dataset,
             tokenizer=tokenizer,
             sample_processor=config.sample_processor,
             seq_len=seq_len,
@@ -539,11 +688,97 @@ class ChatDataLoader(ParallelAwareDataloader):
             "persistent_workers": config.persistent_workers,
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
+            "snapshot_every_n_steps": snapshot_every_n_steps,
             "batch_size": local_batch_size,
         }
 
         super().__init__(
             chat_ds,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            **dataloader_kwargs,
+        )
+
+
+@dataclass(kw_only=True, slots=True)
+class ChatDataSource(ChatDataLoader.Config):
+    """Represent one chat dataset source and its sampling weight"""
+
+    weight: float = 1
+    """Data Source sampling weight"""
+
+
+class InterleavedChatDataLoader(ParallelAwareDataloader):
+    """Configurable chat dataloader that wraps multiple ChatDataset."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(ParallelAwareDataloader.Config):
+        sources: list[ChatDataSource] = field(default_factory=list)
+        """List of datasources to interleave"""
+
+        seed: int = 42
+        """Interleaving seed"""
+
+        stopping_strategy: Literal[
+            "on_first_exhausted", "all_exhausted"
+        ] = "on_first_exhausted"
+        """When to stop iteration: 'on_first_exhausted' or 'all_exhausted'"""
+
+        def __post_init__(self) -> None:
+            if not self.sources:
+                raise ValueError("At least one source should be defined.")
+            infinite_values = [source.infinite for source in self.sources]
+            if len(set(infinite_values)) > 1:
+                raise ValueError(
+                    f"All data sources must have the same 'infinite' setting, "
+                    f"got: {[(s.dataset_path, s.infinite) for s in self.sources]}"
+                )
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        dp_world_size: int,
+        dp_rank: int,
+        tokenizer: BaseTokenizer,
+        seq_len: int,
+        local_batch_size: int,
+        snapshot_every_n_steps: int | None = 1,
+        **kwargs,
+    ):
+        # output from each source is already packed
+        # making interleaved weights a token mixture ratio
+        ds = InterleavedDataset(
+            datasets=[
+                ChatDataset(
+                    dataset=load_dataset(  # type: ignore[arg-type]
+                        source.dataset_path, **source.load_dataset_kwargs
+                    ),
+                    tokenizer=tokenizer,
+                    sample_processor=source.sample_processor,
+                    seq_len=seq_len,
+                    dp_rank=dp_rank,
+                    dp_world_size=dp_world_size,
+                    infinite=source.infinite,
+                )
+                for source in config.sources
+            ],
+            weights=[source.weight for source in config.sources],
+            seed=config.seed,
+            stopping_strategy=config.stopping_strategy,
+        )
+
+        dataloader_kwargs = {
+            "num_workers": config.num_workers,
+            "persistent_workers": config.persistent_workers,
+            "pin_memory": config.pin_memory,
+            "prefetch_factor": config.prefetch_factor,
+            "snapshot_every_n_steps": snapshot_every_n_steps,
+            "batch_size": local_batch_size,
+        }
+
+        super().__init__(
+            ds,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             **dataloader_kwargs,

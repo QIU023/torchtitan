@@ -12,23 +12,33 @@ TorchTitan models for vLLM.
 """
 
 import dataclasses
+from dataclasses import dataclass
+from functools import partial
+
+import spmd_types as spmd
 
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
-from torch.distributed._tensor import DTensor, Replicate
-from torch.distributed.checkpoint.state_dict import (
-    set_model_state_dict,
-    StateDictOptions,
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.config import (
+    apply_overrides,
+    CompileConfig,
+    OverrideConfig,
+    ParallelismConfig,
+    TrainingConfig,
 )
-
-from torchtitan.config import ParallelismConfig
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.spmd_types import current_spmd_mesh
+from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.experiments.rl.models.attention import VLLMAttentionWrapper
+from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.utils import torch_utils as _torch_utils
 
@@ -54,60 +64,90 @@ def _dtensor_safe_weak_ref_tensor(tensor):
 _torch_utils.weak_ref_tensor = _dtensor_safe_weak_ref_tensor
 
 
-def create_torchtitan_config_from_vllm_config(
-    vllm_config: VllmConfig,
-) -> tuple[ParallelDims, ParallelismConfig]:
+# Process-global: install the op swap at most once even if the generator is
+# re-initialized in the same process (re-wrapping would chain shims).
+_tp_all_reduce_patched = False
+
+
+def _patch_vllm_all_reduce() -> None:
+    """Route the generator's tensor-parallel all-reduce through vLLM's custom
+    one-shot/multimem AR instead of DTensor's NCCL ring redistribute (applied
+    when batch-invariant mode is off). Idempotent. Two changes:
+
+    1. Swap torch.ops._c10d_functional.all_reduce (the op every DTensor
+       Partial -> Replicate redistribute calls) for
+       tensor_model_parallel_all_reduce, which reuses vLLM's TP GroupCoordinator
+       -- the same ranks, but the group that owns the custom-AR shared buffers.
+       DTensor wraps the synchronous result in an AsyncCollectiveTensor whose
+       wait_tensor is a no-op. Only sum reductions are routed (the custom AR is
+       sum-only); others fall through to the original op. No-op at world_size 1.
+
+    2. Force the custom AR onto its registered=False path so cudagraph capture
+       works. registered=True records graph buffers and calls cudaIpcGetMemHandle
+       on them, which fails for the expandable_segments (VMM) memory the RL stack
+       enables for Monarch RDMA. registered=False reduces via the init-time
+       buffer_ptrs (raw cudaMalloc, IPC-able), records no graph buffers, at the
+       cost of one staging copy per AR.
+
+    3. (spmd_types) spmd.redistribute issues an in-place dist.all_reduce that the
+       point-1 swap can't see, so route its Partial -> {R,I} reduce straight to
+       the same custom AR. Guarded on no-grad: the generator is inference-only and
+       the custom AR is sum-only/forward-only; under grad we keep spmd.redistribute
+       (its dst-dependent backward is correct).
+
+    TODO: this is a stopgap to close the generator's TP all-reduce perf gap.
+    Improve our native (DTensor) all-reduce path and remove this patch.
     """
-    Create ParallelDims and ParallelismConfig from vLLM configuration.
+    global _tp_all_reduce_patched
+    if _tp_all_reduce_patched:
+        return
 
-    Maps vLLM parallelism settings to TorchTitan's config objects so that
-    TorchTitan's parallelize functions can be called with the correct kwargs.
+    from vllm.distributed import get_tp_group
 
-    This is needed because vLLM doesn't separate model creation and parallelism
-    application — it requires parallelization inside the model constructor
-    (TorchTitanVLLMModelWrapper.__init__).
+    c10d = torch.ops._c10d_functional
+    # Op schema: all_reduce(Tensor input, str reduce_op, Any group_name) -> Tensor.
+    original_all_reduce = c10d.all_reduce
 
-    Args:
-        vllm_config: vLLM configuration object
+    def all_reduce(input, reduce_op, group_name):
+        if reduce_op == "sum":
+            # Use vLLM's helper rather than the incoming group_name: the custom-AR
+            # kernel is bound to vLLM's TP GroupCoordinator and the shared buffers
+            # it registered, so the reduction must run on vLLM's TP group, not
+            # DTensor's TP mesh PG (a different PG over the same ranks -> rank-for-
+            # rank equivalent). The helper resolves that group, guards
+            # world_size==1, and on CUDA dispatches to torch.ops.vllm.all_reduce.
+            return tensor_model_parallel_all_reduce(input)
+        return original_all_reduce(input, reduce_op, group_name)
 
-    Returns:
-        Tuple of (ParallelDims, ParallelismConfig) mapped from vLLM config
+    c10d.all_reduce = all_reduce
 
-    Note:
-        vLLM doesn't use FSDP sharding (dp_shard=1) or expert parallelism (ep=1, etp=1)
-        in inference. These are set to default values.
-    """
-    world_size = dist.get_world_size()
-    parallel_config = vllm_config.parallel_config
+    # Force vLLM's TP custom AR onto its registered=False path (see point 2).
+    device_comm = get_tp_group().device_communicator
+    ca = getattr(device_comm, "ca_comm", None) if device_comm is not None else None
+    if ca is not None and not ca.disabled:
 
-    parallel_dims = ParallelDims(
-        dp_replicate=parallel_config.data_parallel_size,
-        dp_shard=1,
-        cp=parallel_config.decode_context_parallel_size,
-        tp=parallel_config.tensor_parallel_size,
-        pp=parallel_config.pipeline_parallel_size,
-        ep=1,
-        etp=1,
-        world_size=world_size,
-    )
+        def custom_all_reduce(input):
+            # Mirrors CustomAllreduce.custom_all_reduce but always registered=False.
+            if ca.disabled or not ca.should_custom_ar(input):
+                return None
+            return ca.all_reduce(input, registered=False)
 
-    parallelism = ParallelismConfig(
-        data_parallel_replicate_degree=parallel_config.data_parallel_size,
-        data_parallel_shard_degree=1,
-        context_parallel_degree=parallel_config.decode_context_parallel_size,
-        tensor_parallel_degree=parallel_config.tensor_parallel_size,
-        pipeline_parallel_degree=parallel_config.pipeline_parallel_size,
-        expert_parallel_degree=1,
-        expert_tensor_parallel_degree=1,
-    )
+        ca.custom_all_reduce = custom_all_reduce
 
+    original_redistribute = spmd.redistribute
+
+    def redistribute(x, group, *, src, dst, **kwargs):
+        if src == spmd.P and dst in (spmd.R, spmd.I) and not torch.is_grad_enabled():
+            return tensor_model_parallel_all_reduce(x)
+        return original_redistribute(x, group, src=src, dst=dst, **kwargs)
+
+    spmd.redistribute = redistribute
+
+    _tp_all_reduce_patched = True
     logger.info(
-        f"Created TorchTitan config from vLLM: "
-        f"DP={parallel_dims.dp_replicate}, TP={parallel_dims.tp}, "
-        f"CP={parallel_dims.cp}, PP={parallel_dims.pp}"
+        "vllm_allreduce: routed _c10d_functional.all_reduce (TP sum reductions) "
+        "through vLLM custom all-reduce (registered=False, cudagraph-safe)"
     )
-
-    return parallel_dims, parallelism
 
 
 @support_torch_compile(
@@ -116,7 +156,7 @@ def create_torchtitan_config_from_vllm_config(
         "positions": 0,
     }
 )
-class TorchTitanVLLMModelWrapper(Module):
+class VLLMModelWrapper(Module):
     """
     Generic vLLM-compatible model wrapper for TorchTitan models. Implemented
     required interface required by vLLM Engine.
@@ -139,8 +179,12 @@ class TorchTitanVLLMModelWrapper(Module):
         self,
         *,
         model_spec: ModelSpec,
+        parallelism: InferenceParallelismConfig,
+        compile_config: CompileConfig,
+        checkpoint_config: CheckpointManager.Config,
         vllm_config: VllmConfig,
         prefix: str = "",
+        override: OverrideConfig,
     ):
         super().__init__()
 
@@ -160,107 +204,142 @@ class TorchTitanVLLMModelWrapper(Module):
             if attn_config.head_dim is not None
             else model_config.dim // n_heads
         )
-        vllm_backend = VLLMAttentionWrapper.Config(
-            hidden_size=model_config.dim,
-            num_heads=n_heads,
-            num_kv_heads=n_kv_heads,
-            head_dim=head_dim,
-        )
-        new_layers = [
-            dataclasses.replace(
-                layer_cfg,
-                attention=dataclasses.replace(
-                    layer_cfg.attention, inner_attention=vllm_backend
+        new_layers = []
+        for layer_cfg in model_config.layers:
+            vllm_backend = VLLMAttentionWrapper.Config(
+                hidden_size=model_config.dim,
+                num_heads=n_heads,
+                num_kv_heads=n_kv_heads,
+                head_dim=head_dim,
+                sliding_window_size=getattr(
+                    layer_cfg.attention, "sliding_window_size", None
                 ),
             )
-            for layer_cfg in model_config.layers
-        ]
+            new_layers.append(
+                dataclasses.replace(
+                    layer_cfg,
+                    attention=dataclasses.replace(
+                        layer_cfg.attention, inner_attention=vllm_backend
+                    ),
+                )
+            )
         self.config = dataclasses.replace(model_config, layers=new_layers)
         logger.debug(f"Creating model with config: {self.config.to_dict()}")
 
-        # TODO: Check if it's possible to apply meta init
-        self.model = self.config.build()
+        # Translate the inference parallelism into torchtitan's full
+        # ParallelismConfig that ParallelDims / parallelize_fn consume.
+        training_parallelism = parallelism.to_training()
 
-        # RoPE config from model for cache extension
-        self.rope_config = self.config.rope
-
-        # Create ParallelDims and configs from vLLM config at runtime.
-        # vLLM config contains the tensor_parallel_size from command-line args
-        # and this will be consistent across all worker processes.
-        self.parallel_dims, parallelism = create_torchtitan_config_from_vllm_config(
-            vllm_config
+        # Build ParallelDims from the translated ParallelismConfig so TP/EP
+        # sharding sees the same mesh shape as vLLM. data_parallel_shard_degree
+        # carries vLLM's pure DP here (skip_dp=True below), not TorchTitan FSDP.
+        self.parallel_dims = ParallelDims(
+            dp_replicate=training_parallelism.data_parallel_replicate_degree,
+            dp_shard=training_parallelism.data_parallel_shard_degree,
+            cp=training_parallelism.context_parallel_degree,
+            tp=training_parallelism.tensor_parallel_degree,
+            pp=training_parallelism.pipeline_parallel_degree,
+            ep=training_parallelism.expert_parallel_degree,
+            world_size=dist.get_world_size(),
+            spmd_backend=training_parallelism.spmd_backend,
+        )
+        dist_utils.set_spmd_backend(training_parallelism.spmd_backend)
+        self.spmd_context = dist_utils.get_spmd_context(
+            parallel_dims=self.parallel_dims,
+            spmd_typechecking=False,
         )
 
-        # NOTE: We need to apply parallelize within model.__init__ because vllm
-        # doesn't separate model creation and parallelism application and instead
-        # requires parallelization to be done inside model constructor.
+        # Fill sharding configs on the config BEFORE build so every sub-module
+        # is constructed with its ShardingConfig attached (required by the
+        # declarative model.parallelize() API). Need to be called after Attention
+        # module replacement.
+        # Provides the generic config shape (has .parallelism) so
+        # update_from_config can extract parallelism uniformly.
+        @dataclass(kw_only=True, slots=True)
+        class _InferenceConfig:
+            parallelism: ParallelismConfig
+
+        self.config.update_from_config(
+            config=_InferenceConfig(parallelism=training_parallelism)
+        )
+
+        # Apply config overrides (e.g. the fused gate+up SwiGLU) after
+        # update_from_config (which fills the sharding the override factories
+        # read) and before build
+        if override.imports:
+            apply_overrides(override, self.config)
+
+        # Build model on meta device to avoid allocating full model on every GPU
+        with torch.device("meta"):
+            self.model = self.config.build()
+
         self.model = self.parallelize_fn(
             model=self.model,
             parallel_dims=self.parallel_dims,
-            parallelism=parallelism,
-            has_position_id=True,  # vLLM always passes positions explicitly
+            training=TrainingConfig(),
+            parallelism=training_parallelism,
+            compile_config=compile_config,
+            ac_config=None,
+            dump_folder="",
+            # Generator inference replicates parameters across vLLM DP groups.
+            # Keep TP/EP sharding above, but do not translate dp_shard into
+            # TorchTitan FSDP/DDP here.
+            skip_dp=True,
         )
 
-        # Pre-extend RoPE cache to cover vLLM's max model length (profiling
-        # may use up to 2x max_seq_len, so use max_model_len which already
-        # accounts for this). This avoids data-dependent control flow in
-        # forward() which is incompatible with torch.compile.
-        max_model_len = vllm_config.model_config.max_model_len
-        if self.model.freqs_cis.shape[0] < max_model_len:
-            self.model.freqs_cis = self._extend_rope_cache(
-                self.model.freqs_cis, max_model_len
-            )
+        # Load initial weights based on checkpoint config.
+        self._checkpoint_config = checkpoint_config
 
-        # Initial load model weights from HuggingFace checkpoint path
-        self._initial_load_weights(checkpoint_path=vllm_config.model_config.model)
+        # Materialize model on GPU — only allocates local shards (not full
+        # model) thanks to EP/TP DTensor sharding applied above.
+        self.model.to_empty(device=vllm_config.device_config.device)
+        # HF checkpoints do not necessarily contain every TorchTitan buffer
+        # (for example MoE expert_bias_E).
+        # TODO: When checkpoint doesn't contains expert_bias_E, check the config
+        # should use loss based load balancing strategy.
+        with torch.no_grad():
+            # spmd_types parameter init needs the current mesh to materialize
+            # local shards for fused parameters, including the fused QKV linear
+            # used by model variants such as Qwen3.
+            # TODO: Consider an init_non_persistent_buffers contract on the
+            # Decoder / Model class so buffer-only init does not need this
+            # spmd context.
+            with self.spmd_context():
+                self.model.init_weights(buffer_device=None)
+        self._maybe_initial_load_weights()
 
-    def _extend_rope_cache(
-        self, rope_cache: torch.Tensor, required_len: int
-    ) -> torch.Tensor:
-        """
-        Build an extended RoPE cache of at least ``required_len`` positions.
+        # Give each gpt-oss attention's vLLM backend its sink rescale.
+        # Need to do it here after parallelize + weight load so sinks are
+        # TP-sharded.
+        self._inject_attention_sinks()
 
-        Args:
-            rope_cache: Current RoPE cache tensor
-            required_len: Minimum number of positions the cache must cover
+        # Route the TP all-reduce through vLLM's custom AR (off under
+        # batch-invariant mode, where its size-dependent algorithm breaks).
+        if self.parallel_dims.tp_enabled and not is_in_batch_invariant_mode():
+            _patch_vllm_all_reduce()
 
-        Returns:
-            Extended RoPE cache tensor
-        """
-        # Handle DTensor case
-        is_dtensor = isinstance(rope_cache, DTensor)
-        if is_dtensor:
-            device_mesh = rope_cache.device_mesh
-            local_rope_cache = rope_cache.to_local()
-            device = local_rope_cache.device
-            dtype = local_rope_cache.dtype
-        else:
-            device = rope_cache.device
-            dtype = rope_cache.dtype
-
-        # Build a new RoPE module with extended max_seq_len
-        extended_rope_config = dataclasses.replace(
-            self.rope_config, max_seq_len=required_len
+    # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
+    def _inject_attention_sinks(self) -> None:
+        """Give each gpt-oss attention's vLLM backend its sink-rescale hook."""
+        from torchtitan.models.gpt_oss.model import (
+            apply_attention_sink_rescale,
+            Attention,
         )
-        extended_rope = extended_rope_config.build()
-        extended_cache = extended_rope.cache.to(device=device, dtype=dtype)
 
-        # Convert back to DTensor if needed
-        if is_dtensor:
-            rope_cache = DTensor.from_local(
-                extended_cache,
-                device_mesh=device_mesh,
-                placements=[Replicate()],
+        for module in self.model.modules():
+            if not isinstance(module, Attention):
+                continue
+            sinks = module.sinks
+            local_sinks = sinks._local_tensor if isinstance(sinks, DTensor) else sinks
+            module.inner_attention.vllm_attn.impl.out_transform = partial(
+                apply_attention_sink_rescale, sinks=local_sinks
             )
-        else:
-            rope_cache = extended_cache
-
-        return rope_cache
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """vLLM required API.
         Convert input token IDs to embeddings."""
-        return self.model.tok_embeddings(input_ids)
+        with self.spmd_context():
+            return self.model.tok_embeddings(input_ids)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """vLLM required API.
@@ -293,24 +372,26 @@ class TorchTitanVLLMModelWrapper(Module):
         if input_ids is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
 
-        # Convert vLLM interface to TorchTitan interface
-        # vLLM: [total_tokens] → TorchTitan: [batch_size, seq_len]
-        tokens_2d = input_ids.unsqueeze(0)
+        with self.spmd_context():
+            # Convert vLLM interface to TorchTitan interface
+            # vLLM: [total_tokens] -> TorchTitan: [batch_size, seq_len]
+            tokens_2d = input_ids.unsqueeze(0)
 
-        # Get embeddings
-        h = self.model.tok_embeddings(tokens_2d)
+            # Get embeddings
+            h = self.model.tok_embeddings(tokens_2d)
 
-        rope_cache = self.model.freqs_cis
-        positions = positions.unsqueeze(0)
+            positions = positions.unsqueeze(0)
 
-        # Pass through transformer layers
-        for layer in self.model.layers.values():
-            h = layer(h, rope_cache, attention_masks=None, positions=positions)
+            # Pass through transformer layers
+            for layer in self.model.layers.values():
+                h = layer(h, attention_masks=None, positions=positions)
 
-        h = self.model.norm(h)
-        # When parallelism is applied, get full tensor before return to vLLM Engine
+            h = self.model.norm(h)
+        # Inference disables sequence parallelism, so final hidden states should
+        # already be replicated before returning to vLLM.
         if isinstance(h, DTensor):
-            h = h.full_tensor()
+            assert all(isinstance(p, Replicate) for p in h.placements)
+            h = h._local_tensor
 
         # Convert to vLLM format: [total_tokens, hidden_size]
         if h.dim() == 3:
@@ -326,78 +407,84 @@ class TorchTitanVLLMModelWrapper(Module):
         """vLLM required API.
         Compute logits from hidden states."""
 
-        # When TP is applied, we return the full tensor (plain tensor) to vLLM engine
-        # at the end of TorchTitanVLLMModelWrapper.forward().
-        # We need to wrap the input from vLLM engine back to DTensor with Replicate() placement.
-        if self.parallel_dims.tp_enabled:
-            hidden_states = DTensor.from_local(
-                hidden_states,
-                device_mesh=self.parallel_dims.get_mesh("tp"),
-                placements=[
-                    Replicate(),
-                ],
-            )
+        with self.spmd_context():
+            # When TP is applied, forward() returns the full tensor back to vLLM.
+            # The DTensor path wraps that plain tensor before lm_head; spmd_types
+            # keeps tensors local and uses the module sharding contracts directly.
+            if (
+                self.parallel_dims.tp_enabled
+                and self.parallel_dims.spmd_backend != "spmd_types"
+            ):
+                hidden_states = DTensor.from_local(
+                    hidden_states,
+                    device_mesh=self.parallel_dims.get_mesh("tp"),
+                    placements=[
+                        Replicate(),
+                    ],
+                )
 
-        logits = self.model.output(hidden_states)
+            logits = self.model.lm_head(hidden_states)
+
+            # lm_head returns vocab-sharded logits under TP; gather to the
+            # full local logits tensor that vLLM expects.
+            if self.parallel_dims.tp_enabled:
+                if self.parallel_dims.spmd_backend == "spmd_types":
+                    mesh = current_spmd_mesh()
+                    assert mesh is not None
+                    logits = spmd.redistribute(
+                        logits,
+                        mesh.get_group("tp"),
+                        src=spmd.S(-1),
+                        dst=spmd.R,
+                        backward_options={"op_dtype": logits.dtype},
+                    )
+                elif isinstance(logits, DTensor):
+                    placements = tuple(
+                        Replicate()
+                        if isinstance(p, Shard) and p.dim in (-1, logits.ndim - 1)
+                        else p
+                        for p in logits.placements
+                    )
+                    logits = logits.redistribute(placements=placements).to_local()
 
         return logits
 
-    def load_weights_from_state_dict(self, state_dict):
-        """
-        Load model weights from a state dict.
+    def _maybe_initial_load_weights(self) -> None:
+        """Load initial HF weights via CheckpointManager.
 
-        Expects DTensor-wrapped tensors matching the model's placements.
-        The caller is responsible for reconstructing DTensors from plain
-        local tensors before calling this method.
+        Controlled by ``self._checkpoint_config``:
+        - ``enable=True`` and ``initial_load_in_hf=True``: load from HF
+          via CheckpointManager (standalone inference path).
+        - ``enable=False``: skip (RL loop — weights arrive via TorchStore).
         """
-        set_model_state_dict(
-            model=self.model,
-            model_state_dict=state_dict,
-            options=StateDictOptions(strict=False),
+        cfg = self._checkpoint_config
+        if not cfg.enable:
+            return
+
+        sd_adapter = None
+        if self.state_dict_adapter is not None:
+            sd_adapter = self.state_dict_adapter(
+                model_config=self.config,
+                hf_assets_path=cfg.initial_load_path,
+            )
+
+        # Model-only CheckpointManager: initial_load_model_only=True (default)
+        # ensures only MODEL state is loaded, so None optimizer/lr_scheduler
+        # are never accessed.
+        checkpointer = cfg.build(
+            dataloader=None,
+            model_parts=[self.model],
+            optimizers=None,
+            lr_schedulers=None,
+            states={},
+            sd_adapter=sd_adapter,
         )
-
-        return state_dict.keys()
-
-    def _initial_load_weights(self, checkpoint_path):
-        """
-        Helper function to load torchtitan model weights from HF checkpoint when initialize this model.
-
-        Args:
-            checkpoint_path: Path to the HuggingFace checkpoint directory
-        """
-        # Create adapter instance
-        adapter = self.state_dict_adapter(
-            model_config=self.config,
-            hf_assets_path=None,
-        )
-
-        # Get HF storage reader from adapter
-        storage_reader = adapter.get_hf_storage_reader(checkpoint_path)
-
-        # Load HF state dict using DCP
-        hf_state_dict = adapter.to_hf(self.model.state_dict())
-        dcp.load(hf_state_dict, storage_reader=storage_reader)
-
-        # Convert HF state dict to TorchTitan format
-        torchtitan_state_dict = adapter.from_hf(hf_state_dict)
-
-        model_state_dict = {k: v for k, v in self.model.state_dict().items()}
-
-        # Convert to DTensor if target is DTensor (when the target model is sharded)
-        # This only happens when initial loading from HF full state dict
-        for name, tensor in torchtitan_state_dict.items():
-            if name in model_state_dict and isinstance(model_state_dict[name], DTensor):
-                if isinstance(tensor, DTensor):
-                    continue
-                target_dtensor = model_state_dict[name]
-                device_mesh = target_dtensor.device_mesh
-                torchtitan_state_dict[name] = DTensor.from_local(
-                    tensor.to(device_mesh.device_type),
-                    device_mesh=device_mesh,
-                    placements=[Replicate()],
-                )
-
-        return self.load_weights_from_state_dict(torchtitan_state_dict)
+        checkpointer.load()
+        # Free the large transient allocations the HF load/from_hf conversion left in the
+        # caching allocator, so the later CUDA-graph capture (which needs its own private
+        # pool) has room. Without this, large models (e.g. 235B) OOM capture even though
+        # the live weights fit.
+        torch.cuda.empty_cache()
 
     def load_weights(self, weights_iter):
         """

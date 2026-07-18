@@ -4,27 +4,75 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import contextlib
 import math
 import os
 from abc import abstractmethod
 from collections.abc import Iterable
 from datetime import timedelta
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 
 import torch
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 import torch.distributed.tensor._random
 import torch.distributed.tensor.parallel
+from spmd_types.checker import typecheck as spmd_typecheck
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Placement, Shard
 
 from torchtitan.config import CommConfig, DebugConfig
-from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module, device_type
+
+if TYPE_CHECKING:
+    from torchtitan.distributed.parallel_dims import ParallelDims
+
+
+_spmd_backend = "default"
+
+
+def set_spmd_backend(spmd_backend: str) -> None:
+    """Set the active SPMD backend for distributed runtime helpers."""
+    global _spmd_backend
+    _spmd_backend = spmd_backend
+
+
+def get_spmd_backend() -> str:
+    """Return the active SPMD backend."""
+    return _spmd_backend
+
+
+def check_dtensor_placements_match(
+    actual: tuple[Placement, ...],
+    expected: tuple[Placement, ...],
+    tensor_ndim: int,
+) -> bool:
+    """Compare DTensor placements, normalizing negative Shard dims to tensor rank."""
+    if len(actual) != len(expected):
+        return False
+
+    def normalize_dim(dim: int, ndim: int) -> int:
+        return dim + ndim if dim < 0 else dim
+
+    for actual_placement, expected_placement in zip(actual, expected, strict=True):
+        if isinstance(actual_placement, Shard) and isinstance(
+            expected_placement, Shard
+        ):
+            if normalize_dim(actual_placement.dim, tensor_ndim) != normalize_dim(
+                expected_placement.dim, tensor_ndim
+            ):
+                return False
+            continue
+
+        if actual_placement != expected_placement:
+            return False
+
+    return True
 
 
 def _dist_reduce(
@@ -45,15 +93,28 @@ def _dist_reduce(
             process group, and then the result will be all_reduced for the mesh.
     """
     if isinstance(x, DTensor):
-        # functional collectives do not support DTensor inputs
-        x = x.full_tensor()
+        # loss being a DTensor can be 1) full dtensor or 2) non-full dtensor but
+        # TP is enabled. For the former one, a single `full_tensor()` call is enough
+        # but for the later one, we need to treat it as a plain tensor. Since there
+        # is no robust way to distinguish the two and `full_tensor()` may result in
+        # multiple all_reduce() (one for dp_shard and one for CP), we always use
+        # `to_local()` to ensure loss parity in both cases.
+        assert all(p.is_replicate() or p.is_partial() for p in x.placements), (
+            f"_dist_reduce received a DTensor with unsupported placements "
+            f"{x.placements}; only Replicate/Partial are supported."
+        )
+        if extra_pg is not None:
+            raise ValueError(
+                "_dist_reduce does not support DTensor input combined with "
+                "extra_pg: pass a plain tensor when using extra_pg."
+            )
+        x = x.to_local()
 
+    # Plain tensor path.
     if extra_pg is not None:
         x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
-
     if mesh is None:
         return float(x.item())
-
     assert x.numel() == 1  # required by `.item()`
     return float(funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item())
 
@@ -113,23 +174,35 @@ def set_determinism(
     """
     if debug_config.deterministic:
         logger.info("Deterministic algorithm enabled (expect perf degradation).")
-        torch.use_deterministic_algorithms(True)
         torch.use_deterministic_algorithms(
             True, warn_only=debug_config.deterministic_warn_only
         )
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # use_deterministic_algorithms(True) enables fill_uninitialized_memory,
+        # which makes torch.empty() run a fill kernel. This kernel races with
+        # DeepEP comm streams, causing errors.
+        # This also prevents HF modeling from initializing ROPE (inv_freq) buffers to NaN.
+        # pyrefly: ignore [missing-attribute]
+        torch.utils.deterministic.fill_uninitialized_memory = False
         # env var for deterministic CuBLAS
         # https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
         # Ensure flex_attention is compiled without max-autotune. This is needed to ensure
-        # reproducibility, since the autotune results may not be deterministic.
+        # reproducibility, since the autotune results may not be deterministic. We disable
+        # autotune in-place on FlexAttention.inductor_configs (rather than recompiling with
+        # no options) so the regional-inductor scoop configs are preserved.
         from torch.nn.attention.flex_attention import flex_attention
 
         from torchtitan.models.common.attention import FlexAttention
 
-        FlexAttention._compiled_flex_attn = torch.compile(flex_attention)
+        FlexAttention.inductor_configs["max_autotune"] = False
+        FlexAttention.inductor_configs["coordinate_descent_tuning"] = False
+        # pyrefly: ignore [no-matching-overload]
+        FlexAttention._compiled_flex_attn = torch.compile(
+            flex_attention, options=FlexAttention.inductor_configs
+        )
 
     if debug_config.detect_anomaly:
         logger.warning(
@@ -235,24 +308,39 @@ def set_batch_invariance(enable: bool) -> None:
 
     # Register batch-invariant ATen overrides via upstream package
     # https://github.com/thinking-machines-lab/batch_invariant_ops
-    from batch_invariant_ops import (  # pyrefly: ignore [missing-import]
-        enable_batch_invariant_mode as _upstream_enable,
-    )
+    from batch_invariant_ops import enable_batch_invariant_mode as _upstream_enable
 
     _upstream_enable()
 
     # Set NCCL env vars for deterministic inter-GPU collectives.
     # Must be set BEFORE dist.init_process_group.
-    os.environ["NCCL_ALGO"] = "Ring"  # Fixed summation order (Tree may vary)
-    os.environ["NCCL_MIN_NCHANNELS"] = "1"  # Single channel to avoid split interleaving
-    os.environ["NCCL_MAX_NCHANNELS"] = "1"
-    os.environ["NCCL_PROTO"] = "Simple"  # LL/LL128 may reorder reductions
+    # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/batch_invariant.py
+    os.environ["NCCL_LAUNCH_MODE"] = "GROUP"  # Fixed kernel launch ordering
     os.environ[
         "NCCL_COLLNET_ENABLE"
-    ] = "0"  # Disable SHARP (non-deterministic HW reduce)
+    ] = "0"  # Disable SHARP (non-deterministic IB HW reduce)
     os.environ[
         "NCCL_NVLS_ENABLE"
-    ] = "0"  # Disable NVLink SHARP (non-deterministic HW reduce)
+    ] = "0"  # Disable NVLink SHARP (non-deterministic NVSwitch HW reduce)
+    os.environ[
+        "NCCL_P2P_NET_DISABLE"
+    ] = "1"  # Disable P2P to avoid transport-dependent accumulation order
+    os.environ[
+        "NCCL_MIN_NCHANNELS"
+    ] = "1"  # Single channel to prevent split-interleave reordering
+    os.environ[
+        "NCCL_MAX_NCHANNELS"
+    ] = "1"  # Single channel to prevent split-interleave reordering
+    os.environ["NCCL_PROTO"] = "Simple"  # LL/LL128 protocols may reorder reductions
+    os.environ[
+        "NCCL_ALGO"
+    ] = "allreduce:tree"  # Deterministic reduction order across ranks
+    os.environ[
+        "NCCL_NTHREADS"
+    ] = "1"  # Single thread to eliminate scheduling non-determinism
+    os.environ[
+        "NCCL_SOCKET_NTHREADS"
+    ] = "1"  # Single socket thread to eliminate scheduling non-determinism
 
     # Disable reduced-precision reductions: these allow cuBLAS to use
     # lower-precision accumulation that can round differently depending
@@ -273,18 +361,37 @@ def set_batch_invariance(enable: bool) -> None:
     )
 
 
-class TrainContext(Protocol):
+class SpmdContext(Protocol):
     @abstractmethod
     def __call__(self) -> contextlib.AbstractContextManager[None]:
         pass
 
 
-def get_train_context(enable_loss_parallel: bool) -> TrainContext:
+def get_spmd_context(
+    *,
+    parallel_dims: "ParallelDims | None" = None,
+    spmd_typechecking: bool = False,
+) -> SpmdContext:
     @contextlib.contextmanager
     def context():
         with contextlib.ExitStack() as stack:
-            if enable_loss_parallel:
-                stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+            if parallel_dims is not None and parallel_dims.spmd_backend == "spmd_types":
+                if not parallel_dims._single_axis_meshes:
+                    parallel_dims.build_mesh()
+                from torchtitan.distributed.spmd_types import (
+                    set_current_spmd_mesh,
+                    set_spmd_meshes,
+                    spmd_dense_mesh,
+                )
+
+                set_spmd_meshes(
+                    dense_mesh=parallel_dims.spmd_dense_mesh(),
+                    sparse_mesh=parallel_dims.spmd_sparse_mesh(),
+                )
+
+                stack.enter_context(set_current_spmd_mesh(spmd_dense_mesh()))
+            if spmd_typechecking:
+                stack.enter_context(spmd_typecheck(local=False))
 
             yield
 
@@ -383,10 +490,15 @@ def init_distributed(
         os.makedirs(dump_dir, exist_ok=True)
         _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
 
+    # disable autograd multithreading, to enable TLS DeviceMesh stack for spmd_types backend.
+    # this is needed for AC functionality; multi-threaded autograd means BWD threads performing recompute,
+    # cannot access PGs, e.g. current_spmd_mesh().get_group("tp") to perform the collectives they need.
+    torch.autograd.set_multithreading_enabled(False)
+
     device_id: torch.device | None = None
     if comm_config.mode == "torchcomms":
         try:
-            import torchcomms  # noqa: F401  # pyrefly: ignore [missing-import]
+            import torchcomms  # noqa: F401
         except ImportError as err:
             raise ImportError(
                 "torchcomms package is required for --comm.mode=torchcomms."
@@ -439,7 +551,7 @@ def set_pg_timeouts(
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
     ] + [None]
     for group in groups:
-        torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+        torch.distributed.set_timeout(timeout, group)
 
 
 @torch.no_grad()

@@ -9,14 +9,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from torchtitan.distributed.spmd_types import spmd_mesh_size
+from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.moe import GroupedExperts, MoE
 from torchtitan.protocols.module import Module
 
 
+@spmd.register_autograd_function
 class ScaleBiasForward(torch.autograd.Function):
     """
     Custom autograd function that scales bias in forward pass but not in backward.
@@ -27,17 +31,37 @@ class ScaleBiasForward(torch.autograd.Function):
 
     @staticmethod
     # pyrefly: ignore [bad-override]
-    def forward(ctx, bias, tp_degree):
+    def forward(ctx, bias, tp_degree, dtype):
         ctx.tp_degree = tp_degree
         if tp_degree > 1:
-            return bias / tp_degree
-        return bias
+            bias = bias / tp_degree
+        return bias.to(dtype)
+
+    @staticmethod
+    def typecheck_forward(bias, tp_degree, dtype):
+        """
+        Typecheck for bias scaling, already interleaved to num tokens shape.
+        If EP enabled, V on all axes. If disabled, TP axis: R->V.
+        Technically R->P, but easier to mix in local region as V.
+        TODO(pianpwk): .to() dtype casts in LocalTokenDispatcher don't propagate Partial;
+        we would like a spmd_types API where callers are conscious of numerics loss.
+        """
+        enable_ep = spmd_mesh_size("ep") > 1
+        if enable_ep:
+            in_type = out_type = spmd.V
+        else:
+            in_type = {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R}
+            out_type = {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V}
+        spmd.assert_type(bias, in_type)
+        out = ScaleBiasForward.apply(bias, tp_degree, dtype)
+        spmd.assert_type(out, out_type)
+        return out
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
         # Don't scale the gradient - pass it through as-is
-        return grad_output, None
+        return grad_output, None, None
 
 
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
@@ -47,161 +71,121 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     x_linear = x_linear.clamp(min=-limit, max=limit)
     out_glu = x_glu * torch.sigmoid(alpha * x_glu)
     # Note we add an extra bias of 1 to the linear layer
-    return out_glu * (x_linear + 1)
+    return torch.addcmul(out_glu, out_glu, x_linear)
 
 
-def _run_experts_for_loop(
-    mlp1_weight: torch.Tensor,
-    mlp1_bias: torch.Tensor,
-    mlp2_weight: torch.Tensor,
-    mlp2_bias: torch.Tensor,
-    swiglu_limit: float,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    tp_degree: int = 1,
-) -> torch.Tensor:
-    # NOTE: this would incur a synchronization between device and host
-    # pyrefly: ignore [bad-assignment]
-    num_tokens_per_expert = num_tokens_per_expert.tolist()
-
-    # a tuple of tensors indexed by experts
-    # each with shape (tokens_per_expert(varying), dim)
-    # pyrefly: ignore [bad-assignment]
-    x = torch.split(
-        x[: sum(num_tokens_per_expert)],
-        # pyrefly: ignore [bad-argument-type]
-        split_size_or_sections=num_tokens_per_expert,
-        dim=0,
-    )
-    out_experts_splits = []
-    for expert_idx, x_expert in enumerate(x):
-        h = (
-            torch.matmul(x_expert, mlp1_weight[expert_idx].transpose(-2, -1))
-            + mlp1_bias[expert_idx]
-        )
-        h = swiglu(h, limit=swiglu_limit)
-        # Apply custom autograd function to scale bias in forward but not in backward
-        b2 = ScaleBiasForward.apply(mlp2_bias[expert_idx], tp_degree)
-        h = torch.matmul(h, mlp2_weight[expert_idx].transpose(-2, -1)) + b2
-        out_experts_splits.append(h)
-    out = torch.cat(out_experts_splits, dim=0)
-
-    return out
-
-
-def _run_experts_grouped_mm(
-    mlp1_weight: torch.Tensor,
-    mlp1_bias: torch.Tensor,
-    mlp2_weight: torch.Tensor,
-    mlp2_bias: torch.Tensor,
-    swiglu_limit: float,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    tp_degree: int = 1,
-) -> torch.Tensor:
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    # Pad num_tokens_per_expert with tail slack so that repeat_interleave
-    # with output_size=x.shape[0] directly produces a static-shaped output,
-    # avoiding the D2H sync that repeat_interleave incurs without output_size.
-    tail_slack = (x.shape[0] - offsets[-1]).unsqueeze(0).to(num_tokens_per_expert.dtype)
-    num_tokens_per_expert_long = torch.cat([num_tokens_per_expert, tail_slack]).long()
-
-    h = torch._grouped_mm(
-        x.bfloat16(), mlp1_weight.transpose(-2, -1).bfloat16(), offs=offsets
-    )
-
-    b1 = torch.cat([mlp1_bias, mlp1_bias.new_zeros(1, mlp1_bias.shape[-1])])
-    b1 = b1.repeat_interleave(num_tokens_per_expert_long, dim=0, output_size=x.shape[0])
-    h = h + b1.to(h.dtype)
-
-    h = swiglu(h, limit=swiglu_limit)
-    h = torch._grouped_mm(h, mlp2_weight.transpose(-2, -1).bfloat16(), offs=offsets)
-
-    # Apply custom autograd function to scale bias in forward but not in backward
-    b2 = torch.cat([mlp2_bias, mlp2_bias.new_zeros(1, mlp2_bias.shape[-1])])
-    b2 = b2.repeat_interleave(num_tokens_per_expert_long, dim=0, output_size=x.shape[0])
-    b2 = ScaleBiasForward.apply(b2, tp_degree)
-    h = h + b2.to(h.dtype)
-
-    return h
-
-
-class GptOssGroupedExperts(Module):
+class GptOssGroupedExperts(GroupedExperts):
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
         swiglu_limit: float = 7.0
 
     def __init__(self, config: Config):
-        super().__init__()
+        Module.__init__(self)
         dim = config.dim
         hidden_dim = config.hidden_dim
         num_experts = config.num_experts
         self.num_experts = num_experts
-        self.use_grouped_mm = config.use_grouped_mm
         self.swiglu_limit = config.swiglu_limit
 
-        self.mlp1_weight = nn.Parameter(
+        self.mlp1_weight_EGD = nn.Parameter(
             torch.empty((num_experts, hidden_dim * 2, dim))
         )  # (num_experts, out_dim, in_dim)
-        self.mlp1_bias = nn.Parameter(torch.empty((num_experts, hidden_dim * 2)))
-        self.mlp2_weight = nn.Parameter(
+        self.mlp1_bias_EG = nn.Parameter(torch.empty((num_experts, hidden_dim * 2)))
+        self.mlp2_weight_EDF = nn.Parameter(
             torch.empty((num_experts, dim, hidden_dim))
         )  # (num_experts, out_dim, in_dim)
-        self.mlp2_bias = nn.Parameter(torch.empty((num_experts, dim)))
+        self.mlp2_bias_ED = nn.Parameter(torch.empty((num_experts, dim)))
 
     def forward(
         self,
-        x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
     ) -> torch.Tensor:
-        if isinstance(self.mlp1_weight, DTensor):
+        """Raw expert computation without dispatch/combine.
+
+        Shape suffixes here describe logical grouped-mm inputs, not physical
+        sharding. Under EP, E may be a local shard of experts; under TP,
+        expert weights shard hidden dimensions instead; under SP, R may be a
+        local token shard. Keep logical capital suffixes here to avoid encoding
+        a specific parallel layout in these local tensor names.
+        """
+        if isinstance(self.mlp1_weight_EGD, DTensor):
             # Convert parameters from DTensors to plain Tensors, to work with
             # dynamic-shape inputs in EP which cannot be easily expressed as DTensors.
-            mlp1_weight = self.mlp1_weight.to_local()
+            mlp1_weight_EGD = self.mlp1_weight_EGD.to_local()
             # pyrefly: ignore [missing-attribute]
-            mlp1_bias = self.mlp1_bias.to_local()
+            mlp1_bias_EG = self.mlp1_bias_EG.to_local()
             # pyrefly: ignore [missing-attribute]
-            mlp2_weight = self.mlp2_weight.to_local()
+            mlp2_weight_EDF = self.mlp2_weight_EDF.to_local()
             # pyrefly: ignore [missing-attribute]
-            mlp2_bias = self.mlp2_bias.to_local()
+            mlp2_bias_ED = self.mlp2_bias_ED.to_local()
         else:
-            mlp1_weight = self.mlp1_weight
-            mlp1_bias = self.mlp1_bias
-            mlp2_weight = self.mlp2_weight
-            mlp2_bias = self.mlp2_bias
+            mlp1_weight_EGD = self.mlp1_weight_EGD
+            mlp1_bias_EG = self.mlp1_bias_EG
+            mlp2_weight_EDF = self.mlp2_weight_EDF
+            mlp2_bias_ED = self.mlp2_bias_ED
 
         # Determine tp_degree from device mesh if available
         tp_degree = 1
-        if isinstance(self.mlp1_weight, DTensor):
-            mesh_dim_names = self.mlp1_weight.device_mesh.mesh_dim_names
+        if isinstance(self.mlp1_weight_EGD, DTensor):
+            mesh_dim_names = self.mlp1_weight_EGD.device_mesh.mesh_dim_names
             # pyrefly: ignore[not-iterable]
             if "tp" in mesh_dim_names:
                 # pyrefly: ignore [missing-attribute]
                 tp_dim_idx = mesh_dim_names.index("tp")
-                tp_degree = self.mlp1_weight.device_mesh.size(tp_dim_idx)
+                tp_degree = self.mlp1_weight_EGD.device_mesh.size(tp_dim_idx)
 
-        if self.use_grouped_mm:
-            return _run_experts_grouped_mm(
-                mlp1_weight,
-                mlp1_bias,
-                mlp2_weight,
-                mlp2_bias,
-                self.swiglu_limit,
-                x,
-                num_tokens_per_expert,
-                tp_degree,
-            )
-        else:
-            return _run_experts_for_loop(
-                mlp1_weight,
-                mlp1_bias,
-                mlp2_weight,
-                mlp2_bias,
-                self.swiglu_limit,
-                x,
-                num_tokens_per_expert,
-                tp_degree,
-            )
+        if (
+            get_spmd_backend() == "spmd_types"
+            and spmd.is_type_checking()
+            and spmd_mesh_size("ep") == 1
+        ):
+            for axis in ("dp", "cp"):
+                spmd.mutate_type(num_tokens_per_expert_E, axis, src=spmd.P, dst=spmd.V)
+
+        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
+        # Pad num_tokens_per_expert_E with tail slack so that repeat_interleave
+        # with output_size=x_RD.shape[0] directly produces a static-shaped output,
+        # avoiding the D2H sync that repeat_interleave incurs without output_size.
+        tail_slack = (
+            (x_RD.shape[0] - offsets_E[-1])
+            .unsqueeze(0)
+            .to(num_tokens_per_expert_E.dtype)
+        )
+        # shape (E+1,): E expert counts + 1 tail slack for padding
+        num_tokens_per_expert_long = torch.cat(
+            [num_tokens_per_expert_E, tail_slack]
+        ).long()
+
+        # G = gate+up dimension (2*F)
+        h_RG = torch._grouped_mm(
+            x_RD.bfloat16(),
+            mlp1_weight_EGD.transpose(-2, -1).bfloat16(),
+            offs=offsets_E,
+        )
+
+        b1 = torch.cat(
+            [mlp1_bias_EG, mlp1_bias_EG.new_zeros(1, mlp1_bias_EG.shape[-1])]
+        )
+        b1_RG = b1.repeat_interleave(
+            num_tokens_per_expert_long, dim=0, output_size=x_RD.shape[0]
+        )
+        h_RG = h_RG + b1_RG.to(h_RG.dtype)
+
+        h_RF = swiglu(h_RG, limit=self.swiglu_limit)
+        h_RD = torch._grouped_mm(
+            h_RF, mlp2_weight_EDF.transpose(-2, -1).bfloat16(), offs=offsets_E
+        )
+
+        # Apply custom autograd function to scale bias in forward but not in backward
+        b2 = torch.cat(
+            [mlp2_bias_ED, mlp2_bias_ED.new_zeros(1, mlp2_bias_ED.shape[-1])]
+        )
+        b2_RD = b2.repeat_interleave(
+            num_tokens_per_expert_long, dim=0, output_size=x_RD.shape[0]
+        )
+        b2_RD = ScaleBiasForward.apply(b2_RD, tp_degree, h_RD.dtype)
+        return h_RD + b2_RD
 
 
 class GptOssMoE(MoE):
@@ -209,20 +193,4 @@ class GptOssMoE(MoE):
 
     @dataclass(kw_only=True, slots=True)
     class Config(MoE.Config):
-        swiglu_limit: float = 7.0
-
-    def __init__(self, config: Config):
-        # Initialize the base MoE class
-        super().__init__(config)
-
-        # Override the base GroupedExperts with GptOssGroupedExperts
-        gptoss_experts_config = GptOssGroupedExperts.Config(
-            dim=config.experts.dim,
-            hidden_dim=config.experts.hidden_dim,
-            num_experts=config.experts.num_experts,
-            swiglu_limit=config.swiglu_limit,
-            use_grouped_mm=config.experts.use_grouped_mm,
-            param_init=config.experts.param_init,
-        )
-        # pyrefly: ignore [bad-assignment]
-        self.experts = gptoss_experts_config.build()
+        pass

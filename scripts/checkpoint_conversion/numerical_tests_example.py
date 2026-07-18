@@ -66,9 +66,8 @@ def forward_tt(model_name, config_name, checkpoint_path, test_set):
         ["--module", model_name, "--config", config_name]
     )
 
-    # pyrefly: ignore [missing-attribute]
-    model_config = config.model_spec.model
-    model_config.update_from_config(trainer_config=config)
+    model_config = config.model_spec.model  # pyrefly: ignore [missing-attribute]
+    model_config.update_from_config(config=config)
 
     model = model_config.build()
 

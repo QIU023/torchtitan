@@ -10,25 +10,34 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import and_masks, BlockMask
+from torch.distributed.tensor import DTensor
+from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
-    create_attention_mask,
+    BaseQKVLinear,
+    create_varlen_metadata_for_document,
     FlexAttention,
     get_causal_mask_mod,
-    get_document_mask_mod,
+    get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
-    LocalMapInnerAttention,
+    VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.rope import apply_rotary_emb_cos_sin
+from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
-from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.protocols.module import Module
+
+
+def apply_attention_sink_rescale(
+    out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
+) -> torch.Tensor:
+    """Rescale attention output by the learned per-head sink term."""
+    sinks = sinks.view(*([1] * (lse.ndim - 1)), -1)
+    sink_scale = torch.sigmoid(lse - sinks).unsqueeze(-1)
+    return out * sink_scale.to(out.dtype)
 
 
 class Attention(BaseAttention):
@@ -42,14 +51,14 @@ class Attention(BaseAttention):
         n_kv_heads: int = 8
         head_dim: int = 64
         dim: int
-        wq: Linear.Config  # query projection
-        wkv: Linear.Config  # shared config for key + value (build() copies)
+        qkv_linear: BaseQKVLinear.Config
         wo: Linear.Config  # output projection
-        inner_attention: LocalMapInnerAttention.Config = dataclasses.field(
-            default_factory=FlexAttention.Config
+        inner_attention: Module.Config = dataclasses.field(
+            default_factory=VarlenAttention.Config
         )
-        mask_type: str = "causal"
-        sliding_window_size: int = 128
+        sliding_window_size: int | None = None
+        """Per-layer causal sliding-window size"""
+        rope: RoPE.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -62,22 +71,22 @@ class Attention(BaseAttention):
 
         # Standard attention softmax scale (1/sqrt(head_dim))
         self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
+        if config.rope.scaling == "yarn" and config.rope.rope_factor > 1.0:
+            mscale = 0.1 * math.log(config.rope.rope_factor) + 1.0
+            # Merge YaRN attention mscale into softmax_scale, with
+            # m**2 being equivalent to scaling q / k each by mscale.
+            self.softmax_scale *= mscale * mscale
 
-        self.wq = config.wq.build()
-        self.wk = config.wkv.build()  # build() copies — independent module
-        self.wv = config.wkv.build()  # build() copies — independent module
+        self.qkv_linear = config.qkv_linear.build()
         self.wo = config.wo.build()
         self.sinks = nn.Parameter(torch.empty(config.n_heads))
-        assert isinstance(
-            config.inner_attention, FlexAttention.Config
-        ), "gpt-oss only supports FlexAttention"
         self.inner_attention = config.inner_attention.build()
+        self.rope = config.rope.build()
 
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_masks: AttentionMasksType,
         positions: torch.Tensor | None = None,
     ):
         """
@@ -85,39 +94,27 @@ class Attention(BaseAttention):
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies for rope embedding.
-            attention_masks: Attention mask (BlockMask).
+            attention_masks: a ``BlockMask`` (flex) or ``VarlenMetadata`` (varlen).
             positions: Optional position indices (unused, for API compatibility).
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
         bsz, seqlen, _ = x.size()
-        hidden_shape = (bsz, seqlen, -1, self.head_dim)
 
-        q = self.wq(x).view(hidden_shape)
-        k = self.wk(x).view(hidden_shape)
-        v = self.wv(x).view(hidden_shape)
+        q, k, v = self.qkv_linear(x)
 
-        q, k = apply_rotary_emb_cos_sin(q, k, freqs_cis, positions)
+        q, k = self.rope(q, k, positions)
 
-        assert isinstance(attention_masks, BlockMask), attention_masks
-        # FlexAttention handles transpose internally; returns (bs, seq, heads, dim)
-        # and lse as (bs, seq, heads)
-        output, lse = self.inner_attention(
+        output = self.inner_attention(
             q,
             k,
             v,
             attention_masks=attention_masks,
             scale=self.softmax_scale,
-            return_lse=True,
             enable_gqa=self.enable_gqa,
+            out_transform=self._apply_sinks,
         )
-
-        # Apply attention sink rescaling: rescale by sigma(lse - w[h])
-        # output: (bs, seq, heads, dim), lse: (bs, seq, heads)
-        sink_scale = torch.sigmoid(lse - self.sinks.view(1, 1, -1)).unsqueeze(-1)
-        output = output * sink_scale.to(output.dtype)
 
         # Reshape and project output
         output = output.reshape(
@@ -125,6 +122,13 @@ class Attention(BaseAttention):
         ).contiguous()  # (bsz, seqlen, n_heads * v_head_dim)
         output = self.wo(output)  # (bsz, seqlen, dim)
         return output
+
+    def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        """out_transform hook: rescale attention output by this layer's sinks."""
+        sinks = self.sinks
+        if isinstance(sinks, DTensor):
+            sinks = sinks.to_local(grad_placements=sinks.placements)
+        return apply_attention_sink_rescale(out, lse, sinks)
 
 
 class GptOssTransformerBlock(TransformerBlock):
@@ -134,11 +138,16 @@ class GptOssTransformerBlock(TransformerBlock):
 
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
-        use_sliding_attention: bool = False
+        pass
 
     def __init__(self, config: Config):
         super().__init__()
-        self.use_sliding_attention = config.use_sliding_attention
+        assert isinstance(config.attention, Attention.Config)
+        self.attn_mask_key = (
+            "sliding_window_mask"
+            if config.attention.sliding_window_size is not None
+            else "basic_mask"
+        )
         self.attention = config.attention.build()
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
@@ -150,7 +159,6 @@ class GptOssTransformerBlock(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
@@ -159,23 +167,21 @@ class GptOssTransformerBlock(TransformerBlock):
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-            attention_masks (AttentionMasksType): a dict of BlockMasks.
+            attention_masks (AttentionMasksType): with flex, a dict of per-window
+                ``BlockMask``s from which this layer picks its mask; with varlen,
+                a single ``VarlenMetadata`` shared by all layers (the per-layer
+                causal window is baked into each layer's
+                ``VarlenAttention.window_size``).
             positions: Optional position indices.
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        # Extract the appropriate mask for this layer
-        if self.use_sliding_attention:
-            # pyrefly: ignore [missing-attribute]
-            layer_mask = attention_masks.get("sliding_window_mask", None)
-        else:
-            # pyrefly: ignore [missing-attribute]
-            layer_mask = attention_masks.get("basic_mask", None)
-        assert layer_mask is not None
 
-        x = x + self.attention(self.attention_norm(x), freqs_cis, layer_mask, positions)
+        if isinstance(attention_masks, dict):  # flex
+            attention_masks = attention_masks[self.attn_mask_key]
+
+        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
         x = x + self.moe(self.ffn_norm(x))
         return x
 
@@ -193,44 +199,19 @@ class GptOssModel(Decoder):
         def update_from_config(
             self,
             *,
-            trainer_config,
+            config,
             **kwargs,
         ) -> None:
-            training = trainer_config.training
-            parallelism = trainer_config.parallelism
-            seq_len = training.seq_len
-            if seq_len > self.rope.max_seq_len:
-                logger.warning(
-                    f"Sequence length {seq_len} exceeds original maximum {self.rope.max_seq_len}."
-                )
+            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            parallelism = config.parallelism
 
-            # Sync rope max_seq_len
-            self.rope = dataclasses.replace(self.rope, max_seq_len=seq_len)
+            from torchtitan.models.gpt_oss.sharding import set_gpt_oss_sharding_config
 
-            for layer_cfg in self.layers:
-                if layer_cfg.moe is not None:
-                    if (
-                        layer_cfg.moe.experts.use_grouped_mm
-                        and not has_cuda_capability(9, 0)
-                    ):
-                        logger.warning(
-                            "Failed to use grouped mm, which is only supported on SM90 or later",
-                        )
-                        layer_cfg.moe.experts.use_grouped_mm = False
-
-            tp = parallelism.tensor_parallel_degree
-            if tp > 1:
-                n_heads = self.layers[0].attention.n_heads
-                # pyrefly: ignore [missing-attribute]
-                n_kv_heads = self.layers[0].attention.n_kv_heads
-                if n_heads % tp != 0:
-                    raise ValueError(
-                        f"tensor_parallel_degree ({tp}) must divide n_heads ({n_heads})."
-                    )
-                if n_kv_heads % tp != 0:
-                    raise ValueError(
-                        f"tensor_parallel_degree ({tp}) must divide n_kv_heads ({n_kv_heads})."
-                    )
+            set_gpt_oss_sharding_config(
+                self,
+                enable_sp=parallelism.enable_sequence_parallel,
+                enable_ep=parallelism.expert_parallel_degree > 1,
+            )
 
         # pyrefly: ignore [bad-override]
         def get_nparams_and_flops(
@@ -250,45 +231,46 @@ class GptOssModel(Decoder):
 
     def get_attention_masks(
         self,
-        input_batch: torch.Tensor,
-        tokenizer: BaseTokenizer,
-        extra_inputs: dict[str, torch.Tensor] | None = None,
+        positions: torch.Tensor,
     ) -> AttentionMasksType:
-        basic_mask_mods = []
         attn_cfg = self.config.layers[0].attention
         assert isinstance(attn_cfg, Attention.Config)
-        sliding_window_mask_mods = [
-            get_sliding_window_mask_mod(attn_cfg.sliding_window_size)
-        ]
-        match attn_cfg.mask_type:
-            case "causal":
-                B = 1
-                basic_mask_mods.append(get_causal_mask_mod())
-            case "block_causal":
-                B = input_batch.shape[0]
-                assert tokenizer.eos_id is not None
-                basic_mask_mods.append(
-                    get_document_mask_mod(input_batch, tokenizer.eos_id)
+        inner_attn = attn_cfg.inner_attention
+
+        if isinstance(inner_attn, VarlenAttention.Config):
+            return create_varlen_metadata_for_document(positions)
+        elif isinstance(inner_attn, FlexAttention.Config):
+            base_mask_mods = [
+                get_causal_mask_mod(),
+                get_efficient_causal_mask_mod_for_packed_document(positions),
+            ]
+            # Full-attention (causal + document) mask, used by layers without a
+            # sliding window.
+            masks: dict[str, BlockMask] = {
+                "basic_mask": self._create_flex_attention_mask(
+                    positions, attn_cfg, base_mask_mods
                 )
-            case _:
-                raise ValueError(f"Unknown attention mask type: {attn_cfg.mask_type}")
+            }
 
-        # create basic attention mask: causal or block_causal
-        basic_mask = create_attention_mask(
-            and_masks(*basic_mask_mods),
-            B,
-            None,
-            input_batch.shape[1],
-            input_batch.shape[1],
-        )
+            # Sliding-window mask, built only if some layer requests a window.
+            window = None
+            for layer in self.config.layers:
+                if (
+                    isinstance(layer.attention, Attention.Config)
+                    and layer.attention.sliding_window_size is not None
+                ):
+                    window = layer.attention.sliding_window_size
+                    break
+            if window is not None:
+                masks["sliding_window_mask"] = self._create_flex_attention_mask(
+                    positions,
+                    attn_cfg,
+                    [*base_mask_mods, get_sliding_window_mask_mod(window)],
+                )
 
-        # create sliding window mask, has to be created on top of basic attention mask
-        sliding_window_mask = create_attention_mask(
-            and_masks(*basic_mask_mods, *sliding_window_mask_mods),
-            B,
-            None,
-            input_batch.shape[1],
-            input_batch.shape[1],
-        )
-
-        return {"basic_mask": basic_mask, "sliding_window_mask": sliding_window_mask}
+            return masks
+        else:
+            raise TypeError(
+                f"GPT-OSS supports FlexAttention and VarlenAttention inner attention, "
+                f"got {type(inner_attn).__name__}"
+            )

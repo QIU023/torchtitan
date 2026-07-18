@@ -4,144 +4,123 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torch
-import torch._inductor.config
-import torch.nn as nn
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import distribute_tensor, Partial, Replicate, Shard
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    parallelize_module,
-    PrepareModuleInput,
-    PrepareModuleInputOutput,
-    RowwiseParallel,
-    SequenceParallel,
-)
+import torch._dynamo
 
-from torchtitan.components.quantization.float8 import find_float8_linear_config
 from torchtitan.config import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
 )
+
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import apply_ac
-from torchtitan.distributed.compile import apply_compile_sparse
-from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
-from torchtitan.distributed.expert_parallel import (
-    ExpertParallel,
-    ReordererSequenceParallel,
-    TorchAOExpertParallel,
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.compile import apply_compile
+from torchtitan.distributed.context_parallel import apply_cp_to_forward
+from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan.distributed.full_dtensor import (
+    resolve_fsdp_mesh,
+    resolve_sparse_fsdp_mesh,
+    validate_config,
 )
-from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.models.gpt_oss.model import GptOssModel
-from torchtitan.models.llama4.parallelize import apply_fsdp
-from torchtitan.protocols.model_converter import ModelConvertersContainer
-from torchtitan.tools.logging import logger
-
-from .expert_parallel import GptossExpertTensorParallel, GptossTensorParallel
 
 
-# Adapted from llama4/infra/parallelize.py
+def _raise_dynamo_recompile_limit(
+    model: GptOssModel,
+) -> None:
+    # TP/EP sharding can compile a block before every DTensor local tensor has
+    # resolved from AsyncCollectiveTensor to a plain Tensor. Dynamo specializes
+    # on both states, and fullgraph=True turns the recompile cap into a hard
+    # failure instead of falling back. GPT-OSS needs a slightly higher cap
+    # because it alternates sliding-window and full-attention layers.
+    # TODO: remove once https://github.com/pytorch/pytorch/issues/187073 is fixed
+    min_recompile_limit = 12 if _has_sliding_window_attention(model) else 10
+    # PyTorch types this config as Literal[8], but runtime accepts larger ints.
+    # pyrefly: ignore [bad-assignment]
+    torch._dynamo.config.recompile_limit = max(
+        torch._dynamo.config.recompile_limit,
+        min_recompile_limit,
+    )
+
+
+def _has_sliding_window_attention(model: GptOssModel) -> bool:
+    for module in model.modules():
+        window_size = getattr(module, "window_size", None)
+        if (
+            isinstance(window_size, (tuple, list))
+            and len(window_size) > 0
+            and window_size[0] != -1
+        ):
+            return True
+    return False
+
+
 def parallelize_gptoss(
     model: GptOssModel,
     *,
     parallel_dims: ParallelDims,
     training: TrainingConfig,
-    model_converters: ModelConvertersContainer.Config,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: ActivationCheckpointConfig,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
-    assert (
-        training.seq_len % parallel_dims.seq_len_divisor == 0
-    ), f"""
-        Sequence length {training.seq_len} must be divisible by the product of TP degree
-        ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
-        """
-
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )
 
-    if parallel_dims.tp_enabled:
-        if parallelism.enable_async_tensor_parallel and not model_compile_enabled:
-            raise RuntimeError("Async TP requires torch.compile")
+    if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+        validate_config(parallel_dims, model)
+        model.parallelize(parallel_dims)
+    else:
+        # CP: wrap inner attention forward BEFORE parallelize() so CP logic
+        # runs inside the local_map boundary on local tensors.
+        if parallel_dims.cp_enabled:
+            apply_cp_to_forward(
+                # pyrefly: ignore [missing-attribute]
+                [block.attention.inner_attention for block in model.layers.values()],
+                parallel_dims.get_mesh("cp"),
+            )
+        if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
+            model.parallelize(parallel_dims)
 
-        float8_config = find_float8_linear_config(model_converters.converters)
-        enable_float8_linear = float8_config is not None
-        float8_is_rowwise = float8_config is not None and float8_config.recipe_name in (
-            "rowwise",
-            "rowwise_with_gw_hp",
-        )
-
-        # For now, float8 all-gather with TP is only supported for tensorwise
-        # float8 scaling recipes. For rowwise recipes, we use regular TP and
-        # all-gather happens in high precision.
-        enable_float8_tensorwise_tp = enable_float8_linear and not float8_is_rowwise
-
-        enable_sp = parallelism.enable_sequence_parallel
-
-        apply_non_moe_tp(
-            model,
-            parallel_dims.get_mesh("tp"),
-            enable_loss_parallel=not parallelism.disable_loss_parallel,
-            enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
-            enable_async_tp=False,
-            enable_sp=enable_sp,
-        )
-
-    if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-        from torchtitan.components.quantization import find_pad_multiple
-
-        pad_multiple = find_pad_multiple(model_converters.converters)
-
-        apply_moe_ep_tp(
-            model,
-            tp_mesh=parallel_dims.get_optional_mesh("tp"),
-            ep_mesh=parallel_dims.get_optional_mesh("ep"),
-            ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
-            etp_enabled=parallel_dims.etp_enabled,
-            pad_multiple=pad_multiple,
-            enable_sp=True,
-        )
-
-    if parallel_dims.cp_enabled:
-        apply_cp_to_attention_module(
-            # pyrefly: ignore [missing-attribute, not-callable]
-            [block.attention.inner_attention for block in model.layers.values()],
-            parallel_dims.get_mesh("cp"),
-        )
-
-    if ac_config.mode != "none":
-        apply_ac(
-            model,
-            ac_config,
-            model_compile_enabled=model_compile_enabled,
-        )
+    if ac_config is not None:
+        ac_config.build(dump_folder=dump_folder).apply(model)
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
-        apply_compile_sparse(model, compile_config, parallel_dims.ep_enabled)
+        if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
+            _raise_dynamo_recompile_limit(model)
+        apply_compile(model, compile_config)
 
-    dp_mesh_names = (
-        ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    )
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+    # Skip FSDP wrapper for inference. FSDP's forward hooks
+    # are incompatible with torch.inference_mode() used by vLLM.
+    # AC and compile are disabled via config (mode="none", enable=False).
+    if skip_dp:
+        return model
 
-    edp_mesh = None
-    if parallel_dims.ep_enabled:
-        edp_mesh_names = (
-            ["dp_replicate", "efsdp"]
-            if parallel_dims.dp_replicate_enabled
-            else ["efsdp"]
+    if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+    else:
+        dp_mesh_names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
         )
-        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+        dp_mesh_dims = None
+        edp_mesh = None
+        edp_mesh_dims = None
+        if parallel_dims.ep_enabled:
+            edp_mesh_names = (
+                ["dp_replicate", "efsdp"]
+                if parallel_dims.dp_replicate_enabled
+                else ["efsdp"]
+            )
+            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
-    apply_fsdp(
+    apply_fsdp_to_decoder(
         model,
         dp_mesh,
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
@@ -151,176 +130,9 @@ def parallelize_gptoss(
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
+        dp_mesh_dims=dp_mesh_dims,
+        edp_mesh_dims=edp_mesh_dims,
+        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
-
-    logger.info("Applied fully_shard to the model")
-
-    if parallel_dims.cp_enabled:
-        logger.info("Applied Context Parallel to the model")
-
-    if training.enable_cpu_offload:
-        logger.info("Applied CPU Offloading to the model")
 
     return model
-
-
-def apply_non_moe_tp(
-    model: nn.Module,
-    tp_mesh: DeviceMesh,
-    enable_loss_parallel: bool,
-    enable_float8_tensorwise_tp: bool,
-    enable_async_tp: bool,
-    enable_sp: bool = True,
-):
-    """Apply tensor parallelism."""
-    # 1. Parallelize the embedding and shard its outputs (which are the first
-    # transformer block's inputs)
-    # 2. Parallelize the root norm layer over the sequence dim
-    # 3. Parallelize the final linear output layer
-    sp_layout = Shard(1) if enable_sp else Replicate()
-    embed_plan = RowwiseParallel(
-        input_layouts=Replicate(),
-        output_layouts=sp_layout,
-        use_local_output=enable_sp,
-    )
-
-    parallelize_module(
-        model,
-        tp_mesh,
-        {
-            "tok_embeddings": embed_plan,
-            "norm": SequenceParallel() if enable_sp else NoParallel(),
-            "output": ColwiseParallel(
-                input_layouts=sp_layout,
-                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
-                use_local_output=not enable_loss_parallel,
-            ),
-        },
-    )
-
-    # Apply tensor + sequence parallelism to every transformer block
-    norm_plan = SequenceParallel() if enable_sp else NoParallel()
-    rowwise_output_plan = RowwiseParallel(
-        output_layouts=sp_layout, use_local_output=enable_sp
-    )
-
-    # pyrefly: ignore [not-callable]
-    for transformer_block in model.layers.values():
-        layer_plan = {
-            "attention_norm": norm_plan,
-            "attention": PrepareModuleInput(
-                input_layouts=(sp_layout, Replicate(), None, None),
-                desired_input_layouts=(Replicate(), Replicate(), None, None),
-            ),
-            "attention.wq": ColwiseParallel(use_local_output=False),
-            "attention.wk": ColwiseParallel(use_local_output=False),
-            "attention.wv": ColwiseParallel(use_local_output=False),
-            "attention.wo": rowwise_output_plan,
-            "ffn_norm": norm_plan,
-        }
-
-        # shard attention.sinks across heads
-        # pyrefly: ignore [missing-attribute]
-        attn = transformer_block.attention
-        attn.register_parameter(
-            "sinks",
-            nn.Parameter(distribute_tensor(attn.sinks, tp_mesh, [Shard(0)])),
-        )
-
-        parallelize_module(
-            # pyrefly: ignore [bad-argument-type]
-            module=transformer_block,
-            device_mesh=tp_mesh,
-            # pyrefly: ignore [bad-argument-type]
-            parallelize_plan=layer_plan,
-        )
-
-    if enable_async_tp:
-        torch._inductor.config._micro_pipeline_tp = True
-
-    logger.info(
-        f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}{'Async ' if enable_async_tp else ''}"
-        "Tensor Parallelism to the model"
-    )
-
-
-def apply_moe_ep_tp(
-    model: nn.Module,
-    tp_mesh: DeviceMesh | None,
-    ep_mesh: DeviceMesh | None,
-    ep_etp_mesh: DeviceMesh | None,
-    etp_enabled: bool,
-    pad_multiple: int | None = None,
-    enable_sp: bool = True,
-):
-    assert ep_mesh is not None or tp_mesh is not None
-
-    sp_layout = Shard(1) if enable_sp else Replicate()
-
-    # pyrefly: ignore [not-callable]
-    for transformer_block in model.layers.values():
-        # pyrefly: ignore [missing-attribute]
-        if not transformer_block.moe_enabled:
-            continue
-
-        if tp_mesh is not None:
-            moe_layer_plan = {
-                # With SP: all-gather (Shard→Replicate) for input,
-                # reduce-scatter (Partial→Shard) for output.
-                # Without SP: input is already Replicate,
-                # all-reduce (Partial→Replicate) for output.
-                "moe": PrepareModuleInputOutput(
-                    input_layouts=(sp_layout,),
-                    desired_input_layouts=(Replicate(),),
-                    # Keep input as a DTensor from SequenceParallel, do not wrap with to_local.
-                    use_local_input=False,
-                    output_layouts=(Partial(),),
-                    desired_output_layouts=(sp_layout,),
-                ),
-                # replicate computation for the router
-                "moe.router.gate": NoParallel(
-                    local_output_grad_placements=(Partial(),),
-                ),
-            }
-            if ep_mesh is not None and not etp_enabled:
-                # If TP is borrowed for EP, then split the tokens across TP ranks so that
-                # the reorderer, the all-to-all comms, and routed experts computation
-                # are effectively running Sequence Parallel (split along the folded bs*slen dim)
-                # pyrefly: ignore [no-matching-overload]
-                moe_layer_plan.update({"moe.reorderer": ReordererSequenceParallel()})
-
-            parallelize_module(
-                # pyrefly: ignore [bad-argument-type]
-                module=transformer_block,
-                device_mesh=tp_mesh,
-                # pyrefly: ignore [bad-argument-type]
-                parallelize_plan=moe_layer_plan,
-            )
-
-        experts_mesh, experts_plan = None, None
-        if ep_mesh is None:
-            experts_mesh = tp_mesh
-            # input Replicate, output Partial
-            experts_plan = GptossTensorParallel()
-        elif tp_mesh is None or not etp_enabled:
-            experts_mesh = ep_mesh
-            if pad_multiple is not None:
-                experts_plan = TorchAOExpertParallel(pad_multiple)
-            else:
-                # input / output sharding on the batch / tokens dim
-                experts_plan = ExpertParallel()
-        else:
-            if pad_multiple is not None:
-                raise NotImplementedError(
-                    "Quantized grouped GEMMs (FP8/MXFP8) with Expert Tensor "
-                    "Parallelism (ETP) is not yet supported."
-                )
-            experts_mesh = ep_etp_mesh
-            experts_plan = GptossExpertTensorParallel()
-
-        parallelize_module(
-            # pyrefly: ignore [missing-attribute]
-            module=transformer_block.moe.experts,
-            device_mesh=experts_mesh,
-            parallelize_plan=experts_plan,
-        )

@@ -9,11 +9,27 @@ import unittest
 
 from copy import deepcopy
 
+import torch
 from datasets import Dataset
+from torch.nn.attention.flex_attention import and_masks
 
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.hf_datasets.text_datasets import ChatDataset
+from torchtitan.hf_datasets.text_datasets import (
+    ChatDataLoader,
+    ChatDataset,
+    ChatDataSource,
+    InterleavedChatDataLoader,
+)
+from torchtitan.models.common.attention import (
+    BaseAttention,
+    FlexAttention,
+    get_causal_mask_mod,
+    get_document_mask_mod,
+    get_efficient_causal_mask_mod_for_packed_document,
+)
+from torchtitan.models.common.decoder import Decoder
+
 
 # Path to the test tokenizer and fixture data
 _ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
@@ -76,9 +92,8 @@ class TestChatDatasetShiftedTokens(unittest.TestCase):
 
     def test_shifted_by_one(self):
         tokenizer = _load_tokenizer()
-        ds = _load_dataset()
         chat_ds = ChatDataset(
-            dataset=ds,
+            dataset=_load_dataset(),
             tokenizer=tokenizer,
             sample_processor=_process_sample,
             seq_len=2048,
@@ -89,8 +104,9 @@ class TestChatDatasetShiftedTokens(unittest.TestCase):
         input_ids = batch["input"]
         label_ids = labels
 
-        # Tokenize the first sample directly to get ground truth tokens
-        sample = ds[0]
+        # Tokenize the first sample directly to get ground truth tokens. ChatDataset shuffles the
+        # dataset internally at init, and ChatDataset._original_data is the post-shuffle dataset.
+        sample = chat_ds._original_data[0]
         messages = _process_sample(sample)
         full_text = tokenizer.apply_chat_template(messages)
         # Chat templates already include end tokens, so no add_eos
@@ -313,19 +329,19 @@ class TestChatDatasetCheckpointing(unittest.TestCase):
         self.assertEqual(state["epoch"], 0)
 
         # Restore and verify the dataset can produce valid packed batches
-        chat_ds2 = ChatDataset(
+        chat_ds_resumed = ChatDataset(
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
             seq_len=seq_len,
             infinite=False,
         )
-        chat_ds2.load_state_dict(state)
+        chat_ds_resumed.load_state_dict(state)
 
-        self.assertEqual(chat_ds2._sample_idx, state["sample_idx"])
-        self.assertEqual(chat_ds2._epoch, state["epoch"])
+        self.assertEqual(chat_ds_resumed._sample_idx, state["sample_idx"])
+        self.assertEqual(chat_ds_resumed._epoch, state["epoch"])
 
-        remaining = list(chat_ds2)
+        remaining = list(chat_ds_resumed)
         self.assertGreater(len(remaining), 0, "Restored dataset should produce batches")
         for batch, labels in remaining:
             self.assertEqual(batch["input"].shape[0], seq_len)
@@ -333,41 +349,68 @@ class TestChatDatasetCheckpointing(unittest.TestCase):
             self.assertEqual(labels.shape[0], seq_len)
 
     def test_yield_same_data_multi_epoch(self):
-        tokenizer = _load_tokenizer()
-        ds = _load_dataset()
-        seq_len = 128
-        chat_ds = ChatDataset(
-            dataset=ds,
-            tokenizer=tokenizer,
-            sample_processor=_process_sample,
-            seq_len=seq_len,
-            infinite=True,
-        )
-
-        # Consume at least 2 epochs
-        it = iter(chat_ds)
-        for i in range(25):
-            next(it)
-
-        state = deepcopy(chat_ds.state_dict())
-
-        # Restore
-        chat_ds2 = ChatDataset(
-            dataset=ds,
-            tokenizer=tokenizer,
-            sample_processor=_process_sample,
-            seq_len=seq_len,
-            infinite=True,
-        )
-        chat_ds2.load_state_dict(state)
-
-        # verify yield gives same input data
-        # test assertion seveal times in order to empty potential input buffer.
-        it2 = iter(chat_ds2)
-        for _ in range(10):
-            self.assertEqual(
-                next(it)[0]["input"].tolist(), next(it2)[0]["input"].tolist()
+        def _build_dataloader(streaming, batch_size, seq_len, world_size, rank):
+            tokenizer_config = HuggingFaceTokenizer.Config()
+            dl_config = ChatDataLoader.Config(
+                dataset_path="json",
+                load_dataset_kwargs={
+                    "data_files": _DATA_PATH,
+                    "split": "train",
+                    "streaming": streaming,
+                },
+                sample_processor=_process_sample,
+                infinite=True,
             )
+
+            return dl_config.build(
+                dp_world_size=world_size,
+                dp_rank=rank,
+                tokenizer=tokenizer_config.build(tokenizer_path=_TOKENIZER_PATH),
+                seq_len=seq_len,
+                local_batch_size=batch_size,
+            )
+
+        for streaming in [True, False]:
+            for world_size in [2, 4]:
+                for rank in range(world_size):
+                    batch_size = 1
+                    seq_len = 128
+                    dl = _build_dataloader(
+                        streaming, batch_size, seq_len, world_size, rank
+                    )
+
+                    # Consume at least 2 epochs
+                    it = iter(dl)
+                    for _ in range(8):
+                        next(it)
+
+                    state = deepcopy(dl.state_dict())
+                    # Restore
+                    dl_resumed = _build_dataloader(
+                        streaming, batch_size, seq_len, world_size, rank
+                    )
+                    dl_resumed.load_state_dict(state)
+                    # verify yield gives same input data
+                    # test assertion seveal times in order to empty potential input buffer.
+                    it_resumed = iter(dl_resumed)
+
+                    expected, expected_labels = next(it)
+                    input_ids, labels = next(it_resumed)
+                    for _ in range(3):
+                        expected_input_ids, expected_labels = next(it)
+                        input_ids, labels = next(it_resumed)
+                        assert torch.equal(
+                            input_ids["input"], expected_input_ids["input"]
+                        )
+                        assert torch.equal(
+                            input_ids["positions"],
+                            expected_input_ids["positions"],
+                        )
+                        assert torch.equal(labels, expected_labels)
+                        self.assertEqual(
+                            next(it)[0]["input"].tolist(),
+                            next(it_resumed)[0]["input"].tolist(),
+                        )
 
 
 class TestChatDatasetInfiniteLooping(unittest.TestCase):
@@ -409,6 +452,241 @@ class TestChatDatasetInfiniteLooping(unittest.TestCase):
         batches = [next(it) for _ in range(20)]
         self.assertEqual(len(batches), 20)
         self.assertGreaterEqual(chat_ds._epoch, 1)
+
+
+class TestDocumentMaskBlocksCrossDocAttention(unittest.TestCase):
+    """Verify that position-based document masks block cross-document attention."""
+
+    def test_packed_samples_block_cross_document_attention(self):
+        tokenizer = _load_tokenizer()
+        ds = _load_dataset()
+        chat_ds = ChatDataset(
+            dataset=ds,
+            tokenizer=tokenizer,
+            sample_processor=_process_sample,
+            seq_len=2048,
+            infinite=False,
+        )
+
+        r0 = chat_ds._tokenize_sample(ds[0])
+        r1 = chat_ds._tokenize_sample(ds[1])
+        self.assertIsNotNone(r0)
+        self.assertIsNotNone(r1)
+        input_ids_0, _ = r0
+        input_ids_1, _ = r1
+
+        packed = input_ids_0 + input_ids_1
+        boundary = len(input_ids_0)
+        positions = torch.tensor(
+            [list(range(len(input_ids_0))) + list(range(len(input_ids_1)))]
+        )
+
+        mask_mod = get_document_mask_mod(positions)
+        b, h = torch.tensor(0), torch.tensor(0)
+
+        self.assertFalse(
+            mask_mod(b, h, torch.tensor(boundary), torch.tensor(boundary - 1)).item(),
+        )
+        self.assertFalse(
+            mask_mod(b, h, torch.tensor(len(packed) - 1), torch.tensor(0)).item(),
+        )
+        self.assertTrue(
+            mask_mod(b, h, torch.tensor(boundary - 1), torch.tensor(0)).item(),
+        )
+        self.assertTrue(
+            mask_mod(
+                b, h, torch.tensor(len(packed) - 1), torch.tensor(boundary)
+            ).item(),
+        )
+
+    def test_packed_document_mask_composes_with_causal_mask(self):
+        for positions in (
+            torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]]),
+            torch.tensor(
+                [
+                    [0, 1, 2, 0, 1, 0, 1, 2],
+                    [0, 1, 0, 1, 2, 3, 0, 1],
+                ]
+            ),
+        ):
+            causal_mask = get_causal_mask_mod()
+            document_mask = get_document_mask_mod(positions)
+            packed_mask = and_masks(
+                causal_mask,
+                get_efficient_causal_mask_mod_for_packed_document(positions),
+            )
+            h = torch.tensor(0)
+
+            for b in range(positions.shape[0]):
+                b_tensor = torch.tensor(b)
+                for q_idx in range(positions.shape[1]):
+                    q_tensor = torch.tensor(q_idx)
+                    for kv_idx in range(positions.shape[1]):
+                        kv_tensor = torch.tensor(kv_idx)
+                        expected = causal_mask(
+                            b_tensor, h, q_tensor, kv_tensor
+                        ) & document_mask(b_tensor, h, q_tensor, kv_tensor)
+                        self.assertEqual(
+                            packed_mask(b_tensor, h, q_tensor, kv_tensor).item(),
+                            expected.item(),
+                        )
+
+    def test_decoder_block_causal_flex_mask_supports_multiple_samples(self):
+        positions = torch.tensor(
+            [
+                [0, 1, 2, 0, 1, 0, 1, 2],
+                [0, 1, 0, 1, 2, 3, 0, 1],
+            ],
+            dtype=torch.int32,
+        )
+        attn_config = BaseAttention.Config(
+            n_heads=1,
+            inner_attention=FlexAttention.Config(block_size=4),
+        )
+
+        decoder = Decoder.__new__(Decoder)
+        mask = decoder._create_flex_attention_mask_for_document(positions, attn_config)
+
+        self.assertEqual(mask.shape, (positions.shape[0], 1, 8, 8))
+
+
+class TestInterleavedChatDataLoader(unittest.TestCase):
+    """Tests for InterleavedChatDataLoader config validation, construction, and checkpointing."""
+
+    def _make_config(self, **kwargs) -> InterleavedChatDataLoader.Config:
+        defaults = dict(
+            sources=[
+                ChatDataSource(
+                    dataset_path="json",
+                    load_dataset_kwargs={"data_files": _DATA_PATH, "split": "train"},
+                    sample_processor=_process_sample,
+                    weight=1.0,
+                    infinite=True,
+                ),
+                ChatDataSource(
+                    dataset_path="json",
+                    load_dataset_kwargs={"data_files": _DATA_PATH, "split": "train"},
+                    sample_processor=_process_sample,
+                    weight=2.0,
+                    infinite=True,
+                ),
+            ],
+            seed=42,
+            num_workers=0,
+        )
+        defaults.update(kwargs)
+        return InterleavedChatDataLoader.Config(**defaults)
+
+    def _build_dataloader(
+        self, config, batch_size=1, seq_len=256, world_size=1, rank=0
+    ):
+        tokenizer_config = HuggingFaceTokenizer.Config()
+        return config.build(
+            dp_world_size=world_size,
+            dp_rank=rank,
+            tokenizer=tokenizer_config.build(tokenizer_path=_TOKENIZER_PATH),
+            seq_len=seq_len,
+            local_batch_size=batch_size,
+        )
+
+    def test_rejects_empty_sources(self):
+        with self.assertRaises(ValueError) as ctx:
+            InterleavedChatDataLoader.Config(sources=[], seed=42)
+        self.assertIn("At least one source", str(ctx.exception))
+
+    def test_rejects_mixed_infinite(self):
+        with self.assertRaises(ValueError) as ctx:
+            InterleavedChatDataLoader.Config(
+                sources=[
+                    ChatDataSource(
+                        dataset_path="json",
+                        load_dataset_kwargs={
+                            "data_files": _DATA_PATH,
+                            "split": "train",
+                        },
+                        sample_processor=_process_sample,
+                        weight=1.0,
+                        infinite=True,
+                    ),
+                    ChatDataSource(
+                        dataset_path="json",
+                        load_dataset_kwargs={
+                            "data_files": _DATA_PATH,
+                            "split": "train",
+                        },
+                        sample_processor=_process_sample,
+                        weight=1.0,
+                        infinite=False,
+                    ),
+                ],
+                seed=42,
+            )
+        self.assertIn("infinite", str(ctx.exception))
+
+    def test_construction_batch_size_and_num_workers(self):
+        config = self._make_config(num_workers=2)
+        dl = self._build_dataloader(config, batch_size=4)
+        self.assertEqual(dl.batch_size, 4)
+        self.assertEqual(dl.num_workers, 2)
+
+    def test_yields_input_positions_and_labels(self):
+        """Batches must contain 'input' and 'positions' keys with correct shapes."""
+        seq_len = 256
+        config = self._make_config()
+        dl = self._build_dataloader(config, batch_size=2, seq_len=seq_len)
+        batch_input, batch_label = next(iter(dl))
+        self.assertIn("input", batch_input)
+        self.assertIn("positions", batch_input)
+        self.assertEqual(batch_input["input"].shape, (2, seq_len))
+        self.assertEqual(batch_input["positions"].shape, (2, seq_len))
+        self.assertEqual(batch_label.shape, (2, seq_len))
+
+    def test_resumption_mid_epoch(self):
+        """Checkpoint taken before any source exhausts resumes correctly."""
+        config = self._make_config()
+        dl = self._build_dataloader(config)
+        it = iter(dl)
+
+        for _ in range(5):
+            next(it)
+        state = deepcopy(dl.state_dict())
+
+        dl_resumed = self._build_dataloader(self._make_config())
+        dl_resumed.load_state_dict(state)
+        it_resumed = iter(dl_resumed)
+
+        for _ in range(10):
+            expected_input, expected_labels = next(it)
+            input_ids, labels = next(it_resumed)
+            self.assertTrue(torch.equal(input_ids["input"], expected_input["input"]))
+            self.assertTrue(
+                torch.equal(input_ids["positions"], expected_input["positions"])
+            )
+            self.assertTrue(torch.equal(labels, expected_labels))
+
+    def test_resumption_across_reloop(self):
+        """Checkpoint taken after sources have re-looped resumes correctly."""
+        config = self._make_config()
+        dl = self._build_dataloader(config)
+        it = iter(dl)
+
+        # Consume enough to guarantee at least one source has re-looped
+        for _ in range(30):
+            next(it)
+        state = deepcopy(dl.state_dict())
+
+        dl_resumed = self._build_dataloader(self._make_config())
+        dl_resumed.load_state_dict(state)
+        it_resumed = iter(dl_resumed)
+
+        for _ in range(20):
+            expected_input, expected_labels = next(it)
+            input_ids, labels = next(it_resumed)
+            self.assertTrue(torch.equal(input_ids["input"], expected_input["input"]))
+            self.assertTrue(
+                torch.equal(input_ids["positions"], expected_input["positions"])
+            )
+            self.assertTrue(torch.equal(labels, expected_labels))
 
 
 if __name__ == "__main__":

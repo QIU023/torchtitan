@@ -71,6 +71,7 @@ repos:
       name: Pyrefly (type checking)
       pass_filenames: false
       language: system
+      args: ["--remove-unused-ignores", "--summarize-errors"]
 
 
 - repo: local
@@ -78,19 +79,24 @@ repos:
     # Check hyperlinks and external links
     - id: lychee-link-checker
       name: lychee-link-checker
-      verbose: true
       language: system
-      require_serial: true
       entry: |
         /bin/bash -c '
+        mkdir -p /tmp/lychee 2>/dev/null
+        SENTINEL_DIR="/tmp/lychee/lychee_lock_${PPID}"
         if ! command -v lychee >/dev/null 2>&1; then
-            echo "--------------------------------------------------------"
-            echo "Warning: Lychee (link checker) not found. Skipping ... "
-            echo ""
-            echo "To enable local link checking, install Lychee:"
-            echo "  - MacOS: brew install lychee"
-            echo "  - Linux/Windows: https://github.com/lycheeverse/lychee"
-            echo "--------------------------------------------------------"
+            # mkdir is atomic; only one process will succeed in creating it
+            if mkdir "$SENTINEL_DIR" 2>/dev/null; then
+                {
+                  echo "--------------------------------------------------------"
+                  echo "Warning: Lychee (link checker) not found. Skipping ... "
+                  echo ""
+                  echo "To enable local link checking, install Lychee:"
+                  echo "  - MacOS: brew install lychee"
+                  echo "  - Linux/Windows: https://github.com/lycheeverse/lychee"
+                  echo "--------------------------------------------------------"
+                } > /dev/tty 2>/dev/null || true
+            fi
             exit 0
         fi
         lychee "$@"
@@ -98,11 +104,13 @@ repos:
       args:
         - "--quiet"
         - "--no-progress"
+        - "--cache"
         - "--exclude-path=(^|/)\\.[^/]+/"
         - "--root-dir=."
-        - "--accept=200,403,429,503"
+        - "--accept=100..399,400,401,402,403,405..999" # Fail only on 404
         - "--exclude=http://localhost:.*"
         - "--exclude=http://127.0.0.1:.*"
+        - "--exclude=tcp://localhost:.*"
         - "--max-retries=5"
         - "--retry-wait-time=10"
         - "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"

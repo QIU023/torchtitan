@@ -7,7 +7,26 @@
 from abc import abstractmethod
 from dataclasses import dataclass
 
+from torchtitan.config import Configurable
+
 from .module import Module
+
+
+class ModelConfigConverter(Configurable):
+    """Base class for converters that transform the model config tree.
+
+    Subclasses implement ``convert()`` to modify configs before model build
+    (e.g. quantization, LoRA).  Converters may return a replacement root
+    config when the transform needs to wrap the model config itself.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    @abstractmethod
+    def convert(self, model_config: Module.Config) -> Module.Config:
+        raise NotImplementedError
 
 
 class BaseModel(Module):
@@ -48,8 +67,7 @@ class BaseModel(Module):
         if failures:
             details = ", ".join(f"'{fqn}' ({cls})" for fqn, cls in failures)
             raise RuntimeError(
-                f"The following modules do not satisfy the Module protocol: "
-                f"{details}"
+                f"The following modules do not satisfy the Module protocol: {details}"
             )
 
     @dataclass(kw_only=True, slots=True)
@@ -65,7 +83,7 @@ class BaseModel(Module):
         def update_from_config(
             self,
             *,
-            trainer_config,
+            config,
             **kwargs,
         ) -> None:
             pass

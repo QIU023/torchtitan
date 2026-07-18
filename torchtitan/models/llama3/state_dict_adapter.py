@@ -10,8 +10,8 @@ from typing import Any
 
 logger = logging.getLogger()
 
+from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
-
 from .model import Llama3Model
 
 
@@ -25,11 +25,12 @@ class Llama3StateDictAdapter(StateDictAdapter):
 
         self.model_config = model_config
         self.hf_assets_path = hf_assets_path
+
         self.from_hf_map = {
             "model.embed_tokens.weight": "tok_embeddings.weight",
-            "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
-            "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
-            "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
+            "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.qkv_linear.wq.weight",
+            "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.qkv_linear.wk.weight",
+            "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.qkv_linear.wv.weight",
             "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
             "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
             "model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
@@ -38,7 +39,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
             "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
             "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
             "model.norm.weight": "norm.weight",
-            "lm_head.weight": "output.weight",
+            "lm_head.weight": "lm_head.weight",
         }
 
     # HuggingFace permutation function (exact copy from their conversion script)
@@ -66,39 +67,42 @@ class Llama3StateDictAdapter(StateDictAdapter):
         )
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        to_hf_map = {v: k for k, v in self.from_hf_map.items()}
 
-        n_heads = self.model_config.layers[0].attention.n_heads
-        n_kv_heads = (
-            self.model_config.layers[0].attention.n_kv_heads
-            # pyrefly: ignore [missing-attribute]
-            if self.model_config.layers[0].attention.n_kv_heads is not None
-            else n_heads
-        )
-        dim = self.model_config.dim
-        head_dim = dim // n_heads
+        # pyrefly: ignore [missing-attribute]
+        attn = self.model_config.layers[0].attention
+        n_heads = attn.n_heads
+        n_kv_heads = attn.n_kv_heads if attn.n_kv_heads is not None else n_heads
+        dim = self.model_config.dim  # pyrefly: ignore [missing-attribute]
+        head_dim = attn.head_dim or dim // n_heads
         hf_state_dict = {}
+
+        to_hf_map = {v: k for k, v in self.from_hf_map.items() if v is not None}
 
         for key, value in state_dict.items():
             if "layers" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 # pyrefly: ignore [missing-attribute]
                 layer_num = re.search(r"\d+", key).group(0)
-                new_key = to_hf_map[abstract_key]
-                # We need to permute the weights in wq and wk layer in order to account for the difference between
-                # the native Llama and huggingface RoPE implementation.
-                if abstract_key == "layers.{}.attention.wq.weight":
+
+                new_key = to_hf_map.get(abstract_key)
+                if new_key is None:
+                    continue
+
+                # Apply HF permutation for Q/K weights
+                if abstract_key == "layers.{}.attention.qkv_linear.wq.weight":
                     value = self._permute(value, n_heads)
-                if abstract_key == "layers.{}.attention.wk.weight":
-                    # pyrefly: ignore [unsupported-operation]
+                if abstract_key == "layers.{}.attention.qkv_linear.wk.weight":
                     key_value_dim = head_dim * n_kv_heads
                     value = self._permute(value, n_kv_heads, key_value_dim, dim)
 
-                if new_key is None:
-                    continue
                 new_key = new_key.format(layer_num)
             else:
-                if self.model_config.enable_weight_tying and key == "output.weight":
+                if (
+                    self.model_config.enable_weight_tying  # pyrefly: ignore [missing-attribute]
+                    and key == "lm_head.weight"
+                ):
+                    if self.fqn_to_index_mapping:
+                        self.fqn_to_index_mapping.pop("lm_head.weight", None)
                     continue
                 new_key = to_hf_map[key]
 
@@ -107,22 +111,20 @@ class Llama3StateDictAdapter(StateDictAdapter):
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        self._validate_hf_rope_config(ComplexRoPE.Config)
         if (
-            self.model_config.enable_weight_tying
+            self.model_config.enable_weight_tying  # pyrefly: ignore [missing-attribute]
             and "lm_head.weight" not in hf_state_dict
         ):
             assert "model.embed_tokens.weight" in hf_state_dict
             hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
 
-        n_heads = self.model_config.layers[0].attention.n_heads
-        n_kv_heads = (
-            self.model_config.layers[0].attention.n_kv_heads
-            # pyrefly: ignore [missing-attribute]
-            if self.model_config.layers[0].attention.n_kv_heads is not None
-            else n_heads
-        )
-        dim = self.model_config.dim
-        head_dim = dim // n_heads
+        # pyrefly: ignore [missing-attribute]
+        attn = self.model_config.layers[0].attention
+        n_heads = attn.n_heads
+        n_kv_heads = attn.n_kv_heads if attn.n_kv_heads is not None else n_heads
+        dim = self.model_config.dim  # pyrefly: ignore [missing-attribute]
+        head_dim = attn.head_dim or dim // n_heads
         state_dict = {}
 
         for key, value in hf_state_dict.items():
@@ -130,24 +132,23 @@ class Llama3StateDictAdapter(StateDictAdapter):
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 # pyrefly: ignore [missing-attribute]
                 layer_num = re.search(r"\d+", key).group(0)
-                new_key = self.from_hf_map[abstract_key]
 
-                # We need to permute the weights in wq and wk layer in order to account for the difference between
-                # the native Llama and huggingface RoPE implementation.
+                # Reverse-permute Q and K for RoPE compatibility
                 if abstract_key == "model.layers.{}.self_attn.q_proj.weight":
                     value = self._reverse_permute(value, n_heads)
                 if abstract_key == "model.layers.{}.self_attn.k_proj.weight":
-                    # pyrefly: ignore [unsupported-operation]
                     key_value_dim = head_dim * n_kv_heads
                     value = self._reverse_permute(value, n_kv_heads, key_value_dim, dim)
 
+                new_key = self.from_hf_map[abstract_key]
                 if new_key is None:
                     continue
                 new_key = new_key.format(layer_num)
             else:
                 new_key = self.from_hf_map[key]
+                if new_key is None:
+                    continue
 
-            # pyrefly: ignore [unsupported-operation]
             state_dict[new_key] = value
-        # pyrefly: ignore [bad-return]
+
         return state_dict

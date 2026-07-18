@@ -23,10 +23,6 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
-from torchtitan.tools.profiling import (
-    maybe_enable_memory_snapshot,
-    maybe_enable_profiling,
-)
 from torchtitan.trainer import Trainer as TitanTrainer
 
 from .engine import ForgeEngine
@@ -132,6 +128,8 @@ class Trainer(ForgeEngine):
                 pp_has_last_stage=pp_has_last_stage,
             )
 
+        self.profiler = config.profiler.build()
+
         logger.info(
             "Trainer is initialized with "
             f"local batch size {config.training.local_batch_size}, "
@@ -168,20 +166,20 @@ class Trainer(ForgeEngine):
 
     def post_dataloading_process(
         self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         inputs = input_dict["input"]
-        extra_inputs = {k: v for k, v in input_dict.items() if k != "input"}
-        # For arguments, like attention_masks, we have to put them in a separate
-        # dict as extra_inputs are not forwarded to other stages in PP, but
-        # extra_kwargs are.
-        extra_kwargs: dict[str, Any] = {}
+        # Everything except the pipelined input is a model-forward kwarg,
+        # forwarded to all PP stages by the schedule.
+        extra_kwargs: dict[str, Any] = {
+            k: v for k, v in input_dict.items() if k != "input"
+        }
+
+        positions = extra_kwargs.get("positions", None)
 
         try:
             # pyrefly: ignore [not-callable]
             extra_kwargs["attention_masks"] = self.model_parts[0].get_attention_masks(
-                input_batch=inputs,
-                tokenizer=self.tokenizer,
-                extra_inputs=extra_inputs,
+                positions=positions,
             )
         except TypeError:
             pass
@@ -196,21 +194,19 @@ class Trainer(ForgeEngine):
                 self.config.parallelism.context_parallel_load_balancer,
             )
 
-        return inputs, labels, extra_inputs, extra_kwargs
+        return inputs, labels, extra_kwargs
 
     def forward_backward_step(
         self,
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
+        global_valid_tokens: float,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
 
-        inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
-            input_dict, labels
-        )
+        inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
 
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
@@ -221,7 +217,6 @@ class Trainer(ForgeEngine):
                 if self.pp_has_first_stage:
                     self.pp_schedule.step(
                         inputs,
-                        **extra_inputs,
                         **extra_kwargs,
                         target=targets,
                         losses=losses,
@@ -246,9 +241,9 @@ class Trainer(ForgeEngine):
             # Non-PP forward / backward
             with self.train_context():
                 assert len(model_parts) == 1
-                pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+                pred = model_parts[0](inputs, **extra_kwargs)
                 # Compute loss sum (reduction='sum')
-                loss_sum = self.loss_fn(pred, labels)
+                loss_sum, _ = self.loss_fn(pred, labels)
 
                 # Scale the loss by the inverse of the total weight denominator before backward
                 # This ensures gradients are properly normalized across all microbatches
@@ -281,12 +276,13 @@ class Trainer(ForgeEngine):
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
-        local_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
+            global_valid_tokens = dist_utils.dist_sum(
+                local_valid_tokens.to(self.device), batch_mesh
+            )
         else:
-            global_valid_tokens = local_valid_tokens.float()
+            global_valid_tokens = float(local_valid_tokens.item())
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
@@ -345,18 +341,10 @@ class Trainer(ForgeEngine):
         self.checkpointer.load(step=config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}.")
 
-        with (
-            maybe_enable_profiling(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-            ) as torch_profiler,
-            maybe_enable_memory_snapshot(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-            ) as memory_profiler,
-        ):
+        with self.profiler.active(
+            global_step=self.step,
+            base_folder=config.dump_folder,
+        ) as profiler:
             data_iterator = self.batch_generator(self.dataloader)
             while self.step < config.training.steps:
                 self.step += 1
@@ -378,10 +366,7 @@ class Trainer(ForgeEngine):
                 )
 
                 # signal the profiler that the next profiling step has started
-                if torch_profiler:
-                    torch_profiler.step()
-                if memory_profiler:
-                    memory_profiler.step()
+                profiler.step()
 
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)

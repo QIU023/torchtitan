@@ -8,95 +8,107 @@ from collections.abc import Sequence
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-try:
-    from torch.distributed.tensor.experimental._attention import (
-        _context_parallel_shard,
-        _ContextParallel,
-        _enable_context_parallel_dispatcher,
-        _HeadTailLoadBalancer,
-        _PTRRLoadBalancer,
-    )
-except ImportError:
-    # PyTorch 2.9 stable doesn't expose these private CP APIs (renamed or
-    # added in nightly). On configs with CP=1 (which is our case for the
-    # 8x RTX 5090 box) ``apply_cp_to_attention_module`` is never called,
-    # so we stub them. If the runtime path actually invokes these, raise
-    # at call time rather than import time.
-    def _context_parallel_shard(*a, **k):
-        raise NotImplementedError("CP not supported on this torch build")
-
-    class _ContextParallel:
-        def __init__(self, *a, **k):
-            raise NotImplementedError("CP not supported on this torch build")
-
-    def _enable_context_parallel_dispatcher(*a, **k):
-        raise NotImplementedError("CP not supported on this torch build")
-
-    class _HeadTailLoadBalancer:
-        def __init__(self, *a, **k):
-            raise NotImplementedError("CP not supported on this torch build")
-
-    class _PTRRLoadBalancer:
-        def __init__(self, *a, **k):
-            raise NotImplementedError("CP not supported on this torch build")
-from torch.distributed.tensor.parallel import parallelize_module
+from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor.experimental._attention import (
+    _context_parallel_shard,
+    _enable_context_parallel_dispatcher,
+    _HeadTailLoadBalancer,
+    _PTRRLoadBalancer,
+)
+from torch.distributed.tensor.experimental._context_parallel._attention import (
+    flex_cp_allgather,
+)
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    FlexAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
+)
 from torchtitan.tools.logging import logger
 
 
-def apply_cp_to_attention_module(
+def apply_cp_to_forward(
     attention_modules: Sequence[nn.Module],
     cp_mesh: DeviceMesh,
 ) -> None:
-    """
-    Apply context parallelism to attention modules.
+    """Wrap inner attention ``forward`` with CP logic.
 
-    CP splits the sequence dimension across devices to enable training with
-    longer sequences. This function applies CP to the provided attention
-    modules. The attention type is inferred via isinstance on the first module.
+    Must be called **before** ``Module.parallelize()`` so the CP wrapper
+    is captured inside parallelize's ``local_map`` wrapping.
+
+    The attention type is inferred via isinstance on the first module.
+
+    TODO: This is a temporary workaround that manually allgathers K/V
+    (FlexAttention) or wraps inputs as CP-sharded DTensors (SDPA).
+    Once all models adopt config-based sharding with full DTensor,
+    CP redistribution should be expressed declaratively via
+    ShardingConfig and this function should be removed.
 
     Args:
-        attention_modules: Sequence of attention modules to apply CP to
-        cp_mesh: Device mesh for context parallel dimension
-
-    Raises:
-        NotImplementedError: If the attention type does not support CP
+        attention_modules: Sequence of inner attention modules to apply CP to.
+        cp_mesh: Device mesh for context parallel dimension.
     """
-    from torchtitan.models.common.attention import (
-        FlexAttention,
-        ScaledDotProductAttention,
-    )
-
     first = attention_modules[0]
     if isinstance(first, FlexAttention):
-        cp_plan = _ContextParallel(
-            seq_dim=1, attention_type=_ContextParallel.AttentionType.FLEX
-        )
+        for mod in attention_modules:
+            original_forward = mod.forward
+
+            def _make_cp_forward(orig_fn, mesh):
+                pg_name = dist._get_process_group_name(mesh.get_group())
+
+                def cp_forward(q, k, v, **kwargs):
+                    if kwargs.get("score_mod") is not None:
+                        raise NotImplementedError(
+                            "FlexAttention score_mod is not supported with "
+                            "Context Parallel yet. It must be sharded before "
+                            "use with CP."
+                        )
+                    k = k.contiguous()
+                    v = v.contiguous()
+                    global_k, global_v = flex_cp_allgather(k, v, 1, pg_name)
+                    return orig_fn(q, global_k, global_v, **kwargs)
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
     elif isinstance(first, ScaledDotProductAttention):
-        # Enable the DTensor dispatcher to route SDPA operations to the
-        # Context Parallel implementation. This is required for CP to work
-        # with SDPA (but not FlexAttention).
         _enable_context_parallel_dispatcher()
-        cp_plan = _ContextParallel(
-            seq_dim=1, attention_type=_ContextParallel.AttentionType.SDPA
-        )
+
+        for mod in attention_modules:
+            original_forward = mod.forward
+
+            def _make_cp_forward(orig_fn, mesh):
+                placement = [Shard(1)]
+
+                def cp_forward(q, k, v, **kwargs):
+                    if not isinstance(q, DTensor):
+                        q = DTensor.from_local(q, mesh, placement, run_check=False)
+                    if not isinstance(k, DTensor):
+                        k = DTensor.from_local(k, mesh, placement, run_check=False)
+                    if not isinstance(v, DTensor):
+                        v = DTensor.from_local(v, mesh, placement, run_check=False)
+                    output = orig_fn(q, k, v, **kwargs)
+                    return output.to_local() if isinstance(output, DTensor) else output
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
+    elif isinstance(first, VarlenAttention):
+        raise NotImplementedError("Variable-length attention CP is not yet supported")
     else:
         raise NotImplementedError(
-            f"Context Parallel is not supported for {type(first).__name__}"
+            f"Context Parallel forward wrapping is not supported for "
+            f"{type(first).__name__}"
         )
 
-    for attention_module in attention_modules:
-        parallelize_module(
-            module=attention_module,
-            device_mesh=cp_mesh,
-            parallelize_plan=cp_plan,
-        )
-
-    logger.info("Applied Context Parallel to the model")
+    logger.info("Applied Context Parallel (forward wrapping) to the model")
 
 
 def prepare_context_parallel_input(

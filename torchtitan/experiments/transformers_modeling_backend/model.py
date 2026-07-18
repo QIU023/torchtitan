@@ -12,15 +12,97 @@ from dataclasses import dataclass, fields
 import torch
 from torch import nn
 from torch.nn import init
+
+from torch.nn.attention.flex_attention import BlockMask
+
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
+from torchtitan.models.common.attention import FlexAttention
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import ModuleDict
 from torchtitan.tools.logging import logger
+
+
+# Shape suffix legend (matches torchtitan/models/common/attention.py):
+#   B = batch, L = sequence length, N = num heads, H = head dimension.
+# HF attention layout is (B, N, L, H); native TorchTitan layout is (B, L, N, H).
+class HFFlexAttention(FlexAttention):
+    """FlexAttention kernel for HF models.
+
+    Accepts Q/K/V in native TorchTitan layout (B, L, N, H) so that
+    apply_cp_to_forward's K/V all-gather (dim=1, the seq dim) works correctly.
+    The caller (_flex_torchtitan_attention_forward) transposes from HF layout
+    before calling this module, and transposes back after.
+
+    This subclass passes the isinstance(FlexAttention) check in
+    apply_cp_to_forward, so CP wrapping works naturally.
+    """
+
+    def forward(
+        self,
+        q_BLNH: torch.Tensor,
+        k_BLNH: torch.Tensor,
+        v_BLNH: torch.Tensor,
+        *,
+        attention_masks: BlockMask | None = None,
+        scale: float | None = None,
+        enable_gqa: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        # Transpose to (B, N, L, H) for the flex_attention kernel
+        q_BNLH = q_BLNH.transpose(1, 2)
+        k_BNLH = k_BLNH.transpose(1, 2)
+        v_BNLH = v_BLNH.transpose(1, 2)
+        out_BNLH = flex_attention(
+            q_BNLH,
+            k_BNLH,
+            v_BNLH,
+            block_mask=attention_masks,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+        # Transpose back to (B, L, N, H)
+        return out_BNLH.transpose(1, 2)
+
+
+def _flex_torchtitan_attention_forward(
+    module, query_BNLH, key_BNLH, value_BNLH, attention_mask, **kwargs
+):
+    """FlexAttention forward registered via AttentionInterface.
+
+    Routes the kernel call through the HFFlexAttention module attached to
+    each HF attention layer, so apply_cp_to_forward's K/V all-gather wrapping
+    applies automatically.
+
+    Transposes Q/K/V from HF layout (B, N, L, H) to native TorchTitan layout
+    (B, L, N, H) before calling the module, so CP's dim=1 all-gather targets
+    the sequence dimension correctly.
+    """
+    scaling = kwargs.get("scaling")
+    block_mask = attention_mask if isinstance(attention_mask, BlockMask) else None
+
+    # This forward is only registered as the "flex_torchtitan" attention impl,
+    # and HFTransformerModel attaches a _flex_kernel to every self_attn when that
+    # impl is selected, so the kernel module is always present here.
+    flex_module = module._flex_kernel
+
+    # HF layout (B, N, L, H) -> native layout (B, L, N, H)
+    q_BLNH = query_BNLH.transpose(1, 2)
+    k_BLNH = key_BNLH.transpose(1, 2)
+    v_BLNH = value_BNLH.transpose(1, 2)
+    out_BLNH = flex_module(
+        q_BLNH, k_BLNH, v_BLNH, attention_masks=block_mask, scale=scaling
+    )
+    # HF attention interface expects output as (B, L, N, H) (batch, seq, heads,
+    # head_dim) -- same layout sdpa_attention_forward returns. out_BLNH is
+    # already in that layout, so return it directly (no transpose).
+    return out_BLNH, None
 
 
 class SliceableModuleDict(ModuleDict):
@@ -64,6 +146,7 @@ _TT_TO_HF_MAPPINGS = {
         "n_layers": "num_hidden_layers",
         "n_heads": "num_attention_heads",
         "n_kv_heads": "num_key_value_heads",
+        "vocab_size": "vocab_size",
         "norm_eps": "rms_norm_eps",
         "max_seq_len": "max_position_embeddings",
         "eos_id": "eos_token_id",
@@ -81,6 +164,9 @@ _TT_SPECIFIC_ATTRIBUTES = [
 
 
 class HFTransformerModel(BaseModel):
+    # TODO(#ISSUE): Remove after fixing PP backward to skip non-tensor inputs.
+    _skip_lm_head: bool = False
+
     @dataclass(kw_only=True, slots=True)
     class Config(BaseModel.Config, PretrainedConfig):
         """Configuration that bridges TorchTitan and HuggingFace Transformers.
@@ -101,12 +187,14 @@ class HFTransformerModel(BaseModel):
             PretrainedConfig.__init__(
                 self, attn_implementation=attn_implementation, **kwargs
             )
-            # Set param_init before Module.Config.build() accesses it.
-            # PretrainedConfig.__getattribute__ doesn't recognize the
-            # param_init slot inherited from Module.Config.
+            # Set param_init and sharding_config before Module.Config.build()
+            # accesses them. PretrainedConfig.__getattribute__ doesn't
+            # recognize slots inherited from Module.Config.
             self.param_init = (
                 None  # noqa: this sets Config.param_init, not Module._param_init
             )
+            self.sharding_config = None
+
             assert titan_dense_config is not None, "titan_dense_config is required"
 
             # Create getter/setter dynamically for TT <-> HF attribute mappings
@@ -172,10 +260,18 @@ class HFTransformerModel(BaseModel):
             """Configure HuggingFace attention settings."""
             self._titan_injected_model_args["attn_implementation"] = attn_implementation
             self.attn_implementation = attn_implementation
-            # NOTE:(3outeille):This will force create_causal_mask to return None
-            AttentionInterface._global_mapping[
-                attn_implementation
-            ] = sdpa_attention_forward
+            if attn_implementation == "flex_torchtitan":
+                AttentionInterface._global_mapping[
+                    attn_implementation
+                ] = _flex_torchtitan_attention_forward
+            elif attn_implementation not in AttentionInterface._global_mapping:
+                logger.info(
+                    f"'{attn_implementation}' not in HF AttentionInterface registry, "
+                    "defaulting to sdpa_attention_forward"
+                )
+                AttentionInterface._global_mapping[
+                    attn_implementation
+                ] = sdpa_attention_forward
 
         def _create_getter_setter_dynamically(self, has_moe: bool):
             """
@@ -198,6 +294,11 @@ class HFTransformerModel(BaseModel):
                 self._tt_to_hf_attribute_map.update(_TT_TO_HF_MAPPINGS["moe"])
 
             for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
+                # A self-mapped name (e.g. vocab_size -> vocab_size) is already
+                # stored under the correct name; creating an alias property would
+                # make its setter call setattr() on itself and recurse forever.
+                if titan_name == hf_name:
+                    continue
                 # Create getter/setter for attribute that don't already exist
                 if not hasattr(self.__class__, titan_name):
                     setattr(self.__class__, titan_name, _create_property(hf_name))
@@ -214,14 +315,14 @@ class HFTransformerModel(BaseModel):
         def update_from_config(
             self,
             *,
-            trainer_config=None,
+            config=None,
             **kwargs,
         ):
-            training = trainer_config.training
-            parallelism = trainer_config.parallelism
-            debug = trainer_config.debug
-            # Extract HF model ID from the extended trainer_config
-            hf_model_id = getattr(trainer_config, "hf_model", "")
+            training = config.training
+            parallelism = config.parallelism
+            debug = config.debug
+            # Extract HF model ID from the extended config
+            hf_model_id = getattr(config, "hf_model", "")
             # Load HF config (overwrites our HF attributes)
             hf_model_config = AutoConfig.from_pretrained(
                 hf_model_id,
@@ -253,17 +354,34 @@ class HFTransformerModel(BaseModel):
             self.mlp_bias = False
             self.use_cache = False
             self.initializer_range = 1.0  # use as std for normal init in embedding
-
-            if not hasattr(self, "inter_dim"):  # Only for llama model
-                ffn_hidden_size = 4 * self.dim
-                ffn_hidden_size = int(2 * ffn_hidden_size / 3)
-                if self.ffn_dim_multiplier is not None:
-                    ffn_hidden_size = int(self.ffn_dim_multiplier * ffn_hidden_size)
-                self.intermediate_size = self.multiple_of * (
-                    (ffn_hidden_size + self.multiple_of - 1) // self.multiple_of
+            # FlexAttention does not support dropout (not part of PyTorch's
+            # flex_attention API). Override to 0 if the model sets it.
+            if hasattr(self, "attention_dropout") and self.attention_dropout > 0:
+                logger.warning(
+                    f"attention_dropout={self.attention_dropout} is not supported "
+                    "with FlexAttention, setting to 0.0"
                 )
+                self.attention_dropout = 0.0
 
-            self.head_dim = self.dim // self.num_attention_heads
+            # When dim is explicitly overridden (e.g. debugmodel), derive the
+            # dependent sizes from it. Otherwise keep what AutoConfig loaded from
+            # the HF config -- models like Qwen3 decouple head_dim and
+            # intermediate_size from hidden_size/num_heads, so deriving them here
+            # would silently build the wrong architecture.
+            dim_overridden = self._titan_injected_model_args.get("dim") is not None
+            if dim_overridden:
+                if not hasattr(self, "inter_dim"):  # Only for llama model
+                    ffn_hidden_size = 4 * self.dim
+                    ffn_hidden_size = int(2 * ffn_hidden_size / 3)
+                    if self.ffn_dim_multiplier is not None:
+                        ffn_hidden_size = int(self.ffn_dim_multiplier * ffn_hidden_size)
+                    self.intermediate_size = self.multiple_of * (
+                        (ffn_hidden_size + self.multiple_of - 1) // self.multiple_of
+                    )
+                self.head_dim = self.dim // self.num_attention_heads
+            elif not getattr(self, "head_dim", None):
+                # HF config did not provide head_dim; use the standard derivation.
+                self.head_dim = self.dim // self.num_attention_heads
 
             return self
 
@@ -280,11 +398,6 @@ class HFTransformerModel(BaseModel):
 
     def __init__(self, config: Config):
         super().__init__()
-
-        # NOTE(3outeille): This prevents Hugging Face modeling from initializing ROPE (inv_freq) buffers to NaN.
-        # Needed when loading from seed checkpoint.
-        if hasattr(config, "deterministic") and config.deterministic:
-            torch.utils.deterministic.fill_uninitialized_memory = False
 
         # Try to import the model class dynamically from the transformers library if not found in globals
         model_class_name = config.architectures[0]
@@ -348,6 +461,15 @@ class HFTransformerModel(BaseModel):
 
         for layer in self.model.model.layers.values():
             layer.moe_enabled = False
+            # Attach FlexAttention kernel module to each attention layer
+            # so apply_cp_to_forward can find and wrap it for CP.
+            if (
+                hasattr(layer, "self_attn")
+                and config.attn_implementation == "flex_torchtitan"
+            ):
+                layer.self_attn.register_module(
+                    "_flex_kernel", HFFlexAttention(config=HFFlexAttention.Config())
+                )
 
     def set_cp_mesh(self, mesh):
         self.cp_mesh = mesh
@@ -600,23 +722,22 @@ class HFTransformerModel(BaseModel):
             )
 
     @property
-    def output(self):
+    def lm_head(self):
         """Returns the model's output layer, handling different Hugging Face model structures."""
         if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
             return self.model.lm_head
         else:
-            # Add more cases here if needed for other model architectures
             raise AttributeError(
-                "Could not find output (lm_head) in the model. Please check the model structure."
+                "Could not find lm_head in the model. Please check the model structure."
             )
 
-    @output.setter
-    def output(self, value):
+    @lm_head.setter
+    def lm_head(self, value):
         if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
             self.model.lm_head = value
         else:
             raise AttributeError(
-                "Could not find output (lm_head) in the model. Please check the model structure."
+                "Could not find lm_head in the model. Please check the model structure."
             )
 
     @property
@@ -642,17 +763,27 @@ class HFTransformerModel(BaseModel):
                 "Could not find rotary_emb in the model. Please check the model structure."
             )
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, positions=None, attention_masks=None, **kwargs):
         local_seq_len = self.max_seq_len
         local_seq_len //= (
             self.cp_mesh.size()
             if self.cp_mesh is not None and self.cp_mesh.size() > 1
             else 1
         )
-        kwargs["position_ids"] = torch.arange(
-            local_seq_len, device=args[0].device
-        ).unsqueeze(0)
+
+        if positions is not None:
+            kwargs["position_ids"] = positions.to(args[0].device)
+        else:
+            kwargs["position_ids"] = torch.arange(
+                local_seq_len, device=args[0].device
+            ).unsqueeze(0)
+
+        if attention_masks is not None:
+            kwargs["attention_mask"] = attention_masks
+
         output = self.model.model(*args, **kwargs)
+        if self._skip_lm_head:
+            return output.last_hidden_state
         output = self.model.lm_head(output.last_hidden_state)
         return output
 
@@ -688,10 +819,25 @@ class HFTransformerModel(BaseModel):
 
         self.model.apply(selective_init)
 
+        # HF rotary embeddings compute their `inv_freq` buffer in __init__, not in
+        # `_init_weights`. With meta-device init + `to_empty()`, that buffer is
+        # left uninitialized (zeros), which silently disables RoPE (no positional
+        # information -> near-random outputs). Recompute it from each rotary
+        # module's `rope_init_fn` so positions work after materialization.
+        for module in self.model.modules():
+            rope_init_fn = getattr(module, "rope_init_fn", None)
+            if rope_init_fn is not None and hasattr(module, "inv_freq"):
+                device = module.inv_freq.device
+                inv_freq, attention_scaling = rope_init_fn(module.config, device)
+                module.inv_freq.copy_(
+                    inv_freq.to(device=device, dtype=module.inv_freq.dtype)
+                )
+                module.attention_scaling = attention_scaling
+
         # TODO(3outeille): For pipeline parallel, only tie weights if both input and output embeddings are on the same device
         # Maybe better way of handling this?
         if not isinstance(self.tok_embeddings, nn.Identity) and not isinstance(
-            self.output, nn.Identity
+            self.lm_head, nn.Identity
         ):
             self.model.tie_weights()
 
@@ -703,7 +849,7 @@ class HFTransformerModel(BaseModel):
         yield "tok_embeddings", self.tok_embeddings
         yield "layers", self.layers
         yield "norm", self.norm
-        yield "output", self.output
+        yield "lm_head", self.lm_head
         yield "rotary_emb", self.rotary_emb
 
     def __setattr__(self, name, value):

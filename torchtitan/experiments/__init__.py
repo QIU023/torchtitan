@@ -9,13 +9,15 @@ _supported_experiments = frozenset(
         "graph_trainer.llama3",
         "graph_trainer.deepseek_v3",
         "graph_trainer.qwen3",
-        "vlm",
         "transformers_modeling_backend",
         "autoparallel.llama3",
-        "autoparallel.deepseek_v3",
         "autoparallel.local_map_deepseek_v3",
-        "ft.llama3",
+        "torchft.llama3",
         "rl",
+        # RL examples own a per-example config_registry under rl/examples/<name>;
+        # listed here so `--module <name>` resolves (see ConfigManager).
+        "alphabet_sort",
+        "search_r1",
         "attention_residual",
     ]
 )

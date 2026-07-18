@@ -12,25 +12,27 @@ This can enable us to do a parity test with the HF implementation and make sure 
 aligned with the HF implementation.
 
 """
+
 import re
 from typing import Any
 
 from torch.distributed.tensor import DTensor
 
+from torchtitan.models.common.rope import CosSinRoPE
 from torchtitan.models.utils import MoEStateDictAdapter
-
 from .model import Qwen3Model
 
 
 class Qwen3StateDictAdapter(MoEStateDictAdapter):
     def __init__(self, model_config: Qwen3Model.Config, hf_assets_path: str | None):
         super().__init__(model_config, hf_assets_path)
+
         self.from_hf_map = {
             "model.embed_tokens.weight": "tok_embeddings.weight",
             # Attention module
-            "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
-            "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
-            "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
+            "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.qkv_linear.wq.weight",
+            "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.qkv_linear.wk.weight",
+            "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.qkv_linear.wv.weight",
             "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
             "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
             "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm.weight",
@@ -43,12 +45,12 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
             "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
             # MoE
-            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.experts.w1",
-            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.experts.w3",
-            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.experts.w2",
+            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w1_EFD",
+            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w3_EFD",
+            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w2_EDF",
             "model.layers.{}.mlp.gate.weight": "layers.{}.moe.router.gate.weight",
             "model.norm.weight": "norm.weight",
-            "lm_head.weight": "output.weight",
+            "lm_head.weight": "lm_head.weight",
         }
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -56,11 +58,12 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
         1. Convert between the HF shape and the torchtitan shape.
         2. Split the GroupedExperts' weight into separate expert's wegiht.
         """
-        to_hf_map = {v: k for k, v in self.from_hf_map.items()}
+
+        to_hf_map = {v: k for k, v in self.from_hf_map.items() if v is not None}
         hf_state_dict = {}
 
         for key, value in state_dict.items():
-            if "moe.experts" in key:
+            if "moe.routed_experts.inner_experts" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 if abstract_key not in to_hf_map:
                     continue
@@ -88,7 +91,9 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
                 else:
                     # keep this path for offline conversion
                     moe_layer = next(
-                        l for l in self.model_config.layers if l.moe is not None
+                        l
+                        for l in self.model_config.layers  # pyrefly: ignore [missing-attribute]
+                        if l.moe is not None
                     )
                     split_values = self._split_experts_weights(
                         value,
@@ -101,10 +106,11 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
 
             elif "layers" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
-                if abstract_key not in to_hf_map:
-                    continue
                 # pyrefly: ignore [missing-attribute]
                 layer_num = re.search(r"\d+", key).group(0)
+
+                if abstract_key not in to_hf_map:
+                    continue
                 new_key = to_hf_map[abstract_key]
                 new_key = new_key.format(layer_num)
                 hf_state_dict[new_key] = value
@@ -113,7 +119,9 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
                 if key not in to_hf_map:
                     continue
                 # pyrefly: ignore [missing-attribute]
-                if self.model_config.enable_weight_tying and key == "output.weight":
+                if self.model_config.enable_weight_tying and key == "lm_head.weight":
+                    if self.fqn_to_index_mapping:
+                        self.fqn_to_index_mapping.pop("lm_head.weight", None)
                     continue
                 new_key = to_hf_map[key]
                 hf_state_dict[new_key] = value
@@ -125,6 +133,7 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
         1. Convert between the HF shape and the torchtitan shape.
         2. Concate separate expert's wegiht into GroupedExperts' weight.
         """
+        self._validate_hf_rope_config(CosSinRoPE.Config)
 
         state_dict = {}
         expert_weights_by_layer = {}  # {layer: {abstract_key: {expert_id: tensor}}}
@@ -168,7 +177,9 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
                         titan_abstract_key,
                         layer_num,
                         next(
-                            l for l in self.model_config.layers if l.moe is not None
+                            l
+                            for l in self.model_config.layers  # pyrefly: ignore [missing-attribute]
+                            if l.moe is not None
                         ).moe.num_experts,
                     )
 
@@ -179,14 +190,17 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 # pyrefly: ignore [missing-attribute]
                 layer_num = re.search(r"\d+", key).group(0)
+
                 new_key = self.from_hf_map[abstract_key]
-                # pyrefly: ignore [missing-attribute]
+                if new_key is None:
+                    continue
                 new_key = new_key.format(layer_num)
                 state_dict[new_key] = value
 
             else:
                 new_key = self.from_hf_map[key]
-                # pyrefly: ignore [unsupported-operation]
+                if new_key is None:
+                    continue
                 state_dict[new_key] = value
 
         return state_dict

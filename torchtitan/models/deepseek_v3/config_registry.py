@@ -5,33 +5,42 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.components.quantization.float8 import (
-    Float8GroupedMMConverter,
+from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.quantization import (
+    Float8GroupedExpertsConverter,
     Float8LinearConverter,
 )
-from torchtitan.config import (
-    ActivationCheckpointConfig,
-    CompileConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.protocols.model_converter import ModelConvertersContainer
+from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.trainer import Trainer
 
 from . import model_registry
 
 
+def enable_fused_swiglu(config: Trainer.Config) -> None:
+    override = "torchtitan.overrides.fused_swiglu"
+    assert override not in config.override.imports
+    config.override.imports.append(override)
+
+
 def deepseek_v3_debugmodel() -> Trainer.Config:
+    model_spec = model_registry("debugmodel")
     return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
         hf_assets_path="./tests/assets/tokenizer",
         metrics=MetricsProcessor.Config(log_freq=1),
-        model_spec=model_registry("debugmodel"),
+        model_spec=model_spec,
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizersContainer.Config(lr=8e-4),
+        optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -45,32 +54,58 @@ def deepseek_v3_debugmodel() -> Trainer.Config:
         ),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,
-            expert_tensor_parallel_degree=1,
         ),
         checkpoint=CheckpointManager.Config(
             interval=10,
             last_save_model_only=False,
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
     )
 
 
-def deepseek_v3_debugmodel_flex_attn() -> Trainer.Config:
+def deepseek_v3_debugmodel_hybridep() -> Trainer.Config:
     config = deepseek_v3_debugmodel()
-    config.model_spec = model_registry("debugmodel_flex_attn")
+    config.model_spec = model_registry(
+        "debugmodel",
+        moe_comm_backend="hybridep",
+        non_blocking_capacity_factor=1.0,
+    )
+    return config
+
+
+def deepseek_v3_debugmodel_minimal_async_ep() -> Trainer.Config:
+    config = deepseek_v3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        moe_comm_backend="minimal_async_ep",
+    )
+    enable_fused_swiglu(config)
+    config.parallelism = ParallelismConfig(
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=1,
+        tensor_parallel_degree=1,
+        context_parallel_degree=1,
+        pipeline_parallel_degree=1,
+        expert_parallel_degree=1,
+        enable_sequence_parallel=False,
+    )
     return config
 
 
 def deepseek_v3_16b() -> Trainer.Config:
+    model_spec = model_registry("16B", attn_backend="flex")
     return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
         hf_assets_path="./assets/hf/deepseek-moe-16b-base",
-        model_spec=model_registry("16B"),
+        model_spec=model_spec,
         dataloader=HuggingFaceTextDataLoader.Config(
             dataset="c4",
         ),
-        optimizer=OptimizersContainer.Config(lr=2.2e-4),
+        optimizer=default_adamw(lr=2.2e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             decay_ratio=0.8,
             decay_type="cosine",
@@ -84,24 +119,74 @@ def deepseek_v3_16b() -> Trainer.Config:
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="Interleaved1F1B",
             expert_parallel_degree=8,
-            expert_tensor_parallel_degree=1,
         ),
         checkpoint=CheckpointManager.Config(interval=10),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         compile=CompileConfig(enable=True, components=["loss"]),
     )
 
 
+def deepseek_v3_16b_hybridep() -> Trainer.Config:
+    config = deepseek_v3_16b()
+    config.model_spec = model_registry(
+        "16B",
+        attn_backend="flex",
+        moe_comm_backend="hybridep",
+        non_blocking_capacity_factor=1.0,
+    )
+    return config
+
+
+def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:
+    config = deepseek_v3_16b()
+    config.model_spec = model_registry(
+        "16B",
+        attn_backend="flex",
+        moe_comm_backend="minimal_async_ep",
+    )
+    enable_fused_swiglu(config)
+    config.parallelism = ParallelismConfig(
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=1,
+        tensor_parallel_degree=1,
+        context_parallel_degree=1,
+        pipeline_parallel_degree=1,
+        expert_parallel_degree=1,
+        enable_sequence_parallel=False,
+    )
+    return config
+
+
 def deepseek_v3_671b() -> Trainer.Config:
+    compile_config = CompileConfig(enable=True, components=["loss"])
+    model_compile_enabled = (
+        compile_config.enable and "model" in compile_config.components
+    )
+    model_spec = model_registry(
+        "671B",
+        attn_backend="flex",
+        converters=[
+            Float8LinearConverter.Config(
+                filter_fqns=["output", "router.gate"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled
+            ),
+        ],
+    )
     return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
         hf_assets_path="./assets/hf/DeepSeek-V3.1-Base",
-        model_spec=model_registry("671B"),
+        model_spec=model_spec,
         dataloader=HuggingFaceTextDataLoader.Config(
             dataset="c4",
         ),
-        optimizer=OptimizersContainer.Config(lr=2.2e-4),
+        optimizer=default_adamw(lr=2.2e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2000,
             decay_ratio=0.8,
@@ -115,18 +200,9 @@ def deepseek_v3_671b() -> Trainer.Config:
         ),
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="Interleaved1F1B",
-            expert_parallel_degree=1,
-            expert_tensor_parallel_degree=1,
+            expert_parallel_degree=2,
         ),
         checkpoint=CheckpointManager.Config(interval=500),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
-        compile=CompileConfig(enable=True, components=["loss"]),
-        model_converters=ModelConvertersContainer.Config(
-            converters=[
-                Float8LinearConverter.Config(filter_fqns=["output", "router.gate"]),
-                Float8GroupedMMConverter.Config(fqns=["experts"]),
-            ],
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
+        compile=compile_config,
     )

@@ -4,26 +4,25 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import dataclasses
 import math
 from dataclasses import dataclass, field
 
+import spmd_types as spmd
 import torch
 from torch import nn
 
+from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
-    LocalMapInnerAttention,
-    ScaledDotProductAttention,
+    FlexAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.rmsnorm import RMSNorm
-from torchtitan.models.common.rope import apply_rotary_emb_single_complex
+from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
-from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.protocols.module import Module
 
 
 class Attention(BaseAttention):
@@ -50,14 +49,9 @@ class Attention(BaseAttention):
         qk_nope_head_dim: int = 128
         qk_rope_head_dim: int = 64
         v_head_dim: int = 128
-        inner_attention: LocalMapInnerAttention.Config = field(
-            default_factory=ScaledDotProductAttention.Config
-        )
-        mask_type: str = "causal"
+        rope: RoPE.Config
+        inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
         mscale: float = 1.0
-        rope_factor: float = 1.0
-        rope_max_seq_len: int = 4096
-        rope_original_seq_len: int = 4096
 
     def __init__(self, config: Config):
         super().__init__()
@@ -89,17 +83,17 @@ class Attention(BaseAttention):
         self.wo = config.wo.build()
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        if config.rope_max_seq_len > config.rope_original_seq_len:
-            mscale = 0.1 * config.mscale * math.log(config.rope_factor) + 1.0
+        if config.rope.max_seq_len > config.rope.original_seq_len:
+            mscale = 0.1 * config.mscale * math.log(config.rope.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         self.inner_attention = config.inner_attention.build()
+        self.rope = config.rope.build()
 
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_masks: AttentionMasksType,
         positions: torch.Tensor | None = None,
     ):
         bsz, seqlen, _ = x.size()
@@ -110,23 +104,41 @@ class Attention(BaseAttention):
         else:
             q = self.wq_a(x)
             q = self.wq_b(self.q_norm(q))
-        q = q.view(bsz, seqlen, -1, self.qk_head_dim)
+
+        # TODO(pianpwk): same QKV:S(2) unflatten case handled by even sharding
+        with spmd.local():
+            q = q.view(bsz, seqlen, -1, self.qk_head_dim)
+            if get_spmd_backend() == "spmd_types":
+                spmd.assert_type(
+                    q,
+                    {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                )
+
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-        q_pe = apply_rotary_emb_single_complex(q_pe, freqs_cis, positions)
-        q = torch.cat([q_nope, q_pe], dim=-1)
 
         # Key-value projection
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-        k_pe = apply_rotary_emb_single_complex(k_pe.unsqueeze(2), freqs_cis, positions)
+        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(2), positions)
+        q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.wkv_b(self.kv_norm(kv))
-        kv = kv.view(bsz, seqlen, -1, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
+
+        with spmd.local():  # QKV even shard unflatten, but the expand is truly local SPMD
+            kv = kv.view(bsz, seqlen, -1, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(
+                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, k_nope.size(2), -1)], dim=-1)
+            if get_spmd_backend() == "spmd_types" and not torch.compiler.is_compiling():
+                for t in [k, v]:
+                    spmd.assert_type(
+                        t,
+                        {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                    )
 
         output = self.inner_attention(
             q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
@@ -161,13 +173,10 @@ class DeepSeekV3TransformerBlock(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
-        x = x + self.attention(
-            self.attention_norm(x), freqs_cis, attention_masks, positions
-        )
+        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
         if self.moe_enabled:
             x = x + self.moe(self.ffn_norm(x))
         else:
@@ -188,63 +197,21 @@ class DeepSeekV3Model(Decoder):
         def update_from_config(
             self,
             *,
-            trainer_config,
+            config,
             **kwargs,
         ) -> None:
+            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            parallelism = config.parallelism
 
-            training = trainer_config.training
-            parallelism = trainer_config.parallelism
-            debug = trainer_config.debug
-            seq_len = training.seq_len
-            if seq_len > self.rope.max_seq_len:
-                logger.warning(
-                    f"Sequence length {seq_len} exceeds original maximum {self.rope.max_seq_len}."
-                )
-            self.rope = dataclasses.replace(self.rope, max_seq_len=seq_len)
+            from torchtitan.models.deepseek_v3.sharding import (
+                set_deepseek_v3_sharding_config,
+            )
 
-            # Sync rope fields to attention for all layers.
-            # Mutate in-place — simpler than replacing each config in the list.
-            for layer_cfg in self.layers:
-                assert isinstance(layer_cfg.attention, Attention.Config)
-                layer_cfg.attention.rope_max_seq_len = seq_len
-                layer_cfg.attention.rope_factor = self.rope.rope_factor
-                layer_cfg.attention.rope_original_seq_len = self.rope.original_seq_len
-
-            for layer_cfg in self.layers:
-                if layer_cfg.moe is not None:
-                    if (
-                        layer_cfg.moe.experts.use_grouped_mm
-                        and not has_cuda_capability(9, 0)
-                    ):
-                        logger.warning(
-                            "Failed to use grouped mm, which is only supported on SM90 or later",
-                        )
-                        layer_cfg.moe.experts.use_grouped_mm = False
-                    layer_cfg.moe.router._debug_force_load_balance = (
-                        debug.moe_force_load_balance
-                    )
-                    if parallelism.expert_parallel_comm_backend in (
-                        "deepep",
-                        "hybridep",
-                    ):
-                        from torchtitan.models.common.moe_deepep import DeepEPMoE
-
-                        init_kwargs = {
-                            f.name: getattr(layer_cfg.moe, f.name)
-                            for f in dataclasses.fields(layer_cfg.moe)
-                            if f.init
-                        }
-                        layer_cfg.moe = DeepEPMoE.Config(**init_kwargs)
-
-            if parallelism.context_parallel_degree > 1 and not isinstance(
-                self.layers[0].attention.inner_attention,
-                ScaledDotProductAttention.Config,
-            ):
-                raise NotImplementedError(
-                    "Context Parallel for DeepSeek V3 only supports "
-                    "ScaledDotProductAttention. Got "
-                    f"{type(self.layers[0].attention.inner_attention).__name__}."
-                )
+            set_deepseek_v3_sharding_config(
+                self,
+                enable_sp=parallelism.enable_sequence_parallel,
+                enable_ep=parallelism.expert_parallel_degree > 1,
+            )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
