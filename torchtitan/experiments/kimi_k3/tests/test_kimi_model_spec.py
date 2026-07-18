@@ -19,7 +19,7 @@ import unittest
 
 import torch
 
-from torchtitan.experiments.attention_residual.kimi_linear import (
+from torchtitan.experiments.kimi_k3.kimi_linear import (
     flavor_names,
     KimiLinearAttnResModel,
     KimiLinearConfig,
@@ -27,7 +27,7 @@ from torchtitan.experiments.attention_residual.kimi_linear import (
     KimiLinearSpec,
     model_registry,
 )
-from torchtitan.experiments.attention_residual.kimi_linear.config_registry import (
+from torchtitan.experiments.kimi_k3.kimi_linear.config_registry import (
     kimi_linear_194m_baseline,
     kimi_linear_528m_block_attn_res,
     build_kimi_linear_config,

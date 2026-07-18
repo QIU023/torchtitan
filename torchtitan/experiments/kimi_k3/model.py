@@ -12,7 +12,7 @@ Previously this experiment subclassed ``Llama3Model`` /
 ``Llama3TransformerBlock``; that coupled the AttnRes evolution to a
 specific dense family and made it awkward to pivot to the MoE shape
 Kimi's production models use. The refactor keeps AttnRes entirely
-under ``torchtitan/experiments/attention_residual/``, inheriting only from the
+under ``torchtitan/experiments/kimi_k3/``, inheriting only from the
 shared ``Decoder`` / ``TransformerBlock`` bases in
 ``torchtitan/models/common/decoder.py`` — no dependency on the Llama3
 model classes.
@@ -48,7 +48,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from torchtitan.experiments.attention_residual.attn_res import (
+from torchtitan.experiments.kimi_k3.attn_res import (
     AttnResConfig,
     AttnResProjection,
     block_attn_res,

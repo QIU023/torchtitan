@@ -4,38 +4,54 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""TorchTitan RL training with engine-agnostic rollouts.
+"""
+Unified approach for running TorchTitan models with vLLM inference.
 
-Inference engines are imported lazily. Importing this package no longer
-pulls in vLLM (or SGLang); each engine wrapper is loaded only when its
-:func:`register_model_to_*` helper is called.
+To register TorchTitan models with vLLM:
+    from torchtitan.components.checkpoint import CheckpointManager
+    from torchtitan.experiments.rl.models.vllm_registry import register_to_vllm
 
-Usage:
-    # vLLM rollout (default)
-    from torchtitan.experiments.rl.plugin import (
-        register_model_to_vllm_model_registry,
+    # Standalone inference (loads HF weights):
+    register_to_vllm(
+        model_spec,
+        parallelism=parallelism_config,
+        compile_config=compile_config,
+        checkpoint_config=CheckpointManager.Config(
+            enable=True,
+            initial_load_in_hf=True,
+            initial_load_path="/path/to/hf/checkpoint",
+        ),
     )
-    register_model_to_vllm_model_registry(model_spec)
 
-    # SGLang rollout (engine-agnostic Generator path)
-    from torchtitan.experiments.rl.plugin import (
-        register_model_to_sglang_model_registry,
+    # RL loop (skip HF loading, weights from TorchStore):
+    register_to_vllm(
+        model_spec,
+        parallelism=parallelism_config,
+        compile_config=compile_config,
+        checkpoint_config=CheckpointManager.Config(enable=False),
     )
-    register_model_to_sglang_model_registry(model_spec)
-
-The lazy-import pattern was introduced so the framework can be used
-in environments where only one of {vLLM, SGLang} is installed (e.g.
-SGLang's sgl_kernel ABI is locked to torch 2.9 stable, while vLLM's
-pre-built wheels are PyTorch nightly only).
 """
 
-from torchtitan.experiments.rl.plugin import (
-    register_model_to_sglang_model_registry,
-    register_model_to_vllm_model_registry,
-)
+import os
+import sys
+import warnings
+
+# Avoid memory fragmentation and peak reserved memory increasing over time
+# To overwrite, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    if "torch" in sys.modules:
+        warnings.warn(
+            "The 'torch' module has already been imported. "
+            "Setting PYTORCH_CUDA_ALLOC_CONF may not have an effect."
+            "For best results, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing 'torch'."
+        )
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+from torchtitan.experiments.rl.models.vllm_registry import register_to_vllm
+from torchtitan.experiments.rl.models.vllm_wrapper import VLLMModelWrapper
 
 
 __all__ = [
-    "register_model_to_sglang_model_registry",
-    "register_model_to_vllm_model_registry",
+    "VLLMModelWrapper",
+    "register_to_vllm",  # Export register function for manual use
 ]

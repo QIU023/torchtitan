@@ -59,19 +59,19 @@ model-family-specific class.
 
 ```bash
 # Unit tests (all flavors, CPU)
-pytest torchtitan/experiments/attention_residual/tests/ -v
+pytest torchtitan/experiments/kimi_k3/tests/ -v
 
 # Dense single-GPU: A/B baseline vs AttnRes at matched shape.
-bash run_train.sh --module attention_residual --config llama3_175m_baseline \
+bash run_train.sh --module kimi_k3 --config llama3_175m_baseline \
     --training.steps 100
-bash run_train.sh --module attention_residual --config llama3_175m_attn_res \
+bash run_train.sh --module kimi_k3 --config llama3_175m_attn_res \
     --training.steps 100
 
 # MoE A/B: upstream DSv3 as the baseline (same shape, no AttnRes),
 # this experiment's dsv3_attn_res_16b as the variant.
 bash run_train.sh --module deepseek_v3 --config deepseek_v3_16b \
     --training.steps 100
-bash run_train.sh --module attention_residual --config dsv3_attn_res_16b \
+bash run_train.sh --module kimi_k3 --config dsv3_attn_res_16b \
     --training.steps 100
 
 # 4-GPU PP=4 V=2 with the cross-stage caching adapter.

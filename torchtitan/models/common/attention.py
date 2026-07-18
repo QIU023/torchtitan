@@ -22,23 +22,12 @@ import torch.nn.functional as F
 from spmd_types.runtime import get_partition_spec
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.experimental import local_map
-from torch.nn.attention import sdpa_kernel, SDPBackend
-try:
-    from torch.nn.attention import (
-        activate_flash_attention_impl,
-        current_flash_attention_impl,
-    )
-except ImportError:
-    # PyTorch < ~2.10 doesn't expose these (they were added with FA3
-    # backend selection). On SM 12.0 (RTX 5090) we don't go down the
-    # FA3 path anyway — the only call sites are guarded by
-    # ``has_cuda_capability(9, 0)`` (Hopper-only). Provide stubs so
-    # the module imports cleanly on torch 2.9.
-    def activate_flash_attention_impl(_impl: str) -> None:
-        return None
-
-    def current_flash_attention_impl() -> str:
-        return "FA2"
+from torch.nn.attention import (
+    activate_flash_attention_impl,
+    current_flash_attention_impl,
+    sdpa_kernel,
+    SDPBackend,
+)
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
     _mask_mod_signature,

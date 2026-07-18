@@ -106,11 +106,7 @@ def _disable_dynamo_lru_cache() -> None:
     #
     # Also see: https://github.com/pytorch/pytorch/issues/166926
     # pyrefly: ignore [missing-attribute]
-    # NOTE: _set_lru_cache is only present in torch 2.10+ nightly; on
-    # torch 2.9 stable the LRU-cache-miss-after-dynamic-shapes bug doesn't
-    # apply because the SAC HOP path differs. Skip silently if missing.
-    if hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
-        torch._C._dynamo.eval_frame._set_lru_cache(False)
+    torch._C._dynamo.eval_frame._set_lru_cache(False)
 
 
 class ActivationCheckpointing(Configurable):
