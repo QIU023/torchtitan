@@ -114,12 +114,25 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
             "MLA=SDPA are fixed in this implementation).",
             attn_backend,
         )
-    size, variant = _parse_flavor(flavor)
+    # Graft-variant suffixes (post-train flavors): strip and record.
+    gated = False
+    lora_rank = None
+    base_flavor = flavor
+    if base_flavor.endswith("_gated_lora"):
+        base_flavor = base_flavor[: -len("_gated_lora")]
+        gated = True
+        lora_rank = 16
+    elif base_flavor.endswith("_gated"):
+        base_flavor = base_flavor[: -len("_gated")]
+        gated = True
+    size, variant = _parse_flavor(base_flavor)
     kimi_config = build_kimi_linear_config(size)
     num_blocks = resolve_num_blocks(size, variant)
     spec_config = KimiLinearSpec(
         kimi_config=kimi_config,
         num_blocks=num_blocks,
+        attn_res_gated=gated,
+        lora_rank=lora_rank,
     )
     from torchtitan.experiments.kimi_k3.state_dict_adapter import (
         KimiLinearStateDictAdapter,
