@@ -32,9 +32,10 @@ class TestKimiDebugModel(unittest.TestCase):
         cfg = config_registry.kimi_linear_debugmodel()
         model = cfg.model_spec.model.build()
         model.init_weights()
-        tokens = torch.randint(0, 2016, (1, 32))
+        # KDA training path requires chunk mode (seq > 64).
+        tokens = torch.randint(0, 2016, (1, 128))
         logits = model(tokens)
-        self.assertEqual(tuple(logits.shape), (1, 32, 2016))
+        self.assertEqual(tuple(logits.shape), (1, 128, 2016))
         self.assertTrue(torch.isfinite(logits).all())
         logits.sum().backward()
         # AttnRes projections get gradients (zero-init but on the path).
