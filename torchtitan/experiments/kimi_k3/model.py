@@ -975,8 +975,12 @@ class KimiLinearModel(nn.Module):
                 nn.init.ones_(m.weight)
                 if getattr(m, "bias", None) is not None:
                     nn.init.zeros_(m.bias)
-            elif cls_name in ("ShortConvolution", "FusedRMSNormGated"):
-                # fla-core modules ship reset_parameters()
+            elif cls_name in (
+                "ShortConvolution", "FusedRMSNormGated", "KimiLoRALinear",
+            ):
+                # fla-core modules + the LoRA wrapper ship reset_parameters()
+                # (LoRA: kaiming lora_a, zero lora_b -- the generic Linear
+                # pass above only covers their nn.Linear children).
                 m.reset_parameters()
 
         # Pass 2: KDA per-layer raw Parameters (A_log, dt_bias) that
@@ -1046,6 +1050,12 @@ class KimiLinearSpec:
     # with the plain backbone at step 0). For grafting onto pretrained
     # weights; from-scratch flavors keep the paper's ungated read.
     attn_res_gated: bool = False
+    # LoRA (module-level; see lora.py). rank=None disables. When set,
+    # target projections are wrapped (lora_b zero-init -> step-0
+    # identity) and the base freezes EXCEPT the AttnRes graft params
+    # (alpha-fullparam exception).
+    lora_rank: int | None = None
+    lora_alpha: float = 16.0
 
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
@@ -1053,12 +1063,20 @@ class KimiLinearSpec:
             KimiLinearAttnResModel,
         )
         if self.num_blocks is None:
-            return KimiLinearModel(self.kimi_config)
-        return KimiLinearAttnResModel(
-            self.kimi_config,
-            num_blocks=self.num_blocks,
-            gated=self.attn_res_gated,
-        )
+            model = KimiLinearModel(self.kimi_config)
+        else:
+            model = KimiLinearAttnResModel(
+                self.kimi_config,
+                num_blocks=self.num_blocks,
+                gated=self.attn_res_gated,
+            )
+        if self.lora_rank is not None:
+            from torchtitan.experiments.kimi_k3.lora import apply_lora
+
+            apply_lora(
+                model, rank=self.lora_rank, alpha=self.lora_alpha
+            )
+        return model
 
     def update_from_config(self, *, config, **kwargs) -> None:
         """Wire parallelism knobs the model must know BEFORE build.

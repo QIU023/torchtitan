@@ -336,6 +336,28 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
+    """Debug flavor with the full post-train graft stack: alpha-gated
+    Block AttnRes + LoRA rank-8 (frozen base, alpha-fullparam
+    exception). CI-scale rehearsal of the 48B LoRA leg.
+    """
+    cfg = kimi_linear_debugmodel()
+    cfg.model_spec.flavor = "kimi_linear_debugmodel_gated_lora"
+    cfg.model_spec.model.attn_res_gated = True
+    cfg.model_spec.model.lora_rank = 8
+    return cfg
+
+
+def kimi_linear_48b_block_attn_res_gated_lora() -> Trainer.Config:
+    """48B graft + LoRA rank-16: the 5090-feasible post-training target
+    (frozen 48B base sharded at ~12GB/card; only adapters + AttnRes
+    params train)."""
+    cfg = kimi_linear_48b_block_attn_res_gated()
+    cfg.model_spec.flavor = "kimi_linear_48b_block_attn_res_gated_lora"
+    cfg.model_spec.model.lora_rank = 16
+    return cfg
+
+
 def kimi_linear_48b_block_attn_res_gated() -> Trainer.Config:
     """48B Block AttnRes with the alpha graft gate enabled.
 
