@@ -111,6 +111,9 @@ def model_registry(flavor: str) -> ModelSpec:
         kimi_config=kimi_config,
         num_blocks=num_blocks,
     )
+    from torchtitan.experiments.kimi_k3.state_dict_adapter import (
+        KimiLinearStateDictAdapter,
+    )
     return ModelSpec(
         name="kimi_linear",
         flavor=flavor,
@@ -118,5 +121,5 @@ def model_registry(flavor: str) -> ModelSpec:
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=KimiLinearStateDictAdapter,
     )

@@ -44,6 +44,9 @@ from torchtitan.experiments.kimi_k3 import model_registry as attn_res_model_regi
 # so the kimi flavor functions must be module-level attributes here. The
 # ``kimi_linear_`` config-name prefix is preserved for backward compatibility
 # with production launch scripts (only the ``--module`` value changed).
+from torchtitan.experiments.kimi_k3.state_dict_adapter import (
+    KimiLinearStateDictAdapter,
+)
 from torchtitan.experiments.kimi_k3.model_configs import (  # noqa: F401
     _BY_NAME,
     build,
@@ -223,7 +226,7 @@ def kimi_linear_436m_block_attn_res_n4() -> Trainer.Config:
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=KimiLinearStateDictAdapter,
     )
     return cfg
 
@@ -273,7 +276,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=KimiLinearStateDictAdapter,
     )
     return cfg
 
@@ -441,7 +444,7 @@ def _kimi_linear_48b_attnres_downscale(
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=KimiLinearStateDictAdapter,
     )
     return cfg
 
@@ -562,7 +565,7 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=KimiLinearStateDictAdapter,
     )
     return cfg
 
@@ -587,7 +590,7 @@ def kimi_linear_528m_l16_full_attn_res() -> Trainer.Config:
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=KimiLinearStateDictAdapter,
     )
     return cfg
 
@@ -614,6 +617,6 @@ def kimi_linear_528m_l16_baseline() -> Trainer.Config:
         parallelize_fn=parallelize_kimi_linear,
         pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=KimiLinearStateDictAdapter,
     )
     return cfg
