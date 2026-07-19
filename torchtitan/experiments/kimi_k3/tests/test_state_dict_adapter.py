@@ -55,7 +55,7 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         hf = adapter.to_hf(sd)
         num_experts = spec.model.kimi_config.num_experts
         # Per-expert HF keys exist for a known MoE layer
-        moe_keys = [k for k in hf if ".mlp.experts." in k]
+        moe_keys = [k for k in hf if ".block_sparse_moe.experts." in k]
         self.assertTrue(moe_keys)
         self.assertEqual(
             len(moe_keys),

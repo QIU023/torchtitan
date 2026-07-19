@@ -24,8 +24,9 @@ Key-space notes:
 * HF checkpoints appear with two MoE prefixes in the wild: the official
   Kimi export style (``mlp.*`` with gate_proj/up_proj/down_proj expert
   linears) and the block-sparse style (``block_sparse_moe.*`` with
-  w1/w2/w3). Reading accepts both; writing emits the official ``mlp.*``
-  style.
+  w1/w2/w3 routed + gate/up/down_proj shared). Reading accepts both;
+  writing emits the official Kimi-Linear-48B export style
+  (``block_sparse_moe.*``; dense layer-0 MLP stays ``mlp.*``).
 * KDA ``A_log`` is ``[1, 1, H, 1]`` in HF and ``[H]`` in tt; reading
   reshapes, writing passes the tt shape through (the SGLang overlay
   accepts it -- keep in sync with the overlay if this changes).
@@ -142,9 +143,13 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 layer_num = re.search(r"\d+", key).group(0)
                 w_suffixed = key.rsplit(".", 1)[-1]
-                hf_tag = _W_TO_HF[_EXPERT_SUFFIXED_TO_W[w_suffixed]]
+                w_tag = _EXPERT_SUFFIXED_TO_W[w_suffixed]
+                # Official Kimi-Linear-48B export style: routed experts are
+                # block_sparse_moe.experts.{e}.w{1,2,3}.weight (w-naming),
+                # while shared experts use gate/up/down_proj naming.
                 hf_abstract_key = (
-                    "model.layers.{}.mlp.experts.{}." + hf_tag + ".weight"
+                    "model.layers.{}.block_sparse_moe.experts.{}."
+                    + w_tag + ".weight"
                 )
                 if isinstance(value, DTensor):
                     # Online (sharded) path: record placement metadata so
@@ -169,6 +174,12 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                         )
                 continue
 
+            if key.endswith("self_attn.A_log"):
+                # File-side KDA A_log is [1, 1, H, 1]; the model holds [H].
+                # The online HF reader validates placeholder shapes against
+                # the saved file, so the view must happen on this side too
+                # (from_hf flattens back).
+                value = value.reshape(1, 1, -1, 1)
             hf_state_dict[self._tt_key_to_hf(key)] = value
 
         return hf_state_dict
@@ -191,13 +202,13 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             if sub == f"ffn.{proj}.weight":
                 return f"{prefix}.mlp.{proj}.weight"
         if sub == "ffn._moe.router.gate.weight":
-            return f"{prefix}.mlp.gate.weight"
+            return f"{prefix}.block_sparse_moe.gate.weight"
         if sub == "ffn._moe.expert_bias_E":
-            return f"{prefix}.mlp.gate.e_score_correction_bias"
+            return f"{prefix}.block_sparse_moe.gate.e_score_correction_bias"
         if sub.startswith("ffn._moe.shared_experts."):
             tail = sub[len("ffn._moe.shared_experts.") :]
             w_tag, _, suff = tail.partition(".")
-            return f"{prefix}.mlp.shared_experts.{_W_TO_HF[w_tag]}.{suff}"
+            return f"{prefix}.block_sparse_moe.shared_experts.{_W_TO_HF[w_tag]}.{suff}"
         raise ValueError(f"Unmapped tt key: {key!r}")
 
     # ----- HF -> tt -------------------------------------------------- #
@@ -211,7 +222,15 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         # {layer: {titan_abstract_key: {expert_id: tensor}}}
         expert_weights_by_layer: dict[str, dict[str, dict[int, Any]]] = {}
 
-        for key, value in hf_state_dict.items():
+        # Iterate over a key snapshot and pop each entry as it is
+        # consumed: on the online (sharded initial-load) path
+        # hf_state_dict holds every loaded per-expert slice, and keeping
+        # those references alive while the stacked copies are built
+        # doubles the peak -- enough to OOM the 48B load on 32 GiB
+        # cards. Consuming the input dict is part of this method's
+        # contract (the caller replaces it with the returned dict).
+        for key in list(hf_state_dict.keys()):
+            value = hf_state_dict.pop(key)
             expert_m = re.match(
                 r"model\.layers\.(\d+)\.(?:mlp|block_sparse_moe)\.experts\."
                 r"(\d+)\.(\w+)\.weight",
