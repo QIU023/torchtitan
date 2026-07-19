@@ -36,8 +36,15 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         adapter = KimiLinearStateDictAdapter(spec.model, hf_assets_path=None)
         hf = adapter.to_hf(sd)
         back = adapter.from_hf(hf)
-        self.assertEqual(set(back), set(sd))
-        for k in sd:
+        # Graft extras (attn_res/mlp_res) are deliberately NOT part of
+        # the HF key space (official checkpoints must load into graft
+        # flavors without phantom read keys); the round trip covers the
+        # backbone exactly.
+        backbone = {
+            k for k in sd if "attn_res" not in k and "mlp_res" not in k
+        }
+        self.assertEqual(set(back), backbone)
+        for k in backbone:
             self.assertEqual(
                 tuple(back[k].shape), tuple(sd[k].shape), f"shape drift at {k}"
             )

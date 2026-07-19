@@ -140,6 +140,18 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         num_experts = self.kimi_config.num_experts
 
         for key, value in state_dict.items():
+            if (
+                "attn_res" in key
+                or "mlp_res" in key
+                or "lora_a" in key
+                or "lora_b" in key
+            ):
+                # Graft/LoRA extras have no HF-format destination: the HF
+                # key space is the ORIGINAL Kimi architecture (so official
+                # checkpoints load into graft flavors without phantom read
+                # keys). Trained graft/adapter params ship as the
+                # fork-native trainable_state_dict payload instead.
+                continue
             if ".ffn._moe.routed_experts.inner_experts." in key:
                 # layers.{i}.ffn._moe.routed_experts.inner_experts.w1_EFD
                 # -> per-expert HF linears
