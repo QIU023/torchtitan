@@ -336,6 +336,22 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_48b_block_attn_res_gated() -> Trainer.Config:
+    """48B Block AttnRes with the alpha graft gate enabled.
+
+    The post-training graft flavor: load the official
+    Kimi-Linear-48B-A3B weights into the backbone, keep the AttnRes
+    params (pseudo-queries + alphas) zero-init -- at step 0 the model
+    function EXACTLY equals the original checkpoint (alpha=0 identity);
+    alpha then trains away from identity. Use the ungated
+    kimi_linear_48b_block_attn_res for from-scratch pretraining.
+    """
+    cfg = _flavor_trainer_config("48b", "block_attn_res")
+    cfg.model_spec.flavor = "kimi_linear_48b_block_attn_res_gated"
+    cfg.model_spec.model.attn_res_gated = True
+    return cfg
+
+
 def kimi_linear_debugmodel() -> Trainer.Config:
     """Tiny CI flavor: 4 layers (3 KDA + 1 MLA), d=256, 8 experts,
     Block AttnRes, 2016-token bundled test tokenizer, c4_test dataset.

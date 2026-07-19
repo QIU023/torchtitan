@@ -91,13 +91,13 @@ class TestKimiAttnResDecoderLayer(unittest.TestCase):
         blocks = [torch.randn(B, T, D) for _ in range(2)]
         partial = torch.randn(B, T, D)
 
-        new_blocks, new_partial = layer(blocks, partial, is_block_start=True)
+        new_blocks, new_partial, _ = layer(blocks, partial, is_block_start=True)
         # On block start, partial is committed into blocks -> +1 entry.
         self.assertEqual(len(new_blocks), 3)
         self.assertEqual(new_partial.shape, (B, T, D))
 
         # Non-block-start: blocks unchanged, partial accumulates.
-        new_blocks2, new_partial2 = layer(new_blocks, new_partial, is_block_start=False)
+        new_blocks2, new_partial2, _ = layer(new_blocks, new_partial, is_block_start=False)
         self.assertEqual(len(new_blocks2), 3)
         self.assertEqual(new_partial2.shape, (B, T, D))
 

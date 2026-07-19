@@ -1042,6 +1042,10 @@ class KimiLinearSpec:
     kimi_config: KimiLinearConfig
     num_blocks: int | None = None
     param_init: dict | None = None  # torchtitan BaseModel.Config contract
+    # Graft gate: alpha-gated AttnRes reads (alpha=0 == exact identity
+    # with the plain backbone at step 0). For grafting onto pretrained
+    # weights; from-scratch flavors keep the paper's ungated read.
+    attn_res_gated: bool = False
 
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
@@ -1051,7 +1055,9 @@ class KimiLinearSpec:
         if self.num_blocks is None:
             return KimiLinearModel(self.kimi_config)
         return KimiLinearAttnResModel(
-            self.kimi_config, num_blocks=self.num_blocks
+            self.kimi_config,
+            num_blocks=self.num_blocks,
+            gated=self.attn_res_gated,
         )
 
     def update_from_config(self, *, config, **kwargs) -> None:

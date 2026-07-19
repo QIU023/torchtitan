@@ -63,6 +63,20 @@ from torchtitan.experiments.kimi_k3.model import (
 )
 
 
+
+
+def _plain_stream(
+    blocks: list[torch.Tensor], partial_block: torch.Tensor
+) -> torch.Tensor:
+    """Reconstruct the standard residual stream: sum of committed blocks
+    plus the current partial. This is the exact input the plain
+    (non-AttnRes) backbone would see at this point."""
+    out = partial_block
+    for b in blocks:
+        out = out + b
+    return out
+
+
 # ----- Per-layer AttnRes wrapper ------------------------------------------ #
 
 class KimiAttnResDecoderLayer(nn.Module):
@@ -85,7 +99,9 @@ class KimiAttnResDecoderLayer(nn.Module):
     t=0 training is equivalent to standard residuals).
     """
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
+    def __init__(
+        self, config: KimiLinearConfig, layer_idx: int, gated: bool = False,
+    ) -> None:
         super().__init__()
         # Reuse the base KimiDecoderLayer entirely — we just delegate
         # to its sub-modules rather than calling its forward.
@@ -108,17 +124,34 @@ class KimiAttnResDecoderLayer(nn.Module):
         self.mlp_res_proj = AttnResProjection(proj_cfg)
         self.attn_res_norm = nn.RMSNorm(d, eps=config.rms_norm_eps)
         self.mlp_res_norm = nn.RMSNorm(d, eps=config.rms_norm_eps)
+        # Graft gate (HANDOFF sec 5 anchor): per-read scalar alpha, zero-init.
+        # h = partial + alpha * (mix - partial): alpha=0 makes the read the
+        # plain residual stream, so a pretrained backbone's step-0 function
+        # is EXACTLY preserved; alpha then trains away from identity.
+        # Ungated (from-scratch pretraining) keeps the paper's uniform-mix
+        # zero-init read, matching all historical numerics evidence.
+        self.attn_res_gated = gated
+        if gated:
+            self.attn_res_alpha = nn.Parameter(torch.zeros(()))
+            self.mlp_res_alpha = nn.Parameter(torch.zeros(()))
 
     def forward(
         self,
         blocks: list[torch.Tensor],
         partial_block: torch.Tensor,
         is_block_start: bool,
-    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        plain_stream: torch.Tensor | None = None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor | None]:
         # Pre-attention aggregation (paper Figure 2, pre-attention step).
         h = block_attn_res(
             blocks, partial_block, self.attn_res_proj, self.attn_res_norm
         )
+        if self.attn_res_gated:
+            # plain_stream is accumulated SEQUENTIALLY (same op order as
+            # the plain backbone) so alpha=0 is bit-identical to it;
+            # reconstructing sum(blocks)+partial would reorder additions.
+            assert plain_stream is not None
+            h = plain_stream + self.attn_res_alpha * (h - plain_stream)
 
         # Block boundary: commit partial into blocks, start fresh accumulator.
         if is_block_start:
@@ -128,16 +161,22 @@ class KimiAttnResDecoderLayer(nn.Module):
         # Attention sub-layer (KDA or MLA).
         attn_out = self.self_attn(self.input_layernorm(h))
         partial_block = attn_out if partial_block is None else partial_block + attn_out
+        if self.attn_res_gated:
+            plain_stream = plain_stream + attn_out
 
         # Pre-FFN aggregation (paper Figure 2, pre-FFN step).
         h = block_attn_res(
             blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm
         )
+        if self.attn_res_gated:
+            h = plain_stream + self.mlp_res_alpha * (h - plain_stream)
 
         # FFN sub-layer (MoE or dense SwiGLU).
         ffn_out = self.ffn(self.post_attention_layernorm(h))
         partial_block = partial_block + ffn_out
-        return blocks, partial_block
+        if self.attn_res_gated:
+            plain_stream = plain_stream + ffn_out
+        return blocks, partial_block, plain_stream
 
 
 # ----- Top-level AttnRes-woven model -------------------------------------- #
@@ -173,7 +212,10 @@ class KimiLinearAttnResModel(KimiLinearModel):
     layers receive the full accumulated block list every layer.
     """
 
-    def __init__(self, config: KimiLinearConfig, *, num_blocks: int) -> None:
+    def __init__(
+        self, config: KimiLinearConfig, *, num_blocks: int,
+        gated: bool = False,
+    ) -> None:
         # Skip KimiLinearModel.__init__'s layer build (it builds
         # KimiDecoderLayer); we need KimiAttnResDecoderLayer instead.
         # Call nn.Module's init, then build what we need ourselves.
@@ -195,8 +237,12 @@ class KimiLinearAttnResModel(KimiLinearModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         # ModuleDict for pipeline_module_split compatibility — see
         # KimiLinearModel.__init__ for the same pattern.
+        self.attn_res_gated = gated
         self.layers = nn.ModuleDict(
-            {str(i): KimiAttnResDecoderLayer(config, i) for i in range(n_layers)}
+            {
+                str(i): KimiAttnResDecoderLayer(config, i, gated=gated)
+                for i in range(n_layers)
+            }
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(
@@ -212,6 +258,8 @@ class KimiLinearAttnResModel(KimiLinearModel):
         self.final_attn_res_norm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        if gated:
+            self.final_attn_res_alpha = nn.Parameter(torch.zeros(()))
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -365,11 +413,19 @@ class KimiLinearAttnResModel(KimiLinearModel):
         # 3) Thread blocks + partial through this stage's layer slice.
         # ModuleDict keys are original layer indices (preserved across
         # pipeline_module_split); int() them to drive block-start detection.
+        # Gated graft: seed the sequential plain stream. First stage:
+        # the embedding; PP mid-stage: reconstruct once at entry (the
+        # only reorder point -- single-stage runs stay bit-exact).
+        plain_stream = (
+            _plain_stream(block_list, partial_block)
+            if self.attn_res_gated
+            else None
+        )
         for layer_key, layer in self.layers.items():
             layer_idx = int(layer_key)
             is_block_start = (layer_idx % self.layers_per_block == 0)
-            block_list, partial_block = layer(
-                block_list, partial_block, is_block_start
+            block_list, partial_block, plain_stream = layer(
+                block_list, partial_block, is_block_start, plain_stream
             )
 
         is_last_stage = self.lm_head is not None
@@ -394,6 +450,10 @@ class KimiLinearAttnResModel(KimiLinearModel):
             self.final_attn_res_proj,
             self.final_attn_res_norm,
         )
+        if self.attn_res_gated:
+            h_final = plain_stream + self.final_attn_res_alpha * (
+                h_final - plain_stream
+            )
         if self.norm is not None:
             h_final = self.norm(h_final)
         return self.lm_head(h_final)
@@ -422,3 +482,12 @@ class KimiLinearAttnResModel(KimiLinearModel):
                 nn.init.zeros_(layer.mlp_res_proj.weight)
         if self.final_attn_res_proj is not None:
             nn.init.zeros_(self.final_attn_res_proj.weight)
+        # Graft-gate alphas start at exact zero (identity anchor).
+        for layer in self.layers.values():
+            for name in ("attn_res_alpha", "mlp_res_alpha"):
+                a = getattr(layer, name, None)
+                if isinstance(a, nn.Parameter):
+                    nn.init.zeros_(a)
+        a = getattr(self, "final_attn_res_alpha", None)
+        if isinstance(a, nn.Parameter):
+            nn.init.zeros_(a)

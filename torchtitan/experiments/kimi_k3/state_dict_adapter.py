@@ -74,9 +74,12 @@ _DIRECT_MAP_FROM_HF = {
     "lm_head.weight": "lm_head.weight",
     "model.final_attn_res_proj.weight": "final_attn_res_proj.weight",
     "model.final_attn_res_norm.weight": "final_attn_res_norm.weight",
+    "model.final_attn_res_alpha": "final_attn_res_alpha",
 }
 
 _PASSTHROUGH_LAYER_TAGS = (
+    "attn_res_alpha",
+    "mlp_res_alpha",
     "attn_res_proj.weight",
     "attn_res_norm.weight",
     "mlp_res_proj.weight",
