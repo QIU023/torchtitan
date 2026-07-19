@@ -166,8 +166,7 @@ def parallelize_kimi_linear(
         # MoE only at the block boundary (after FFN residual add),
         # so EP routing within the FFN body is transparent to the
         # AttnRes block-commit logic.
-        ep_mesh = parallel_dims.get_mesh("ep")
-        apply_ep_kimi_linear(model, ep_mesh)
+        apply_ep_kimi_linear(model, parallel_dims)
         logger.info(
             "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
             parallel_dims.ep,
@@ -435,7 +434,7 @@ def apply_tp_kimi_linear(
     # Replicate so the backward all-reduces dY back to Replicate before
     # entering the module's backward — matching the forward-side
     # Replicate placement of the params.
-    no_par_local = NoParallel(local_output_grad_placements=(Replicate(),))
+    no_par_local = NoParallel(use_local_output=True)
 
     # fla-core triton kernels (causal_conv1d in ShortConvolution,
     # fused_norm_gated in FusedRMSNormGated) do not dispatch through
@@ -541,9 +540,7 @@ def apply_tp_kimi_linear(
             # so attn_out is plain Tensor everywhere — partial_block
             # accumulation and AttnRes block_attn_res both see uniform
             # plain Tensors.
-            plan["self_attn"] = NoParallel(
-                local_output_grad_placements=(Replicate(),),
-            )
+            plan["self_attn"] = NoParallel(use_local_output=True)
         else:
             # MLA layer: DSv3-style plan.
             # NOTE: ``kv_a_proj_with_mqa`` is NOT sharded — its output
@@ -706,8 +703,11 @@ def apply_tp_kimi_linear(
         # shared_experts only; routed experts are EP/ETP territory.
         if is_moe and not skip_expert_params:
             ffn = layer.ffn
-            experts = ffn._moe.experts
-            for name in ("w1", "w2", "w3"):
+            # Post-merge common MoE tree: routed experts live at
+            # _moe.routed_experts.inner_experts with shape-suffixed
+            # params (w1_EFD / w2_EDF / w3_EFD).
+            experts = ffn._moe.routed_experts.inner_experts
+            for name in ("w1_EFD", "w2_EDF", "w3_EFD"):
                 p = getattr(experts, name, None)
                 if p is not None and not isinstance(p, DTensor):
                     setattr(
@@ -744,7 +744,7 @@ def apply_tp_kimi_linear(
             ffn = getattr(layer, "ffn", None)
             if ffn is None or getattr(ffn, "_moe", None) is None:
                 continue
-            for p in ffn._moe.experts.parameters():
+            for p in ffn._moe.routed_experts.inner_experts.parameters():
                 expert_param_ids.add(id(p))
     for module in model.modules():
         for name, p in list(module._parameters.items()):
@@ -756,22 +756,18 @@ def apply_tp_kimi_linear(
                 )
 
 
-def apply_ep_kimi_linear(model: nn.Module, ep_mesh: DeviceMesh) -> None:
+def apply_ep_kimi_linear(model: nn.Module, parallel_dims) -> None:
     """Phase 6 A6 Expert Parallel plan for kimi_linear MoE flavors.
 
-    Applies ``ExpertParallel()`` to every MoE layer's expert container.
-    The KimiMoE module wraps the torchtitan common MoE as ``self._moe``;
-    its ``experts`` field is the ModuleList that EP shards across the
-    EP mesh, with token dispatch + combine via all-to-all collectives
-    on that mesh.
+    Calls ``_moe.parallelize(parallel_dims)`` on every MoE layer: the
+    upstream common MoE distributes its GroupedExperts states over the
+    "ep" mesh (per-Module sharding_config) and wires the token
+    dispatcher's ep/tp meshes for all-to-all dispatch + combine.
 
     Layers without MoE (``layer.is_moe == False``, i.e. dense MLP at
     the first ``first_k_dense_replace`` indices) are skipped — they
     have no experts to shard.
     """
-    from torchtitan.distributed.expert_parallel import ExpertParallel
-
-    plan = ExpertParallel()
     moe_layers_wrapped = 0
     for layer in model.layers.values():
         if not bool(getattr(layer, "is_moe", False)):
@@ -779,19 +775,18 @@ def apply_ep_kimi_linear(model: nn.Module, ep_mesh: DeviceMesh) -> None:
         ffn = getattr(layer, "ffn", None)
         if ffn is None:
             continue
-        # KimiMoE wraps the torchtitan common MoE as self._moe; its
-        # experts container is the ModuleList of per-expert MLPs.
+        # KimiMoE wraps the torchtitan common MoE as self._moe. Upstream
+        # removed the standalone ExpertParallel style: EP is now module-
+        # internal -- MoE.parallelize(parallel_dims) distributes the
+        # GroupedExperts states over the "ep" mesh via each Module's
+        # sharding_config and wires the token dispatcher's ep/tp meshes.
         moe = getattr(ffn, "_moe", None)
-        if moe is None or not hasattr(moe, "experts"):
+        if moe is None or not hasattr(moe, "parallelize"):
             raise ValueError(
-                f"layer {layer.layer_idx} MoE ffn missing _moe.experts; "
-                "EP plan needs the standard torchtitan MoE wrapping."
+                f"layer {layer.layer_idx} MoE ffn missing a parallelizable "
+                "_moe; EP needs the standard torchtitan MoE wrapping."
             )
-        parallelize_module(
-            module=moe.experts,
-            device_mesh=ep_mesh,
-            parallelize_plan=plan,
-        )
+        moe.parallelize(parallel_dims)
         moe_layers_wrapped += 1
     logger.info(
         "EP plan wrapped %d MoE layer experts.", moe_layers_wrapped
@@ -936,15 +931,15 @@ def apply_fsdp(
             assert (
                 ffn is not None
                 and getattr(ffn, "_moe", None) is not None
-                and hasattr(ffn._moe, "experts")
+                and hasattr(ffn._moe, "routed_experts")
             ), (
                 f"layer {getattr(layer, 'layer_idx', '?')} is_moe=True "
-                "but ffn._moe.experts missing; EP-aware FSDP needs the "
-                "standard KimiMoE wrapping."
+                "but ffn._moe.routed_experts missing; EP-aware FSDP needs "
+                "the standard KimiMoE wrapping."
             )
-            # Inner unit: experts on edp_mesh.
+            # Inner unit: routed experts (GroupedExperts) on edp_mesh.
             fully_shard(
-                ffn._moe.experts,
+                ffn._moe.routed_experts.inner_experts,
                 **edp_fsdp_config,
                 reshard_after_forward=reshard_after_forward,
             )
