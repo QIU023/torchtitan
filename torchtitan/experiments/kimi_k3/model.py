@@ -1012,8 +1012,11 @@ class KimiLinearSpec:
             self.kimi_config, num_blocks=self.num_blocks
         )
 
-    def update_from_config(self, *, trainer_config, **kwargs) -> None:
+    def update_from_config(self, *, config, **kwargs) -> None:
         """No-op: Kimi Linear's NoPE-MLA + KDA are seq-len-agnostic.
+
+        Signature matches ``BaseModel.Config.update_from_config``
+        (keyword ``config`` = the Trainer.Config).
 
         (If a future variant adds RoPE'd MLA, propagate ``training.seq_len``
         into ``self.kimi_config.rope_theta`` or per-layer rope knobs here.)
@@ -1128,6 +1131,18 @@ class KimiLinearSpec:
         """
         return self.kimi_config.num_hidden_layers
 
+    def traverse(self, config_cls, *, recurse: bool = False, _prefix: str = ""):
+        """Config-tree leaf: yield nothing.
+
+        The Kimi Linear model is built as plain modules from
+        :class:`KimiLinearConfig`, not from a ``Configurable.Config``
+        tree, so there are no nested component configs to expose.
+        Implemented because the Trainer chain requires it on every
+        model config (``has_quantization``, the override mechanism via
+        ``ModelSpec.traverse``).
+        """
+        return iter(())
+
 
 @dataclass(kw_only=True, slots=True)
 class KimiLinearFloat8Spec(KimiLinearSpec):
@@ -1178,3 +1193,35 @@ class KimiLinearFloat8Spec(KimiLinearSpec):
             config=self.torchao_float8_config,
             module_filter_fn=_filter,
         )
+
+    def traverse(self, config_cls, *, recurse: bool = False, _prefix: str = ""):
+        """Yield a single synthetic Float8Linear.Config marker.
+
+        The Float8 swap here is module-level (``build()``), so there is
+        no real config tree to report. Config-tree consumers -- today
+        only ``has_quantization``, which gates the misleading-under-fp8
+        MFU metric -- still need to see that quantization is active.
+        The marker's dims are placeholders (16x16, the fp8 alignment
+        unit); treat it strictly as a boolean signal, never as a real
+        layer description.
+        """
+        from torchtitan.components.quantization.float8 import Float8Linear
+
+        if (
+            self.torchao_float8_config is not None
+            and Float8Linear is not None
+            and issubclass(Float8Linear.Config, config_cls)
+        ):
+            fqn = (
+                f"{_prefix}.module_level_float8_swap"
+                if _prefix
+                else "module_level_float8_swap"
+            )
+            marker = Float8Linear.Config(
+                in_features=16,
+                out_features=16,
+                _torchao_config=self.torchao_float8_config,
+            )
+            yield fqn, marker, None, None
+        else:
+            yield from ()

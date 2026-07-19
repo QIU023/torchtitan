@@ -24,6 +24,7 @@ from functools import partial
 import torch.nn as nn
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, OptimizersContainer
@@ -87,6 +88,12 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
         raise ValueError(f"Unknown size '{size_name}'")
     spec = _BY_NAME[size_name]
     return Trainer.Config(
+        # Plain (non-chunked) CE: matches the numerics of all historical
+        # kimi runs, and the KimiLinear* models don't implement the
+        # _skip_lm_head forward that ChunkedLossWrapper requires.
+        # 163840 = Kimi tokenizer vocab (build_kimi_linear_config
+        # default; no flavor overrides it).
+        loss=CrossEntropyLoss.Config(global_vocab_size=163840),
         hf_assets_path="./assets/hf/Llama-3.1-8B",
         metrics=MetricsProcessor.Config(
             enable_tensorboard=True, log_freq=10,
