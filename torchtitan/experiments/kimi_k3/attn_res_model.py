@@ -132,8 +132,8 @@ class KimiAttnResDecoderLayer(nn.Module):
         # zero-init read, matching all historical numerics evidence.
         self.attn_res_gated = gated
         if gated:
-            self.attn_res_alpha = nn.Parameter(torch.zeros(()))
-            self.mlp_res_alpha = nn.Parameter(torch.zeros(()))
+            self.attn_res_alpha = nn.Parameter(torch.zeros(1))
+            self.mlp_res_alpha = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -259,7 +259,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
             config.hidden_size, eps=config.rms_norm_eps
         )
         if gated:
-            self.final_attn_res_alpha = nn.Parameter(torch.zeros(()))
+            self.final_attn_res_alpha = nn.Parameter(torch.zeros(1))
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
