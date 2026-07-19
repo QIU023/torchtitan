@@ -1127,3 +1127,54 @@ class KimiLinearSpec:
         without reaching into kimi_config.
         """
         return self.kimi_config.num_hidden_layers
+
+
+@dataclass(kw_only=True, slots=True)
+class KimiLinearFloat8Spec(KimiLinearSpec):
+    """:class:`KimiLinearSpec` whose ``build()`` swaps eligible
+    ``nn.Linear`` modules to torchao ``Float8Linear``.
+
+    The Kimi Linear model is constructed as plain modules, not from a
+    ``Linear.Config`` tree, so ``Float8LinearConverter.convert``'s
+    config traversal cannot apply here. Instead the swap happens
+    module-level right after construction (on the meta device, before
+    parallelize/init), mirroring the converter's ``module_filter_fn``
+    semantics: all dims divisible by 16, filtered FQNs skipped.
+    Additionally every Linear inside a :class:`KimiDeltaAttention` is
+    skipped structurally -- KDA and MLA layers share the ``self_attn``
+    attribute name, so no FQN substring can express "KDA only".
+    ``init_weights`` still covers swapped modules because torchao's
+    ``Float8Linear`` subclasses ``nn.Linear``.
+    """
+
+    torchao_float8_config: object = None
+    filter_fqns: list[str] = field(default_factory=list)
+
+    def build(self, **kwargs):
+        from torchao.float8 import convert_to_float8_training
+
+        # Explicit base call: zero-arg super() breaks under
+        # @dataclass(slots=True), which recreates the class object.
+        model = KimiLinearSpec.build(self, **kwargs)
+
+        kda_linear_fqns = {
+            f"{name}.{sub_name}"
+            for name, m in model.named_modules()
+            if isinstance(m, KimiDeltaAttention)
+            for sub_name, sub in m.named_modules()
+            if sub_name and isinstance(sub, nn.Linear)
+        }
+
+        def _filter(mod: nn.Module, fqn: str) -> bool:
+            return (
+                mod.in_features % 16 == 0
+                and mod.out_features % 16 == 0
+                and fqn not in kda_linear_fqns
+                and not any(f in fqn for f in self.filter_fqns)
+            )
+
+        return convert_to_float8_training(
+            model,
+            config=self.torchao_float8_config,
+            module_filter_fn=_filter,
+        )

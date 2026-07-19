@@ -275,38 +275,54 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     """447M Block AttnRes with FP8 rowwise training.
 
     Wraps :func:`kimi_linear_447m_aligned_block_attn_res_n4` and adds a
-    Float8LinearConverter with the ``rowwise_with_gw_hp`` recipe (weights
-    + activations in FP8, grad-output stays high-precision). KDA-specific
-    low-dim projections (``kda.*``), MLA LoRA projections, and the
-    vocab/router heads are excluded via ``filter_fqns`` — those layers
-    have either non-16-aligned shapes or numerical sensitivity that
-    regresses under rowwise FP8.
+    Float8LinearConverter with the ``rowwise`` recipe. Excluded from the
+    swap: every Linear inside a KDA layer (structurally, via
+    KimiLinearFloat8Spec -- KDA and MLA share the ``self_attn`` name so
+    no FQN substring can single out KDA), the MLA low-rank down-proj
+    (``kv_a_proj_with_mqa``), the AttnRes projections, and the
+    vocab/router heads -- those layers have either non-16-aligned
+    shapes or numerical sensitivity that regresses under rowwise FP8.
 
     MoE experts (grouped_mm) stay bf16 — Float8GroupedMMConverter is a
     perf-prototype upstream and not in the dispatch path here.
+
+    The Kimi Linear model is built as plain modules (KimiLinearSpec),
+    not from a ``Linear.Config`` tree, so ``Float8LinearConverter``'s
+    config-traversal ``convert`` cannot apply. The converter is still
+    built here for its torchao/SM89 validation and recipe resolution;
+    the actual swap is module-level inside
+    :class:`KimiLinearFloat8Spec.build` with the same filter semantics.
 
     Expected speedup on RTX 5090 (SM 12.0): 1.3-1.5× over bf16 for the
     dense MLA / projector / output paths; smaller win at the model level
     because KDA Triton + MoE grouped_mm dominate the per-step compute.
     """
     from torchtitan.components.quantization import Float8LinearConverter
+    from torchtitan.experiments.kimi_k3.model import KimiLinearFloat8Spec
 
     cfg = kimi_linear_447m_aligned_block_attn_res_n4()
     converter = Float8LinearConverter.Config(
         recipe_name="rowwise",
         filter_fqns=[
-            "output",
             "lm_head",
             "router.gate",
-            "kda",
-            "mla.q_lora_proj",
-            "mla.k_lora_proj",
+            "kv_a_proj_with_mqa",
             "attn_res_proj",
             "mlp_res_proj",
             "final_attn_res_proj",
         ],
+    ).build()
+    if not converter.enabled:
+        # torchao too old for recipe lookup; converter already warned.
+        return cfg
+    inner = cfg.model_spec.model
+    cfg.model_spec.model = KimiLinearFloat8Spec(
+        kimi_config=inner.kimi_config,
+        num_blocks=inner.num_blocks,
+        param_init=inner.param_init,
+        torchao_float8_config=converter.torchao_config,
+        filter_fqns=list(converter.config.filter_fqns),
     )
-    cfg.model_spec.model = converter.build().convert(cfg.model_spec.model)
     return cfg
 
 
