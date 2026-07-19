@@ -1028,16 +1028,25 @@ class KimiLinearSpec:
     ) -> tuple[int, int]:
         """(total_n_params, flops_per_TOKEN) for MFU reporting.
 
-        Matches torchtitan's MoE convention in
-        ``torchtitan.models.utils.get_moe_model_nparams_and_flops``:
+        Follows torchtitan's MoE convention in
+        ``torchtitan.models.utils.get_moe_model_nparams_and_flops``
+        (6x = fwd 2x + bwd 4x), extended for this architecture:
 
-            flops_per_token = 6 * activated_non_embedding
-                            + 6 * n_mla_layers * n_heads * head_dims * seq_len
+            flops_per_token = 6 * activated_non_embedding          (linear)
+                            + 6 * n_mla * n_heads * head_dims * seq (MLA)
+                            + 12 * n_kda * kda_heads * kda_dim^2    (KDA)
+                            + 6 * (2*n_layers + 1) * (N+1) * hidden (AttnRes)
 
-        — a ``6 * W`` constant per-token linear term plus an attention
-        term that's linear in seq_len (the O(N²) MLA softmax, counted
-        per-token as O(N)). KDA layers have linear-attention FLOPs in
-        seq_len, negligible relative to MLA here; we omit them.
+        * MLA: O(seq) per token (softmax attention counted per-token).
+        * KDA: linear attention -- the per-head [kda_head_dim x
+          kda_head_dim] recurrent state is written (delta-rule update)
+          and read (output) once per token, seq-len INDEPENDENT; the 2
+          state touches give the 12x (= 6 * 2) factor. Projections are
+          already inside the 6*W linear term.
+        * AttnRes (only when ``num_blocks`` is set): each sub-layer read
+          mixes up to N block sources + the partial block per token
+          (softmax over sources + weighted sum over hidden), twice per
+          layer (attn + mlp reads) plus the final read.
 
         Activated params: dense + shared_expert + router + routed*top_k/num_experts.
 
@@ -1077,8 +1086,7 @@ class KimiLinearSpec:
             + nparams_routed * top_k // n_experts
         )
 
-        # MLA attention FLOPs: only full_attn_layers (MLA), KDA has linear
-        # attention we approximate as zero in this term.
+        # MLA attention FLOPs: only full_attn_layers (softmax, O(seq)/token).
         n_mla_layers = len(cfg.full_attn_layers) if cfg.full_attn_layers else 0
         head_dims_attn = (
             cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim
@@ -1087,7 +1095,35 @@ class KimiLinearSpec:
             6 * n_mla_layers * cfg.num_attention_heads * head_dims_attn * seq_len
         )
 
-        flops_per_token = 6 * nparams_active_linear + attn_flops_per_token
+        # KDA linear-attention state ops: per token each head writes and
+        # reads its [kda_head_dim x kda_head_dim] recurrent state once.
+        n_kda_layers = (
+            len(cfg.kda_layers)
+            if cfg.kda_layers
+            else cfg.num_hidden_layers - n_mla_layers
+        )
+        kda_flops_per_token = (
+            12 * n_kda_layers * cfg.kda_num_heads * cfg.kda_head_dim**2
+        )
+
+        # AttnRes source mixing: 2 reads per layer + the final read, each
+        # mixing up to (num_blocks + 1) sources over hidden_size.
+        if self.num_blocks is not None:
+            attn_res_flops_per_token = (
+                6
+                * (2 * cfg.num_hidden_layers + 1)
+                * (self.num_blocks + 1)
+                * cfg.hidden_size
+            )
+        else:
+            attn_res_flops_per_token = 0
+
+        flops_per_token = (
+            6 * nparams_active_linear
+            + attn_flops_per_token
+            + kda_flops_per_token
+            + attn_res_flops_per_token
+        )
         return nparams_total, flops_per_token
 
     def to_dict(self) -> dict:
