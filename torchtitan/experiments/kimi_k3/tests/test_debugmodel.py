@@ -6,9 +6,9 @@
 
 """CI smoke for the kimi_linear_debugmodel flavor.
 
-Config build + a CPU forward/backward through the real module tree
-(KDA fla CPU fallback, MLA SDPA, 8-expert MoE, Block AttnRes) in a few
-seconds. The GPU train smoke lives in the launcher docs:
+Config build + a forward/backward through the real module tree (KDA
+via fla -- triton on GPU boxes, CPU fallback otherwise -- MLA SDPA,
+8-expert MoE, Block AttnRes) in a few seconds. The GPU train smoke lives in the launcher docs:
 ``--module kimi_k3 --config kimi_linear_debugmodel`` (10 steps).
 """
 
@@ -28,12 +28,17 @@ class TestKimiDebugModel(unittest.TestCase):
         self.assertEqual(kimi.vocab_size, 2016)
         self.assertEqual(kimi.num_experts, 8)
 
-    def test_cpu_forward_backward(self):
+    def test_forward_backward(self):
+        # fla dispatches to triton whenever CUDA is available (even for
+        # CPU tensors), so run on GPU when present and only exercise the
+        # CPU fallback on CUDA-less boxes.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         cfg = config_registry.kimi_linear_debugmodel()
-        model = cfg.model_spec.model.build()
-        model.init_weights()
-        # KDA training path requires chunk mode (seq > 64).
-        tokens = torch.randint(0, 2016, (1, 128))
+        with torch.device(device):
+            model = cfg.model_spec.model.build()
+            model.init_weights()
+            # KDA training path requires chunk mode (seq > 64).
+            tokens = torch.randint(0, 2016, (1, 128))
         logits = model(tokens)
         self.assertEqual(tuple(logits.shape), (1, 128, 2016))
         self.assertTrue(torch.isfinite(logits).all())
