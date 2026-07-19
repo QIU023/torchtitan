@@ -342,13 +342,3 @@ def flavor_names() -> list[str]:
 # ----- Trainer.Config factories ------------------------------------------ #
 # One function per flavor, hand-rolled so the torchtitan ConfigManager
 # can import them by name. Pattern matches attn_res/config_registry.py.
-
-from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.components.validate import Validator
-from torchtitan.config import ActivationCheckpointConfig, TrainingConfig
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.tools.profiling import ProfilingConfig
-from torchtitan.trainer import Trainer

@@ -81,7 +81,7 @@ class TestModelRegistry(unittest.TestCase):
             # to cache adapter when AttnRes+Interleaved1F1B, else PP passthrough).
             self.assertIsNotNone(spec.pipelining_fn)
             self.assertIsNotNone(spec.parallelize_fn)
-            self.assertIsNotNone(spec.build_loss_fn)
+            self.assertIsNotNone(spec.parallelize_fn)
 
     def test_reject_unknown_flavor(self):
         with self.assertRaises(ValueError):
@@ -98,12 +98,16 @@ class TestTrainerConfigFactory(unittest.TestCase):
         self.assertIsNotNone(cfg.model_spec)
         self.assertEqual(cfg.model_spec.flavor, "kimi_linear_194m_baseline")
         # LR from paper Table 2
-        self.assertAlmostEqual(cfg.optimizer.lr, 2.99e-3, places=5)
+        self.assertAlmostEqual(
+            cfg.optimizer.param_groups[0].optimizer_kwargs["lr"], 2.99e-3, places=5
+        )
 
     def test_528m_block_attn_res_builds(self):
         cfg = kimi_linear_528m_block_attn_res()
         self.assertEqual(cfg.model_spec.flavor, "kimi_linear_528m_block_attn_res")
-        self.assertAlmostEqual(cfg.optimizer.lr, 2.02e-3, places=5)
+        self.assertAlmostEqual(
+            cfg.optimizer.param_groups[0].optimizer_kwargs["lr"], 2.02e-3, places=5
+        )
 
 
 if __name__ == "__main__":

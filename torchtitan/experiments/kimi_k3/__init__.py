@@ -740,6 +740,11 @@ def _dense_model_registry(flavor: str) -> ModelSpec:
     The cross-stage caching ``pipelining_fn`` is the same for both because
     it wraps core ``pipeline_llm`` and is agnostic to the model shape.
     """
+    if flavor not in attn_res_configs:
+        raise ValueError(
+            f"Unknown flavor '{flavor}'. Valid dense/DSv3 flavors: "
+            f"{sorted(attn_res_configs)}; Kimi flavors start with 'kimi_linear_'."
+        )
     config = attn_res_configs[flavor]()
     has_moe = any(layer.moe is not None for layer in config.layers)
     if has_moe:

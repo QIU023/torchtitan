@@ -629,9 +629,13 @@ class KimiMoE(nn.Module):
         # just translate Kimi's config knobs into MoE.Config.
         from torchtitan.models.common.feed_forward import FeedForward
         from torchtitan.models.common.linear import Linear
+        from torchtitan.models.common.config_utils import (
+            make_token_dispatcher_config,
+        )
         from torchtitan.models.common.moe import (
             GroupedExperts,
             MoE,
+            RoutedExperts,
             TokenChoiceTopKRouter,
         )
 
@@ -665,7 +669,6 @@ class KimiMoE(nn.Module):
             # on small per-expert batches (typical at LOCAL_BS<=8). Requires
             # PyTorch ≥ 2.5 with grouped_mm support; works on Hopper / Ada /
             # Blackwell; CPU path raises so MoE forward is GPU-only.
-            use_grouped_mm=True,
         )
 
         # Shared experts — Kimi's reference uses KimiMLP at
@@ -693,11 +696,22 @@ class KimiMoE(nn.Module):
                 ),
             )
 
+        # TODO(kimi-parity): upstream removed score_before_experts; Kimi's
+        # reference applies router scores BEFORE the experts. Verify the
+        # fixed upstream ordering against the official 48B ckpt (the
+        # SGLang-side A/B from PR15 is the harness) before training.
         moe_cfg = MoE.Config(
             num_experts=config.num_experts,
-            experts=experts_cfg,
+            routed_experts=RoutedExperts.Config(
+                inner_experts=experts_cfg,
+                token_dispatcher=make_token_dispatcher_config(
+                    num_experts=config.num_experts,
+                    top_k=config.num_experts_per_token,
+                    comm_backend="standard",
+                    hidden_dim=config.hidden_size,
+                ),
+            ),
             router=router_cfg,
-            score_before_experts=True,
             load_balance_coeff=1e-3,
             shared_experts=shared_cfg,
         )

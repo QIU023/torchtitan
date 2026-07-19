@@ -57,16 +57,14 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torchtitan.distributed.tensor_parallel import NoParallel
 
 from torchtitan.config import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import apply_ac
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
-from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
 
 
@@ -75,10 +73,9 @@ def parallelize_kimi_linear(
     *,
     parallel_dims: ParallelDims,
     training: TrainingConfig,
-    model_converters: ModelConvertersContainer.Config,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: ActivationCheckpointConfig,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> nn.Module:
     """Apply the configured parallelism plan to a Kimi Linear model.
@@ -175,30 +172,13 @@ def parallelize_kimi_linear(
             "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
             parallel_dims.ep,
         )
-    if ac_config.mode != "none":
-        # Kimi's decoder layers live at ``model.layers`` as ``nn.ModuleList``,
-        # matching llama3's iteration pattern, so the shared apply_ac
-        # implementation works without a per-module specialization.
-        #
+    if ac_config is not None:
         # Caveat for KDA layers: ``selective`` mode recomputes ops not
-        # marked MUST_SAVE during backward. fla-core's chunk_kda triton
-        # kernel is recomputed (it's not in the SAVE set). This works
-        # but increases the kernel's invocation count by ~2x — if you're
-        # hitting the device-side assert in
-        # ``fla/modules/fused_norm_gate.py`` (KDA crash, see phase5
-        # task #46), AC will trigger it more often. ``full`` mode is
-        # safer if you can spare the extra recompute, since it saves
-        # only the layer-input and recomputes the whole block linearly.
-        apply_ac(
-            model,
-            ac_config,
-            model_compile_enabled=compile_config.enable,
-            base_folder=dump_folder,
-        )
-        logger.info(
-            "Applied activation checkpointing mode=%s to KimiDecoderLayer stack.",
-            ac_config.mode,
-        )
+        # marked MUST_SAVE during backward; fla-core's chunk_kda kernel is
+        # recomputed (~2x invocations). ``full`` mode is safer if you can
+        # spare the recompute (see fla fused_norm_gate crash history).
+        ac_config.build(dump_folder=dump_folder).apply(model)
+        logger.info("Applied activation checkpointing to KimiDecoderLayer stack.")
     # torch.compile applied per-decoder-layer BEFORE FSDP wrap (so each
     # FSDP unit wraps a compiled subgraph). MoE for-loop expert path
     # is NOT compiled (torchtitan upstream has the same carve-out: see

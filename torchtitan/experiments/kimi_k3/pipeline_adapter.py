@@ -1162,7 +1162,7 @@ def _kimi_llm_fqns(
     tweaks there apply to us automatically.
     """
     from torchtitan.distributed.pipeline_parallel import (
-        generate_llm_fqn_per_model_part,
+        _generate_llm_fqn_per_model_part as generate_llm_fqn_per_model_part,
     )
     raw = generate_llm_fqn_per_model_part(
         num_stages, num_layers, input_weight, output_weight

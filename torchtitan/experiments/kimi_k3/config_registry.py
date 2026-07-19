@@ -40,14 +40,14 @@ import torch.nn as nn
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import default_adamw, OptimizersContainer
 from torchtitan.components.validate import Validator
 from torchtitan.config import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.kimi_k3 import model_registry as attn_res_model_registry
 
@@ -63,7 +63,9 @@ from torchtitan.experiments.kimi_k3.model_configs import (  # noqa: F401
     build_kimi_linear_config,
     flavor_names,
     resolve_num_blocks,
+    _alternating_kda_mla_layers,
     SCALING_LAW_TABLE,
+    Variant,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common import (
@@ -82,7 +84,6 @@ from torchtitan.models.llama3.model import Llama3Model, Llama3TransformerBlock
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.tools.profiling import ProfilingConfig
 from torchtitan.trainer import Trainer
 
 
@@ -280,13 +281,12 @@ def llama3_175m_baseline() -> Trainer.Config:
     """
     return Trainer.Config(
         hf_assets_path="./assets/hf/Llama-3.1-8B",
-        profiling=ProfilingConfig(enable_profiling=False),
         metrics=MetricsProcessor.Config(
             enable_tensorboard=True,
             log_freq=10,
         ),
         model_spec=_baseline_model_registry(),
-        optimizer=OptimizersContainer.Config(lr=3e-4),
+        optimizer=default_adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=500,
             decay_ratio=0.8,
@@ -308,7 +308,7 @@ def llama3_175m_baseline() -> Trainer.Config:
             keep_latest_k=2,
             last_save_model_only=False,
         ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        activation_checkpoint=SelectiveAC.Config(),
         validator=Validator.Config(freq=500, steps=50),
     )
 
@@ -540,7 +540,7 @@ def dsv3_attn_res_debugmodel() -> Trainer.Config:
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=attn_res_model_registry("dsv3_debugmodel_attn_res"),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizersContainer.Config(lr=8e-4),
+        optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -556,7 +556,7 @@ def dsv3_attn_res_debugmodel() -> Trainer.Config:
             interval=10,
             last_save_model_only=False,
         ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        activation_checkpoint=SelectiveAC.Config(),
     )
 
 
@@ -574,7 +574,7 @@ def dsv3_attn_res_16b() -> Trainer.Config:
         hf_assets_path="./assets/hf/deepseek-moe-16b-base",
         model_spec=attn_res_model_registry("dsv3_16b_attn_res"),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
-        optimizer=OptimizersContainer.Config(lr=2.2e-4),
+        optimizer=default_adamw(lr=2.2e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             decay_ratio=0.8,
             decay_type="cosine",
@@ -588,10 +588,9 @@ def dsv3_attn_res_16b() -> Trainer.Config:
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="Interleaved1F1B",
             expert_parallel_degree=8,
-            expert_tensor_parallel_degree=1,
         ),
         checkpoint=CheckpointManager.Config(interval=10),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        activation_checkpoint=SelectiveAC.Config(),
         compile=CompileConfig(enable=True, components=["loss"]),
     )
 
@@ -655,12 +654,11 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
     spec = _BY_NAME[size_name]
     return Trainer.Config(
         hf_assets_path="./assets/hf/Llama-3.1-8B",
-        profiling=ProfilingConfig(enable_profiling=False),
         metrics=MetricsProcessor.Config(
             enable_tensorboard=True, log_freq=10,
         ),
         model_spec=None,  # filled in by the per-flavor wrapper
-        optimizer=OptimizersContainer.Config(lr=spec.lr),
+        optimizer=default_adamw(lr=spec.lr),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=500,
             decay_ratio=0.8,
@@ -680,7 +678,7 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
             last_save_model_only=False,
         ),
         # AC off — kimi_linear/parallelize.py Phase 4c doesn't implement it.
-        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
+        activation_checkpoint=None,
         validator=Validator.Config(freq=500, steps=50),
     )
 
@@ -857,32 +855,24 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     dense MLA / projector / output paths; smaller win at the model level
     because KDA Triton + MoE grouped_mm dominate the per-step compute.
     """
-    from torchtitan.components.quantization.float8 import (
-        Float8LinearConverter,
-    )
-    from torchtitan.protocols.model_converter import (
-        ModelConvertersContainer,
-    )
+    from torchtitan.components.quantization import Float8LinearConverter
 
     cfg = kimi_linear_447m_aligned_block_attn_res_n4()
-    cfg.model_converters = ModelConvertersContainer.Config(
-        converters=[
-            Float8LinearConverter.Config(
-                recipe_name="rowwise",
-                filter_fqns=[
-                    "output",
-                    "lm_head",
-                    "router.gate",
-                    "kda",
-                    "mla.q_lora_proj",
-                    "mla.k_lora_proj",
-                    "attn_res_proj",
-                    "mlp_res_proj",
-                    "final_attn_res_proj",
-                ],
-            ),
+    converter = Float8LinearConverter.Config(
+        recipe_name="rowwise",
+        filter_fqns=[
+            "output",
+            "lm_head",
+            "router.gate",
+            "kda",
+            "mla.q_lora_proj",
+            "mla.k_lora_proj",
+            "attn_res_proj",
+            "mlp_res_proj",
+            "final_attn_res_proj",
         ],
     )
+    cfg.model_spec.model = converter.build().convert(cfg.model_spec.model)
     return cfg
 
 
