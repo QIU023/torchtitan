@@ -43,6 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 
 from torchtitan.models.common.linear import Linear as _TTLinear
 
@@ -141,6 +142,12 @@ class KimiLinearConfig:
     moe_layer_freq: int = 1
     use_grouped_topk: bool = True
     num_expert_group: int = 1
+    # Wired by KimiLinearSpec.update_from_config from config.parallelism
+    # BEFORE build; consumed by KimiMoE to populate the upstream
+    # module-internal MoE sharding configs (EP/TP). False = the
+    # previously validated FSDP/PP plain path, untouched.
+    moe_enable_ep: bool = False
+    moe_enable_tp: bool = False
     topk_group: int = 1
 
     # ---- norm / act ----
@@ -715,10 +722,45 @@ class KimiMoE(nn.Module):
             load_balance_coeff=1e-3,
             shared_experts=shared_cfg,
         )
+        if config.moe_enable_ep or config.moe_enable_tp:
+            # Upstream (post-merge) parallelizes MoE module-internally:
+            # sharding configs are declared on the Config BEFORE build,
+            # then _moe.parallelize(parallel_dims) distributes states and
+            # wires the token dispatcher (see parallelize.py). Same
+            # expert-param TP layout as deepseek_v3.
+            import spmd_types as spmd
+
+            from torchtitan.models.common.moe_sharding import (
+                set_moe_sharding_config,
+            )
+
+            set_moe_sharding_config(
+                moe_cfg,
+                enable_ep=config.moe_enable_ep,
+                enable_sp=False,
+                expert_param_layout={
+                    "w1_EFD": spmd.S(1),
+                    "w2_EDF": spmd.S(2),
+                    "w3_EFD": spmd.S(1),
+                },
+            )
         self._moe = moe_cfg.build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._moe(x)
+        out = self._moe(x)
+        if isinstance(out, DTensor):
+            # Module-internal MoE parallelization (EP/TP) emits DTensor
+            # (Partial on the TP axis before reduction). This model's
+            # boundary convention is plain tensors (PP P2P, AttnRes
+            # stacking, fla kernels) -- reduce to Replicate (the required
+            # TP all-reduce) and unwrap. to_local's default grad
+            # placement is the tensor's own Replicate.
+            if any(not p.is_replicate() for p in out.placements):
+                out = out.redistribute(
+                    placements=[Replicate()] * len(out.placements)
+                )
+            out = out.to_local()
+        return out
 
 
 # ----- Decoder layer ------------------------------------------------------- #
@@ -1013,14 +1055,24 @@ class KimiLinearSpec:
         )
 
     def update_from_config(self, *, config, **kwargs) -> None:
-        """No-op: Kimi Linear's NoPE-MLA + KDA are seq-len-agnostic.
+        """Wire parallelism knobs the model must know BEFORE build.
 
         Signature matches ``BaseModel.Config.update_from_config``
         (keyword ``config`` = the Trainer.Config).
 
-        (If a future variant adds RoPE'd MLA, propagate ``training.seq_len``
-        into ``self.kimi_config.rope_theta`` or per-layer rope knobs here.)
+        MoE EP/TP: upstream parallelizes MoE module-internally via
+        sharding configs declared at config-build time; KimiMoE reads
+        these flags when constructing its MoE.Config. Seq-len needs no
+        propagation (NoPE-MLA + KDA are seq-len-agnostic).
         """
+        parallelism = getattr(config, "parallelism", None)
+        if parallelism is not None:
+            self.kimi_config.moe_enable_ep = (
+                parallelism.expert_parallel_degree > 1
+            )
+            self.kimi_config.moe_enable_tp = (
+                parallelism.tensor_parallel_degree > 1
+            )
         return None
 
     def get_nparams_and_flops(

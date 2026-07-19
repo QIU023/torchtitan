@@ -115,7 +115,10 @@ def parallelize_kimi_linear(
         tp_mesh = parallel_dims.get_mesh("tp")
         apply_tp_kimi_linear(
             model, tp_mesh,
-            skip_expert_params=parallel_dims.ep_enabled,
+            skip_expert_params=(
+                parallel_dims.ep_enabled or _model_has_moe(model)
+            ),
+            moe_module_parallel=_model_has_moe(model),
         )
         # Stash the TP mesh on the model so AttnRes top-level forward
         # can DTensor-ify PP-received block tensors when they arrive
@@ -156,7 +159,7 @@ def parallelize_kimi_linear(
             "Track upstream fla-core for ring-KDA support; "
             "until then, run with context_parallel_degree=1."
         )
-    if parallel_dims.ep > 1:
+    if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
         # Phase 6 A6: Expert Parallel for Kimi MoE layers. The
         # KimiMoE module wraps torchtitan.models.common.moe.MoE as
         # self._moe; the expert ModuleList is at self._moe.experts.
@@ -349,10 +352,20 @@ def _patch_fla_for_dtensor() -> None:
     _make_patch(FusedRMSNormGated)
 
 
+def _model_has_moe(model: nn.Module) -> bool:
+    """True if any layer carries a KimiMoE ffn (module-internal MoE
+    parallelization applies)."""
+    return any(
+        bool(getattr(layer, "is_moe", False))
+        for layer in model.layers.values()
+    )
+
+
 def apply_tp_kimi_linear(
     model: nn.Module,
     tp_mesh: DeviceMesh,
     skip_expert_params: bool = False,
+    moe_module_parallel: bool = False,
 ) -> None:
     """Phase 6 A3 TP plan for kimi_linear, modeled on
     ``deepseek_v3/parallelize.py``.
@@ -642,10 +655,20 @@ def apply_tp_kimi_linear(
                 raise ValueError(
                     f"MoE layer {layer.layer_idx}: missing ffn._moe"
                 )
-            # router.gate: NoParallel boundary — gate(plain x) becomes
-            # gate(DTensor x), gate.weight is DTensor, gate forward
-            # produces DTensor, exits as plain via local_output.
-            plan["ffn._moe.router.gate"] = no_par_local
+            if moe_module_parallel:
+                # The post-merge module-internal MoE path owns ALL MoE
+                # parallelization (sharding configs declared at config
+                # build; _moe.parallelize(parallel_dims) distributes
+                # states + wires the dispatcher). Leave every _moe
+                # submodule out of the TP plan.
+                ffn = None
+            if ffn is None:
+                pass
+            else:
+                # router.gate: NoParallel boundary -- gate(plain x) becomes
+                # gate(DTensor x), gate.weight is DTensor, gate forward
+                # produces DTensor, exits as plain via local_output.
+                plan["ffn._moe.router.gate"] = no_par_local
             # experts (GroupedExperts): the forward already to_local's
             # its DTensor params before the grouped_mm kernel call (see
             # moe.py:100-111). Wrapping the module with NoParallel
@@ -659,7 +682,11 @@ def apply_tp_kimi_linear(
             # individually wrapped as no_par_local so it accepts the
             # plain input from MoE.forward (post-to_local at line 410)
             # while keeping its weight as DTensor on tp_mesh.
-            shared = getattr(ffn._moe, "shared_experts", None)
+            shared = (
+                getattr(ffn._moe, "shared_experts", None)
+                if ffn is not None
+                else None
+            )
             if shared is not None:
                 # Treat shared_experts as a small dense MLP. Its forward
                 # is called as ``self.shared_experts(x)`` from MoE; x is
@@ -744,7 +771,12 @@ def apply_tp_kimi_linear(
             ffn = getattr(layer, "ffn", None)
             if ffn is None or getattr(ffn, "_moe", None) is None:
                 continue
-            for p in ffn._moe.routed_experts.inner_experts.parameters():
+            # Exclude the ENTIRE _moe subtree: the module-internal MoE
+            # path (sharding configs + _moe.parallelize) owns every param
+            # under it (gate, shared experts, routed experts), and runs
+            # AFTER this sweep -- a Replicate promotion here would
+            # conflict with the declared shardings.
+            for p in ffn._moe.parameters():
                 expert_param_ids.add(id(p))
     for module in model.modules():
         for name, p in list(module._parameters.items()):
