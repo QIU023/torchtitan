@@ -1012,17 +1012,15 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
     # a single softmax + two einsums, so eager dispatch doesn't lose
     # meaningful compile gains.
     #
-    # We patch in-place at every callsite's bound module — both the
-    # source module (attn_res.attn_res) and importers (kimi_linear's
-    # attn_res_model and the standalone attn_res.model) — because each
-    # ``from .attn_res import block_attn_res`` creates an independent
-    # binding that wouldn't be touched by patching the source module.
+    # We patch in-place at every callsite's bound module -- both the
+    # source module (attn_res) and its importer (attn_res_model) --
+    # because each ``from .attn_res import block_attn_res`` creates an
+    # independent binding that wouldn't be touched by patching the
+    # source module alone.
     from torchtitan.experiments.kimi_k3 import attn_res as _src
-    from torchtitan.experiments.kimi_k3 import dense_model as _llama_attn_res_mod
     from torchtitan.experiments.kimi_k3 import attn_res_model as _kimi_attn_res_mod
     disabled = torch.compiler.disable(_src.block_attn_res, recursive=True)
     _src.block_attn_res = disabled
-    _llama_attn_res_mod.block_attn_res = disabled
     _kimi_attn_res_mod.block_attn_res = disabled
 
     # KDA forward: also opaque to dynamo. Body is all fla-core triton

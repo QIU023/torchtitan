@@ -18,14 +18,12 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from torchtitan.experiments.kimi_k3 import attn_res_configs
 from torchtitan.experiments.kimi_k3.attn_res import (
     AttnResProjection,
     block_attn_res,
     stack_blocks,
     unstack_blocks,
 )
-from torchtitan.experiments.kimi_k3.dense_model import AttnResTransformerBlock  # noqa: F401 -- imported for the direct block test below
 from torchtitan.models.common.nn_modules import RMSNorm
 
 
@@ -175,163 +173,6 @@ class TestStackUnstackBlocks(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(b0.grad)
         self.assertIsNotNone(b1.grad)
-
-
-class TestAttnResModel(unittest.TestCase):
-    """End-to-end tests of a debug-sized AttnResModel.
-
-    Builds the ``debugmodel_attn_res`` config (6 layers / 3 blocks), runs a
-    forward pass on random tokens, and checks the output shape, zero-init of
-    pseudo-queries, backward, and the PP-intermediate-stage tuple return.
-    """
-
-    def _build_model(self):
-        config = attn_res_configs["debugmodel_attn_res"]()
-        model = config.build()
-        model.init_states()
-        return model, config
-
-    def test_build_and_forward(self):
-        model, config = self._build_model()
-        B, T = 2, 16
-        tokens = torch.randint(0, config.vocab_size, (B, T))
-        logits = model(tokens)
-        self.assertEqual(logits.shape, torch.Size([B, T, config.vocab_size]))
-
-    def test_pseudo_queries_are_zero_after_init(self):
-        """All per-layer and final pseudo-queries must be zero right after init_states."""
-        model, _ = self._build_model()
-        for layer in model.layers.values():
-            self.assertTrue(torch.all(layer.attn_res_proj.weight == 0))
-            self.assertTrue(torch.all(layer.mlp_res_proj.weight == 0))
-        self.assertTrue(torch.all(model.final_attn_res_proj.weight == 0))
-
-    def test_forward_backward(self):
-        model, config = self._build_model()
-        B, T = 2, 8
-        tokens = torch.randint(0, config.vocab_size, (B, T))
-        logits = model(tokens)
-        loss = logits.sum()
-        loss.backward()
-        for layer in model.layers.values():
-            self.assertIsNotNone(layer.attn_res_proj.weight.grad)
-            self.assertIsNotNone(layer.mlp_res_proj.weight.grad)
-        self.assertIsNotNone(model.final_attn_res_proj.weight.grad)
-
-    def test_pp_intermediate_stage_returns_tuple(self):
-        """When tok_embeddings / output are pruned (PP middle stage), forward
-        should return (partial_block, stacked_blocks) so PipelineStage can
-        send both tensors to the next stage.
-        """
-        config = attn_res_configs["debugmodel_attn_res"]()
-        model = config.build()
-        model.init_states()
-
-        # Simulate a PP middle stage by stripping embedding/output/norm.
-        model.tok_embeddings = None
-        model.norm = None
-        model.lm_head = None
-
-        B, T, D = 2, 8, config.dim
-        partial = torch.randn(B, T, D)
-        blocks_tensor = torch.randn(1, B, T, D)
-        out = model(partial, blocks=blocks_tensor)
-        self.assertIsInstance(out, tuple)
-        self.assertEqual(len(out), 2)
-        new_partial, new_blocks = out
-        self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
-        self.assertEqual(new_blocks.shape[1:], torch.Size([B, T, D]))
-        # Stage has 6 layers / 3 blocks = 2 layers per block. Every even
-        # layer_id is a block start, so the stage commits blocks at
-        # layer_id = 0, 2, 4 -> 3 new commits added to the initial 1 block.
-        self.assertEqual(new_blocks.shape[0], 4)
-
-    def test_return_only_new_blocks_empty_commit(self):
-        """Under _return_only_new_blocks=True, a stage that spans no
-        is_block_start layer must return a zero-first-dim stacked tensor
-        rather than raising. This unblocks configs where
-        num_virtual_stages > num_blocks (e.g. the Phase-3 8-GPU layout:
-        PP=8, layers_per_stage=1, n_layers=16 -> 16 virtual stages /
-        2 chunks per rank, with N=8 blocks).
-        """
-        config = attn_res_configs["debugmodel_attn_res"]()
-        model = config.build()
-        model.init_states()
-
-        # Simulate a PP middle stage that owns exactly ONE non-block-start
-        # layer (layer_id=1: 1 % 2 != 0, so no commit).
-        model.tok_embeddings = None
-        model.norm = None
-        model.lm_head = None
-        model.layers = nn.ModuleDict({"1": model.layers["1"]})
-        model._return_only_new_blocks = True
-
-        B, T, D = 2, 8, config.dim
-        partial = torch.randn(B, T, D)
-        blocks_tensor = torch.randn(1, B, T, D)
-        out = model(partial, blocks=blocks_tensor)
-        self.assertIsInstance(out, tuple)
-        self.assertEqual(len(out), 2)
-        new_partial, new_blocks = out
-        self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
-        # Key assertion: zero new blocks, but a valid stacked tensor
-        # (shape [0, B, T, D]) so P2P gets a static per-stage shape.
-        self.assertEqual(new_blocks.shape, torch.Size([0, B, T, D]))
-        self.assertEqual(new_blocks.dtype, partial.dtype)
-
-
-class TestAttnResTransformerBlockDirect(unittest.TestCase):
-    """Tests that call ``AttnResTransformerBlock.forward`` directly (not
-    through ``AttnResModel``).
-
-    Since the Llama3-subclass refactor, the block has exactly ONE forward
-    path — ``(blocks, partial_block, is_block_start, ...)
-    -> (blocks, partial_block)``. No fallback-to-standard-residual mode
-    remains. These tests pin that contract so a regression that
-    accidentally re-introduces positional-argument ambiguity is caught.
-    """
-
-    def _first_layer(self):
-        config = attn_res_configs["debugmodel_attn_res"]()
-        model = config.build()
-        model.init_states()
-        layer = model.layers["0"]
-        return layer, config.dim
-
-    def test_direct_forward_returns_blocks_and_partial(self):
-        layer, D = self._first_layer()
-        B, T = 2, 4
-        partial = torch.randn(B, T, D)
-        # Layer 0 is a block start in debugmodel (layers_per_block=2).
-        blocks, new_partial = layer(
-            [],
-            partial,
-            True,  # is_block_start
-            None,  # attention_masks
-            None,  # positions
-        )
-        # After a block start at an empty blocks list, the committed
-        # partial becomes blocks[0]; new_partial is attention+MLP output.
-        self.assertEqual(len(blocks), 1)
-        self.assertEqual(blocks[0].shape, torch.Size([B, T, D]))
-        self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
-
-    def test_direct_forward_non_block_start_keeps_blocks(self):
-        layer, D = self._first_layer()
-        B, T = 2, 4
-        b0 = torch.randn(B, T, D)
-        partial = torch.randn(B, T, D)
-        blocks, new_partial = layer(
-            [b0],
-            partial,
-            False,  # NOT a block start
-            None,
-            None,
-        )
-        # Non-start: blocks list length unchanged.
-        self.assertEqual(len(blocks), 1)
-        self.assertEqual(new_partial.shape, torch.Size([B, T, D]))
-
 
 if __name__ == "__main__":
     unittest.main()

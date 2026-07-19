@@ -1,195 +1,87 @@
-# Block Attention Residuals (AttnRes)
+# Kimi K3 (KDA + MLA + MoE + Block Attention Residuals)
 
-Reference implementation of **Block Attention Residuals** from
-[*Attention Residuals* (Kimi Team, 2026), arXiv:2603.15031](https://arxiv.org/abs/2603.15031),
-inside torchtitan.
+Torchtitan implementation of the **Kimi K3 architecture family**: the
+[Kimi-Linear](https://arxiv.org/pdf/2510.26692) backbone (Kimi Delta
+Attention + MLA + sigmoid-gated MoE) with **Block Attention Residuals**
+([arXiv:2603.15031](https://arxiv.org/abs/2603.15031)) woven in.
+[Kimi K3](https://www.kimi.com/blog/kimi-k3) (2026-07-16) confirmed
+AttnRes + KDA as production architecture components; open weights and the
+tech report are due 2026-07-27, and this experiment's configs will be
+aligned to the official release (structure details currently pending hold
+placeholder interfaces).
 
-> **Status (2026-07-17).** RFC [pytorch/torchtitan#3029](https://github.com/pytorch/torchtitan/issues/3029)
-> was gated by reviewers on the **Kimi K3** release -- that gate is now met:
-> K3 shipped 2026-07-16 with AttnRes + KDA confirmed as core architecture
-> components (weights + tech report due 2026-07-27). A follow-up RFC proposing
-> `experiments/kimi_k3/` is in preparation; until it lands, this fork is the
-> canonical reference implementation. The dense Llama3 A/B evidence (paper
-> Table 1 reproduction) and the cross-stage caching adapter for
-> `Interleaved1F1B` PP (paper §4.1) are both functional and tested here.
-
-## Motivation
-
-Standard residuals `h_{l+1} = h_l + f_l(h_l)` accumulate layer contributions with
-equal weight, causing hidden-state magnitude to grow with depth and diluting
-shallow-layer signal. AttnRes replaces the fixed add with softmax attention over
-previous layer outputs, using a per-layer learned pseudo-query. **Block AttnRes**
-is the practical variant: partition the layer stack into `N` blocks, use standard
-residuals inside each block, attention only at block boundaries — keeping memory
-and cross-stage communication at `O(N d)` instead of `O(L d)`.
-
-Empirically (paper Table 1 / Figure 3) AttnRes ≈ baseline × 1.25 effective
-compute at matched param count, with PP-friendly `N ≈ 8`.
+> **Status (2026-07-18).** RFC
+> [pytorch/torchtitan#3029](https://github.com/pytorch/torchtitan/issues/3029)
+> was gated by reviewers on the Kimi K3 release -- that gate is now met. A
+> follow-up RFC proposing this experiment is in preparation.
 
 ## What's in this folder
 
 | File | Role |
 | --- | --- |
-| [`attn_res.py`](./attn_res.py) | `block_attn_res()` primitive, `AttnResConfig`, `AttnResProjection` (pseudo-query, zero-initialized), `stack_blocks` / `unstack_blocks` |
-| [`model.py`](./model.py) | Kimi K3 backbone: `KimiDeltaAttention` (KDA via `fla-core`), `KimiMLAAttention`, `KimiMoE`, `KimiDecoderLayer`, `KimiLinearModel` |
-| [`attn_res_model.py`](./attn_res_model.py) | `KimiLinearAttnResModel`: AttnRes weave over the Kimi backbone (per-block-start RMSNorm + zero-init pseudo-queries) |
-| [`multimodal_model.py`](./multimodal_model.py) | `KimiLinearMultimodalModel` + `KimiVisionProjector` (SigLIP-splice scaffold) |
-| [`parallelize.py`](./parallelize.py) | `parallelize_kimi_linear`: FSDP2/HSDP + TP + EP for the Kimi backbone (CP blocked on fla-core) |
-| [`dense_model.py`](./dense_model.py) | Dense GQA / DSv3-MoE AttnRes carrier (`AttnResModel`): the unit-test and PP-pressure-test bed |
-| [`model_configs.py`](./model_configs.py) | Architecture-side builders: scaling-law table (194M..528M, 447M-aligned, 48B), `build_kimi_linear_config` |
-| [`config_registry.py`](./config_registry.py) | Trainer configs for all flavor families (dense llama3_*, dsv3_*, kimi_linear_*) |
-| [`__init__.py`](./__init__.py) | Flavor registry + unified `model_registry` dispatch (`kimi_linear_*` -> Kimi backbone; else dense/DSv3 carrier) |
-| [`pipeline_adapter.py`](./pipeline_adapter.py) | Cross-stage caching adapter + `pipelining_fn`s (generic + Kimi wiring). Activates when `TORCHTITAN_ATTNRES_CACHE=1`. |
+| [`model.py`](./model.py) | K3 backbone: `KimiDeltaAttention` (KDA via `fla-core`), `KimiMLAAttention`, `KimiMoE`, `KimiDecoderLayer`, `KimiLinearModel` |
+| [`attn_res_model.py`](./attn_res_model.py) | `KimiLinearAttnResModel`: AttnRes weave over the backbone (per-block-start RMSNorm + zero-init pseudo-queries) |
+| [`attn_res.py`](./attn_res.py) | `block_attn_res()` primitive, `AttnResConfig`, `AttnResProjection`, `stack_blocks` / `unstack_blocks` |
+| [`multimodal_model.py`](./multimodal_model.py) | `KimiLinearMultimodalModel` + `KimiVisionProjector` (SigLIP-splice scaffold for the vision-native path) |
+| [`parallelize.py`](./parallelize.py) | `parallelize_kimi_linear`: FSDP2/HSDP + TP + EP (CP blocked on fla-core `chunk_kda`) |
+| [`pipeline_adapter.py`](./pipeline_adapter.py) | Cross-stage caching adapter + `pipelining_fn` (Interleaved1F1B), private to this experiment. Opt-in via `TORCHTITAN_ATTNRES_CACHE=1`. |
 | [`layout.py`](./layout.py) | Static block-delta layout tables consumed by the PP adapter |
-| [`reference/`](./reference/) | Verbatim HF blueprint (`modeling_kimi.py`, `configuration_kimi.py`) -- not imported |
-| [`tests/`](./tests/) | CPU unit tests. `test_kimi_*` need `fla-core` (GPU box); DSv3 forward tests need CUDA (FlexAttention has no CPU backward). |
-
-### Flavor families
-
-| Family | Attention | FFN | `parallelize_fn` | Flavors |
-| --- | --- | --- | --- | --- |
-| Dense + GQA (Llama3 shape) | GQA | dense SwiGLU | `parallelize_llama` | `debugmodel_attn_res`, `175M_attn_res` (default N=6), `175M_attn_res_n{2,3,4,12}`, `175M_attn_res_L16_n8` |
-| MoE + MLA (DSv3 shape) | MLA (DSv3) | first-N dense + rest MoE | `parallelize_deepseekv3` | `dsv3_debugmodel_attn_res`, `dsv3_16b_attn_res` (default N=9), `dsv3_16b_attn_res_n{3,27}` |
-
-No MoE / MLA code is duplicated under this folder. The MoE module is
-torchtitan's shared `torchtitan.models.common.moe.MoE`, and MLA reuses DSv3's
-own `torchtitan.models.deepseek_v3.model.Attention` class verbatim — via the
-one-way `experiments → core` dependency rule documented in
-`torchtitan/experiments/README.md`.
-
-Core torchtitan files are not modified: `AttnResModel` inherits from the shared
-`Decoder` base in `torchtitan/models/common/decoder.py`, not from any
-model-family-specific class.
+| [`model_configs.py`](./model_configs.py) | Architecture-side builders: AttnRes tech-report Table 2 scaling-law table (194m..528m), the SGLang-aligned 447m carrier, the 48B-A3B layout, `build_kimi_linear_config` |
+| [`config_registry.py`](./config_registry.py) | Trainer configs for every `kimi_linear_<size>_<variant>` flavor (variants: baseline / block_attn_res / full_attn_res; + fp8 rowwise) |
+| [`__init__.py`](./__init__.py) | `model_registry` -> `ModelSpec` (fla-core guarded) |
+| [`tests/`](./tests/) | CPU unit tests: AttnRes primitive, KDA/MLA/MoE layers, AttnRes model, multimodal splice, pipeline-adapter wiring, all-flavor registry sweep |
 
 ## Running
 
 ```bash
-# Unit tests (all flavors, CPU)
+# Unit tests (CPU; KDA falls back to fla-core's CPU path)
 pytest torchtitan/experiments/kimi_k3/tests/ -v
 
-# Dense single-GPU: A/B baseline vs AttnRes at matched shape.
-bash run_train.sh --module kimi_k3 --config llama3_175m_baseline \
-    --training.steps 100
-bash run_train.sh --module kimi_k3 --config llama3_175m_attn_res \
-    --training.steps 100
+# Single-node FSDP, 447M carrier
+bash run_train.sh --module kimi_k3 --config kimi_linear_447m_aligned_block_attn_res_n4     --training.steps 100
 
-# MoE A/B: upstream DSv3 as the baseline (same shape, no AttnRes),
-# this experiment's dsv3_attn_res_16b as the variant.
-bash run_train.sh --module deepseek_v3 --config deepseek_v3_16b \
-    --training.steps 100
-bash run_train.sh --module kimi_k3 --config dsv3_attn_res_16b \
-    --training.steps 100
-
-# 4-GPU PP=4 V=2 with the cross-stage caching adapter.
-# Launchers in the outer logbook:
-#   <logbook>/phase3/launch_4gpu_naive.sh   (PP, no cache)
-#   <logbook>/phase3/launch_4gpu_adapter.sh (PP, with cache adapter)
+# PP with the cross-stage cache adapter
+TORCHTITAN_ATTNRES_CACHE=1 torchrun --nproc_per_node=4 ...     --module kimi_k3 --config kimi_linear_436m_block_attn_res     --parallelism.pipeline_parallel_degree 4     --parallelism.pipeline_parallel_schedule Interleaved1F1B
 ```
+
+Dependencies: `pip install fla-core` (KDA kernels; CPU fallback exists for
+tests, training needs the triton path).
 
 ## Design notes
 
-- **Zero-init pseudo-queries.** Each `AttnResProjection.weight` is
-  zero-initialized so softmax weights are uniform at step 0 and the model is
-  numerically equivalent to standard residuals on the first forward. Training
-  stability depends on this.
-- **FSDP dispatch.** `AttnResTransformerBlock.forward` routes through
-  `__call__` (not `forward_attn_res` directly) when AttnRes kwargs are
-  provided, so FSDP2's pre-forward `all_gather` hook fires on the block unit
-  and AttnRes sub-params unshard before the `rms_norm` mul.
-- **PP intermediate stage.** `AttnResModel.forward` returns
-  `(partial_block, stack_blocks(blocks))` at non-last stages so `PipelineStage`
-  sends both tensors via P2P. The last stage (identified by
-  `self.output is not None`) applies a final cross-block aggregation before
-  `norm` and `output`.
-- **Cross-stage caching adapter.** Producer stages publish each completed
-  block's output once via `_LocalCacheAugment`'s detached-leaf cache; consumer
-  stages on the same rank read it back through a hook + `register_hook` bridge
-  so the second-order backward pass through the cached tensor doesn't double-
-  accumulate gradients into the producer stage.
+- **Zero-init pseudo-queries.** AttnRes projections are zero-initialized so
+  softmax weights are uniform at step 0 and the model is numerically
+  equivalent to standard residuals on the first forward -- also the anchor
+  for grafting AttnRes onto the released Kimi-Linear-48B checkpoint.
+- **PP cross-stage cache adapter.** Producer stages publish each committed
+  block once; consumers on the same rank read it back through a
+  detached-leaf cache + gradient bridge, so backward through cached
+  tensors does not double-accumulate into the producer. Delta mode sends
+  only newly committed blocks.
+- **CP is out of scope**: KDA needs Ulysses-style head sharding or
+  LASP-style cross-rank state passing, neither of which fla-core provides
+  today (same blank as `qwen3_5`).
 
 ## Evidence
 
-Three tracks share this folder.
+Development history, pretraining runs, and PP pressure tests live in the
+companion logbook repo
+[QIU023/torchtitan_attention_residual](https://github.com/QIU023/torchtitan_attention_residual):
 
-### 1. Single-GPU dense correctness — paper Table 1 reproduction
-
-174M Llama3 dense, FSDP, 20 k steps on C4-en, identical hyperparameters; only
-`model_spec` differs:
-
-| step | baseline | attn_res | Δ |
-|---:|---:|---:|---:|
-| 500   | 6.1412 | 6.0146 | −0.1265 |
-| 5000  | 4.3575 | 4.2696 | −0.0879 |
-| 10000 | 4.3235 | 4.2192 | −0.1043 |
-| 15000 | 3.7368 | 3.6861 | −0.0507 |
-
-AttnRes is consistently below baseline at every logged milestone — consistent
-with the paper's "≈ baseline × 1.25 compute" range.
-
-### 2. PP cross-stage caching adapter — 4-GPU PP=4 V=2, 1000 steps
-
-`llama3_175m_attn_res_L16_n8` (16 layers / 8 blocks), `layers_per_stage=2` —
-every stage boundary is a block boundary, so the cache adapter fires at every
-transition.
-
-- `|Δ_naive→adapter|` max **0.06** at step 1000
-- `|Δ_naive→naive|` (seed-vs-seed nondeterminism band) max **0.13**
-- Memory accounting matches design: +260 MB cache on rank 3 for 175M at M=4 mb
-- 41 / 41 CPU unit tests green
-
-What is **not** yet shown:
-
-- ≥ 5 k step PP horizon stability,
-- PP=8 scale-up,
-- AttnRes-vs-baseline delta preservation under PP,
-- the 1.5–2 B PCIe-overhead headline plot.
-
-These are the natural next experiments — gated on multi-node access, not on the
-algorithm or adapter.
-
-### 3. MoE + MLA + AttnRes — two shapes, two roles
-
-There are two MoE+MLA+AttnRes integrations in this fork, on purpose:
-
-**3a. DSv3-shape (`dsv3_*_attn_res`, this folder) — minimal MoE smoke target.**
-The first MoE+MLA+AttnRes integration pass: CPU forward+backward tests pass on
-the debug flavor, and the flavors register cleanly through
-`parallelize_deepseekv3`. Reuses torchtitan's stock MoE module
-(`torchtitan.models.common.moe.MoE`) and DSv3's stock MLA verbatim, so it is
-the smallest possible "MoE + AttnRes runs end-to-end" target — no `fla-core`,
-no KDA, no sigmoid-gated grouped-topk routing. Useful as a regression smoke
-when changing the AttnRes primitive or the cache adapter. Has not been GPU-
-trained; the PP adapter + MoE + EP combo on this shape is still untested.
-
-**3b. Kimi-Linear-shape (sibling the Kimi model files in this folder) —
-end-to-end production-aligned run.**
-KDA + MLA + sigmoid-gated grouped-topk MoE + AttnRes wrapper, with the
-cross-stage cache adapter wired through. Phase 4 ran a 436M FSDP overnight
-baseline + a PP=4 cache-adapter overnight run (both 12,500 steps). This is
-the shape Kimi K3 will almost certainly ship with — the actual evidence that
-MoE + MLA + AttnRes + PP cache adapter trains end-to-end on this hardware
-lives there.
-
-**For Kimi-K3-shape work, start at `model.py` / `attn_res_model.py`.**
-For minimal MoE+AttnRes smoke regression on the AttnRes primitive itself,
-keep using the `dsv3_*_attn_res` flavors in this folder.
-
-## Why this lives here as a "reference implementation"
-
-- The single-GPU evidence (Track 1) reproduces paper Table 1 numbers
-  independently inside torchtitan.
-- The PP adapter (Track 2) is an integration story that's hard to reconstruct
-  from the paper alone — the cache lifecycle and the second-order backward fix
-  are non-obvious.
-- Track 3 (DSv3-shape smoke + Kimi-Linear-shape end-to-end) is the
-  production-aligned shape Kimi will almost certainly ship with K3.
-
-Reviewers on RFC [#3029](https://github.com/pytorch/torchtitan/issues/3029)
-asked to defer upstream merge until K3 lands. Until then, anyone who wants
-AttnRes inside torchtitan can pull this fork instead of re-implementing from
-the paper.
+- **PP adapter numerics**: naive-vs-adapter |dLoss| <= 0.011 across PPxVP
+  shapes up to PP=8 x VP=4 (32 virtual stages), incl. a 48B-layout
+  carrier -- [pressure-test report](https://github.com/QIU023/torchtitan_attention_residual/blob/main/phase3_attnres_pp_integration/PRESSURE_TEST_REPORT_2026-05-12.md).
+- **12.5K-step pretraining** on the 436M/447M shapes --
+  [phase-4 log](https://github.com/QIU023/torchtitan_attention_residual/blob/main/phase4_kimi_attnres_lm_pretrain/README.md).
+- **Dense A/B + adapter test grid**: the Llama3-shape/DSv3-shape AttnRes
+  test carrier (paper Table 1 reproduction; 1460-line PP adapter test
+  grid) was developed here and now lives at
+  [phase3 `dense_carrier/`](https://github.com/QIU023/torchtitan_attention_residual/tree/main/phase3_attnres_pp_integration/dense_carrier)
+  (runnable against fork history <= `666cf7ad6`).
+- **HF reference blueprint** (`modeling_kimi.py`, for correctness diffs):
+  [phase4 `hf_reference/`](https://github.com/QIU023/torchtitan_attention_residual/tree/main/phase4_kimi_attnres_lm_pretrain/hf_reference).
 
 ## Ownership
 
-- Owner: [@QIU023](https://github.com/QIU023) — open issues on the fork repo
-  for technical questions.
+- Owner: [@QIU023](https://github.com/QIU023) -- open issues on the fork
+  repo for technical questions.

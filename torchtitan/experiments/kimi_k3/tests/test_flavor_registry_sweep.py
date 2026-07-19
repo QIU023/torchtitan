@@ -19,12 +19,6 @@ from torchtitan.experiments.kimi_k3 import config_registry
 
 
 class TestFlavorRegistrySweep(unittest.TestCase):
-    def test_every_dense_model_spec_builds(self):
-        for flavor in sorted(kimi_k3.attn_res_configs):
-            with self.subTest(flavor=flavor):
-                spec = kimi_k3.model_registry(flavor)
-                self.assertIsNotNone(spec.parallelize_fn)
-
     def test_every_kimi_model_spec_builds(self):
         for flavor in config_registry.flavor_names():
             with self.subTest(flavor=flavor):
@@ -36,7 +30,7 @@ class TestFlavorRegistrySweep(unittest.TestCase):
             if not (
                 inspect.isfunction(fn)
                 and fn.__module__ == config_registry.__name__
-                and name.startswith(("llama3_", "dsv3_", "kimi_linear_"))
+                and name.startswith("kimi_linear_")
             ):
                 continue
             with self.subTest(flavor=name):
