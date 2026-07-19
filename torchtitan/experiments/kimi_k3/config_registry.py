@@ -336,6 +336,62 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_debugmodel() -> Trainer.Config:
+    """Tiny CI flavor: 4 layers (3 KDA + 1 MLA), d=256, 8 experts,
+    Block AttnRes, 2016-token bundled test tokenizer, c4_test dataset.
+
+    Runs a few-step train smoke in seconds on 1 GPU (or a CPU forward
+    via the fla fallback); meant for CI and quick regression checks,
+    not a training target.
+    """
+    from torchtitan.experiments.kimi_k3 import (
+        KimiLinearSpec,
+        parallelize_kimi_linear,
+        pipeline_kimi_linear_with_cache_adapter,
+    )
+    from torchtitan.experiments.kimi_k3.state_dict_adapter import (
+        KimiLinearStateDictAdapter,
+    )
+    from torchtitan.protocols.model_spec import ModelSpec
+
+    kimi_config = build_kimi_linear_config(
+        "debugmodel", num_experts=8, vocab_size=2016,
+    )
+    spec_config = KimiLinearSpec(
+        kimi_config=kimi_config,
+        num_blocks=resolve_num_blocks("debugmodel", "block_attn_res"),
+    )
+    return Trainer.Config(
+        loss=CrossEntropyLoss.Config(global_vocab_size=2016),
+        hf_assets_path="./tests/assets/tokenizer",
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model_spec=ModelSpec(
+            name="kimi_linear",
+            flavor="kimi_linear_debugmodel",
+            model=spec_config,
+            parallelize_fn=parallelize_kimi_linear,
+            pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+            post_optimizer_build_fn=None,
+            state_dict_adapter=KimiLinearStateDictAdapter,
+        ),
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=2,
+            seq_len=512,
+            steps=10,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        checkpoint=CheckpointManager.Config(interval=100),
+        activation_checkpoint=None,
+    )
+
+
 def kimi_linear_528m_baseline() -> Trainer.Config:
     return _flavor_trainer_config("528m", "baseline")
 

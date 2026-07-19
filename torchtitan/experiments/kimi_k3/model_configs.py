@@ -104,6 +104,14 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
 
 _BY_NAME: dict[str, _SweepSize] = {s.name: s for s in SCALING_LAW_TABLE}
 
+# CI debug size -- NOT a paper row (kept out of SCALING_LAW_TABLE so the
+# table stays verbatim Table 2). 4 layers = 3 KDA + 1 MLA at the default
+# 3:1 ratio; d=256/H=4 -> head_dim 64, kv_lora 128; builds and runs a
+# forward on CPU in seconds with the bundled 2016-token test tokenizer.
+_BY_NAME["debugmodel"] = _SweepSize(
+    "debugmodel", 1, 0.01, 4, 4, 256, 128, 3e-4, 8
+)
+
 
 # ----- 48B-A3B reference (upscale target, kept for docs) ------------------ #
 # Faithful to the HF config.json at moonshotai/Kimi-Linear-48B-A3B-Base.
