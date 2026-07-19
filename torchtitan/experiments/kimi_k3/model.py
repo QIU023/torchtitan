@@ -1219,6 +1219,16 @@ class KimiLinearSpec:
         """
         return self.kimi_config.num_hidden_layers
 
+    @property
+    def dim(self) -> int:
+        """veRL's torchtitan engine matches flavors by (dim, n_layers,
+        vocab_size); expose the Decoder.Config-style names."""
+        return self.kimi_config.hidden_size
+
+    @property
+    def vocab_size(self) -> int:
+        return self.kimi_config.vocab_size
+
     def traverse(self, config_cls, *, recurse: bool = False, _prefix: str = ""):
         """Config-tree leaf: yield nothing.
 

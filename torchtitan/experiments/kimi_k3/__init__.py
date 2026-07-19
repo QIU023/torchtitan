@@ -133,3 +133,11 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )
+
+
+# Flavor-name dict for registry-discovery consumers (veRL's torchtitan
+# engine looks for a module-level ``*_configs`` dict and uses its KEYS
+# with ``model_registry``). Values are unused.
+kimi_linear_configs: dict[str, None] = {
+    name: None for name in flavor_names()
+}
