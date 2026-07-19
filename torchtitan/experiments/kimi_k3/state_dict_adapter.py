@@ -140,6 +140,13 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         num_experts = self.kimi_config.num_experts
 
         for key, value in state_dict.items():
+            # LoRA wrapping renames base weights (q_proj.weight ->
+            # q_proj.base.weight); the HF destination is the original
+            # name, and the value stays a view of the same storage so
+            # the online read path fills the real param in place.
+            key = key.replace(".base.weight", ".weight").replace(
+                ".base.bias", ".bias"
+            )
             if (
                 "attn_res" in key
                 or "mlp_res" in key
