@@ -19,6 +19,7 @@ is private to this experiment by design -- see the AttnRes RFC history.
 """
 
 from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.tools.logging import logger
 
 # fla-core (triton) is required by the KDA path; guard so environments
 # without it (e.g. CPU-only dev boxes) can still import the package and
@@ -95,7 +96,7 @@ def _parse_flavor(flavor: str) -> tuple[str, str]:
     raise ValueError(f"Unknown flavor '{flavor}'.")
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
     """Return a :class:`ModelSpec` for a ``kimi_linear_<size>_<variant>``
     flavor. The ``baseline`` variant disables AttnRes (plain backbone);
     the cache-adapter ``pipelining_fn`` is always wired and passes
@@ -104,6 +105,15 @@ def model_registry(flavor: str) -> ModelSpec:
         raise ImportError(
             "Kimi K3 flavors require fla-core (KDA kernels)."
         ) from _KIMI_IMPORT_ERROR
+    # attn_backend is accepted for registry-interface compatibility
+    # (veRL's torchtitan engine passes it): KDA runs on fla kernels and
+    # MLA on SDPA here, so backend selection does not apply yet.
+    if attn_backend is not None:
+        logger.warning(
+            "kimi_k3.model_registry ignores attn_backend=%r (KDA=fla, "
+            "MLA=SDPA are fixed in this implementation).",
+            attn_backend,
+        )
     size, variant = _parse_flavor(flavor)
     kimi_config = build_kimi_linear_config(size)
     num_blocks = resolve_num_blocks(size, variant)
