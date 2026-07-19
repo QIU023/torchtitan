@@ -220,6 +220,19 @@ def parallelize_kimi_linear(
             edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
         param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
         reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
+        if training.enable_cpu_offload:
+            # FSDP CPUOffloadPolicy streams PARAMETERS to GPU per unit
+            # but leaves buffers where they materialized (CPU) -- the
+            # MoE router's expert_bias_E then meets GPU activations.
+            # Lazily hoist CPU buffers to the compute device on first
+            # forward (no-op afterwards).
+            def _hoist_cpu_buffers(module, args):
+                for m in module.modules():
+                    for bname, buf in list(m.named_buffers(recurse=False)):
+                        if buf is not None and buf.device.type == "cpu":
+                            setattr(m, bname, buf.cuda())
+
+            model.register_forward_pre_hook(_hoist_cpu_buffers)
         apply_fsdp(
             model,
             dp_mesh=dp_mesh,
