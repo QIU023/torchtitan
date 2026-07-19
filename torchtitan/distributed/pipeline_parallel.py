@@ -61,6 +61,19 @@ def _build_get_mesh_callback(
     return _get_mesh
 
 
+# Per-step loss kwargs for PP schedules. torch 2.12 stable's
+# schedule.step() cannot forward loss kwargs to the loss function
+# (nightly-only feature upstream titan relies on); the Trainer stores
+# them here right before step() and _scalar_loss_fn merges them in.
+_step_loss_kwargs: dict = {}
+
+
+def set_step_loss_kwargs(kwargs: dict) -> None:
+    """Set loss kwargs (e.g. global_valid_tokens) for the next PP step()."""
+    _step_loss_kwargs.clear()
+    _step_loss_kwargs.update(kwargs)
+
+
 def pipeline_llm(
     model: nn.Module,
     *,
@@ -273,8 +286,12 @@ def _build_pipeline_schedule(
         )
 
     # Pipeline schedules expect a bare scalar loss tensor.
+    # torch 2.12 stable has no loss_kwargs plumbing in schedule.step()
+    # (upstream titan tracks nightly, where step() forwards them to the
+    # loss); per-step loss kwargs arrive via set_step_loss_kwargs()
+    # instead, which the Trainer calls right before each step().
     def _scalar_loss_fn(*args: object, **kwargs: object) -> torch.Tensor:
-        loss, _ = loss_fn(*args, **kwargs)
+        loss, _ = loss_fn(*args, **{**_step_loss_kwargs, **kwargs})
         return loss
 
     if looped_schedule:

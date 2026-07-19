@@ -708,8 +708,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
 
         if parallel_dims.pp_enabled:
-            # Pipeline Parallel forward / backward inside step() call
-            loss_kwargs = {"global_valid_tokens": global_valid_tokens}
+            # Pipeline Parallel forward / backward inside step() call.
+            # torch 2.12 stable step() has no loss_kwargs parameter
+            # (nightly-only); route per-step loss kwargs through the
+            # pipeline_parallel module holder instead -- anything
+            # unknown to step() would be forwarded to the stage
+            # forward and TypeError there.
+            from torchtitan.distributed.pipeline_parallel import (
+                set_step_loss_kwargs,
+            )
+
+            set_step_loss_kwargs({"global_valid_tokens": global_valid_tokens})
             with self.train_context():
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
@@ -720,7 +729,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         **extra_kwargs,
                         target=targets,
                         losses=losses,
-                        loss_kwargs=loss_kwargs,
                         return_outputs=False,
                     )
                 else:
@@ -728,7 +736,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         **extra_kwargs,
                         target=targets,
                         losses=losses,
-                        loss_kwargs=loss_kwargs,
                         return_outputs=False,
                     )
 

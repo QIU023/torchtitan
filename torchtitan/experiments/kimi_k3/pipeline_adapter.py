@@ -598,7 +598,15 @@ class CrossStageCacheAdapter(nn.Module):
             new_blocks_out.shape[1:]
             if new_blocks_out.shape[0] > 0 else partial_out.shape
         )
-        return partial_out, partial_out.new_zeros((expected_K, *per_block_shape))
+        # requires_grad must mirror the runtime delta emission: torch >= 2.12
+        # derives the downstream recv-buffer and grad-send metadata from the
+        # shape-inference tensors, and a requires_grad=False placeholder makes
+        # the consumer stage drop the delta's backward edge (None grads at
+        # SEND_B -> PipeliningMetadataError).
+        return partial_out, partial_out.new_zeros(
+            (expected_K, *per_block_shape),
+            requires_grad=partial_out.requires_grad,
+        )
 
     def _forward_delta(self, *args, **kwargs):
         """Interleaved1F1B delta forward (spec §4.1).
@@ -1010,7 +1018,7 @@ def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
     import math as _math
     from torch.distributed.pipelining.schedules import PipelineScheduleSingle
     from torchtitan.distributed.pipeline_parallel import (
-        generate_llm_fqn_per_model_part,
+        _generate_llm_fqn_per_model_part as generate_llm_fqn_per_model_part,
         get_schedule_class,
     )
 
