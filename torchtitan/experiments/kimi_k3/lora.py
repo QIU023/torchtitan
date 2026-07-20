@@ -51,6 +51,10 @@ DEFAULT_LORA_TARGETS: tuple[str, ...] = (
     "gate_proj",
     "up_proj",
     "down_proj",
+    # shared experts (common FeedForward leaf naming)
+    "w1",
+    "w2",
+    "w3",
 )
 
 # Params that stay full-param trainable under base-freeze: the AttnRes
@@ -202,3 +206,59 @@ def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         for name, p in model.named_parameters()
         if p.requires_grad
     }
+
+
+_nf4_experts_cls_cache: dict[type, type] = {}
+
+
+def _nf4_experts_subclass(cls: type) -> type:
+    """Subclass with dequant properties over the NF4-packed expert params."""
+    if cls in _nf4_experts_cls_cache:
+        return _nf4_experts_cls_cache[cls]
+
+    def _make_fget(name: str):
+        def fget(self):
+            p = self._parameters[name]
+            t = p.to(torch.bfloat16)
+            return t.view(self._nf4_shapes[name])
+
+        return fget
+
+    sub = type(
+        f"NF4{cls.__name__}",
+        (cls,),
+        {n: property(_make_fget(n)) for n in ("w1_EFD", "w2_EDF", "w3_EFD")},
+    )
+    _nf4_experts_cls_cache[cls] = sub
+    return sub
+
+
+def quantize_grouped_experts_nf4(model: nn.Module) -> int:
+    """Pack every GroupedExperts weight to NF4 (the 48B memory/comms bulk).
+
+    3-D [E, A, B] params pack as a 2-D (E*A, B) NF4 view; a dequant
+    property restores the logical shape at forward time (GroupedExperts
+    reads self.w1_EFD etc. and casts to bf16 anyway). Params stay
+    registered (frozen) so FSDP can shard the packed bytes.
+    """
+    from torchao.dtypes.nf4tensor import to_nf4
+
+    from torchtitan.models.common.moe import GroupedExperts
+
+    num_quantized = 0
+    for m in model.modules():
+        if isinstance(m, GroupedExperts) and not hasattr(m, "_nf4_shapes"):
+            shapes: dict[str, tuple[int, ...]] = {}
+            for name in ("w1_EFD", "w2_EDF", "w3_EFD"):
+                p = m._parameters.get(name)
+                if p is None:
+                    continue
+                shapes[name] = tuple(p.shape)
+                packed = to_nf4(
+                    p.data.reshape(-1, p.shape[-1]).to(torch.bfloat16)
+                )
+                m._parameters[name] = nn.Parameter(packed, requires_grad=False)
+            m._nf4_shapes = shapes
+            m.__class__ = _nf4_experts_subclass(type(m))
+            num_quantized += 1
+    return num_quantized
