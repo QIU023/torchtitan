@@ -285,3 +285,42 @@ def quantize_grouped_experts_nf4(model: nn.Module) -> int:
             m.__class__ = _nf4_experts_subclass(type(m))
             num_quantized += 1
     return num_quantized
+
+
+@torch.no_grad()
+def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Fold LoRA adapters into base weights and return a plain state dict
+    keyed by ORIGINAL param names (no ``.base``/``lora_a``/``lora_b``).
+
+    For each wrapped linear, ``W_merged = W_base + scaling * (B @ A)``.
+    This is the deployable/exportable form: feed it straight to
+    ``KimiLinearStateDictAdapter.to_hf`` to save a trained LoRA back to
+    HF format (the raw adapter drops lora_* keys, so without merge a
+    trained LoRA cannot be exported). NF4-quantized bases are
+    dequantized to bf16 before merge.
+    """
+    # Start from the full state dict (includes tied params like a tied
+    # lm_head and buffers), then overwrite each LoRA slot with its merged
+    # weight and drop the adapter keys.
+    sd = dict(model.state_dict())
+    for mod_name, module in model.named_modules():
+        if not isinstance(module, KimiLoRALinear):
+            continue
+        base_w = module.base.weight
+        if module._quantize_base == "nf4":
+            from torchao.dtypes.nf4tensor import NF4Tensor
+            if isinstance(base_w, NF4Tensor):
+                base_w = base_w.get_original_weight()
+        out_dtype = (
+            base_w.dtype if base_w.dtype != torch.uint8 else torch.bfloat16
+        )
+        # fp32 delta for deployable precision, cast back to base dtype.
+        delta = module._lora_scaling * (
+            module.lora_b.float() @ module.lora_a.float()
+        )
+        sd[f"{mod_name}.weight"] = (
+            (base_w.float() + delta).to(out_dtype).contiguous()
+        )
+        for suffix in (".base.weight", ".base.bias", ".lora_a", ".lora_b"):
+            sd.pop(f"{mod_name}{suffix}", None)
+    return sd
