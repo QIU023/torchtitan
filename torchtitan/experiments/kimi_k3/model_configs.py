@@ -100,6 +100,13 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     # 400B mid-train; "global batch size of 8M tokens" → 8M/4096
     # context = 1953 seqs ≈ 2048).
     _SweepSize("48b", 3000, 1400.0, 27, 32, 2304, 1024, 1.0e-3, 2048),
+    # PROVISIONAL K3 2.8T-A50B target (blog: 2.8T total / A50B active,
+    # 896 experts / 16 active). Layer count + d_model are PLACEHOLDERS
+    # pending the 7.27 config: chosen to land near ~2.8T params with 896
+    # experts (61 layers x d=7168 x 896 experts, moe_ff=2048). This row
+    # exists ONLY for config-level construction + EP@896 mesh validation
+    # (nobody single-node-trains 2.8T); numbers reconcile at 7.27.
+    _SweepSize("2p8t", 50000, 1400.0, 61, 64, 7168, 2048, 4.0e-4, 4096),
 )
 
 _BY_NAME: dict[str, _SweepSize] = {s.name: s for s in SCALING_LAW_TABLE}
@@ -185,7 +192,12 @@ def build_kimi_linear_config(
 
     # Size-specific defaults that differ between scaling-law sweep and
     # full 48B-A3B. Each is overridable from the kwargs above.
-    if size == "48b":
+    if size == "2p8t":
+        num_experts_default = 896       # K3 blog
+        tie_default = False
+        dense_d_ff_default = 18432      # scaled with d_model
+        use_grouped_topk_default = True
+    elif size == "48b":
         num_experts_default = 256
         tie_default = False
         dense_d_ff_default = 9216  # HF config.json:intermediate_size
@@ -274,7 +286,7 @@ def build_kimi_linear_config(
         full_attn_layers=list(full_attn_layers),
         # MoE
         num_experts=num_experts,
-        num_experts_per_token=8,
+        num_experts_per_token=(16 if size == "2p8t" else 8),
         moe_intermediate_size=spec.d_ff,
         moe_renormalize=True,
         moe_router_activation_func="sigmoid",

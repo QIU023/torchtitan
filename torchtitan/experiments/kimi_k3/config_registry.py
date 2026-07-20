@@ -430,6 +430,15 @@ def kimi_linear_debugmodel() -> Trainer.Config:
     )
 
 
+def kimi_linear_2p8t_block_attn_res() -> Trainer.Config:
+    """PROVISIONAL K3 2.8T-A50B flavor (896 experts / 16 active, Block
+    AttnRes). Config-level construction target only -- multi-node + EP
+    to materialize; dims are placeholders pending the 7.27 config. Used
+    for the 'scale-out is config-level' claim and EP@896 mesh checks.
+    """
+    return _flavor_trainer_config("2p8t", "block_attn_res")
+
+
 def kimi_linear_528m_baseline() -> Trainer.Config:
     return _flavor_trainer_config("528m", "baseline")
 
