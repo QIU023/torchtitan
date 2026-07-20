@@ -49,9 +49,12 @@ class TestGatedMLA(unittest.TestCase):
         with torch.no_grad():
             lp = plain(tok).float()
             lg = gated(tok).float()
-        # near-identity: within the sigmoid(6) gate-leak band, NOT bitwise.
-        self.assertLess((lp - lg).abs().max().item(), 1e-2)
-        self.assertGreater((lp - lg).abs().max().item(), 0.0)
+        # near-identity: relative (scale-invariant) is robust to
+        # random-init amplification; the sigmoid(6) gate leak keeps it
+        # small but NON-zero (not bit-exact, unlike the alpha gate).
+        rel = ((lp - lg).norm() / lp.norm()).item()
+        self.assertLess(rel, 2e-2)
+        self.assertGreater(rel, 0.0)
         # gate trains
         gated.train()
         gated(tok).float().sum().backward()
