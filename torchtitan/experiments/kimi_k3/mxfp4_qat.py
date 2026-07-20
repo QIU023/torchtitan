@@ -44,6 +44,12 @@ def _fake_quant_mx(t: torch.Tensor, elem_dtype, block_size: int) -> torch.Tensor
     q = MXTensor.to_mx(
         t.contiguous().to(torch.bfloat16), elem_dtype=elem_dtype, block_size=block_size
     ).dequantize()
+    # Emulated MX can overflow E2M1/E4M3 range on out-of-distribution
+    # values (real QAT weights train in-range; random-init or exploding
+    # activations do not). Never emit non-finite: fall back to the
+    # high-precision value elementwise where quant blew up.
+    q = q.to(t.dtype)
+    q = torch.where(torch.isfinite(q), q, t)
     # STE: forward q, backward identity through t.
     return t + (q - t).detach()
 
