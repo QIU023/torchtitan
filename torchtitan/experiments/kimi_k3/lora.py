@@ -94,12 +94,21 @@ class KimiLoRALinear(nn.Module):
             # unquantized gated graft; QLoRA trades exactness for a ~4x
             # cut in memory AND (on comms-bound fabrics) in FSDP
             # all-gather traffic.
+            #
+            # torchao NF4 double-quant requires numel divisible by
+            # block_size(64) * scaler_block_size(256) = 16384. Dims that
+            # don't divide are left in bf16 (a real torchao constraint,
+            # not all model dims are NF4-friendly). _nf4_ok reports it.
             from torchao.dtypes.nf4tensor import to_nf4
 
-            self.base.weight = nn.Parameter(
-                to_nf4(self.base.weight.data.to(torch.bfloat16)),
-                requires_grad=False,
-            )
+            self._nf4_ok = self.base.weight.numel() % 16384 == 0
+            if self._nf4_ok:
+                self.base.weight = nn.Parameter(
+                    to_nf4(self.base.weight.data.to(torch.bfloat16)),
+                    requires_grad=False,
+                )
+            else:
+                self._quantize_base = None  # fell back to bf16
         elif quantize_base is not None:
             raise ValueError(f"Unsupported quantize_base={quantize_base!r}")
         if self.base.bias is not None:
