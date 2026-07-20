@@ -20,12 +20,12 @@ import torch
 
 @unittest.skipIf(not torch.cuda.is_available(), "build needs CUDA (fla)")
 class TestLoRAMerge(unittest.TestCase):
-    def _lora_model(self, quantize=None):
+    def _lora_model(self, quantize=None, mla_only=False):
         # Real QLoRA order: build+init a plain backbone, THEN wrap/quantize
         # (quantizing a loaded weight, not init'ing over an NF4 tensor).
         from torchtitan.experiments.kimi_k3.lora import apply_lora
 
-        spec = self._spec_plain()
+        spec = self._spec_plain(mla_only=mla_only)
         with torch.device("cuda"):
             m = spec.build()
             m.init_weights()
@@ -36,11 +36,21 @@ class TestLoRAMerge(unittest.TestCase):
                 p.data.normal_(0, 0.02)  # trained-like adapter
         return m
 
-    def _spec_plain(self):
+    def _spec_plain(self, mla_only=False):
+        import dataclasses
+
         from torchtitan.experiments.kimi_k3 import config_registry
         from torchtitan.experiments.kimi_k3.model import KimiLinearSpec
 
         kc = config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
+        if mla_only:
+            # All-MLA: KDA kernels are nondeterministic at debug scale and
+            # can NaN under accumulated cross-test GPU state; forward-
+            # executing tests use the deterministic MLA path.
+            n = kc.num_hidden_layers
+            kc = dataclasses.replace(
+                kc, kda_layers=[], full_attn_layers=list(range(1, n + 1))
+            )
         return KimiLinearSpec(kimi_config=kc, num_blocks=None)
 
     def test_merge_tensor_math_and_key_space(self):
@@ -93,6 +103,45 @@ class TestLoRAMerge(unittest.TestCase):
         self.assertFalse(
             any(isinstance(v, NF4Tensor) for v in merged.values())
         )
+
+    def test_post_load_quantize_hook(self):
+        # The trainer order: build+load bf16, THEN quantize (not at
+        # build over init noise / meta storage).
+        from torchao.dtypes.nf4tensor import NF4Tensor
+
+        from torchtitan.experiments.kimi_k3.lora import (
+            KimiLoRALinear,
+            quantize_lora_bases,
+        )
+
+        # all-MLA: this test runs a forward (deterministic MLA path)
+        m = self._lora_model(mla_only=True)  # bf16 bases, loaded-like
+        # a reference: one alignable base weight, pre-quantization
+        ref = None
+        for module in m.modules():
+            if (
+                isinstance(module, KimiLoRALinear)
+                and module.base.weight.numel() % 16384 == 0
+            ):
+                ref = (module, module.base.weight.detach().float().clone())
+                break
+        self.assertIsNotNone(ref, "need >=1 NF4-alignable base for this test")
+
+        packed = quantize_lora_bases(m, experts=False)
+        self.assertGreater(packed, 0)
+        module, ref_w = ref
+        self.assertIsInstance(module.base.weight, NF4Tensor)
+        # dequant tracks the loaded weight within NF4 error (not init noise)
+        deq = module.base.weight.get_original_weight().float()
+        self.assertLess(
+            (deq - ref_w).norm().item() / ref_w.norm().item(), 0.15
+        )
+        # idempotent: second call packs nothing new, no error
+        self.assertEqual(quantize_lora_bases(m, experts=False), packed)
+        # forward still runs through the NF4 base path
+        tok = torch.randint(0, 2016, (1, 96), device="cuda")
+        with torch.no_grad():
+            m(tok)
 
 
 if __name__ == "__main__":

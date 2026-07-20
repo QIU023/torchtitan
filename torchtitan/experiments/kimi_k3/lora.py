@@ -87,39 +87,24 @@ class KimiLoRALinear(nn.Module):
         assert rank > 0
         self.base = base
         self.base.weight.requires_grad_(False)
-        self._quantize_base = quantize_base
+        self._quantize_base = None
         if quantize_base == "nf4":
-            # QLoRA: pack the frozen base to NF4 (torchao). Lossy by
-            # design -- the step-0 identity anchor holds only for the
-            # unquantized gated graft; QLoRA trades exactness for a ~4x
-            # cut in memory AND (on comms-bound fabrics) in FSDP
-            # all-gather traffic.
-            #
-            # torchao NF4 double-quant requires numel divisible by
-            # block_size(64) * scaler_block_size(256) = 16384. Dims that
-            # don't divide are left in bf16 (a real torchao constraint,
-            # not all model dims are NF4-friendly). _nf4_ok reports it.
-            from torchao.dtypes.nf4tensor import to_nf4
-
-            self._nf4_ok = self.base.weight.numel() % 16384 == 0
-            if self._nf4_ok:
-                self.base.weight = nn.Parameter(
-                    to_nf4(self.base.weight.data.to(torch.bfloat16)),
-                    requires_grad=False,
-                )
-            else:
-                self._quantize_base = None  # fell back to bf16
+            self.quantize_base_nf4()
         elif quantize_base is not None:
             raise ValueError(f"Unsupported quantize_base={quantize_base!r}")
         if self.base.bias is not None:
             self.base.bias.requires_grad_(False)
         self._lora_scaling = alpha / rank
         dev = base.weight.device
+        # Adapters match the base compute dtype (NF4Tensor.dtype reports
+        # its bf16 logical dtype); otherwise a bf16 base + fp32 adapter
+        # mismatches in the forward matmul.
+        pdtype = base.weight.dtype
         self.lora_a = nn.Parameter(
-            torch.empty(rank, base.in_features, device=dev)
+            torch.empty(rank, base.in_features, device=dev, dtype=pdtype)
         )
         self.lora_b = nn.Parameter(
-            torch.empty(base.out_features, rank, device=dev)
+            torch.empty(base.out_features, rank, device=dev, dtype=pdtype)
         )
         self.reset_parameters()
 
@@ -127,6 +112,38 @@ class KimiLoRALinear(nn.Module):
         if self.lora_a.device.type != "meta":
             nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
             nn.init.zeros_(self.lora_b)
+
+    @torch.no_grad()
+    def quantize_base_nf4(self) -> bool:
+        """Pack the frozen base to NF4 (torchao). Idempotent.
+
+        QLoRA is lossy by design -- the step-0 identity anchor holds
+        only for the unquantized gated graft; QLoRA trades exactness for
+        a ~4x cut in memory AND (on comms-bound fabrics) in FSDP
+        all-gather traffic. Callable at build (over default weights) or
+        post-load (over checkpoint weights) -- the latter is the correct
+        trainer order, so real weights, not init noise, get quantized.
+
+        torchao NF4 double-quant requires numel divisible by
+        block_size(64) * scaler_block_size(256) = 16384. Dims that don't
+        divide are left in bf16 (a real torchao constraint, not all
+        model dims are NF4-friendly); returns False in that case.
+        """
+        from torchao.dtypes.nf4tensor import NF4Tensor, to_nf4
+
+        if isinstance(self.base.weight, NF4Tensor):
+            self._quantize_base = "nf4"
+            return True  # already packed
+        self._nf4_ok = self.base.weight.numel() % 16384 == 0
+        if not self._nf4_ok:
+            self._quantize_base = None  # leave bf16
+            return False
+        self.base.weight = nn.Parameter(
+            to_nf4(self.base.weight.data.to(torch.bfloat16)),
+            requires_grad=False,
+        )
+        self._quantize_base = "nf4"
+        return True
 
     @property
     def in_features(self) -> int:
@@ -285,6 +302,28 @@ def quantize_grouped_experts_nf4(model: nn.Module) -> int:
             m.__class__ = _nf4_experts_subclass(type(m))
             num_quantized += 1
     return num_quantized
+
+
+def quantize_lora_bases(model: nn.Module, *, experts: bool = True) -> int:
+    """Post-load QLoRA hook: NF4-pack every LoRA base after weights load.
+
+    The titan trainer's meta-first flow builds, then materializes real
+    weights (init or checkpoint), THEN should quantize -- packing at
+    build time (KimiLoRALinear(quantize_base='nf4')) quantizes init
+    noise / meta storage, not the loaded checkpoint, and breaks
+    ``init_weights`` (normal_ over an NF4Tensor). Call this AFTER load
+    and BEFORE fully_shard so FSDP shards the packed bytes. Idempotent;
+    returns the number of bases packed (wrapped linears + grouped
+    experts when ``experts``). Non-alignable dims stay bf16 (see
+    ``quantize_base_nf4``).
+    """
+    packed = 0
+    for module in model.modules():
+        if isinstance(module, KimiLoRALinear) and module.quantize_base_nf4():
+            packed += 1
+    if experts:
+        packed += quantize_grouped_experts_nf4(model)
+    return packed
 
 
 @torch.no_grad()
