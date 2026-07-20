@@ -218,8 +218,17 @@ def _nf4_experts_subclass(cls: type) -> type:
 
     def _make_fget(name: str):
         def fget(self):
-            p = self._parameters[name]
-            t = p.to(torch.bfloat16)
+            from torch.distributed.tensor import DTensor
+            from torchao.dtypes.nf4tensor import NF4Tensor
+
+            t = self._parameters[name + "_nf4"]
+            if isinstance(t, DTensor):
+                # Pre-unshard access (outside FSDP's forward window):
+                # gather explicitly. During forward FSDP2 exposes the
+                # plain unsharded NF4.
+                t = t.full_tensor()
+            if isinstance(t, NF4Tensor):
+                t = t.get_original_weight()
             return t.view(self._nf4_shapes[name])
 
         return fget
@@ -257,7 +266,12 @@ def quantize_grouped_experts_nf4(model: nn.Module) -> int:
                 packed = to_nf4(
                     p.data.reshape(-1, p.shape[-1]).to(torch.bfloat16)
                 )
-                m._parameters[name] = nn.Parameter(packed, requires_grad=False)
+                # Store under a distinct name: the logical name becomes
+                # a dequant property, and FSDP shards the packed param.
+                del m._parameters[name]
+                m.register_parameter(
+                    name + "_nf4", nn.Parameter(packed, requires_grad=False)
+                )
             m._nf4_shapes = shapes
             m.__class__ = _nf4_experts_subclass(type(m))
             num_quantized += 1
