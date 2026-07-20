@@ -336,6 +336,22 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_debugmodel_k3faithful() -> Trainer.Config:
+    """Debug flavor with the K3-faithful architecture deltas ON:
+    Gated MLA + alpha-graft Block AttnRes. CI-scale proof that the K3
+    architecture (beyond the plain kimi_linear backbone) trains through
+    the real trainer. MXFP4 QAT + Per-Head Muon are applied via their
+    module/optimizer hooks (not config flags), see mxfp4_qat.py / muon.py.
+    """
+    import dataclasses as _dc
+    cfg = kimi_linear_debugmodel()
+    cfg.model_spec.flavor = "kimi_linear_debugmodel_k3faithful"
+    m = cfg.model_spec.model
+    m.kimi_config = _dc.replace(m.kimi_config, mla_gated=True)  # Gated MLA
+    m.attn_res_gated = True                                     # alpha graft
+    return cfg
+
+
 def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
     """Debug flavor with the full post-train graft stack: alpha-gated
     Block AttnRes + LoRA rank-8 (frozen base, alpha-fullparam
