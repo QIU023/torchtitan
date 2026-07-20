@@ -72,19 +72,41 @@ class KimiLoRALinear(nn.Module):
     ``KimiLinearModel.init_weights`` by class name.
     """
 
-    def __init__(self, base: nn.Linear, rank: int, alpha: float) -> None:
+    def __init__(
+        self,
+        base: nn.Linear,
+        rank: int,
+        alpha: float,
+        quantize_base: str | None = None,
+    ) -> None:
         super().__init__()
         assert rank > 0
         self.base = base
         self.base.weight.requires_grad_(False)
+        self._quantize_base = quantize_base
+        if quantize_base == "nf4":
+            # QLoRA: pack the frozen base to NF4 (torchao). Lossy by
+            # design -- the step-0 identity anchor holds only for the
+            # unquantized gated graft; QLoRA trades exactness for a ~4x
+            # cut in memory AND (on comms-bound fabrics) in FSDP
+            # all-gather traffic.
+            from torchao.dtypes.nf4tensor import to_nf4
+
+            self.base.weight = nn.Parameter(
+                to_nf4(self.base.weight.data.to(torch.bfloat16)),
+                requires_grad=False,
+            )
+        elif quantize_base is not None:
+            raise ValueError(f"Unsupported quantize_base={quantize_base!r}")
         if self.base.bias is not None:
             self.base.bias.requires_grad_(False)
         self._lora_scaling = alpha / rank
+        dev = base.weight.device
         self.lora_a = nn.Parameter(
-            torch.empty(rank, base.in_features)
+            torch.empty(rank, base.in_features, device=dev)
         )
         self.lora_b = nn.Parameter(
-            torch.empty(base.out_features, rank)
+            torch.empty(base.out_features, rank, device=dev)
         )
         self.reset_parameters()
 
@@ -102,7 +124,12 @@ class KimiLoRALinear(nn.Module):
         return self.base.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = self.base(x)
+        if self._quantize_base == "nf4":
+            from torchao.dtypes.nf4tensor import linear_nf4
+
+            base_out = linear_nf4(x, self.base.weight)
+        else:
+            base_out = self.base(x)
         lora_out = F.linear(F.linear(x, self.lora_a), self.lora_b)
         return base_out + self._lora_scaling * lora_out
 
@@ -114,6 +141,7 @@ def apply_lora(
     alpha: float,
     targets: tuple[str, ...] = DEFAULT_LORA_TARGETS,
     freeze_base: bool = True,
+    quantize_base: str | None = None,
 ) -> int:
     """Swap target Linears for LoRA wrappers; optionally freeze the base.
 
@@ -133,7 +161,12 @@ def apply_lora(
                 setattr(
                     module,
                     child_name,
-                    KimiLoRALinear(child, rank=rank, alpha=alpha),
+                    KimiLoRALinear(
+                        child,
+                        rank=rank,
+                        alpha=alpha,
+                        quantize_base=quantize_base,
+                    ),
                 )
                 num_wrapped += 1
     if num_wrapped == 0:
