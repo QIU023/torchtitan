@@ -119,6 +119,11 @@ class KimiLinearConfig:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     mla_use_nope: bool = True
+    # Gated MLA (K3 delta): sigmoid output gate, near-identity init so a
+    # non-gated-MLA-pretrained checkpoint's function is ~preserved at
+    # step 0 (graft-viable per PLAN 0a #4). PROVISIONAL: exact gate form
+    # reconciles at 7.27. Off by default (plain MLA = validated path).
+    mla_gated: bool = False
     rope_theta: float = 10000.0
 
     # ---- KDA (linear-attn layers) ----
@@ -313,6 +318,16 @@ class KimiMLAAttention(nn.Module):
             self.num_heads * self.v_head_dim, self.hidden_size, bias=False
         )
 
+        # Gated MLA (K3 delta, provisional): per-head sigmoid gate on the
+        # attention output before o_proj. Near-identity init: the gate
+        # projection is zero-init and a +LARGE bias makes sigmoid(.)~=1,
+        # so at step 0 gated_out ~= plain attn_out (graft-preserving).
+        self.mla_gated = config.mla_gated
+        if self.mla_gated:
+            self.attn_gate_proj = Linear(
+                self.hidden_size, self.num_heads, bias=True
+            )
+
         # SDPA-only sub-module so the TP plan can wrap it with
         # use_local_output=True (DSv3 pattern). Has no parameters.
         self.inner_attention = KimiMLAInnerAttention()
@@ -377,7 +392,12 @@ class KimiMLAAttention(nn.Module):
             q_full, k_full, v, scale=self.scaling,
         )  # (B, H, T, v_head_dim)
 
-        attn_out = attn_out.transpose(1, 2).reshape(B, T, -1)
+        attn_out = attn_out.transpose(1, 2)  # (B, T, H, Dv)
+        if self.mla_gated:
+            # Per-head sigmoid gate from x; near-identity at init.
+            gate = torch.sigmoid(self.attn_gate_proj(x))  # (B, T, H)
+            attn_out = attn_out * gate.unsqueeze(-1)
+        attn_out = attn_out.reshape(B, T, -1)
         return self.o_proj(attn_out)
 
 
@@ -994,6 +1014,13 @@ class KimiLinearModel(nn.Module):
                 attn.A_log.data.uniform_(1.0, 16.0).log_()
             if hasattr(attn, "dt_bias"):
                 nn.init.zeros_(attn.dt_bias)
+            # Gated MLA near-identity init: zero the gate projection
+            # weight and set a large positive bias so sigmoid(gate)~=1
+            # at step 0 (gated_out ~= plain attn_out; graft-preserving).
+            gate_proj = getattr(attn, "attn_gate_proj", None)
+            if gate_proj is not None:
+                nn.init.zeros_(gate_proj.weight)
+                nn.init.constant_(gate_proj.bias, 6.0)  # sigmoid(6)=0.9975
 
         # Pass 3: torchtitan MoE — GroupedExperts holds raw [E, ...]
         # parameter tensors (not nn.Linear), and MoE/router carry
@@ -1056,6 +1083,7 @@ class KimiLinearSpec:
     # (alpha-fullparam exception).
     lora_rank: int | None = None
     lora_alpha: float = 16.0
+    lora_quantize_base: str | None = None  # 'nf4' => QLoRA
 
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
@@ -1074,7 +1102,8 @@ class KimiLinearSpec:
             from torchtitan.experiments.kimi_k3.lora import apply_lora
 
             apply_lora(
-                model, rank=self.lora_rank, alpha=self.lora_alpha
+                model, rank=self.lora_rank, alpha=self.lora_alpha,
+                quantize_base=self.lora_quantize_base,
             )
         return model
 
