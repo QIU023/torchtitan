@@ -62,6 +62,11 @@ class TestKimiLoRA(unittest.TestCase):
                 shared[k2] = v
         self.assertEqual(set(shared), set(bsd))
         base.load_state_dict(shared, strict=True)
+        # apply_lora keeps the frozen base bf16-resident; outside the
+        # trainer there is no mp_policy to unify compute dtype, so cast
+        # both models to bf16 to compare the actual compute graph.
+        lora.to(torch.bfloat16)
+        base.to(torch.bfloat16)
         g = torch.Generator().manual_seed(0)
         tokens = torch.randint(0, 2016, (2, 128), generator=g).to(_device())
         lora.eval()
@@ -78,6 +83,10 @@ class TestKimiLoRA(unittest.TestCase):
                 lora_rank=8,
             )
         )
+        # Unify compute dtype (the trainer's mp_policy does this in the
+        # real path; unwrapped bf16 frozen base vs fp32 adapters would
+        # dtype-clash otherwise).
+        model.to(torch.bfloat16)
         g = torch.Generator().manual_seed(0)
         tokens = torch.randint(0, 2016, (2, 128), generator=g).to(_device())
         model(tokens).sum().backward()

@@ -148,6 +148,13 @@ def apply_lora(
             if any(m in name for m in _FULLPARAM_EXCEPTION_MARKERS):
                 continue
             p.requires_grad_(False)
+            # Frozen params need no fp32 master copy: keep them bf16
+            # resident. At 48B this is the difference between 12 GiB/card
+            # sharded (fast, no offload) and 24.6 GiB fp32 shards that
+            # force CPU offload (~5 min/step over PCIe). HF checkpoints
+            # are bf16, so the load path is dtype-exact too.
+            if p.dtype == torch.float32:
+                p.data = p.data.to(torch.bfloat16)
     return num_wrapped
 
 
