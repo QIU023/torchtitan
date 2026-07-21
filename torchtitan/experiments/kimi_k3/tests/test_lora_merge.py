@@ -36,6 +36,26 @@ class TestLoRAMerge(unittest.TestCase):
                 p.data.normal_(0, 0.02)  # trained-like adapter
         return m
 
+    def _graft_lora_model(self):
+        # AttnRes-graft (alpha gate) + LoRA -- the 48B post-training flavor:
+        # base frozen, LoRA adapters + graft params (alpha-fullparam
+        # exception) train. This is what the real 48B LoRA run exercised.
+        from torchtitan.experiments.kimi_k3 import config_registry
+        from torchtitan.experiments.kimi_k3.lora import apply_lora
+        from torchtitan.experiments.kimi_k3.model import KimiLinearSpec
+
+        kc = config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
+        spec = KimiLinearSpec(kimi_config=kc, num_blocks=2, attn_res_gated=True)
+        with torch.device("cuda"):
+            m = spec.build()
+            m.init_weights()
+        m = m.to(torch.bfloat16)
+        apply_lora(m, rank=8, alpha=16)
+        for n, p in m.named_parameters():
+            if n.endswith("lora_b"):
+                p.data.normal_(0, 0.02)
+        return spec, m
+
     def _spec_plain(self, mla_only=False):
         import dataclasses
 
@@ -142,6 +162,65 @@ class TestLoRAMerge(unittest.TestCase):
         tok = torch.randint(0, 2016, (1, 96), device="cuda")
         with torch.no_grad():
             m(tok)
+
+    def test_graft_lora_compose_merge_and_export(self):
+        # The 48B post-training composition: AttnRes graft + LoRA. Locks
+        # (1) trainable set = LoRA + graft, base frozen; (2) merge folds
+        # LoRA and CARRIES THE GRAFT params through unchanged; (3) to_hf
+        # drops both graft and lora keys, leaving a clean base HF export.
+        from torchtitan.experiments.kimi_k3.lora import (
+            KimiLoRALinear,
+            merge_lora_state_dict,
+        )
+        from torchtitan.experiments.kimi_k3.state_dict_adapter import (
+            KimiLinearStateDictAdapter,
+        )
+
+        spec, m = self._graft_lora_model()
+        graft = "attn_res", "mlp_res"
+        train = {n for n, p in m.named_parameters() if p.requires_grad}
+        # every trainable is either a LoRA adapter or a graft param
+        for n in train:
+            self.assertTrue(
+                n.endswith("lora_a")
+                or n.endswith("lora_b")
+                or any(g in n for g in graft),
+                f"unexpected trainable param {n}",
+            )
+        self.assertTrue(any(any(g in n for g in graft) for n in train))
+        self.assertTrue(any(n.endswith("lora_b") for n in train))
+
+        merged = merge_lora_state_dict(m)
+        self.assertFalse(any("lora_a" in k or "lora_b" in k for k in merged))
+        self.assertFalse(any(".base." in k for k in merged))
+        # graft params survive the merge unchanged (carried as non-LoRA)
+        graft_keys = [n for n in train if any(g in n for g in graft)]
+        for gk in graft_keys:
+            self.assertIn(gk, merged)
+        # one wrapped linear merged correctly
+        for mod_name, module in m.named_modules():
+            if isinstance(module, KimiLoRALinear):
+                expect = (
+                    module.base.weight.float()
+                    + module._lora_scaling
+                    * (module.lora_b.float() @ module.lora_a.float())
+                ).to(module.base.weight.dtype)
+                got = merged[f"{mod_name}.weight"]
+                self.assertLess(
+                    (got.float() - expect.float()).abs().max().item(), 1e-2
+                )
+                break
+
+        # HF export drops graft + lora, keeps the base backbone
+        adapter = KimiLinearStateDictAdapter(spec, hf_assets_path=None)
+        hf = adapter.to_hf(merged)
+        self.assertTrue(hf)
+        self.assertFalse(
+            any(
+                "lora" in k or ".base." in k or any(g in k for g in graft)
+                for k in hf
+            )
+        )
 
 
 if __name__ == "__main__":
