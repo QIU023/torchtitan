@@ -565,22 +565,29 @@ class KimiDeltaAttention(nn.Module):
             in_mesh = x.device_mesh
             in_placements = x.placements
         x = _to_local_if_dtensor(x)
-        # Context parallel (correctness-first): the trainer seq-shards x
-        # across the cp mesh, but chunk_kda is a causal scan needing the
-        # full sequence. All-gather the seq at the KDA boundary, run the
-        # unchanged forward on the full sequence, and slice this rank's
-        # shard back out. Differentiable all_gather -> backward is
-        # reduce-scatter, so grads are correct. (Ulysses head-sharding --
-        # validated bit-exact, kda_ulysses_cp_probe -- is the memory
-        # optimization on top; see CP_ULYSSES_DESIGN.) MLA layers get CP
-        # via the standard SDPA ring path.
+        # Context parallel: the trainer seq-shards x across the cp mesh, but
+        # chunk_kda is a causal scan needing the full sequence. All-gather
+        # the seq at the KDA boundary (backward = reduce-scatter, so grads
+        # are correct), then HEAD-SHARD the scan: chunk_kda is bit-exactly
+        # per-head independent (kda_ulysses_cp_probe), so each cp rank runs
+        # only its H/cp heads over the full sequence and the heads are
+        # all-gathered before o_proj. This cuts the dominant scan's
+        # compute/memory by cp; proj/conv still run replicated on the full
+        # seq (the fla conv is a fused triton path -- seq-sharding it via
+        # halo is the remaining optimization, CP_ULYSSES_DESIGN). MLA layers
+        # get CP via the seq all-gather in KimiMLAAttention.forward.
         cp_slice = None
+        cp_hslice = None
         cp_group = getattr(self, "_cp_group", None)
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
             import torch.distributed.nn.functional as dist_nn
 
             cp_rank = dist.get_rank(cp_group)
+            cp_size = dist.get_world_size(cp_group)
             t_loc = x.shape[1]
+            if self.num_heads % cp_size == 0:
+                h_loc = self.num_heads // cp_size
+                cp_hslice = (cp_rank * h_loc, (cp_rank + 1) * h_loc)
             gathered = dist_nn.all_gather(x.contiguous(), group=cp_group)
             x = torch.cat(gathered, dim=1)
             cp_slice = (cp_rank * t_loc, (cp_rank + 1) * t_loc)
@@ -626,7 +633,19 @@ class KimiDeltaAttention(nn.Module):
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
-        # 5) Run KDA op
+        # 6) Output gate (computed before the head-shard so the slice below
+        # covers it too).
+        g_out = _local_linear(self.g_b_proj, _local_linear(self.g_a_proj, x))
+        g_out = rearrange(g_out, "... (h d) -> ... h d", d=self.head_dim)
+
+        # CP head-shard: keep only this rank's H/cp heads for the scan.
+        if cp_hslice is not None:
+            h0, h1 = cp_hslice
+            q, k, v = q[:, :, h0:h1], k[:, :, h0:h1], v[:, :, h0:h1]
+            g, beta = g[:, :, h0:h1], beta[:, :, h0:h1]
+            g_out = g_out[:, :, h0:h1]
+
+        # 5) Run KDA op (on this rank's head subset under CP)
         kda_fn = chunk_kda if mode == "chunk" else fused_recurrent_kda
         o, _ = kda_fn(
             q=q,
@@ -640,13 +659,15 @@ class KimiDeltaAttention(nn.Module):
             cu_seqlens=None,
         )
 
-        # 6) Output gate + norm
-        g_out = _local_linear(self.g_b_proj, _local_linear(self.g_a_proj, x))
-        g_out = rearrange(g_out, "... (h d) -> ... h d", d=self.head_dim)
         # FusedRMSNormGated.forward is patched at TP-init time too, so
         # it handles DTensor weight transparently. We pass plain o + g_out
         # here (both are plain after the to_local+linear chain).
         o = self.o_norm(o, g_out)  # o * sigmoid(g_out), normed
+
+        # CP: all-gather the head shards back before the head-mixing o_proj
+        # (differentiable -> backward is reduce-scatter over heads).
+        if cp_hslice is not None:
+            o = torch.cat(dist_nn.all_gather(o.contiguous(), group=cp_group), dim=2)
 
         # 7) Reshape back and project
         o = rearrange(o, "b t h d -> b t (h d)")
