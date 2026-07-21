@@ -41,6 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
@@ -339,6 +340,27 @@ class KimiMLAAttention(nn.Module):
         Returns:
             ``[B, T, D]`` attention output.
         """
+        # Context parallel (correctness-first): all-gather the seq shard so
+        # RoPE positions and the causal attention see the full sequence,
+        # then slice this rank's shard from the output. Same pattern as KDA
+        # (see KimiDeltaAttention.forward); the memory-optimal path is SDPA
+        # ring (CP_ULYSSES_DESIGN). Only the CP-without-TP path (plain x);
+        # under TP x is a DTensor and CP+TP is out of scope here.
+        cp_slice = None
+        cp_group = getattr(self, "_cp_group", None)
+        if (
+            cp_group is not None
+            and not isinstance(x, DTensor)
+            and dist.get_world_size(cp_group) > 1
+        ):
+            import torch.distributed.nn.functional as dist_nn
+
+            cp_rank = dist.get_rank(cp_group)
+            t_loc = x.shape[1]
+            x = torch.cat(
+                dist_nn.all_gather(x.contiguous(), group=cp_group), dim=1
+            )
+            cp_slice = (cp_rank * t_loc, (cp_rank + 1) * t_loc)
         B, T, _ = x.shape
 
         # Q path: direct projection -> (B, T, H, q_head_dim) -> (B, H, T, q_head_dim)
@@ -397,7 +419,10 @@ class KimiMLAAttention(nn.Module):
             gate = torch.sigmoid(self.attn_gate_proj(x))  # (B, T, H)
             attn_out = attn_out * gate.unsqueeze(-1)
         attn_out = attn_out.reshape(B, T, -1)
-        return self.o_proj(attn_out)
+        out = self.o_proj(attn_out)
+        if cp_slice is not None:
+            out = out[:, cp_slice[0] : cp_slice[1], :]
+        return out
 
 
 # ----- KDA (Kimi Delta-rule Attention) ------------------------------------ #
@@ -540,6 +565,25 @@ class KimiDeltaAttention(nn.Module):
             in_mesh = x.device_mesh
             in_placements = x.placements
         x = _to_local_if_dtensor(x)
+        # Context parallel (correctness-first): the trainer seq-shards x
+        # across the cp mesh, but chunk_kda is a causal scan needing the
+        # full sequence. All-gather the seq at the KDA boundary, run the
+        # unchanged forward on the full sequence, and slice this rank's
+        # shard back out. Differentiable all_gather -> backward is
+        # reduce-scatter, so grads are correct. (Ulysses head-sharding --
+        # validated bit-exact, kda_ulysses_cp_probe -- is the memory
+        # optimization on top; see CP_ULYSSES_DESIGN.) MLA layers get CP
+        # via the standard SDPA ring path.
+        cp_slice = None
+        cp_group = getattr(self, "_cp_group", None)
+        if cp_group is not None and dist.get_world_size(cp_group) > 1:
+            import torch.distributed.nn.functional as dist_nn
+
+            cp_rank = dist.get_rank(cp_group)
+            t_loc = x.shape[1]
+            gathered = dist_nn.all_gather(x.contiguous(), group=cp_group)
+            x = torch.cat(gathered, dim=1)
+            cp_slice = (cp_rank * t_loc, (cp_rank + 1) * t_loc)
         _, T, _ = x.shape
         # mode selection matches reference: chunk for long, recurrent for short
         # training gate: chunk required (ref asserts this)
@@ -607,6 +651,12 @@ class KimiDeltaAttention(nn.Module):
         # 7) Reshape back and project
         o = rearrange(o, "b t h d -> b t (h d)")
         out = _local_linear(self.o_proj, o)
+
+        # CP: slice this rank's sequence shard back out (backward of the
+        # slice zero-pads; composed with the differentiable input
+        # all_gather's reduce-scatter backward this is the correct grad).
+        if cp_slice is not None:
+            out = out[:, cp_slice[0] : cp_slice[1], :]
 
         # Re-wrap the output as DTensor so the parent NoParallel hook
         # gets the type it expects. Replicate placement matches the

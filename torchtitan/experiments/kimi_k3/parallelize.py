@@ -130,33 +130,35 @@ def parallelize_kimi_linear(
             "Applied DSv3-style TP plan tp_degree=%d.", parallel_dims.tp,
         )
     if parallel_dims.cp_enabled:
-        # Phase 6 CP: blocked on fla-core. The kimi_linear backbone
-        # alternates KDA (3:1 ratio) and MLA layers. KDA's forward
-        # path uses fla-core's chunk_kda triton kernel, which runs a
-        # causal recurrence over the seq dim. CP shards the seq dim
-        # across ranks; chunk_kda would see only seq_len/cp tokens
-        # per rank and the recurrence state across rank boundaries
-        # would be lost. Making KDA CP-correct requires a ring-
-        # recurrence variant of chunk_kda that exchanges state between
-        # adjacent CP ranks at the chunk boundary — which lives in
-        # fla-core upstream (https://github.com/fla-org/flash-linear-attention),
-        # not in torchtitan or this experiment.
+        # Phase 6 CP for the hybrid KDA/MLA backbone.
         #
-        # MLA + dense MLP compose with CP via the standard torchtitan
-        # path (apply_cp_to_attention_module + SDPA dispatcher). The KDA
-        # boundary needs an all-to-all head-shard wrapper (Ulysses):
-        # chunk_kda is bit-exactly per-head independent, so head-sharding
-        # is numerically EXACT (validated cp=2/4 rel-err 0.00,
-        # phase13/kda_ulysses_cp_probe.py). The layer forward + conv-weight
-        # slicing + cp-mesh wiring is specced in phase13/CP_ULYSSES_DESIGN.md
-        # but NOT landed yet -- this guard stays until it is parity-tested,
-        # so CP fails loudly rather than running a subtly-wrong hybrid path.
-        raise NotImplementedError(
-            "CP is not currently supported for kimi_linear "
-            "(KDA layers' fla-core chunk_kda kernel does not "
-            "implement ring-recurrence over CP shards). "
-            "Track upstream fla-core for ring-KDA support; "
-            "until then, run with context_parallel_degree=1."
+        # Correctness-first CP for the hybrid KDA/MLA backbone: both layer
+        # types all-gather the seq shard at their boundary, run the
+        # unchanged forward on the full sequence, and slice this rank's
+        # shard from the output (see KimiDeltaAttention/KimiMLAAttention
+        # .forward). Differentiable all_gather -> reduce-scatter backward,
+        # so grads are correct. KDA can't ring (fla-core chunk_kda scan)
+        # and our custom MLA inner_attention isn't the torchtitan SDPA type
+        # apply_cp_to_forward expects, so the uniform all-gather keeps CP
+        # correct + composable with FSDP/PP/EP. The memory-optimal path
+        # (KDA Ulysses head-shard -- validated bit-exact,
+        # phase13/kda_ulysses_cp_probe.py + CP_ULYSSES_DESIGN.md -- and MLA
+        # SDPA ring) is the optimization on top. CP+TP is out of scope (the
+        # all-gather guards on plain, non-DTensor activations).
+        from torchtitan.experiments.kimi_k3.model import (
+            KimiDeltaAttention,
+            KimiMLAAttention,
+        )
+
+        cp_group = parallel_dims.get_mesh("cp").get_group()
+        n_attn = 0
+        for m in model.modules():
+            if isinstance(m, (KimiDeltaAttention, KimiMLAAttention)):
+                m._cp_group = cp_group
+                n_attn += 1
+        logger.info(
+            "Applied CP cp_degree=%d (seq all-gather at %d attn layers).",
+            parallel_dims.cp, n_attn,
         )
     if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
         # Phase 6 A6: Expert Parallel for Kimi MoE layers. The
