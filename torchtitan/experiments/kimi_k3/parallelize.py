@@ -724,11 +724,66 @@ def apply_tp_kimi_linear(
             if hasattr(layer, name) and getattr(layer, name) is not None:
                 plan[name] = no_par_local
 
+        # LoRA-aware TP: a Colwise/Rowwise style can't target a
+        # KimiLoRALinear (ColwiseParallel needs nn.Linear). Redirect the
+        # style to the inner ``.base`` Linear and shard the adapters to
+        # match -- Colwise (output-sharded): lora_a Replicate, lora_b
+        # Shard(0); Rowwise (input-sharded): lora_a Shard(1), lora_b
+        # Replicate. The small adapter matmul then composes with the base's
+        # sharded output/input via DTensor dispatch in KimiLoRALinear.forward.
+        from torchtitan.experiments.kimi_k3.lora import KimiLoRALinear
+
+        lora_tp: list[tuple[nn.Module, bool]] = []
+        for key in list(plan.keys()):
+            style = plan[key]
+            if not isinstance(style, (ColwiseParallel, RowwiseParallel)):
+                continue
+            try:
+                target = layer.get_submodule(key)
+            except AttributeError:
+                continue
+            if isinstance(target, KimiLoRALinear):
+                del plan[key]
+                plan[f"{key}.base"] = style
+                lora_tp.append((target, isinstance(style, ColwiseParallel)))
+
         parallelize_module(
             module=layer,
             device_mesh=tp_mesh,
             parallelize_plan=plan,
         )
+
+        for mod, is_colwise in lora_tp:
+            a_pl = [Replicate()] if is_colwise else [Shard(1)]
+            b_pl = [Shard(0)] if is_colwise else [Replicate()]
+            mod.lora_a = nn.Parameter(
+                distribute_tensor(mod.lora_a, tp_mesh, a_pl),
+                requires_grad=mod.lora_a.requires_grad,
+            )
+            mod.lora_b = nn.Parameter(
+                distribute_tensor(mod.lora_b, tp_mesh, b_pl),
+                requires_grad=mod.lora_b.requires_grad,
+            )
+
+        # Any remaining LoRA adapters (e.g. NoParallel MoE shared experts,
+        # which the plan wraps by name so the loop above skips them) must
+        # ALSO land on the tp mesh as Replicate -- otherwise clip_grad_norm_
+        # stacks per-param grad norms across (fsdp,) and (fsdp,tp) meshes and
+        # fails (same rationale as the KDA NoParallel-everything note).
+        for m in layer.modules():
+            if not isinstance(m, KimiLoRALinear):
+                continue
+            for nm in ("lora_a", "lora_b"):
+                p = getattr(m, nm)
+                if not isinstance(p, DTensor):
+                    setattr(
+                        m,
+                        nm,
+                        nn.Parameter(
+                            distribute_tensor(p, tp_mesh, [Replicate()]),
+                            requires_grad=p.requires_grad,
+                        ),
+                    )
 
         # MoE experts (GroupedExperts.w1/w2/w3): distribute as
         # DTensor(Replicate) without installing module hooks. The

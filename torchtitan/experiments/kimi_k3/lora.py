@@ -25,11 +25,13 @@ P0 semantics (HANDOFF LoRA trio):
 * ``trainable_state_dict`` gives the LoRA-only checkpoint payload
   (adapters + AttnRes params), the unit veRL weight-sync ships.
 
-TP-plan extension for LoRA (colwise/rowwise adapter placements per
-``_lora_adapter_sharding``) is NOT wired yet: P0 targets the veRL
-FSDP path first. Wrapped FQNs keep their public name (``q_proj`` ->
-``q_proj.base`` + ``q_proj.lora_a/b``), so the TP plan must be
-extended before combining LoRA with tensor_parallel_degree > 1.
+TP for LoRA IS wired (parallelize.apply_tp_kimi_linear): a Colwise/
+Rowwise style on a wrapped projection is redirected to ``.base`` and the
+adapters are distributed to match (Colwise -> lora_a Replicate / lora_b
+Shard(0); Rowwise -> lora_a Shard(1) / lora_b Replicate); any remaining
+adapters (NoParallel MoE shared experts) go Replicate so clip_grad_norm_
+sees one mesh. The forward aligns adapters with the input's tensor kind.
+LoRA composes with FSDP / TP / EP / PP / CP and their 4D combos.
 """
 
 import math
@@ -213,6 +215,9 @@ class KimiLoRALinear(nn.Module):
         return self.base.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from torch.distributed.tensor import DTensor, Replicate
+
+        x_is_dt = isinstance(x, DTensor)
         if self._quantize_base == "nf4":
             from torchao.dtypes.nf4tensor import linear_nf4
 
@@ -225,8 +230,44 @@ class KimiLoRALinear(nn.Module):
             if self.base.bias is not None:
                 base_out = base_out + self.base.bias
         else:
-            base_out = self.base(x)
-        lora_out = F.linear(F.linear(x, self.lora_a), self.lora_b)
+            bw = self.base.weight
+            if not x_is_dt and isinstance(bw, DTensor):
+                # Plain input but a DTensor base weight (NoParallel descent,
+                # e.g. MoE shared experts run in plain-tensor land; the MoE
+                # to_locals direct-child weights but not one nested under a
+                # LoRA wrapper's .base). Densify to match the plain compute.
+                bb = self.base.bias
+                if isinstance(bb, DTensor):
+                    bb = bb.to_local()
+                base_out = F.linear(x, bw.to_local(), bb)
+            else:
+                base_out = self.base(x)
+
+        # TP: align the adapters with the input's tensor kind so the matmul
+        # isn't mixed Tensor/DTensor. Colwise/Rowwise-styled projections get
+        # DTensor adapters (distributed in parallelize) and a DTensor input;
+        # NoParallel descents (MoE shared experts) may leave the raw adapter
+        # params plain while the input is a DTensor, or run plain input
+        # against distributed adapters -- handle both directions.
+        la, lb = self.lora_a, self.lora_b
+        if x_is_dt:
+            mesh = x.device_mesh
+            repl = [Replicate()] * mesh.ndim
+            if not isinstance(la, DTensor):
+                la = DTensor.from_local(la, mesh, repl, run_check=False)
+            if not isinstance(lb, DTensor):
+                lb = DTensor.from_local(lb, mesh, repl, run_check=False)
+        else:
+            if isinstance(la, DTensor):
+                la = la.to_local()
+            if isinstance(lb, DTensor):
+                lb = lb.to_local()
+        lora_out = F.linear(F.linear(x, la), lb)
+        # DTensor input but a plain (all-reduced/local) base output
+        # (rowwise use_local_output): densify the adapter's DTensor output
+        # (Partial full_tensor all-reduces, Shard all-gathers) to match.
+        if isinstance(lora_out, DTensor) and not isinstance(base_out, DTensor):
+            lora_out = lora_out.full_tensor()
         return base_out + self._lora_scaling * lora_out
 
 
