@@ -87,19 +87,22 @@ class KimiLoRALinear(nn.Module):
         assert rank > 0
         self.base = base
         self.base.weight.requires_grad_(False)
+        # Capture before quantization: mxfp4 drops base.weight (split
+        # storage), so dtype/device must be read first. Adapters match the
+        # base compute dtype, else a bf16 base + fp32 adapter mismatches in
+        # the forward matmul.
+        pdtype = base.weight.dtype
+        dev = base.weight.device
         self._quantize_base = None
         if quantize_base == "nf4":
             self.quantize_base_nf4()
+        elif quantize_base == "mxfp4":
+            self.quantize_base_mxfp4()
         elif quantize_base is not None:
             raise ValueError(f"Unsupported quantize_base={quantize_base!r}")
         if self.base.bias is not None:
             self.base.bias.requires_grad_(False)
         self._lora_scaling = alpha / rank
-        dev = base.weight.device
-        # Adapters match the base compute dtype (NF4Tensor.dtype reports
-        # its bf16 logical dtype); otherwise a bf16 base + fp32 adapter
-        # mismatches in the forward matmul.
-        pdtype = base.weight.dtype
         self.lora_a = nn.Parameter(
             torch.empty(rank, base.in_features, device=dev, dtype=pdtype)
         )
@@ -145,6 +148,62 @@ class KimiLoRALinear(nn.Module):
         self._quantize_base = "nf4"
         return True
 
+    @torch.no_grad()
+    def quantize_base_mxfp4(self) -> bool:
+        """Pack the frozen base to MXFP4 (torchao MX, block 32) -- K3's
+        native weight format (FP4 E2M1 + MX E8M0 block scale). Idempotent.
+
+        Split storage: MXTensor's packed qdata is half-width, so the logical
+        weight view is non-contiguous and FSDP2 rejects it as a param. Store
+        qdata (uint8) and scale (E8M0 bytes viewed as uint8, since FSDP2's
+        all-gather has no float8_e8m0fnu copy kernel) as plain contiguous
+        frozen params + the flatten ctx, and reconstruct the MXTensor via
+        __tensor_unflatten__ after all-gather. block_size 32 needs
+        in_features % 32 == 0 (all K3 dims satisfy this); else stays bf16.
+        """
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+        if getattr(self, "_mx_ctx", None) is not None:
+            self._quantize_base = "mxfp4"
+            return True  # already packed
+        w = self.base._parameters.get("weight")
+        if w is None or w.shape[-1] % 32 != 0:
+            self._quantize_base = None
+            return False
+        mx = MXTensor.to_mx(
+            w.data.to(torch.bfloat16),
+            elem_dtype=torch.float4_e2m1fn_x2,
+            block_size=32,
+        )
+        _, self._mx_ctx = mx.__tensor_flatten__()
+        self._mx_scale_dtype = mx.scale.dtype
+        self.base_qdata = nn.Parameter(
+            mx.qdata.contiguous(), requires_grad=False
+        )
+        self.base_scale = nn.Parameter(
+            mx.scale.view(torch.uint8).contiguous(), requires_grad=False
+        )
+        # Drop the bf16 base weight so FSDP shards only the packed bytes.
+        del self.base._parameters["weight"]
+        self._quantize_base = "mxfp4"
+        return True
+
+    def _dequant_base_mxfp4(self) -> torch.Tensor:
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+        qdata, scale = self.base_qdata, self.base_scale
+        if hasattr(qdata, "full_tensor"):
+            qdata = qdata.full_tensor()
+        if hasattr(scale, "full_tensor"):
+            scale = scale.full_tensor()
+        mx = MXTensor.__tensor_unflatten__(
+            {"qdata": qdata, "scale": scale.view(self._mx_scale_dtype)},
+            self._mx_ctx,
+            None,
+            None,
+        )
+        return mx.dequantize()
+
     @property
     def in_features(self) -> int:
         return self.base.in_features
@@ -158,6 +217,13 @@ class KimiLoRALinear(nn.Module):
             from torchao.dtypes.nf4tensor import linear_nf4
 
             base_out = linear_nf4(x, self.base.weight)
+        elif self._quantize_base == "mxfp4":
+            # No weight-only MXFP4 linear in torchao yet: dequant then
+            # matmul (memory/comms win from the packed base still holds).
+            w = self._dequant_base_mxfp4().to(x.dtype)
+            base_out = F.linear(x, w)
+            if self.base.bias is not None:
+                base_out = base_out + self.base.bias
         else:
             base_out = self.base(x)
         lora_out = F.linear(F.linear(x, self.lora_a), self.lora_b)
@@ -304,24 +370,36 @@ def quantize_grouped_experts_nf4(model: nn.Module) -> int:
     return num_quantized
 
 
-def quantize_lora_bases(model: nn.Module, *, experts: bool = True) -> int:
-    """Post-load QLoRA hook: NF4-pack every LoRA base after weights load.
+def quantize_lora_bases(
+    model: nn.Module, *, mode: str = "nf4", experts: bool = True
+) -> int:
+    """Post-load QLoRA hook: quantize every LoRA base after weights load.
 
     The titan trainer's meta-first flow builds, then materializes real
     weights (init or checkpoint), THEN should quantize -- packing at
-    build time (KimiLoRALinear(quantize_base='nf4')) quantizes init
-    noise / meta storage, not the loaded checkpoint, and breaks
-    ``init_weights`` (normal_ over an NF4Tensor). Call this AFTER load
-    and BEFORE fully_shard so FSDP shards the packed bytes. Idempotent;
-    returns the number of bases packed (wrapped linears + grouped
-    experts when ``experts``). Non-alignable dims stay bf16 (see
-    ``quantize_base_nf4``).
+    build time (KimiLoRALinear(quantize_base=...)) quantizes init noise /
+    meta storage, not the loaded checkpoint, and breaks ``init_weights``.
+    Call this AFTER load and BEFORE fully_shard so FSDP shards the packed
+    bytes. ``mode`` is ``nf4`` (torchao QLoRA codebook, titan customer
+    option) or ``mxfp4`` (K3's native FP4 format). Idempotent; returns the
+    number of bases packed (wrapped linears + grouped experts when
+    ``experts``). Non-alignable dims stay bf16.
     """
+    if mode not in ("nf4", "mxfp4"):
+        raise ValueError(f"Unsupported quantize mode {mode!r}")
     packed = 0
     for module in model.modules():
-        if isinstance(module, KimiLoRALinear) and module.quantize_base_nf4():
-            packed += 1
-    if experts:
+        if not isinstance(module, KimiLoRALinear):
+            continue
+        did = (
+            module.quantize_base_nf4()
+            if mode == "nf4"
+            else module.quantize_base_mxfp4()
+        )
+        packed += int(did)
+    if experts and mode == "nf4":
+        # GroupedExperts MXFP4 packing is a follow-up (3-D per-expert MX);
+        # nf4 experts remain the validated path.
         packed += quantize_grouped_experts_nf4(model)
     return packed
 
@@ -345,11 +423,16 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     for mod_name, module in model.named_modules():
         if not isinstance(module, KimiLoRALinear):
             continue
-        base_w = module.base.weight
-        if module._quantize_base == "nf4":
+        if module._quantize_base == "mxfp4":
+            base_w = module._dequant_base_mxfp4()
+        elif module._quantize_base == "nf4":
             from torchao.dtypes.nf4tensor import NF4Tensor
+
+            base_w = module.base.weight
             if isinstance(base_w, NF4Tensor):
                 base_w = base_w.get_original_weight()
+        else:
+            base_w = module.base.weight
         out_dtype = (
             base_w.dtype if base_w.dtype != torch.uint8 else torch.bfloat16
         )
@@ -360,6 +443,13 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         sd[f"{mod_name}.weight"] = (
             (base_w.float() + delta).to(out_dtype).contiguous()
         )
-        for suffix in (".base.weight", ".base.bias", ".lora_a", ".lora_b"):
+        for suffix in (
+            ".base.weight",
+            ".base.bias",
+            ".base_qdata",
+            ".base_scale",
+            ".lora_a",
+            ".lora_b",
+        ):
             sd.pop(f"{mod_name}{suffix}", None)
     return sd

@@ -163,6 +163,63 @@ class TestLoRAMerge(unittest.TestCase):
         with torch.no_grad():
             m(tok)
 
+    def test_mxfp4_base_merge_and_export(self):
+        # MXFP4 (K3's native FP4 weight format) base + LoRA: merge must
+        # dequant the split-storage MXTensor and leave NO qdata/scale in
+        # the exported HF dict.
+        from torchtitan.experiments.kimi_k3.lora import merge_lora_state_dict
+        from torchtitan.experiments.kimi_k3.state_dict_adapter import (
+            KimiLinearStateDictAdapter,
+        )
+
+        m = self._lora_model(quantize="mxfp4")
+        merged = merge_lora_state_dict(m)
+        self.assertFalse(
+            any(
+                "qdata" in k or "scale" in k or ".base." in k for k in merged
+            )
+        )
+        spec = self._spec_plain()
+        hf = KimiLinearStateDictAdapter(spec, hf_assets_path=None).to_hf(merged)
+        self.assertTrue(hf)
+        self.assertFalse(any("qdata" in k or "lora" in k for k in hf))
+
+    def test_post_load_quantize_mxfp4(self):
+        # Trainer order: build+load bf16, THEN MXFP4-pack (not at build).
+        from torchtitan.experiments.kimi_k3.lora import (
+            KimiLoRALinear,
+            quantize_lora_bases,
+        )
+
+        m = self._lora_model(mla_only=True)  # forward-running -> MLA path
+        ref = None
+        for mod in m.modules():
+            if isinstance(mod, KimiLoRALinear) and (
+                mod.base._parameters.get("weight") is not None
+                and mod.base.weight.shape[-1] % 32 == 0
+            ):
+                ref = (mod, mod.base.weight.detach().float().clone())
+                break
+        self.assertIsNotNone(ref)
+        packed = quantize_lora_bases(m, mode="mxfp4", experts=False)
+        self.assertGreater(packed, 0)
+        mod, ref_w = ref
+        # split-storage present, bf16 base weight gone
+        param_names = {n for n, _ in mod.named_parameters()}
+        self.assertIn("base_qdata", param_names)
+        self.assertIn("base_scale", param_names)
+        self.assertNotIn("weight", mod.base._parameters)
+        # dequant tracks the loaded weight within MXFP4 error (~10-13%)
+        deq = mod._dequant_base_mxfp4().float()
+        self.assertLess(
+            (deq - ref_w).norm().item() / ref_w.norm().item(), 0.15
+        )
+        # idempotent + forward runs through the MXFP4 base path
+        self.assertEqual(quantize_lora_bases(m, mode="mxfp4", experts=False), packed)
+        tok = torch.randint(0, 2016, (1, 96), device="cuda")
+        with torch.no_grad():
+            m(tok)
+
     def test_graft_lora_compose_merge_and_export(self):
         # The 48B post-training composition: AttnRes graft + LoRA. Locks
         # (1) trainable set = LoRA + graft, base frozen; (2) merge folds
