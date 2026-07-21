@@ -459,14 +459,23 @@ class MoE(Module):
         ) = self.router(x_BLD, self.expert_bias_E)
 
         # Build a one-hot routing map (B, L, E) marking the experts each token
-        # is routed to. Under TP/SP the router outputs are DTensors sharded on
-        # the token dim; scatter_ writes along the (replicated) expert dim, so
-        # DTensor runs it as a local op with no redistribution.
-        routing_map_BLE = torch.zeros_like(scores_BLE, dtype=torch.bool).scatter_(
-            -1,
-            topk_expert_ids_BLK,
-            True,
-        )
+        # is routed to. Under TP+EP the router outputs are DTensors sharded on
+        # the token dim; DTensor has no scatter strategy that preserves that
+        # Shard(dim=1) (in-place scatter_ errors, out-of-place scatter would
+        # redistribute to Replicate and break the downstream Partial(sum)
+        # token-count contract). Do the scatter on the local shard and rewrap
+        # with the router's placement so the seq-shard is preserved.
+        if isinstance(scores_BLE, DTensor):
+            local_map = torch.zeros_like(
+                scores_BLE.to_local(), dtype=torch.bool
+            ).scatter_(-1, topk_expert_ids_BLK.to_local(), True)
+            routing_map_BLE = DTensor.from_local(
+                local_map, scores_BLE.device_mesh, scores_BLE.placements
+            )
+        else:
+            routing_map_BLE = torch.zeros_like(
+                scores_BLE, dtype=torch.bool
+            ).scatter_(-1, topk_expert_ids_BLK, True)
         num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
 
         # tokens_per_expert_E will be used to update the expert bias for load balancing,
