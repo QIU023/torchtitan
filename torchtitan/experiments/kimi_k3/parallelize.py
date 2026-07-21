@@ -142,16 +142,15 @@ def parallelize_kimi_linear(
         # fla-core upstream (https://github.com/fla-org/flash-linear-attention),
         # not in torchtitan or this experiment.
         #
-        # MLA + dense MLP would compose with CP via the standard
-        # torchtitan path (apply_cp_to_attention_module + SDPA
-        # dispatcher), but applying CP only to MLA while replicating
-        # the seq across KDA layers requires a per-layer all-gather
-        # at the KDA boundary — a non-trivial wrapper that is out of
-        # scope here.
-        #
-        # Status: CP is documented as out-of-scope until fla-core
-        # ships ring-attention KDA. Non-AttnRes / MLA-only flavors
-        # would compose with CP cleanly.
+        # MLA + dense MLP compose with CP via the standard torchtitan
+        # path (apply_cp_to_attention_module + SDPA dispatcher). The KDA
+        # boundary needs an all-to-all head-shard wrapper (Ulysses):
+        # chunk_kda is bit-exactly per-head independent, so head-sharding
+        # is numerically EXACT (validated cp=2/4 rel-err 0.00,
+        # phase13/kda_ulysses_cp_probe.py). The layer forward + conv-weight
+        # slicing + cp-mesh wiring is specced in phase13/CP_ULYSSES_DESIGN.md
+        # but NOT landed yet -- this guard stays until it is parity-tested,
+        # so CP fails loudly rather than running a subtly-wrong hybrid path.
         raise NotImplementedError(
             "CP is not currently supported for kimi_linear "
             "(KDA layers' fla-core chunk_kda kernel does not "
