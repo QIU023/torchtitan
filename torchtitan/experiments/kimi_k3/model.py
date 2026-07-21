@@ -347,6 +347,7 @@ class KimiMLAAttention(nn.Module):
         # ring (CP_ULYSSES_DESIGN). Only the CP-without-TP path (plain x);
         # under TP x is a DTensor and CP+TP is out of scope here.
         cp_slice = None
+        cp_hslice = None
         cp_group = getattr(self, "_cp_group", None)
         if (
             cp_group is not None
@@ -356,11 +357,17 @@ class KimiMLAAttention(nn.Module):
             import torch.distributed.nn.functional as dist_nn
 
             cp_rank = dist.get_rank(cp_group)
+            cp_size = dist.get_world_size(cp_group)
             t_loc = x.shape[1]
             x = torch.cat(
                 dist_nn.all_gather(x.contiguous(), group=cp_group), dim=1
             )
             cp_slice = (cp_rank * t_loc, (cp_rank + 1) * t_loc)
+            # Head-shard the SDPA too (per-head independent): each rank runs
+            # its H/cp heads over the full seq, heads all-gathered after.
+            if self.num_heads % cp_size == 0:
+                h_loc = self.num_heads // cp_size
+                cp_hslice = (cp_rank * h_loc, (cp_rank + 1) * h_loc)
         B, T, _ = x.shape
 
         # Q path: direct projection -> (B, T, H, q_head_dim) -> (B, H, T, q_head_dim)
@@ -409,9 +416,22 @@ class KimiMLAAttention(nn.Module):
         # to plain Tensors before SDPA's mem-efficient cutlass kernel
         # path sees them — avoiding "aten.bmm got mixed Tensor and
         # DTensor" inside SDPA's internal dispatcher.
+        if cp_hslice is not None:
+            h0, h1 = cp_hslice
+            q_full, k_full, v = (
+                q_full[:, h0:h1],
+                k_full[:, h0:h1],
+                v[:, h0:h1],
+            )
         attn_out = self.inner_attention(
             q_full, k_full, v, scale=self.scaling,
         )  # (B, H, T, v_head_dim)
+        if cp_hslice is not None:
+            # all-gather the head shards back (differentiable).
+            attn_out = torch.cat(
+                dist_nn.all_gather(attn_out.contiguous(), group=cp_group),
+                dim=1,
+            )
 
         attn_out = attn_out.transpose(1, 2)  # (B, T, H, Dv)
         if self.mla_gated:
