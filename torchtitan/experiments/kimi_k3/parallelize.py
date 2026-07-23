@@ -80,13 +80,16 @@ def parallelize_kimi_linear(
 ) -> nn.Module:
     """Apply the configured parallelism plan to a Kimi Linear model.
 
-    Wires (in order, before FSDP wrap): TP → CP (raises) → EP → AC →
-    compile → FSDP/HSDP. AC is applied before compile so the compiled
-    subgraph is the checkpointed unit (matches upstream llama3/qwen3
-    ordering).
+    Wires (in order, before FSDP wrap): TP -> CP -> EP -> AC -> compile ->
+    FSDP/HSDP. AC is applied before compile so the compiled subgraph is
+    the checkpointed unit (matches upstream llama3/qwen3 ordering).
 
-    CP raises ``NotImplementedError`` — see the inline comment near the
-    CP guard for the fla-core ``chunk_kda`` ring-recurrence blocker.
+    CP is correctness-first seq all-gather at the KDA/MLA attention
+    boundary (composes with FSDP/PP/EP); see the inline comment near the
+    CP guard for the design and the KDA Ulysses head-shard optimization
+    that sits on top of it. CP+TP is out of scope: the CP all-gather
+    guards on plain, non-DTensor activations (the TP boundary contract),
+    so it cannot also track a TP mesh dimension.
     """
     # Enable TF32 tensor cores for fp32 matmuls (loss aggregation,
     # optimizer master weight updates, fp32 RoPE etc.). bf16 path is
