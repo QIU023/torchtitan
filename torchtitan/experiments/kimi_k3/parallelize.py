@@ -133,6 +133,31 @@ def parallelize_kimi_linear(
             "Applied DSv3-style TP plan tp_degree=%d.", parallel_dims.tp,
         )
     if parallel_dims.cp_enabled:
+        # Fail loudly on configs the CP implementation cannot honor.
+        # Silent degradation here has already produced plausible-but-wrong
+        # runs (MLA skipping CP under TP; headtail-permuted sequences), so
+        # these are ValueErrors, not warnings.
+        if parallel_dims.tp_enabled:
+            raise NotImplementedError(
+                "CP+TP is not supported yet for kimi_linear: under TP the "
+                "MLA CP guard sees DTensor activations and skips CP while "
+                "KDA still applies it, producing silently wrong numerics "
+                "(block-diagonal MLA attention). Drop tensor_parallel_degree "
+                "or context_parallel_degree until Ulysses CP+TP lands."
+            )
+        cp_load_balancer = parallelism.context_parallel_load_balancer
+        if cp_load_balancer is not None:
+            raise ValueError(
+                "kimi_linear CP requires context_parallel_load_balancer="
+                f"None, got '{cp_load_balancer}'. The KDA/MLA CP path "
+                "reassembles the full sequence as contiguous rank-ordered "
+                "shards; a load balancer (e.g. headtail) permutes the "
+                "sequence before sharding, which silently breaks causal "
+                "order inside the attention kernels (future-token leakage). "
+                "Load balancing is also unnecessary here: every rank "
+                "computes the full sequence for its head subset, so "
+                "per-rank work is already symmetric."
+            )
         # Phase 6 CP for the hybrid KDA/MLA backbone.
         #
         # Correctness-first CP for the hybrid KDA/MLA backbone: both layer

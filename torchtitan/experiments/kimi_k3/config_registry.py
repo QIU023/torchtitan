@@ -124,6 +124,11 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
         # AC off — kimi_linear/parallelize.py Phase 4c doesn't implement it.
         activation_checkpoint=None,
         validator=Validator.Config(freq=500, steps=50),
+        # Kimi CP reassembles contiguous rank-ordered seq shards inside
+        # KDA/MLA (see model.py); the headtail load balancer permutes the
+        # sequence and silently breaks causal order, so it must stay off.
+        # parallelize_kimi_linear raises if this is set back to a balancer.
+        parallelism=ParallelismConfig(context_parallel_load_balancer=None),
     )
 
 
@@ -443,6 +448,8 @@ def kimi_linear_debugmodel() -> Trainer.Config:
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         checkpoint=CheckpointManager.Config(interval=100),
         activation_checkpoint=None,
+        # See _base_trainer_config: kimi CP requires contiguous seq shards.
+        parallelism=ParallelismConfig(context_parallel_load_balancer=None),
     )
 
 
