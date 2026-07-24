@@ -64,12 +64,18 @@ from torchtitan.experiments.kimi_k3.model import (
 )
 
 
-def _scalar_local(a: torch.Tensor) -> torch.Tensor:
+def _scalar_local(a: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     """Under TP the graft alphas are NoParallel DTensors (Replicate); the
     plain block stream is a plain Tensor, so ``alpha * (h - plain)`` mixes
     DTensor and Tensor. The alpha is a replicated scalar -- to_local gives
-    the identical value on every rank and keeps the mul plain."""
-    return a.to_local() if isinstance(a, DTensor) else a
+    the identical value on every rank and keeps the mul plain.
+
+    Also cast to ``like``'s dtype: frozen-base LoRA keeps the trainable
+    alpha as an fp32 master while the stream is bf16; without the cast
+    the elementwise mix silently promotes the residual stream to fp32
+    (matches FSDP mixed-precision compute when the cast is a no-op)."""
+    a = a.to_local() if isinstance(a, DTensor) else a
+    return a.to(like.dtype) if a.dtype != like.dtype else a
 
 
 
@@ -160,7 +166,7 @@ class KimiAttnResDecoderLayer(nn.Module):
             # the plain backbone) so alpha=0 is bit-identical to it;
             # reconstructing sum(blocks)+partial would reorder additions.
             assert plain_stream is not None
-            h = plain_stream + _scalar_local(self.attn_res_alpha) * (h - plain_stream)
+            h = plain_stream + _scalar_local(self.attn_res_alpha, plain_stream) * (h - plain_stream)
 
         # Block boundary: commit partial into blocks, start fresh accumulator.
         if is_block_start:
@@ -178,7 +184,7 @@ class KimiAttnResDecoderLayer(nn.Module):
             blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm
         )
         if self.attn_res_gated:
-            h = plain_stream + _scalar_local(self.mlp_res_alpha) * (h - plain_stream)
+            h = plain_stream + _scalar_local(self.mlp_res_alpha, plain_stream) * (h - plain_stream)
 
         # FFN sub-layer (MoE or dense SwiGLU).
         ffn_out = self.ffn(self.post_attention_layernorm(h))
@@ -461,7 +467,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
         )
         if self.attn_res_gated:
             h_final = plain_stream + _scalar_local(
-                self.final_attn_res_alpha
+                self.final_attn_res_alpha, plain_stream
             ) * (h_final - plain_stream)
         if self.norm is not None:
             h_final = self.norm(h_final)

@@ -69,6 +69,12 @@ def block_attn_res(
     """
     V = torch.stack(blocks + [partial_block], dim=0)  # [N+1, B, T, D]
     K = norm(V)
+    if K.dtype != V.dtype:
+        # Frozen-base LoRA keeps trainable AttnRes norms as fp32 masters
+        # while the stream is bf16; RMSNorm promotes its output to fp32,
+        # which would leak fp32 into the residual stream downstream.
+        # Compute in the stream dtype (matches FSDP mixed-precision).
+        K = K.to(V.dtype)
     # proj.weight is [1, D]; squeeze to [D] and contract with K's channel dim.
     # Under TP, proj is wrapped with NoParallel, which makes proj.weight a
     # DTensor(Replicate) on the tp mesh dim. The downstream einsum mixes
@@ -110,6 +116,14 @@ def block_attn_res(
             # this path exactly as before.
             weight = weight.to_local()
     query = weight.squeeze(0)
+    if query.dtype != K.dtype:
+        # Frozen-base LoRA keeps the backbone bf16 while trainable
+        # AttnRes pseudo-queries stay fp32 masters. Under FSDP the
+        # mixed-precision policy casts the master to bf16 for compute;
+        # without FSDP (dp_shard=1 debug runs) nothing reconciles the
+        # dtypes and einsum (unlike elementwise ops) refuses mixed
+        # inputs. Compute in the stream dtype to match FSDP numerics.
+        query = query.to(K.dtype)
     logits = torch.einsum("d,nbtd->nbt", query, K)
     weights = F.softmax(logits, dim=0)
     h = torch.einsum("nbt,nbtd->btd", weights, V)

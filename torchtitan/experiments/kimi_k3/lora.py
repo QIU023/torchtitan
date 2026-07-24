@@ -262,6 +262,13 @@ class KimiLoRALinear(nn.Module):
                 la = la.to_local()
             if isinstance(lb, DTensor):
                 lb = lb.to_local()
+        if la.dtype != x.dtype:
+            # Frozen-base LoRA: trainable adapters stay fp32 masters while
+            # the frozen base (and thus x) is bf16. Under FSDP the
+            # mixed-precision policy casts adapters for compute; without
+            # FSDP (dp_shard=1 debug runs) align here instead.
+            la = la.to(x.dtype)
+            lb = lb.to(x.dtype)
         lora_out = F.linear(F.linear(x, la), lb)
         # DTensor input but a plain (all-reduced/local) base output
         # (rowwise use_local_output): densify the adapter's DTensor output
