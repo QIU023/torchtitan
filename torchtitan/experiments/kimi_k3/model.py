@@ -1292,6 +1292,11 @@ class KimiLinearModel(nn.Module):
         for m in self.modules():
             cls_name = type(m).__name__
             if isinstance(m, nn.Linear):
+                if "weight" not in m._parameters:
+                    # Packed-MXFP4 LoRA base: quantize_base_mxfp4 dropped
+                    # base.weight (split qdata/scale storage); the packed
+                    # values come from the checkpoint, not init.
+                    continue
                 nn.init.normal_(m.weight, mean=0.0, std=std)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)

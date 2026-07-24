@@ -172,6 +172,35 @@ class KimiLoRALinear(nn.Module):
         if w is None or w.shape[-1] % 32 != 0:
             self._quantize_base = None
             return False
+        if w.is_meta:
+            # Meta-first trainer flow: register the PACKED LAYOUT only
+            # (qdata [out, in/2] uint8 + scale [out, in/32] e8m0-as-uint8)
+            # so FSDP shards the packed bytes; the actual quantized values
+            # arrive via DCP checkpoint load (stream_quantize_mxfp4_dcp.py
+            # converts a bf16 checkpoint to this layout). Valid because
+            # MX block-32 quantization is row-blockwise, so it commutes
+            # with FSDP2's Shard(0) row sharding: quantize-then-shard ==
+            # shard-then-load-quantized-rows. The flatten ctx carries no
+            # shape/data, so a 1x32 dummy reproduces it exactly.
+            out_f, in_f = w.shape
+            dummy = MXTensor.to_mx(
+                torch.zeros(1, 32, dtype=torch.bfloat16),
+                elem_dtype=torch.float4_e2m1fn_x2,
+                block_size=32,
+            )
+            _, self._mx_ctx = dummy.__tensor_flatten__()
+            self._mx_scale_dtype = dummy.scale.dtype
+            self.base_qdata = nn.Parameter(
+                torch.empty(out_f, in_f // 2, dtype=torch.uint8, device="meta"),
+                requires_grad=False,
+            )
+            self.base_scale = nn.Parameter(
+                torch.empty(out_f, in_f // 32, dtype=torch.uint8, device="meta"),
+                requires_grad=False,
+            )
+            del self.base._parameters["weight"]
+            self._quantize_base = "mxfp4"
+            return True
         mx = MXTensor.to_mx(
             w.data.to(torch.bfloat16),
             elem_dtype=torch.float4_e2m1fn_x2,

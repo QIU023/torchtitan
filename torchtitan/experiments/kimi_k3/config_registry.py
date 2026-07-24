@@ -369,6 +369,22 @@ def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_debugmodel_gated_qlora_mxfp4() -> Trainer.Config:
+    """Debug QLoRA: gated_lora with the frozen base packed to MXFP4.
+
+    Meta-first trainer flow: the model builds with the PACKED layout
+    (base_qdata/base_scale, no base.weight), FSDP shards the packed
+    bytes, and the quantized values load from a DCP checkpoint produced
+    by phase13 stream_quantize_mxfp4_dcp.py from a bf16 run. CI-scale
+    rehearsal of 48B QLoRA on small-VRAM fleets (no rank ever holds the
+    full bf16 model).
+    """
+    cfg = kimi_linear_debugmodel_gated_lora()
+    cfg.model_spec.flavor = "kimi_linear_debugmodel_gated_qlora_mxfp4"
+    cfg.model_spec.model.lora_quantize_base = "mxfp4"
+    return cfg
+
+
 def kimi_linear_48b_block_attn_res_gated_lora() -> Trainer.Config:
     """48B graft + LoRA rank-16: the 5090-feasible post-training target
     (frozen 48B base sharded at ~12GB/card; only adapters + AttnRes
