@@ -235,16 +235,25 @@ def parallelize_kimi_linear(
             compile_config.backend,
         )
 
-    if parallel_dims.dp_shard_enabled or parallel_dims.dp_replicate_enabled:
-        # Use "fsdp" (shard only) when shard>1 replicate=1; "batch"
-        # mesh combines shard + replicate when replicate>1. Fall back
-        # to whichever is valid for the current mesh layout.
-        if parallel_dims.dp_replicate_enabled and parallel_dims.dp_shard_enabled:
-            dp_mesh = parallel_dims.get_mesh("batch")
-        elif parallel_dims.dp_shard_enabled:
-            dp_mesh = parallel_dims.get_mesh("fsdp")
+    # NOTE cp_enabled belongs in this gate: torchtitan's "fsdp" mesh is
+    # dp_shard x cp and FSDP is the mechanism that reduces param grads
+    # over cp. Gating on dp alone silently skipped FSDP at dp_shard=1,
+    # cp>1 -- every cp rank then trained an UNSYNCED replica on its own
+    # seq shard (diverging, no error; per-rank grad_norm was the only
+    # visible symptom). Upstream llama3 applies FSDP unconditionally.
+    if (
+        parallel_dims.dp_shard_enabled
+        or parallel_dims.dp_replicate_enabled
+        or parallel_dims.cp_enabled
+    ):
+        # The FSDP shard axis must be "fsdp" (= dp_shard x cp), never
+        # "batch" (= dp_replicate x dp_shard, EXCLUDES cp): grads only
+        # reduce over cp through FSDP's mesh. Mirrors upstream llama3's
+        # ["dp_replicate", "fsdp"] selection.
+        if parallel_dims.dp_replicate_enabled:
+            dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
         else:
-            dp_mesh = parallel_dims.get_mesh("dp_replicate")
+            dp_mesh = parallel_dims.get_mesh("fsdp")
         # Under EP, MoE expert parameters must shard via the *edp* mesh
         # (= dp_shard with the EP rank dim factored out) so FSDP's
         # mesh does not overlap EP's mesh on the same physical ranks.
