@@ -369,6 +369,27 @@ def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_debugmodel8h() -> Trainer.Config:
+    """8-head debug flavor (d=512, H=8) for deep tp x cp meshes.
+
+    The 4-head debugmodel binds at tp*cp=4 (MLA heads must divide
+    tp*cp); this flavor enables tp2cp4 / tp4cp2 cells on 8 ranks.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_debugmodel()
+    cfg.model_spec.flavor = "kimi_linear_debugmodel8h"
+    kimi_config = build_kimi_linear_config(
+        "debugmodel8h", num_experts=8, vocab_size=2016,
+    )
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=kimi_config,
+        num_blocks=resolve_num_blocks("debugmodel8h", "block_attn_res"),
+    )
+    return cfg
+
+
 def kimi_linear_debugmodel_gated_qlora_mxfp4() -> Trainer.Config:
     """Debug QLoRA: gated_lora with the frozen base packed to MXFP4.
 

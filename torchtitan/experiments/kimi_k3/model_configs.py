@@ -119,6 +119,12 @@ _BY_NAME["debugmodel"] = _SweepSize(
     "debugmodel", 1, 0.01, 4, 4, 256, 128, 3e-4, 8
 )
 
+# 8-head debug size for deep tp x cp meshes: H=4 binds at tp*cp=4, so
+# tp2cp4 / tp4cp2 (8 ranks) need H=8. d=512 keeps head_dim 64.
+_BY_NAME["debugmodel8h"] = _SweepSize(
+    "debugmodel8h", 4, 0.01, 4, 8, 512, 128, 3e-4, 8
+)
+
 
 # ----- 48B-A3B reference (upscale target, kept for docs) ------------------ #
 # Faithful to the HF config.json at moonshotai/Kimi-Linear-48B-A3B-Base.
