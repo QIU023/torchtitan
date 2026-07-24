@@ -84,12 +84,14 @@ def parallelize_kimi_linear(
     FSDP/HSDP. AC is applied before compile so the compiled subgraph is
     the checkpointed unit (matches upstream llama3/qwen3 ordering).
 
-    CP is correctness-first seq all-gather at the KDA/MLA attention
-    boundary (composes with FSDP/PP/EP); see the inline comment near the
-    CP guard for the design and the KDA Ulysses head-shard optimization
-    that sits on top of it. CP+TP is out of scope: the CP all-gather
-    guards on plain, non-DTensor activations (the TP boundary contract),
-    so it cannot also track a TP mesh dimension.
+    CP is Ulysses-style (seq-local projections, all-to-all seq<->head,
+    full-seq attention on the local head subset) inside each KDA/MLA
+    module; the module boundary stays a seq-sharded plain tensor, which
+    is what keeps CP composable with FSDP/PP/EP. CP+TP composes too: the
+    CP collectives run on plain local tensors AFTER the TP-wrapped
+    projections (to_local at the same gap the TP plan already strips
+    DTensor), so under TP each rank computes num_heads/(tp*cp) MLA heads.
+    Requires context_parallel_load_balancer=None (validated below).
     """
     # Enable TF32 tensor cores for fp32 matmuls (loss aggregation,
     # optimizer master weight updates, fp32 RoPE etc.). bf16 path is
@@ -135,16 +137,8 @@ def parallelize_kimi_linear(
     if parallel_dims.cp_enabled:
         # Fail loudly on configs the CP implementation cannot honor.
         # Silent degradation here has already produced plausible-but-wrong
-        # runs (MLA skipping CP under TP; headtail-permuted sequences), so
-        # these are ValueErrors, not warnings.
-        if parallel_dims.tp_enabled:
-            raise NotImplementedError(
-                "CP+TP is not supported yet for kimi_linear: under TP the "
-                "MLA CP guard sees DTensor activations and skips CP while "
-                "KDA still applies it, producing silently wrong numerics "
-                "(block-diagonal MLA attention). Drop tensor_parallel_degree "
-                "or context_parallel_degree until Ulysses CP+TP lands."
-            )
+        # runs (headtail-permuted sequences), so these are ValueErrors,
+        # not warnings.
         cp_load_balancer = parallelism.context_parallel_load_balancer
         if cp_load_balancer is not None:
             raise ValueError(
@@ -158,21 +152,17 @@ def parallelize_kimi_linear(
                 "computes the full sequence for its head subset, so "
                 "per-rank work is already symmetric."
             )
-        # Phase 6 CP for the hybrid KDA/MLA backbone.
-        #
-        # Correctness-first CP for the hybrid KDA/MLA backbone: both layer
-        # types all-gather the seq shard at their boundary, run the
-        # unchanged forward on the full sequence, and slice this rank's
-        # shard from the output (see KimiDeltaAttention/KimiMLAAttention
-        # .forward). Differentiable all_gather -> reduce-scatter backward,
-        # so grads are correct. KDA can't ring (fla-core chunk_kda scan)
-        # and our custom MLA inner_attention isn't the torchtitan SDPA type
-        # apply_cp_to_forward expects, so the uniform all-gather keeps CP
-        # correct + composable with FSDP/PP/EP. The memory-optimal path
-        # (KDA Ulysses head-shard -- validated bit-exact,
-        # phase13/kda_ulysses_cp_probe.py + CP_ULYSSES_DESIGN.md -- and MLA
-        # SDPA ring) is the optimization on top. CP+TP is out of scope (the
-        # all-gather guards on plain, non-DTensor activations).
+        # Ulysses CP for the hybrid KDA/MLA backbone: each attention
+        # module runs its projections seq-local, swaps seq<->head
+        # sharding with one fused differentiable all-to-all on the cp
+        # sub-mesh, and runs conv/scan/SDPA on its head subset over the
+        # full sequence (see KimiDeltaAttention/KimiMLAAttention
+        # ._forward_cp). chunk_kda is bit-exactly per-head independent
+        # (phase13/kda_ulysses_cp_probe.py), so head sharding is exact.
+        # KDA can't ring (fla-core scan) and the custom MLA
+        # inner_attention isn't the torchtitan SDPA type
+        # apply_cp_to_forward expects -- hence this module-internal CP
+        # rather than the upstream dispatcher.
         from torchtitan.experiments.kimi_k3.model import (
             KimiDeltaAttention,
             KimiMLAAttention,
@@ -656,6 +646,15 @@ def apply_tp_kimi_linear(
                     ),
                 }
             )
+            # Gated MLA (k3faithful flavors): per-head gate projection,
+            # out_features = num_heads -> shard on the head axis like
+            # q_proj so the local gate matches the local attn heads in
+            # both the TP-only and the CP+TP forward. Without this the
+            # plain-tensor gate param meets DTensor x (mixed-op crash).
+            if getattr(layer.self_attn, "attn_gate_proj", None) is not None:
+                plan["self_attn.attn_gate_proj"] = ColwiseParallel(
+                    use_local_output=True,
+                )
 
         # FFN path.
         if not is_moe:
