@@ -254,6 +254,57 @@ class KimiMLAInnerAttention(nn.Module):
         )
 
 
+def _cp_all_to_all_headseq(
+    x: torch.Tensor, cp_group, seq_to_head: bool
+) -> torch.Tensor:
+    """Differentiable Ulysses all-to-all swapping which of (seq, head) is
+    sharded across the CP group.
+
+    seq_to_head=True:  ``[B, T/cp, H, K]`` (seq-sharded) -> ``[B, T, H/cp, K]``.
+    seq_to_head=False: ``[B, T, H/cp, K]`` -> ``[B, T/cp, H, K]``.
+
+    Numerics (round-trip and per-head chunk_kda parity) validated
+    bit-exact in phase13 kda_ulysses_cp_probe.py; backward is the
+    transposed all-to-all via torch.distributed.nn.functional.
+    """
+    import torch.distributed.nn.functional as dist_nn
+
+    cp = dist.get_world_size(cp_group)
+    B, d1, d2, K = x.shape
+    if seq_to_head:
+        t_loc, num_heads = d1, d2
+        # [B, T/cp, H, K] -> [cp, B, T/cp, H/cp, K] (split heads by dest)
+        x_split = (
+            x.reshape(B, t_loc, cp, num_heads // cp, K)
+            .permute(2, 0, 1, 3, 4)
+            .contiguous()
+        )
+        out = dist_nn.all_to_all_single(
+            torch.empty_like(x_split), x_split, group=cp_group
+        )
+        # recv[s] holds src s's T/cp for THIS rank's head subset -> stack seq
+        return (
+            out.permute(1, 0, 2, 3, 4)
+            .reshape(B, cp * t_loc, num_heads // cp, K)
+            .contiguous()
+        )
+    t_full, h_loc = d1, d2
+    t_loc = t_full // cp
+    x_split = (
+        x.reshape(B, cp, t_loc, h_loc, K).permute(1, 0, 2, 3, 4).contiguous()
+    )
+    out = dist_nn.all_to_all_single(
+        torch.empty_like(x_split), x_split, group=cp_group
+    )
+    # out[s] = src s's head subset for THIS rank's seq shard; put T/cp
+    # before the src(cp) axis so reshape stacks heads in ascending order.
+    return (
+        out.permute(1, 2, 0, 3, 4)
+        .reshape(B, t_loc, cp * h_loc, K)
+        .contiguous()
+    )
+
+
 class KimiMLAAttention(nn.Module):
     """Multi-head Latent Attention, Kimi NoPE variant.
 
@@ -340,34 +391,13 @@ class KimiMLAAttention(nn.Module):
         Returns:
             ``[B, T, D]`` attention output.
         """
-        # Context parallel (correctness-first): all-gather the seq shard so
-        # RoPE positions and the causal attention see the full sequence,
-        # then slice this rank's shard from the output. Same pattern as KDA
-        # (see KimiDeltaAttention.forward); the memory-optimal path is SDPA
-        # ring (CP_ULYSSES_DESIGN). Only the CP-without-TP path (plain x);
-        # under TP x is a DTensor and CP+TP is out of scope here.
-        cp_slice = None
-        cp_hslice = None
+        # Context parallel: Ulysses path (seq-local projections,
+        # all-to-all seq<->head, full-seq SDPA on this rank's head
+        # subset). Handles both plain x and DTensor x (TP), so there is
+        # no silent CP skip under TP anymore.
         cp_group = getattr(self, "_cp_group", None)
-        if (
-            cp_group is not None
-            and not isinstance(x, DTensor)
-            and dist.get_world_size(cp_group) > 1
-        ):
-            import torch.distributed.nn.functional as dist_nn
-
-            cp_rank = dist.get_rank(cp_group)
-            cp_size = dist.get_world_size(cp_group)
-            t_loc = x.shape[1]
-            x = torch.cat(
-                dist_nn.all_gather(x.contiguous(), group=cp_group), dim=1
-            )
-            cp_slice = (cp_rank * t_loc, (cp_rank + 1) * t_loc)
-            # Head-shard the SDPA too (per-head independent): each rank runs
-            # its H/cp heads over the full seq, heads all-gathered after.
-            if self.num_heads % cp_size == 0:
-                h_loc = self.num_heads // cp_size
-                cp_hslice = (cp_rank * h_loc, (cp_rank + 1) * h_loc)
+        if cp_group is not None and dist.get_world_size(cp_group) > 1:
+            return self._forward_cp(x, cp_group)
         B, T, _ = x.shape
 
         # Q path: direct projection -> (B, T, H, q_head_dim) -> (B, H, T, q_head_dim)
@@ -416,22 +446,9 @@ class KimiMLAAttention(nn.Module):
         # to plain Tensors before SDPA's mem-efficient cutlass kernel
         # path sees them — avoiding "aten.bmm got mixed Tensor and
         # DTensor" inside SDPA's internal dispatcher.
-        if cp_hslice is not None:
-            h0, h1 = cp_hslice
-            q_full, k_full, v = (
-                q_full[:, h0:h1],
-                k_full[:, h0:h1],
-                v[:, h0:h1],
-            )
         attn_out = self.inner_attention(
             q_full, k_full, v, scale=self.scaling,
         )  # (B, H, T, v_head_dim)
-        if cp_hslice is not None:
-            # all-gather the head shards back (differentiable).
-            attn_out = torch.cat(
-                dist_nn.all_gather(attn_out.contiguous(), group=cp_group),
-                dim=1,
-            )
 
         attn_out = attn_out.transpose(1, 2)  # (B, T, H, Dv)
         if self.mla_gated:
@@ -440,8 +457,105 @@ class KimiMLAAttention(nn.Module):
             attn_out = attn_out * gate.unsqueeze(-1)
         attn_out = attn_out.reshape(B, T, -1)
         out = self.o_proj(attn_out)
-        if cp_slice is not None:
-            out = out[:, cp_slice[0] : cp_slice[1], :]
+        return out
+
+    def _forward_cp(self, x: torch.Tensor, cp_group) -> torch.Tensor:
+        """Ulysses CP forward.
+
+        Tensor-name legend (shape suffixes): B batch, L local seq (T/cp),
+        T full seq, H local head count before CP split (num_heads/tp),
+        G CP-local head count (H/cp), Q q_head_dim, N qk_nope_head_dim,
+        V v_head_dim, R qk_rope_head_dim, W concatenated feature dim.
+
+        Input x is ``[B, L, D]`` -- plain, or DTensor(Replicate on
+        tp_mesh) under TP. Projections run through their (possibly
+        TP-wrapped) modules at seq length L; the CP collectives operate
+        on plain local tensors only, in the same gap where the TP plan
+        already strips DTensor (inner_attention use_local_output). Under
+        TP the head axis is already tp-sharded, so this rank computes
+        num_heads/(tp*cp) heads over the full sequence. No rank ever
+        materializes ``[B, T, D]`` hidden states: activation memory
+        follows the Ulysses contract, unlike the previous all-gather-SP
+        path which kept O(T x D) per rank at any cp degree.
+        """
+        import torch.distributed.nn.functional as dist_nn
+
+        cp_size = dist.get_world_size(cp_group)
+        B, t_loc, _ = x.shape
+
+        q_BLE = self.q_proj(x)
+        compressed_kv = self.kv_a_proj_with_mqa(x)
+        k_pass, k_rot_BLR = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        kv_BLF = self.kv_b_proj(self.kv_a_layernorm(k_pass))
+
+        # Leave DTensor land (no-ops when TP is off). All CP collectives
+        # below run on plain local tensors on the cp sub-mesh group.
+        q_BLE = _to_local_if_dtensor(q_BLE)
+        kv_BLF = _to_local_if_dtensor(kv_BLF)
+        k_rot_BLR = _to_local_if_dtensor(k_rot_BLR)
+
+        kv_head_dim = self.qk_nope_head_dim + self.v_head_dim
+        h_loc = q_BLE.shape[-1] // self.q_head_dim
+        if h_loc % cp_size != 0:
+            raise ValueError(
+                f"MLA CP: local head count {h_loc} is not divisible by "
+                f"cp={cp_size} (num_attention_heads must divide tp*cp)"
+            )
+
+        # One fused all-to-all for q and kv (concat on the feature axis).
+        qkv_BLHW = torch.cat(
+            [
+                q_BLE.view(B, t_loc, h_loc, self.q_head_dim),
+                kv_BLF.view(B, t_loc, h_loc, kv_head_dim),
+            ],
+            dim=-1,
+        )
+        qkv_BTGW = _cp_all_to_all_headseq(qkv_BLHW, cp_group, seq_to_head=True)
+        q_BTGQ, k_pass_BTGN, v_BTGV = torch.split(
+            qkv_BTGW,
+            [self.q_head_dim, self.qk_nope_head_dim, self.v_head_dim],
+            dim=-1,
+        )
+        t_full = t_loc * cp_size
+        h_cp = h_loc // cp_size
+
+        # k_rot is broadcast across heads (headless): all-gather the seq
+        # shards (differentiable -> reduce-scatter backward) and expand
+        # onto this rank's head subset. Tiny tensor (R per token).
+        k_rot_BTR = torch.cat(
+            dist_nn.all_gather(k_rot_BLR.contiguous(), group=cp_group), dim=1
+        )
+        k_BTGQ = torch.cat(
+            [
+                k_pass_BTGN,
+                k_rot_BTR.view(B, t_full, 1, self.qk_rope_head_dim).expand(
+                    B, t_full, h_cp, self.qk_rope_head_dim
+                ),
+            ],
+            dim=-1,
+        )
+
+        attn_BGTV = self.inner_attention(
+            q_BTGQ.transpose(1, 2),
+            k_BTGQ.transpose(1, 2),
+            v_BTGV.transpose(1, 2),
+            scale=self.scaling,
+        )
+        attn_BLHV = _cp_all_to_all_headseq(
+            attn_BGTV.transpose(1, 2).contiguous(), cp_group, seq_to_head=False
+        )
+        if self.mla_gated:
+            # Per-head sigmoid gate from the seq-local x; pointwise per
+            # (b, t, h), so it applies after the heads return seq-local.
+            gate_BLH = torch.sigmoid(
+                _to_local_if_dtensor(self.attn_gate_proj(x))
+            )
+            attn_BLHV = attn_BLHV * gate_BLH.unsqueeze(-1)
+        out = self.o_proj(
+            attn_BLHV.reshape(B, t_loc, h_loc * self.v_head_dim)
+        )
         return out
 
 
@@ -585,32 +699,19 @@ class KimiDeltaAttention(nn.Module):
             in_mesh = x.device_mesh
             in_placements = x.placements
         x = _to_local_if_dtensor(x)
-        # Context parallel: the trainer seq-shards x across the cp mesh, but
-        # chunk_kda is a causal scan needing the full sequence. All-gather
-        # the seq at the KDA boundary (backward = reduce-scatter, so grads
-        # are correct), then HEAD-SHARD the scan: chunk_kda is bit-exactly
-        # per-head independent (kda_ulysses_cp_probe), so each cp rank runs
-        # only its H/cp heads over the full sequence and the heads are
-        # all-gathered before o_proj. This cuts the dominant scan's
-        # compute/memory by cp; proj/conv still run replicated on the full
-        # seq (the fla conv is a fused triton path -- seq-sharding it via
-        # halo is the remaining optimization, CP_ULYSSES_DESIGN). MLA layers
-        # get CP via the seq all-gather in KimiMLAAttention.forward.
-        cp_slice = None
-        cp_hslice = None
+        # Context parallel: Ulysses path (seq-local projections,
+        # all-to-all seq<->head, full-seq conv + scan on this rank's head
+        # subset). chunk_kda is bit-exactly per-head independent
+        # (kda_ulysses_cp_probe), so head-sharding the scan is exact.
+        # MLA layers get the same treatment in KimiMLAAttention.
         cp_group = getattr(self, "_cp_group", None)
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            import torch.distributed.nn.functional as dist_nn
-
-            cp_rank = dist.get_rank(cp_group)
-            cp_size = dist.get_world_size(cp_group)
-            t_loc = x.shape[1]
-            if self.num_heads % cp_size == 0:
-                h_loc = self.num_heads // cp_size
-                cp_hslice = (cp_rank * h_loc, (cp_rank + 1) * h_loc)
-            gathered = dist_nn.all_gather(x.contiguous(), group=cp_group)
-            x = torch.cat(gathered, dim=1)
-            cp_slice = (cp_rank * t_loc, (cp_rank + 1) * t_loc)
+            out = self._forward_cp(x, cp_group)
+            if in_mesh is not None and in_placements is not None:
+                out = DTensor.from_local(
+                    out, in_mesh, in_placements, run_check=False,
+                )
+            return out
         _, T, _ = x.shape
         # mode selection matches reference: chunk for long, recurrent for short
         # training gate: chunk required (ref asserts this)
@@ -658,14 +759,7 @@ class KimiDeltaAttention(nn.Module):
         g_out = _local_linear(self.g_b_proj, _local_linear(self.g_a_proj, x))
         g_out = rearrange(g_out, "... (h d) -> ... h d", d=self.head_dim)
 
-        # CP head-shard: keep only this rank's H/cp heads for the scan.
-        if cp_hslice is not None:
-            h0, h1 = cp_hslice
-            q, k, v = q[:, :, h0:h1], k[:, :, h0:h1], v[:, :, h0:h1]
-            g, beta = g[:, :, h0:h1], beta[:, :, h0:h1]
-            g_out = g_out[:, :, h0:h1]
-
-        # 5) Run KDA op (on this rank's head subset under CP)
+        # 5) Run KDA op
         kda_fn = chunk_kda if mode == "chunk" else fused_recurrent_kda
         o, _ = kda_fn(
             q=q,
@@ -684,20 +778,9 @@ class KimiDeltaAttention(nn.Module):
         # here (both are plain after the to_local+linear chain).
         o = self.o_norm(o, g_out)  # o * sigmoid(g_out), normed
 
-        # CP: all-gather the head shards back before the head-mixing o_proj
-        # (differentiable -> backward is reduce-scatter over heads).
-        if cp_hslice is not None:
-            o = torch.cat(dist_nn.all_gather(o.contiguous(), group=cp_group), dim=2)
-
         # 7) Reshape back and project
         o = rearrange(o, "b t h d -> b t (h d)")
         out = _local_linear(self.o_proj, o)
-
-        # CP: slice this rank's sequence shard back out (backward of the
-        # slice zero-pads; composed with the differentiable input
-        # all_gather's reduce-scatter backward this is the correct grad).
-        if cp_slice is not None:
-            out = out[:, cp_slice[0] : cp_slice[1], :]
 
         # Re-wrap the output as DTensor so the parent NoParallel hook
         # gets the type it expects. Replicate placement matches the
@@ -706,6 +789,139 @@ class KimiDeltaAttention(nn.Module):
             out = DTensor.from_local(
                 out, in_mesh, in_placements, run_check=False,
             )
+        return out
+
+    def _forward_cp(self, x: torch.Tensor, cp_group) -> torch.Tensor:
+        """Ulysses CP forward for KDA.
+
+        Tensor-name legend (shape suffixes): B batch, L local seq (T/cp),
+        T full seq, H head count (KDA is never tp-sharded), G CP-local
+        head count (H/cp), K head_dim, C flattened head-subset channels
+        (G*K).
+
+        Input x is the plain local ``[B, L, D]`` shard (caller already
+        stripped DTensor). Projections run seq-local at L; one fused
+        all-to-all moves (q, k, v, g_raw, g_out, beta) to full-seq
+        head-subset layout; the causal short conv, fused_kda_gate, and
+        chunk_kda then run on the full sequence for this rank's G heads
+        (conv weights channel-sliced -- depthwise conv, exact; validated
+        bit-exact vs ShortConvolution). No rank materializes the full
+        sequence at hidden dim D.
+
+        Gradient note: each rank's param-grad contribution covers its
+        (seq shard x head subset) sector with zeros elsewhere; FSDP's
+        dp_shard_cp mesh reduces over cp, reconstructing full grads --
+        the same contract the previous all-gather-SP path relied on.
+        """
+        from fla.modules.conv.causal_conv1d import causal_conv1d
+
+        cp_size = dist.get_world_size(cp_group)
+        cp_rank = dist.get_rank(cp_group)
+        B, t_loc, _ = x.shape
+        num_heads, head_dim = self.num_heads, self.head_dim
+        if num_heads % cp_size != 0:
+            raise ValueError(
+                f"KDA CP: num_heads {num_heads} is not divisible by "
+                f"cp={cp_size}"
+            )
+        h_cp = num_heads // cp_size
+        h0 = cp_rank * h_cp
+
+        # 1) Seq-local projections at L (no cross-seq ops here).
+        q_BLHK = _local_linear(self.q_proj, x).view(
+            B, t_loc, num_heads, head_dim
+        )
+        k_BLHK = _local_linear(self.k_proj, x).view(
+            B, t_loc, num_heads, head_dim
+        )
+        v_BLHK = _local_linear(self.v_proj, x).view(
+            B, t_loc, num_heads, head_dim
+        )
+        g_raw_BLHK = _local_linear(
+            self.f_b_proj, _local_linear(self.f_a_proj, x)
+        ).view(B, t_loc, num_heads, head_dim)
+        g_out_BLHK = _local_linear(
+            self.g_b_proj, _local_linear(self.g_a_proj, x)
+        ).view(B, t_loc, num_heads, head_dim)
+        beta_BLH1 = _local_linear(self.b_proj, x).unsqueeze(-1)
+
+        # 2) One fused all-to-all: seq-shard -> full-seq head-subset.
+        packed_BLHW = torch.cat(
+            [q_BLHK, k_BLHK, v_BLHK, g_raw_BLHK, g_out_BLHK, beta_BLH1],
+            dim=-1,
+        )
+        packed_BTGW = _cp_all_to_all_headseq(
+            packed_BLHW, cp_group, seq_to_head=True
+        )
+        q_BTGK, k_BTGK, v_BTGK, g_raw_BTGK, g_out_BTGK, beta_BTG1 = (
+            torch.split(
+                packed_BTGW,
+                [head_dim, head_dim, head_dim, head_dim, head_dim, 1],
+                dim=-1,
+            )
+        )
+        t_full = t_loc * cp_size
+
+        mode = "fused_recurrent" if t_full <= 64 else "chunk"
+        if self.training:
+            assert mode == "chunk", "KDA training requires chunk mode (T > 64)"
+
+        # 3) Short causal conv on the full sequence, weights sliced to
+        # this rank's head-subset channels (depthwise conv -> exact).
+        def conv_subset(conv: ShortConvolution, x_BTGK: torch.Tensor):
+            w_CW = _to_local_if_dtensor(conv.weight).squeeze(1)[
+                h0 * head_dim : (h0 + h_cp) * head_dim
+            ]
+            b_C = (
+                _to_local_if_dtensor(conv.bias)[
+                    h0 * head_dim : (h0 + h_cp) * head_dim
+                ]
+                if conv.bias is not None
+                else None
+            )
+            y_BTC, _ = causal_conv1d(
+                x_BTGK.reshape(B, t_full, h_cp * head_dim),
+                weight=w_CW,
+                bias=b_C,
+                activation=conv.activation,
+                backend=conv.backend,
+            )
+            return y_BTC.view(B, t_full, h_cp, head_dim)
+
+        q_BTGK = conv_subset(self.q_conv1d, q_BTGK)
+        k_BTGK = conv_subset(self.k_conv1d, k_BTGK)
+        v_BTGK = conv_subset(self.v_conv1d, v_BTGK)
+
+        # 4) Forget gate + beta on the head subset (A_log/dt_bias sliced).
+        g_BTGK = fused_kda_gate(
+            g_raw_BTGK,
+            _to_local_if_dtensor(self.A_log)[h0 : h0 + h_cp],
+            dt_bias=_to_local_if_dtensor(self.dt_bias)
+            .view(num_heads, head_dim)[h0 : h0 + h_cp]
+            .reshape(-1),
+        )
+        beta_BTG = beta_BTG1.squeeze(-1).float().sigmoid()
+
+        # 5) KDA scan on this rank's heads over the full sequence.
+        kda_fn = chunk_kda if mode == "chunk" else fused_recurrent_kda
+        o_BTGK, _ = kda_fn(
+            q=q_BTGK,
+            k=k_BTGK,
+            v=v_BTGK,
+            g=g_BTGK,
+            beta=beta_BTG,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=None,
+        )
+        o_BTGK = self.o_norm(o_BTGK, g_out_BTGK)
+
+        # 6) All-to-all back to seq-shard full-head layout, then o_proj.
+        o_BLHK = _cp_all_to_all_headseq(o_BTGK, cp_group, seq_to_head=False)
+        out = _local_linear(
+            self.o_proj, o_BLHK.reshape(B, t_loc, num_heads * head_dim)
+        )
         return out
 
 

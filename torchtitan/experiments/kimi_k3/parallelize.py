@@ -179,14 +179,35 @@ def parallelize_kimi_linear(
         )
 
         cp_group = parallel_dims.get_mesh("cp").get_group()
+        cp_degree = parallel_dims.cp
+        tp_degree = parallel_dims.tp
         n_attn = 0
         for m in model.modules():
-            if isinstance(m, (KimiDeltaAttention, KimiMLAAttention)):
+            if isinstance(m, KimiMLAAttention):
+                # Under TP the head axis is already tp-sharded; Ulysses
+                # further splits the local heads by cp.
+                if m.num_heads % (tp_degree * cp_degree) != 0:
+                    raise ValueError(
+                        f"MLA num_attention_heads={m.num_heads} must be "
+                        f"divisible by tp*cp={tp_degree * cp_degree} for "
+                        "Ulysses CP head sharding"
+                    )
+                m._cp_group = cp_group
+                n_attn += 1
+            elif isinstance(m, KimiDeltaAttention):
+                # KDA is NoParallel under TP (replicated), so only cp
+                # splits its heads.
+                if m.num_heads % cp_degree != 0:
+                    raise ValueError(
+                        f"KDA kda_num_heads={m.num_heads} must be "
+                        f"divisible by cp={cp_degree} for Ulysses CP "
+                        "head sharding"
+                    )
                 m._cp_group = cp_group
                 n_attn += 1
         logger.info(
-            "Applied CP cp_degree=%d (seq all-gather at %d attn layers).",
-            parallel_dims.cp, n_attn,
+            "Applied Ulysses CP cp_degree=%d (all-to-all at %d attn layers).",
+            cp_degree, n_attn,
         )
     if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
         # Phase 6 A6: Expert Parallel for Kimi MoE layers. The
