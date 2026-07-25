@@ -12,10 +12,14 @@ frozen-base-LoRA dtype alignment in the AttnRes read path (fp32 masters
 meeting a bf16 stream must not crash nor promote the stream).
 """
 
+import os
 import unittest
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.experiments.kimi_k3.attn_res import (
     AttnResProjection,
@@ -74,6 +78,42 @@ class TestAttnResDtypeAlignment(unittest.TestCase):
         partial = torch.randn(2, 4, d)
         h = block_attn_res(blocks, partial, proj, norm)
         self.assertEqual(h.dtype, torch.float32)
+
+
+class TestPackedMXFP4NoParallelInput(unittest.TestCase):
+    """Packed base under a NoParallel descent (MoE shared experts).
+
+    NoParallel's prepare_input wraps the plain input into a DTensor while
+    the packed base dequantizes to a plain tensor, so the base matmul saw
+    mixed Tensor/DTensor operands and raised. Only the Colwise/Rowwise
+    styles set ``_tp_style``; shared experts never do.
+    """
+
+    def setUp(self):
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29517")
+        self._owns_pg = not dist.is_initialized()
+        if self._owns_pg:
+            dist.init_process_group("gloo", rank=0, world_size=1)
+        self.mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+
+    def tearDown(self):
+        if self._owns_pg and dist.is_initialized():
+            dist.destroy_process_group()
+
+    def test_dtensor_input_against_packed_base(self):
+        torch.manual_seed(0)
+        mod = KimiLoRALinear(
+            nn.Linear(64, 16, bias=False), rank=4, alpha=8.0, quantize_base="mxfp4"
+        )
+        self.assertEqual(mod._quantize_base, "mxfp4")
+        self.assertIsNone(getattr(mod, "_tp_style", None))
+
+        x = torch.randn(2, 3, 64)
+        y_plain = mod(x)
+        y_dt = mod(DTensor.from_local(x, self.mesh, [Replicate()], run_check=False))
+        self.assertIsInstance(y_dt, DTensor)
+        torch.testing.assert_close(y_dt.full_tensor(), y_plain)
 
 
 class TestLoRAAdapterDtypeAlignment(unittest.TestCase):

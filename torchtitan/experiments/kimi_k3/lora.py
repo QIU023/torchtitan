@@ -365,6 +365,14 @@ class KimiLoRALinear(nn.Module):
             # No weight-only MXFP4 linear in torchao yet: dequant then
             # matmul (memory/comms win from the packed base still holds).
             w = self._dequant_base_mxfp4().to(x.dtype)
+            if x_is_dt:
+                # Dequant densifies the packed params, but a NoParallel
+                # descent (MoE shared experts) hands us a DTensor input:
+                # replicate w so the matmul stays DTensor x DTensor.
+                mesh = x.device_mesh
+                w = DTensor.from_local(
+                    w, mesh, [Replicate()] * mesh.ndim, run_check=False
+                )
             base_out = F.linear(x, w)
             if self.base.bias is not None:
                 base_out = base_out + self.base.bias
