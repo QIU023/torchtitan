@@ -219,14 +219,64 @@ class KimiLoRALinear(nn.Module):
         self._quantize_base = "mxfp4"
         return True
 
+    def apply_packed_mxfp4_tp(self, tp_mesh, colwise: bool) -> None:
+        """TP-shard the packed MXFP4 base (call at parallelize time).
+
+        Colwise (out-sharded): qdata/scale shard on dim 0 -- MX block-32
+        quantization is row-blockwise, so row sharding is exact. Rowwise
+        (in-sharded): shard on dim 1; requires (in_features // tp) % 32
+        == 0 so the shard boundary lands on whole MX blocks (then the
+        qdata byte boundary in/2/tp and the scale boundary in/32/tp are
+        integral too). Registered as DTensor so DCP resharding of the
+        packed checkpoint keeps working; the forward computes on the
+        LOCAL shard (see the packed-TP branch in :meth:`forward`).
+        """
+        from torch.distributed.tensor import distribute_tensor, Shard
+
+        tp = tp_mesh.size()
+        out_f, in_f = self.base.out_features, self.base.in_features
+        if colwise:
+            if out_f % tp != 0:
+                raise ValueError(
+                    f"packed-MXFP4 colwise TP: out_features {out_f} not "
+                    f"divisible by tp={tp}"
+                )
+            placements = [Shard(0)]
+        else:
+            if in_f % tp != 0 or (in_f // tp) % 32 != 0:
+                raise ValueError(
+                    f"packed-MXFP4 rowwise TP: in_features {in_f} must be "
+                    f"divisible by tp={tp} with (in/tp) % 32 == 0 (MX "
+                    "block alignment)"
+                )
+            placements = [Shard(1)]
+        self.base_qdata = nn.Parameter(
+            distribute_tensor(self.base_qdata, tp_mesh, placements),
+            requires_grad=False,
+        )
+        self.base_scale = nn.Parameter(
+            distribute_tensor(self.base_scale, tp_mesh, placements),
+            requires_grad=False,
+        )
+        self._tp_style = "colwise" if colwise else "rowwise"
+        self._tp_mesh = tp_mesh
+
     def _dequant_base_mxfp4(self) -> torch.Tensor:
         from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
         qdata, scale = self.base_qdata, self.base_scale
-        if hasattr(qdata, "full_tensor"):
-            qdata = qdata.full_tensor()
-        if hasattr(scale, "full_tensor"):
-            scale = scale.full_tensor()
+        if getattr(self, "_tp_style", None) is not None:
+            # TP-sharded packed base: dequantize this rank's LOCAL shard
+            # (row rows for colwise, whole-block column slice for
+            # rowwise); the forward's packed-TP branch does the local
+            # matmul + collective.
+            qdata = qdata.to_local() if hasattr(qdata, "to_local") else qdata
+            scale = scale.to_local() if hasattr(scale, "to_local") else scale
+        else:
+            if hasattr(qdata, "full_tensor"):
+                qdata = qdata.full_tensor()
+            if hasattr(scale, "full_tensor"):
+                scale = scale.full_tensor()
         mx = MXTensor.__tensor_unflatten__(
             {"qdata": qdata, "scale": scale.view(self._mx_scale_dtype)},
             self._mx_ctx,
@@ -243,6 +293,64 @@ class KimiLoRALinear(nn.Module):
     def out_features(self) -> int:
         return self.base.out_features
 
+    def _forward_packed_tp(self, x: torch.Tensor) -> torch.Tensor:
+        """TP forward for the packed-MXFP4 base: local dequant + local
+        matmul, DTensor only at the boundary.
+
+        Colwise: x is replicated (DTensor(Replicate) or plain local);
+        each rank computes its out/tp columns; returns
+        DTensor(Shard(-1)) to match ColwiseParallel(use_local_output=
+        False) consumers. Rowwise: x is the in/tp local shard (plain, or
+        DTensor(Shard(-1))); local partial matmul, ONE all-reduce over
+        tp for base+adapter combined (linearity: sum commutes), returns
+        a plain replicated tensor to match RowwiseParallel(
+        output_layouts=Replicate, use_local_output=True).
+
+        Backward: explicit grad_placements make the tp reductions
+        happen -- replicated operands used by all ranks (colwise x and
+        lora_a, rowwise lora_b) carry Partial gradients that must
+        all-reduce; a bare to_local() would silently skip it (same trap
+        as the attn_res pseudo-query note).
+        """
+        from torch.distributed.tensor import DTensor, Partial, Replicate
+
+        colwise = self._tp_style == "colwise"
+        tp_mesh = self._tp_mesh
+
+        if isinstance(x, DTensor):
+            grad_pl = (Partial(),) if colwise else None
+            x_loc = x.to_local(grad_placements=grad_pl)
+        else:
+            x_loc = x
+
+        w_loc = self._dequant_base_mxfp4().to(x_loc.dtype)
+
+        la, lb = self.lora_a, self.lora_b
+        if colwise:
+            # lora_a Replicate (grads sum over tp), lora_b Shard(0) local.
+            la = la.to_local(grad_placements=(Partial(),)) if isinstance(la, DTensor) else la
+            lb = lb.to_local() if isinstance(lb, DTensor) else lb
+        else:
+            # lora_a Shard(1) local, lora_b Replicate (grads sum over tp).
+            la = la.to_local() if isinstance(la, DTensor) else la
+            lb = lb.to_local(grad_placements=(Partial(),)) if isinstance(lb, DTensor) else lb
+        if la.dtype != x_loc.dtype:
+            la = la.to(x_loc.dtype)
+            lb = lb.to(x_loc.dtype)
+
+        out_loc = F.linear(x_loc, w_loc) + self._lora_scaling * F.linear(
+            F.linear(x_loc, la), lb
+        )
+        if colwise:
+            from torch.distributed.tensor import Shard
+
+            return DTensor.from_local(
+                out_loc, tp_mesh, [Shard(out_loc.dim() - 1)], run_check=False
+            )
+        # Rowwise: local outputs are partial sums over the in/tp shards.
+        out = DTensor.from_local(out_loc, tp_mesh, [Partial()], run_check=False)
+        return out.redistribute(tp_mesh, [Replicate()]).to_local()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from torch.distributed.tensor import DTensor, Replicate
 
@@ -252,6 +360,8 @@ class KimiLoRALinear(nn.Module):
 
             base_out = linear_nf4(x, self.base.weight)
         elif self._quantize_base == "mxfp4":
+            if getattr(self, "_tp_style", None) is not None:
+                return self._forward_packed_tp(x)
             # No weight-only MXFP4 linear in torchao yet: dequant then
             # matmul (memory/comms win from the packed base still holds).
             w = self._dequant_base_mxfp4().to(x.dtype)

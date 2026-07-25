@@ -791,6 +791,7 @@ def apply_tp_kimi_linear(
         from torchtitan.experiments.kimi_k3.lora import KimiLoRALinear
 
         lora_tp: list[tuple[nn.Module, bool]] = []
+        packed_tp: list[tuple[KimiLoRALinear, bool]] = []
         for key in list(plan.keys()):
             style = plan[key]
             if not isinstance(style, (ColwiseParallel, RowwiseParallel)):
@@ -801,14 +802,26 @@ def apply_tp_kimi_linear(
                 continue
             if isinstance(target, KimiLoRALinear):
                 del plan[key]
-                plan[f"{key}.base"] = style
-                lora_tp.append((target, isinstance(style, ColwiseParallel)))
+                is_colwise = isinstance(style, ColwiseParallel)
+                if target._quantize_base == "mxfp4":
+                    # Packed base has no base.weight for a Colwise/Rowwise
+                    # style to target; shard the packed qdata/scale
+                    # directly (row/whole-block-column sharding is exact
+                    # for MX block-32) and let the module's packed-TP
+                    # forward do local dequant + matmul + collective.
+                    packed_tp.append((target, is_colwise))
+                else:
+                    plan[f"{key}.base"] = style
+                lora_tp.append((target, is_colwise))
 
         parallelize_module(
             module=layer,
             device_mesh=tp_mesh,
             parallelize_plan=plan,
         )
+
+        for mod, is_colwise in packed_tp:
+            mod.apply_packed_mxfp4_tp(tp_mesh, colwise=is_colwise)
 
         for mod, is_colwise in lora_tp:
             a_pl = [Replicate()] if is_colwise else [Shard(1)]
@@ -830,9 +843,13 @@ def apply_tp_kimi_linear(
         for m in layer.modules():
             if not isinstance(m, KimiLoRALinear):
                 continue
-            for nm in ("lora_a", "lora_b"):
-                p = getattr(m, nm)
-                if not isinstance(p, DTensor):
+            # base_qdata/base_scale: packed bases NOT hit by a
+            # Colwise/Rowwise style above (e.g. MoE shared experts) stay
+            # tp-replicated so every param in the FSDP unit lives on the
+            # same (fsdp, tp) mesh.
+            for nm in ("lora_a", "lora_b", "base_qdata", "base_scale"):
+                p = getattr(m, nm, None)
+                if p is not None and not isinstance(p, DTensor):
                     setattr(
                         m,
                         nm,
