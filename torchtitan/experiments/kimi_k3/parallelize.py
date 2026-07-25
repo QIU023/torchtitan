@@ -64,7 +64,10 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
+from torchtitan.distributed.fsdp import (
+    disable_fsdp_gradient_division,
+    get_fsdp_reshard_after_forward_policy,
+)
 from torchtitan.tools.logging import logger
 
 
@@ -1135,6 +1138,14 @@ def apply_fsdp(
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
+
+    # The trainer's loss is local_loss_sum / global_valid_tokens, so
+    # gradients must be SUMMED over the data-parallel axes, not averaged --
+    # FSDP2's default mean-reduction would divide every gradient by the
+    # fsdp mesh size (dp_shard x cp). The shared apply_fsdp_to_decoder does
+    # this for llama3/deepseek_v3/qwen3/gpt_oss; this private copy of the
+    # Llama3 layout must too.
+    disable_fsdp_gradient_division(model)
 
 
 def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) -> None:
