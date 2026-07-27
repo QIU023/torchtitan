@@ -68,6 +68,11 @@ def block_attn_res(
         Aggregated hidden state [B, T, D].
     """
     V = torch.stack(blocks + [partial_block], dim=0)  # [N+1, B, T, D]
+    # ORDER IS LOAD-BEARING under FSDP2: ``proj.weight`` is read directly
+    # below (never through proj.forward), so no FSDP pre-forward hook fires
+    # on proj. ``norm`` shares proj's FSDP param group, so calling it HERE
+    # is what all-gathers proj.weight. Moving the weight access above this
+    # line would read a sharded param. See apply_fsdp's attn_res_tail note.
     K = norm(V)
     if K.dtype != V.dtype:
         # Frozen-base LoRA keeps trainable AttnRes norms as fp32 masters

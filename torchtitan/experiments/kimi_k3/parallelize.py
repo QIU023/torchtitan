@@ -1056,14 +1056,21 @@ def apply_fsdp(
     )
 
     # Collect the "output tail" modules. norm + lm_head ALWAYS run
-    # together every forward, so they share an FSDP unit — that
-    # amortizes a single all-gather over both. final_attn_res_proj
-    # and final_attn_res_norm are AttnRes-only and only fire at the
-    # very end of forward (block_attn_res(...) accumulates into
-    # h_final), so they get their OWN FSDP unit; bundling them with
-    # norm/lm_head triggers FSDP2's "module did not run forward
-    # before backward" warning because dynamo / autograd sees the
-    # AttnRes call timing as separate from the lm_head pass.
+    # together every forward, so they share an FSDP unit -- that
+    # amortizes a single all-gather over both. final_attn_res_proj and
+    # final_attn_res_norm are AttnRes-only and fire at the very end of
+    # forward (inside block_attn_res), so they get their own unit.
+    #
+    # FSDP2 warns that final_attn_res_proj "did not run forward before
+    # backward". That is expected and benign: block_attn_res reads
+    # ``proj.weight`` directly as the pseudo-query rather than calling
+    # proj(...), so no forward hook fires on it. Pairing it with
+    # final_attn_res_norm in ONE unit is what makes it correct -- norm IS
+    # called (``K = norm(V)``) one line earlier and triggers the shared
+    # param group's all-gather, so the weight is unsharded by the time it
+    # is read. That ordering inside block_attn_res is therefore
+    # load-bearing; do not move the weight access above the norm call.
+    # Verified on both ranks at dp2 (phase13 attnres_fsdp_tail_probe.py).
     head_tail: list[nn.Module] = []
     if getattr(model, "norm", None) is not None:
         head_tail.append(model.norm)

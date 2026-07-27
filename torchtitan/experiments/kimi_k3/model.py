@@ -1200,10 +1200,24 @@ class KimiMoE(nn.Module):
             route_norm=config.moe_renormalize,
             route_scale=config.routed_scaling_factor,
         )
-        experts_cfg = GroupedExperts.Config(
+        # K3 sets hidden_act="situ" globally, so the routed experts use
+        # SiTU-GLU (Eq. 12); core GroupedExperts is SwiGLU-only.
+        if config.hidden_act == "situ":
+            from torchtitan.experiments.kimi_k3.moe import KimiSiTUGroupedExperts
+
+            experts_config_cls = KimiSiTUGroupedExperts.Config
+            experts_act_kwargs = {
+                "situ_beta": config.activation_situ_beta,
+                "situ_linear_beta": config.activation_situ_linear_beta,
+            }
+        else:
+            experts_config_cls = GroupedExperts.Config
+            experts_act_kwargs = {}
+        experts_cfg = experts_config_cls(
             dim=expert_dim,
             hidden_dim=config.moe_intermediate_size,
             num_experts=config.num_experts,
+            **experts_act_kwargs,
             # torch._grouped_mm fuses all expert GEMMs into one batched call.
             # For-loop path (use_grouped_mm=False) launches one GEMM per
             # expert per layer, which hurts tensor core utilization badly
@@ -1218,6 +1232,13 @@ class KimiMoE(nn.Module):
         # the SwiGLU math is identical.
         shared_cfg = None
         if config.num_shared_experts > 0 and self.latent_size is None:
+            if config.hidden_act == "situ":
+                raise ValueError(
+                    'hidden_act="situ" with shared experts requires the latent '
+                    "MoE path (routed_expert_hidden_size set), because the "
+                    "non-latent path builds shared experts from core "
+                    "FeedForward, which is SwiGLU-only. K3 always sets both."
+                )
             shared_dim = config.moe_intermediate_size * config.num_shared_experts
             shared_cfg = FeedForward.Config(
                 w1=Linear.Config(
