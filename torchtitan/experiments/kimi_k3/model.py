@@ -158,7 +158,12 @@ class KimiLinearConfig:
 
     # ---- norm / act ----
     rms_norm_eps: float = 1e-5
-    hidden_act: Literal["silu", "gelu"] = "silu"
+    hidden_act: Literal["silu", "gelu", "situ"] = "silu"
+    # SiTU (Sigmoid Tanh Unit), K3's activation. Official config.json ships
+    # activation_situ_beta=4.0 and activation_situ_linear_beta=25.0; both are
+    # only read when hidden_act == "situ".
+    activation_situ_beta: float = 4.0
+    activation_situ_linear_beta: float | None = 25.0
 
     # ---- init ----
     initializer_range: float = 0.02
@@ -197,6 +202,32 @@ class KimiLinearConfig:
 # the ported Kimi Linear backbone.
 
 
+# ----- SiTU activation ---------------------------------------------------- #
+
+
+def situ_and_mul(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+) -> torch.Tensor:
+    """K3's Sigmoid Tanh Unit, gated form (reference: SituAndMul).
+
+    ``situ(g) = beta * tanh(g / beta) * sigmoid(g)`` -- a soft-clipped SiLU:
+    the tanh caps the magnitude at +/- beta while sigmoid keeps the SiLU-like
+    gating shape near 0. When ``linear_beta`` is set the linear branch is
+    clipped the same way before the product. Computed in fp32 and cast back,
+    as the reference does, because the product of two saturating nonlinearities
+    is sensitive to bf16 rounding near the caps.
+    """
+    g = gate.float()
+    u = up.float()
+    out = beta * torch.tanh(g / beta) * torch.sigmoid(g)
+    if linear_beta is not None:
+        u = linear_beta * torch.tanh(u / linear_beta)
+    return (out * u).to(gate.dtype)
+
+
 # ----- Dense SwiGLU MLP --------------------------------------------------- #
 
 class KimiMLP(nn.Module):
@@ -210,21 +241,38 @@ class KimiMLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        hidden_act: Literal["silu", "gelu"] = "silu",
+        hidden_act: Literal["silu", "gelu", "situ"] = "silu",
+        situ_beta: float = 4.0,
+        situ_linear_beta: float | None = 25.0,
     ) -> None:
         super().__init__()
         self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
+        self.hidden_act = hidden_act
+        self._situ_beta = situ_beta
+        self._situ_linear_beta = situ_linear_beta
         if hidden_act == "silu":
             self.act_fn = F.silu
         elif hidden_act == "gelu":
             self.act_fn = F.gelu
+        elif hidden_act == "situ":
+            # SiTU is gated over BOTH branches, so there is no elementwise
+            # act_fn to apply to the gate alone; forward dispatches instead.
+            self.act_fn = None
         else:
             raise ValueError(f"Unknown hidden_act: {hidden_act}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        if self.hidden_act == "situ":
+            return self.down_proj(
+                situ_and_mul(
+                    gate, up, self._situ_beta, self._situ_linear_beta
+                )
+            )
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 # ----- MLA (NoPE variant) -------------------------------------------------- #
