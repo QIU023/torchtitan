@@ -154,11 +154,30 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
         # Sanity: CE loss should be at most a few times log(vocab_size).
         self.assertLess(loss.item(), 10 * math.log(cfg.vocab_size))
 
-    def test_rejects_non_divisible_num_blocks(self):
+    def test_partial_final_block_is_allowed(self):
+        # K3 requires this: attn_res_block_size=12 over 93 layers gives 7 full
+        # blocks plus a 9-layer partial tail (report sec 2.2, "giving a partial
+        # final block"). A non-divisible split must therefore be ACCEPTED, with
+        # layers_per_block ceil-derived.
         cfg = _dense_mla_only_config(num_hidden_layers=5)  # prime
-        with self.assertRaises(AssertionError):
-            # 5 layers, 2 blocks -> not divisible -> reject
-            KimiLinearAttnResModel(cfg, num_blocks=2)
+        model = KimiLinearAttnResModel(cfg, num_blocks=2)
+        self.assertEqual(model.layers_per_block, 3)  # ceil(5/2)
+        # commits fire at layer 0 and 3; the 2-layer tail never commits
+        self.assertEqual(model.num_committed_blocks, 2)
+
+    def test_official_k3_partition(self):
+        # the exact official shape: 93 layers, block size 12 -> 8 blocks
+        n_layers, block_size = 93, 12
+        num_blocks = -(-n_layers // block_size)
+        self.assertEqual(num_blocks, 8)
+        cfg = _dense_mla_only_config(num_hidden_layers=n_layers)
+        model = KimiLinearAttnResModel(cfg, num_blocks=num_blocks)
+        self.assertEqual(model.layers_per_block, block_size)
+        self.assertEqual(model.num_committed_blocks, 8)
+        commits = [i for i in range(n_layers) if i % block_size == 0]
+        self.assertEqual(commits, [0, 12, 24, 36, 48, 60, 72, 84])
+        # the tail is the 9 layers after the last commit -- 84..92
+        self.assertEqual(n_layers - commits[-1], 9)
 
 
 if __name__ == "__main__":

@@ -59,15 +59,15 @@ class BlockLayoutTables:
             raise ValueError("pp_size and virtual_stages_per_rank must be >= 1")
         if n_layers <= 0 or layers_per_block <= 0:
             raise ValueError("n_layers and layers_per_block must be positive")
-        if n_layers % layers_per_block != 0:
+        # A partial final block is legal: K3 uses attn_res_block_size=12 over
+        # 93 layers (report sec 2.2), so the last block holds 9 layers and
+        # never reaches a commit. num_blocks is therefore the CEIL.
+        expected_blocks = -(-n_layers // layers_per_block)
+        if num_blocks != expected_blocks:
             raise ValueError(
-                f"n_layers ({n_layers}) must be divisible by "
-                f"layers_per_block ({layers_per_block})"
-            )
-        if num_blocks != n_layers // layers_per_block:
-            raise ValueError(
-                f"num_blocks ({num_blocks}) must equal n_layers // "
-                f"layers_per_block ({n_layers // layers_per_block})"
+                f"num_blocks ({num_blocks}) must equal ceil(n_layers / "
+                f"layers_per_block) = {expected_blocks} for n_layers="
+                f"{n_layers}, layers_per_block={layers_per_block}"
             )
 
         self.P = pp_size

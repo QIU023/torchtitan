@@ -243,12 +243,17 @@ class KimiLinearAttnResModel(KimiLinearModel):
         assert 1 <= num_blocks <= n_layers, (
             f"num_blocks={num_blocks} out of range [1, {n_layers}]"
         )
-        assert n_layers % num_blocks == 0, (
-            f"n_layers={n_layers} must be divisible by num_blocks={num_blocks}; "
-            "Block AttnRes requires a uniform block layout"
-        )
+        # K3 partitions by BLOCK SIZE, not by an equal split: the official
+        # config ships attn_res_block_size=12 over 93 layers, i.e. 7 full
+        # blocks plus a 9-layer partial tail (report sec 2.2: "we partition
+        # its layers into 8 blocks with 12-layer size, giving a partial final
+        # block"). So layers_per_block is ceil-derived and the last block is
+        # allowed to be short; the commit rule (layer_idx %% layers_per_block)
+        # is unchanged and simply never fires inside the partial tail, which
+        # matches the reference (its remainder layer does not commit).
         self.num_blocks = num_blocks
-        self.layers_per_block = n_layers // num_blocks
+        self.layers_per_block = -(-n_layers // num_blocks)  # ceil
+        self.num_committed_blocks = -(-n_layers // self.layers_per_block)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         # ModuleDict for pipeline_module_split compatibility — see
