@@ -69,3 +69,124 @@ class TestMuon(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerHeadMuonTagging(unittest.TestCase):
+    """Per-Head Muon was inert: ``_muon_heads`` was set only inside tests, so a
+    real run fell back to full-matrix orthogonalization with nothing to show it.
+    These tests make the tagging and the fallback both observable."""
+
+    def _model(self):
+        import torch
+
+        from torchtitan.experiments.kimi_k3.model import KimiLinearModel
+        from torchtitan.experiments.kimi_k3.model_configs import (
+            build_kimi_linear_config,
+        )
+
+        with torch.device("meta"):
+            return KimiLinearModel(
+                build_kimi_linear_config("k3mini", vocab_size=256)
+            )
+
+    def _tagged(self, model):
+        out = {}
+        for fqn, mod in model.named_modules():
+            w = getattr(mod, "weight", None)
+            if w is not None and getattr(w, "_muon_heads", None):
+                out[fqn] = w._muon_heads
+        return out
+
+    def test_tags_qkv_on_both_attention_types(self):
+        from torchtitan.experiments.kimi_k3.muon import tag_per_head_muon
+
+        model = self._model()
+        self.assertEqual(self._tagged(model), {}, "nothing tagged before the call")
+        n = tag_per_head_muon(model)
+        tagged = self._tagged(model)
+        self.assertEqual(n, len(tagged))
+        leaves = {fqn.rsplit(".", 1)[1] for fqn in tagged}
+        # MLA compressed-Q path and fused KV, plus KDA's q/k/v
+        self.assertEqual(
+            leaves, {"q_b_proj", "kv_b_proj", "q_proj", "k_proj", "v_proj"}
+        )
+
+    def test_o_proj_is_deliberately_not_tagged(self):
+        # report sec 2.5 names Q, K and V. o_proj carries the head axis on its
+        # INPUT side, so a row partition would not be a head partition.
+        from torchtitan.experiments.kimi_k3.muon import tag_per_head_muon
+
+        model = self._model()
+        tag_per_head_muon(model)
+        for fqn in self._tagged(model):
+            self.assertFalse(fqn.endswith("o_proj"), fqn)
+
+    def test_head_counts_divide_the_row_dimension(self):
+        from torchtitan.experiments.kimi_k3.muon import tag_per_head_muon
+
+        model = self._model()
+        tag_per_head_muon(model)
+        for fqn, heads in self._tagged(model).items():
+            w = model.get_submodule(fqn).weight
+            self.assertEqual(
+                w.size(0) % heads, 0, f"{fqn}: {tuple(w.shape)} rows vs {heads}"
+            )
+
+    def test_tagging_is_idempotent(self):
+        from torchtitan.experiments.kimi_k3.muon import tag_per_head_muon
+
+        model = self._model()
+        first = tag_per_head_muon(model)
+        self.assertEqual(tag_per_head_muon(model), first)
+
+    def test_untagged_group_warns_that_per_head_is_inert(self):
+        import torch
+
+        from torchtitan.experiments.kimi_k3.muon import Muon
+
+        w = torch.nn.Parameter(torch.randn(8, 4))
+        w.grad = torch.randn(8, 4)
+        opt = Muon([w], lr=1e-3, per_head=True)
+        with self.assertLogs(level="WARNING") as cm:
+            opt.step()
+        self.assertTrue(
+            any("tag_per_head_muon" in line for line in cm.output),
+            f"no actionable warning: {cm.output}",
+        )
+
+    def test_tagged_group_does_not_warn(self):
+        import logging
+
+        import torch
+
+        from torchtitan.experiments.kimi_k3.muon import Muon
+
+        w = torch.nn.Parameter(torch.randn(8, 4))
+        w._muon_heads = 2
+        w.grad = torch.randn(8, 4)
+        opt = Muon([w], lr=1e-3, per_head=True)
+        with self.assertNoLogs(level=logging.WARNING):
+            opt.step()
+
+    def test_per_head_update_differs_from_full_matrix(self):
+        """If these agreed, the tagging would be cosmetic."""
+        import copy
+
+        import torch
+
+        from torchtitan.experiments.kimi_k3.muon import Muon
+
+        torch.manual_seed(0)
+        base = torch.randn(8, 4)
+        grad = torch.randn(8, 4)
+
+        a = torch.nn.Parameter(base.clone())
+        a._muon_heads = 4
+        a.grad = grad.clone()
+        Muon([a], lr=0.1, per_head=True).step()
+
+        b = torch.nn.Parameter(base.clone())
+        b.grad = grad.clone()
+        Muon([b], lr=0.1, per_head=False).step()
+
+        self.assertGreater((a.data - b.data).abs().max().item(), 1e-4)

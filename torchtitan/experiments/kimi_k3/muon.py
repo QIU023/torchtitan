@@ -22,7 +22,10 @@ reference Muon recipe.
 """
 
 import torch
+import torch.nn as nn
 from torch.optim.optimizer import Optimizer
+
+from torchtitan.tools.logging import logger
 
 
 def _newton_schulz(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
@@ -88,8 +91,27 @@ class Muon(Optimizer):
         )
         super().__init__(params, defaults)
 
+    def _warn_if_per_head_is_inert(self) -> None:
+        """Per-head Muon needs ``_muon_heads`` tags; without any it is just
+        Muon. That degeneration is invisible in the loss, so say so once."""
+        if getattr(self, "_per_head_checked", False):
+            return
+        self._per_head_checked = True
+        for group in self.param_groups:
+            if not group.get("per_head") or not group.get("use_muon", True):
+                continue
+            if any(getattr(p, "_muon_heads", None) for p in group["params"]):
+                continue
+            logger.warning(
+                "Muon(per_head=True) but no parameter in this group carries "
+                "_muon_heads, so every update falls back to full-matrix "
+                "orthogonalization. Call tag_per_head_muon(model) before "
+                "building the optimizer."
+            )
+
     @torch.no_grad()
     def step(self, closure=None):
+        self._warn_if_per_head_is_inert()
         loss = closure() if closure is not None else None
         for group in self.param_groups:
             for p in group["params"]:
@@ -140,3 +162,57 @@ class Muon(Optimizer):
         if group["weight_decay"]:
             p.mul_(1 - group["adamw_lr"] * group["weight_decay"])
         p.addcdiv_(st["exp_avg"], denom, value=-group["adamw_lr"] / bc1)
+
+
+# Report sec 2.5 scopes the per-head refinement to the Q, K and V projections:
+# "instead of applying Newton-Schulz orthogonalization to the full Q, K, and V
+# projection matrices, we partition their momentum matrices along the head
+# dimension and orthogonalize each head's block separately." o_proj is excluded
+# deliberately -- it is the head axis on its INPUT side, so a row partition
+# would not correspond to heads at all.
+_PER_HEAD_MLA = ("q_proj", "q_b_proj", "kv_b_proj")
+_PER_HEAD_KDA = ("q_proj", "k_proj", "v_proj")
+
+
+def tag_per_head_muon(model: nn.Module) -> int:
+    """Mark every Q/K/V projection with its head count. Returns the count.
+
+    Per-Head Muon is driven by a ``_muon_heads`` attribute on the parameter,
+    which nothing set outside the tests -- so a real run silently degenerated to
+    plain full-matrix Muon. Call this before building the optimizer.
+
+    The head count is read from the owning attention module rather than guessed
+    from shapes, and a projection whose output width is not a multiple of its
+    head count is left untagged instead of partitioned wrongly.
+    """
+    from torchtitan.experiments.kimi_k3.model import (
+        KimiDeltaAttention,
+        KimiMLAAttention,
+    )
+
+    tagged = 0
+    for module in model.modules():
+        if isinstance(module, KimiMLAAttention):
+            names, heads = _PER_HEAD_MLA, module.num_heads
+        elif isinstance(module, KimiDeltaAttention):
+            names, heads = _PER_HEAD_KDA, module.num_heads
+        else:
+            continue
+        for name in names:
+            proj = getattr(module, name, None)
+            if proj is None:
+                continue
+            weight = getattr(proj, "weight", None)
+            if weight is None or weight.dim() != 2:
+                continue
+            if weight.size(0) % heads != 0:
+                # e.g. a fused projection whose rows do not tile by head. Better
+                # to run full-matrix Muon on it than to partition into blocks
+                # that are not heads.
+                continue
+            # kv_b_proj's per-head block holds that head's K_nope rows AND its V
+            # rows; "partition along the head dimension" keeps them together,
+            # which is what a fused KV matrix makes them.
+            weight._muon_heads = heads
+            tagged += 1
+    return tagged
