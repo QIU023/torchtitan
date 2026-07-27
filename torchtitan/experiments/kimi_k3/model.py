@@ -38,10 +38,10 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
@@ -69,6 +69,7 @@ class Linear(_TTLinear):
     ) -> None:
         nn.Linear.__init__(self, in_features, out_features, bias=bias)
 
+
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
@@ -80,6 +81,7 @@ except ImportError as err:  # pragma: no cover - import-time guard
 
 
 # ----- Config -------------------------------------------------------------- #
+
 
 @dataclass(kw_only=True, slots=True)
 class KimiLinearConfig:
@@ -199,6 +201,7 @@ class KimiLinearConfig:
 
 # ----- Dense SwiGLU MLP --------------------------------------------------- #
 
+
 class KimiMLP(nn.Module):
     """SwiGLU dense FFN. Used for layer 0 (pre-MoE dense replace) AND
     as the shared-experts module in MoE layers.
@@ -251,7 +254,11 @@ class KimiMLAInnerAttention(nn.Module):
         scale: float,
     ) -> torch.Tensor:
         return F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, scale=scale,
+            q,
+            k,
+            v,
+            is_causal=True,
+            scale=scale,
         )
 
 
@@ -291,19 +298,11 @@ def _cp_all_to_all_headseq(
         )
     t_full, h_loc = d1, d2
     t_loc = t_full // cp
-    x_split = (
-        x.reshape(B, cp, t_loc, h_loc, K).permute(1, 0, 2, 3, 4).contiguous()
-    )
-    out = dist_nn.all_to_all_single(
-        torch.empty_like(x_split), x_split, group=cp_group
-    )
+    x_split = x.reshape(B, cp, t_loc, h_loc, K).permute(1, 0, 2, 3, 4).contiguous()
+    out = dist_nn.all_to_all_single(torch.empty_like(x_split), x_split, group=cp_group)
     # out[s] = src s's head subset for THIS rank's seq shard; put T/cp
     # before the src(cp) axis so reshape stacks heads in ascending order.
-    return (
-        out.permute(1, 2, 0, 3, 4)
-        .reshape(B, t_loc, cp * h_loc, K)
-        .contiguous()
-    )
+    return out.permute(1, 2, 0, 3, 4).reshape(B, t_loc, cp * h_loc, K).contiguous()
 
 
 class KimiMLAAttention(nn.Module):
@@ -341,7 +340,7 @@ class KimiMLAAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.use_nope = config.mla_use_nope
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.scaling = self.q_head_dim ** -0.5
+        self.scaling = self.q_head_dim**-0.5
 
         assert self.q_lora_rank is None, (
             "This port targets Kimi 48B-A3B's q_lora_rank=null path; "
@@ -376,9 +375,7 @@ class KimiMLAAttention(nn.Module):
         # so at step 0 gated_out ~= plain attn_out (graft-preserving).
         self.mla_gated = config.mla_gated
         if self.mla_gated:
-            self.attn_gate_proj = Linear(
-                self.hidden_size, self.num_heads, bias=True
-            )
+            self.attn_gate_proj = Linear(self.hidden_size, self.num_heads, bias=True)
 
         # SDPA-only sub-module so the TP plan can wrap it with
         # use_local_output=True (DSv3 pattern). Has no parameters.
@@ -448,7 +445,10 @@ class KimiMLAAttention(nn.Module):
         # path sees them — avoiding "aten.bmm got mixed Tensor and
         # DTensor" inside SDPA's internal dispatcher.
         attn_out = self.inner_attention(
-            q_full, k_full, v, scale=self.scaling,
+            q_full,
+            k_full,
+            v,
+            scale=self.scaling,
         )  # (B, H, T, v_head_dim)
 
         attn_out = attn_out.transpose(1, 2)  # (B, T, H, Dv)
@@ -550,13 +550,9 @@ class KimiMLAAttention(nn.Module):
         if self.mla_gated:
             # Per-head sigmoid gate from the seq-local x; pointwise per
             # (b, t, h), so it applies after the heads return seq-local.
-            gate_BLH = torch.sigmoid(
-                _to_local_if_dtensor(self.attn_gate_proj(x))
-            )
+            gate_BLH = torch.sigmoid(_to_local_if_dtensor(self.attn_gate_proj(x)))
             attn_BLHV = attn_BLHV * gate_BLH.unsqueeze(-1)
-        out = self.o_proj(
-            attn_BLHV.reshape(B, t_loc, h_loc * self.v_head_dim)
-        )
+        out = self.o_proj(attn_BLHV.reshape(B, t_loc, h_loc * self.v_head_dim))
         return out
 
 
@@ -594,11 +590,7 @@ def _local_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     a DTensor(Replicate) on tp_mesh.
     """
     weight = _to_local_if_dtensor(linear.weight)
-    bias = (
-        _to_local_if_dtensor(linear.bias)
-        if linear.bias is not None
-        else None
-    )
+    bias = _to_local_if_dtensor(linear.bias) if linear.bias is not None else None
     return F.linear(x, weight, bias)
 
 
@@ -648,17 +640,13 @@ class KimiDeltaAttention(nn.Module):
         # fla-core 0.5.0 expects shape [H]; HF reference had [1, 1, H, 1]
         # but it's fed through fused_kda_gate which reshapes internally.
         self.A_log = nn.Parameter(
-            torch.log(
-                torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)
-            )
+            torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16))
         )
 
         # dt_bias: per-(head, head_dim) bias, shape [H * K]. Applied
         # inside fused_kda_gate as softplus(g + dt_bias). Kept zero-init
         # to reproduce HF reference's default init behavior.
-        self.dt_bias = nn.Parameter(
-            torch.zeros(projection_size, dtype=torch.float32)
-        )
+        self.dt_bias = nn.Parameter(torch.zeros(projection_size, dtype=torch.float32))
 
         # Low-rank forget-gate and output-gate projections
         self.f_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
@@ -671,7 +659,9 @@ class KimiDeltaAttention(nn.Module):
 
         # Output RMSNorm with sigmoid-gated modulation from g, then o_proj
         self.o_norm = FusedRMSNormGated(
-            self.head_dim, eps=config.rms_norm_eps, activation="sigmoid",
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            activation="sigmoid",
         )
         self.o_proj = Linear(projection_size, self.hidden_size, bias=False)
 
@@ -710,7 +700,10 @@ class KimiDeltaAttention(nn.Module):
             out = self._forward_cp(x, cp_group)
             if in_mesh is not None and in_placements is not None:
                 out = DTensor.from_local(
-                    out, in_mesh, in_placements, run_check=False,
+                    out,
+                    in_mesh,
+                    in_placements,
+                    run_check=False,
                 )
             return out
         _, T, _ = x.shape
@@ -726,13 +719,19 @@ class KimiDeltaAttention(nn.Module):
         # DTensor input/weight by to_local + re-DTensor; we feed plain
         # x here so the patch is a no-op when x is already plain.
         q, _ = self.q_conv1d(
-            x=_local_linear(self.q_proj, x), cache=None, output_final_state=False,
+            x=_local_linear(self.q_proj, x),
+            cache=None,
+            output_final_state=False,
         )
         k, _ = self.k_conv1d(
-            x=_local_linear(self.k_proj, x), cache=None, output_final_state=False,
+            x=_local_linear(self.k_proj, x),
+            cache=None,
+            output_final_state=False,
         )
         v, _ = self.v_conv1d(
-            x=_local_linear(self.v_proj, x), cache=None, output_final_state=False,
+            x=_local_linear(self.v_proj, x),
+            cache=None,
+            output_final_state=False,
         )
 
         # 2) Forget-gate g: (B,T,D) low-rank via f_a/f_b, reshape to
@@ -788,7 +787,10 @@ class KimiDeltaAttention(nn.Module):
         # incoming x's placement (input_layernorm output).
         if in_mesh is not None and in_placements is not None:
             out = DTensor.from_local(
-                out, in_mesh, in_placements, run_check=False,
+                out,
+                in_mesh,
+                in_placements,
+                run_check=False,
             )
         return out
 
@@ -822,28 +824,21 @@ class KimiDeltaAttention(nn.Module):
         num_heads, head_dim = self.num_heads, self.head_dim
         if num_heads % cp_size != 0:
             raise ValueError(
-                f"KDA CP: num_heads {num_heads} is not divisible by "
-                f"cp={cp_size}"
+                f"KDA CP: num_heads {num_heads} is not divisible by " f"cp={cp_size}"
             )
         h_cp = num_heads // cp_size
         h0 = cp_rank * h_cp
 
         # 1) Seq-local projections at L (no cross-seq ops here).
-        q_BLHK = _local_linear(self.q_proj, x).view(
+        q_BLHK = _local_linear(self.q_proj, x).view(B, t_loc, num_heads, head_dim)
+        k_BLHK = _local_linear(self.k_proj, x).view(B, t_loc, num_heads, head_dim)
+        v_BLHK = _local_linear(self.v_proj, x).view(B, t_loc, num_heads, head_dim)
+        g_raw_BLHK = _local_linear(self.f_b_proj, _local_linear(self.f_a_proj, x)).view(
             B, t_loc, num_heads, head_dim
         )
-        k_BLHK = _local_linear(self.k_proj, x).view(
+        g_out_BLHK = _local_linear(self.g_b_proj, _local_linear(self.g_a_proj, x)).view(
             B, t_loc, num_heads, head_dim
         )
-        v_BLHK = _local_linear(self.v_proj, x).view(
-            B, t_loc, num_heads, head_dim
-        )
-        g_raw_BLHK = _local_linear(
-            self.f_b_proj, _local_linear(self.f_a_proj, x)
-        ).view(B, t_loc, num_heads, head_dim)
-        g_out_BLHK = _local_linear(
-            self.g_b_proj, _local_linear(self.g_a_proj, x)
-        ).view(B, t_loc, num_heads, head_dim)
         beta_BLH1 = _local_linear(self.b_proj, x).unsqueeze(-1)
 
         # 2) One fused all-to-all: seq-shard -> full-seq head-subset.
@@ -851,15 +846,11 @@ class KimiDeltaAttention(nn.Module):
             [q_BLHK, k_BLHK, v_BLHK, g_raw_BLHK, g_out_BLHK, beta_BLH1],
             dim=-1,
         )
-        packed_BTGW = _cp_all_to_all_headseq(
-            packed_BLHW, cp_group, seq_to_head=True
-        )
-        q_BTGK, k_BTGK, v_BTGK, g_raw_BTGK, g_out_BTGK, beta_BTG1 = (
-            torch.split(
-                packed_BTGW,
-                [head_dim, head_dim, head_dim, head_dim, head_dim, 1],
-                dim=-1,
-            )
+        packed_BTGW = _cp_all_to_all_headseq(packed_BLHW, cp_group, seq_to_head=True)
+        q_BTGK, k_BTGK, v_BTGK, g_raw_BTGK, g_out_BTGK, beta_BTG1 = torch.split(
+            packed_BTGW,
+            [head_dim, head_dim, head_dim, head_dim, head_dim, 1],
+            dim=-1,
         )
         t_full = t_loc * cp_size
 
@@ -874,9 +865,7 @@ class KimiDeltaAttention(nn.Module):
                 h0 * head_dim : (h0 + h_cp) * head_dim
             ]
             b_C = (
-                _to_local_if_dtensor(conv.bias)[
-                    h0 * head_dim : (h0 + h_cp) * head_dim
-                ]
+                _to_local_if_dtensor(conv.bias)[h0 * head_dim : (h0 + h_cp) * head_dim]
                 if conv.bias is not None
                 else None
             )
@@ -920,13 +909,12 @@ class KimiDeltaAttention(nn.Module):
 
         # 6) All-to-all back to seq-shard full-head layout, then o_proj.
         o_BLHK = _cp_all_to_all_headseq(o_BTGK, cp_group, seq_to_head=False)
-        out = _local_linear(
-            self.o_proj, o_BLHK.reshape(B, t_loc, num_heads * head_dim)
-        )
+        out = _local_linear(self.o_proj, o_BLHK.reshape(B, t_loc, num_heads * head_dim))
         return out
 
 
 # ----- MoE (training-capable via torchtitan.models.common.moe) ------------ #
+
 
 class KimiMoE(nn.Module):
     """Kimi's sigmoid-gated grouped-topk MoE, implemented via
@@ -957,15 +945,14 @@ class KimiMoE(nn.Module):
 
     def __init__(self, config: KimiLinearConfig) -> None:
         super().__init__()
+        from torchtitan.models.common.config_utils import make_token_dispatcher_config
+
         # Full reuse: torchtitan.models.common.moe.MoE already wires
         # router + TokenReorderer + GroupedExperts + shared_experts +
         # expert_bias buffer + auxiliary-loss-free load balancing. We
         # just translate Kimi's config knobs into MoE.Config.
         from torchtitan.models.common.feed_forward import FeedForward
         from torchtitan.models.common.linear import Linear
-        from torchtitan.models.common.config_utils import (
-            make_token_dispatcher_config,
-        )
         from torchtitan.models.common.moe import (
             GroupedExperts,
             MoE,
@@ -1057,9 +1044,7 @@ class KimiMoE(nn.Module):
             # expert-param TP layout as deepseek_v3.
             import spmd_types as spmd
 
-            from torchtitan.models.common.moe_sharding import (
-                set_moe_sharding_config,
-            )
+            from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 
             set_moe_sharding_config(
                 moe_cfg,
@@ -1083,14 +1068,13 @@ class KimiMoE(nn.Module):
             # TP all-reduce) and unwrap. to_local's default grad
             # placement is the tensor's own Replicate.
             if any(not p.is_replicate() for p in out.placements):
-                out = out.redistribute(
-                    placements=[Replicate()] * len(out.placements)
-                )
+                out = out.redistribute(placements=[Replicate()] * len(out.placements))
             out = out.to_local()
         return out
 
 
 # ----- Decoder layer ------------------------------------------------------- #
+
 
 class KimiDecoderLayer(nn.Module):
     """One transformer block: pre-norm + attention + residual +
@@ -1134,9 +1118,7 @@ class KimiDecoderLayer(nn.Module):
             )
             self.is_moe = False
 
-        self.input_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1157,6 +1139,7 @@ class KimiDecoderLayer(nn.Module):
 
 
 # ----- Top-level model ----------------------------------------------------- #
+
 
 class KimiLinearModel(nn.Module):
     """Kimi Linear stack: embed -> decoder layers -> final RMSNorm -> LM head.
@@ -1180,13 +1163,13 @@ class KimiLinearModel(nn.Module):
         # layer-id string keys and the adapter's layer_to_stage discovery
         # works unchanged. Matches the attn_res/ experiment's pattern.
         self.layers = nn.ModuleDict(
-            {str(i): KimiDecoderLayer(config, i)
-             for i in range(config.num_hidden_layers)}
+            {
+                str(i): KimiDecoderLayer(config, i)
+                for i in range(config.num_hidden_layers)
+            }
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = Linear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
         if config.tie_word_embeddings:
             # Not used on 48B-A3B (tie_word_embeddings=False) but kept for
@@ -1196,11 +1179,15 @@ class KimiLinearModel(nn.Module):
         # Hook for AttnRes subclass + PP adapter.
         self._return_only_new_blocks: bool = False
 
-    def forward(self, tokens: torch.Tensor, *,
-                inputs_embeds: torch.Tensor | None = None,
-                vision_embeds: torch.Tensor | None = None,
-                image_mask: torch.Tensor | None = None,
-                **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        vision_embeds: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
         """Forward pass with PP-split awareness.
 
         Args:
@@ -1237,7 +1224,9 @@ class KimiLinearModel(nn.Module):
             # embed_tokens externally would split the root).
             if vision_embeds is not None and image_mask is not None:
                 h = h.clone()
-                h[image_mask] = vision_embeds.reshape(-1, vision_embeds.size(-1)).to(h.dtype)
+                h[image_mask] = vision_embeds.reshape(-1, vision_embeds.size(-1)).to(
+                    h.dtype
+                )
         else:
             h = tokens  # middle/last PP stage: tokens IS the hidden state
         for layer in self.layers.values():
@@ -1308,7 +1297,9 @@ class KimiLinearModel(nn.Module):
                 if getattr(m, "bias", None) is not None:
                     nn.init.zeros_(m.bias)
             elif cls_name in (
-                "ShortConvolution", "FusedRMSNormGated", "KimiLoRALinear",
+                "ShortConvolution",
+                "FusedRMSNormGated",
+                "KimiLoRALinear",
             ):
                 # fla-core modules + the LoRA wrapper ship reset_parameters()
                 # (LoRA: kaiming lora_a, zero lora_b -- the generic Linear
@@ -1399,9 +1390,8 @@ class KimiLinearSpec:
 
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
-        from torchtitan.experiments.kimi_k3.attn_res_model import (
-            KimiLinearAttnResModel,
-        )
+        from torchtitan.experiments.kimi_k3.attn_res_model import KimiLinearAttnResModel
+
         if self.num_blocks is None:
             model = KimiLinearModel(self.kimi_config)
         else:
@@ -1414,7 +1404,9 @@ class KimiLinearSpec:
             from torchtitan.experiments.kimi_k3.lora import apply_lora
 
             apply_lora(
-                model, rank=self.lora_rank, alpha=self.lora_alpha,
+                model,
+                rank=self.lora_rank,
+                alpha=self.lora_alpha,
                 quantize_base=self.lora_quantize_base,
             )
         return model
@@ -1432,16 +1424,14 @@ class KimiLinearSpec:
         """
         parallelism = getattr(config, "parallelism", None)
         if parallelism is not None:
-            self.kimi_config.moe_enable_ep = (
-                parallelism.expert_parallel_degree > 1
-            )
-            self.kimi_config.moe_enable_tp = (
-                parallelism.tensor_parallel_degree > 1
-            )
+            self.kimi_config.moe_enable_ep = parallelism.expert_parallel_degree > 1
+            self.kimi_config.moe_enable_tp = parallelism.tensor_parallel_degree > 1
         return None
 
     def get_nparams_and_flops(
-        self, model: nn.Module, seq_len: int,
+        self,
+        model: nn.Module,
+        seq_len: int,
     ) -> tuple[int, int]:
         """(total_n_params, flops_per_TOKEN) for MFU reporting.
 
@@ -1498,16 +1488,16 @@ class KimiLinearSpec:
         top_k = cfg.num_experts_per_token
         n_experts = cfg.num_experts or 1
         nparams_active_linear = (
-            nparams_dense - nparams_embedding
-            + nparams_shared + nparams_router
+            nparams_dense
+            - nparams_embedding
+            + nparams_shared
+            + nparams_router
             + nparams_routed * top_k // n_experts
         )
 
         # MLA attention FLOPs: only full_attn_layers (softmax, O(seq)/token).
         n_mla_layers = len(cfg.full_attn_layers) if cfg.full_attn_layers else 0
-        head_dims_attn = (
-            cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim
-        )
+        head_dims_attn = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim
         attn_flops_per_token = (
             6 * n_mla_layers * cfg.num_attention_heads * head_dims_attn * seq_len
         )
@@ -1552,11 +1542,13 @@ class KimiLinearSpec:
         shows the actual Kimi hyperparameters (not just a reference).
         """
         import dataclasses
+
         out = dataclasses.asdict(self.kimi_config)
         out["__spec__"] = {
             "num_blocks": self.num_blocks,
             "model_class": (
-                "KimiLinearAttnResModel" if self.num_blocks is not None
+                "KimiLinearAttnResModel"
+                if self.num_blocks is not None
                 else "KimiLinearModel"
             ),
         }

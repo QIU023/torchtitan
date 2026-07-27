@@ -28,9 +28,9 @@ from torchtitan.experiments.kimi_k3 import (
     model_registry,
 )
 from torchtitan.experiments.kimi_k3.config_registry import (
-    kimi_linear_194m_baseline,
-    kimi_linear_528m_block_attn_res,
     build_kimi_linear_config,
+    kimi_linear_48b_baseline,
+    kimi_linear_48b_block_attn_res,
     SCALING_LAW_TABLE,
 )
 from torchtitan.protocols.model_spec import ModelSpec
@@ -93,20 +93,20 @@ class TestModelRegistry(unittest.TestCase):
 
 
 class TestTrainerConfigFactory(unittest.TestCase):
-    def test_194m_baseline_builds(self):
-        cfg = kimi_linear_194m_baseline()
+    def test_48b_baseline_builds(self):
+        cfg = kimi_linear_48b_baseline()
         self.assertIsNotNone(cfg.model_spec)
-        self.assertEqual(cfg.model_spec.flavor, "kimi_linear_194m_baseline")
-        # LR from paper Table 2
+        self.assertEqual(cfg.model_spec.flavor, "kimi_linear_48b_baseline")
+        # LR from the paper's training recipe for the 48B-A3B row
         self.assertAlmostEqual(
-            cfg.optimizer.param_groups[0].optimizer_kwargs["lr"], 2.99e-3, places=5
+            cfg.optimizer.param_groups[0].optimizer_kwargs["lr"], 1.0e-3, places=5
         )
 
-    def test_528m_block_attn_res_builds(self):
-        cfg = kimi_linear_528m_block_attn_res()
-        self.assertEqual(cfg.model_spec.flavor, "kimi_linear_528m_block_attn_res")
+    def test_48b_block_attn_res_builds(self):
+        cfg = kimi_linear_48b_block_attn_res()
+        self.assertEqual(cfg.model_spec.flavor, "kimi_linear_48b_block_attn_res")
         self.assertAlmostEqual(
-            cfg.optimizer.param_groups[0].optimizer_kwargs["lr"], 2.02e-3, places=5
+            cfg.optimizer.param_groups[0].optimizer_kwargs["lr"], 1.0e-3, places=5
         )
 
 

@@ -87,7 +87,7 @@ def _parse_flavor(flavor: str) -> tuple[str, str]:
             f"Unknown flavor '{flavor}'. Kimi K3 flavors follow "
             "'kimi_linear_<size>_<variant>'; see flavor_names()."
         )
-    rest = flavor[len("kimi_linear_"):]
+    rest = flavor[len("kimi_linear_") :]
     for variant in ("baseline", "block_attn_res", "full_attn_res"):
         suffix = f"_{variant}"
         if rest.endswith(suffix):
@@ -137,6 +137,7 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
     from torchtitan.experiments.kimi_k3.state_dict_adapter import (
         KimiLinearStateDictAdapter,
     )
+
     return ModelSpec(
         name="kimi_linear",
         flavor=flavor,
@@ -151,6 +152,4 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
 # Flavor-name dict for registry-discovery consumers (veRL's torchtitan
 # engine looks for a module-level ``*_configs`` dict and uses its KEYS
 # with ``model_registry``). Values are unused.
-kimi_linear_configs: dict[str, None] = {
-    name: None for name in flavor_names()
-}
+kimi_linear_configs: dict[str, None] = {name: None for name in flavor_names()}

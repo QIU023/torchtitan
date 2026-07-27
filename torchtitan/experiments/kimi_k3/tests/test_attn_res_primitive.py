@@ -174,5 +174,6 @@ class TestStackUnstackBlocks(unittest.TestCase):
         self.assertIsNotNone(b0.grad)
         self.assertIsNotNone(b1.grad)
 
+
 if __name__ == "__main__":
     unittest.main()

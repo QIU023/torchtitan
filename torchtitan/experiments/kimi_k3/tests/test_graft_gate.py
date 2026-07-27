@@ -72,14 +72,16 @@ class TestGraftGate(unittest.TestCase):
         # non-deterministic, so assert a very tight tolerance.
         rel = ((lg - lb).norm() / (lb.norm() + 1e-9)).item()
         self.assertLess(
-            rel, 1e-4,
+            rel,
+            1e-4,
             f"gated graft must be ~identity at step 0; rel {rel:.3e}",
         )
 
     def test_ungated_zero_init_is_not_identity(self):
         lg, lb = _pair(gated=False)
         self.assertGreater(
-            (lg - lb).abs().max().item(), 1e-4,
+            (lg - lb).abs().max().item(),
+            1e-4,
             "ungated zero-init read is a uniform source-average and is "
             "expected to differ from the plain backbone -- if this ever "
             "matches exactly, the read semantics changed",

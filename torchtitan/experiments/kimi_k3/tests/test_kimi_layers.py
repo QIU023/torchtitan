@@ -105,8 +105,7 @@ class TestKimiMLAAttention(unittest.TestCase):
         self.assertIsNotNone(x.grad)
         # Any param should have grad populated
         any_param_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0
-            for p in mla.parameters()
+            p.grad is not None and p.grad.abs().sum() > 0 for p in mla.parameters()
         )
         self.assertTrue(any_param_grad)
 

@@ -93,9 +93,7 @@ class TestLoRAMerge(unittest.TestCase):
                 ).to(module.base.weight.dtype)
                 got = merged[f"{mod_name}.weight"]
                 self.assertEqual(got.shape, module.base.weight.shape)
-                self.assertLess(
-                    (got.float() - expect.float()).abs().max().item(), 1e-2
-                )
+                self.assertLess((got.float() - expect.float()).abs().max().item(), 1e-2)
                 checked += 1
         self.assertGreater(checked, 0)
 
@@ -120,9 +118,7 @@ class TestLoRAMerge(unittest.TestCase):
 
         m = self._lora_model(quantize="nf4")
         merged = merge_lora_state_dict(m)
-        self.assertFalse(
-            any(isinstance(v, NF4Tensor) for v in merged.values())
-        )
+        self.assertFalse(any(isinstance(v, NF4Tensor) for v in merged.values()))
 
     def test_post_load_quantize_hook(self):
         # The trainer order: build+load bf16, THEN quantize (not at
@@ -153,9 +149,7 @@ class TestLoRAMerge(unittest.TestCase):
         self.assertIsInstance(module.base.weight, NF4Tensor)
         # dequant tracks the loaded weight within NF4 error (not init noise)
         deq = module.base.weight.get_original_weight().float()
-        self.assertLess(
-            (deq - ref_w).norm().item() / ref_w.norm().item(), 0.15
-        )
+        self.assertLess((deq - ref_w).norm().item() / ref_w.norm().item(), 0.15)
         # idempotent: second call packs nothing new, no error
         self.assertEqual(quantize_lora_bases(m, experts=False), packed)
         # forward still runs through the NF4 base path
@@ -175,9 +169,7 @@ class TestLoRAMerge(unittest.TestCase):
         m = self._lora_model(quantize="mxfp4")
         merged = merge_lora_state_dict(m)
         self.assertFalse(
-            any(
-                "qdata" in k or "scale" in k or ".base." in k for k in merged
-            )
+            any("qdata" in k or "scale" in k or ".base." in k for k in merged)
         )
         spec = self._spec_plain()
         hf = KimiLinearStateDictAdapter(spec, hf_assets_path=None).to_hf(merged)
@@ -211,9 +203,7 @@ class TestLoRAMerge(unittest.TestCase):
         self.assertNotIn("weight", mod.base._parameters)
         # dequant tracks the loaded weight within MXFP4 error (~10-13%)
         deq = mod._dequant_base_mxfp4().float()
-        self.assertLess(
-            (deq - ref_w).norm().item() / ref_w.norm().item(), 0.15
-        )
+        self.assertLess((deq - ref_w).norm().item() / ref_w.norm().item(), 0.15)
         # idempotent + forward runs through the MXFP4 base path
         self.assertEqual(quantize_lora_bases(m, mode="mxfp4", experts=False), packed)
         tok = torch.randint(0, 2016, (1, 96), device="cuda")
@@ -263,9 +253,7 @@ class TestLoRAMerge(unittest.TestCase):
                     * (module.lora_b.float() @ module.lora_a.float())
                 ).to(module.base.weight.dtype)
                 got = merged[f"{mod_name}.weight"]
-                self.assertLess(
-                    (got.float() - expect.float()).abs().max().item(), 1e-2
-                )
+                self.assertLess((got.float() - expect.float()).abs().max().item(), 1e-2)
                 break
 
         # HF export drops graft + lora, keeps the base backbone
@@ -273,10 +261,7 @@ class TestLoRAMerge(unittest.TestCase):
         hf = adapter.to_hf(merged)
         self.assertTrue(hf)
         self.assertFalse(
-            any(
-                "lora" in k or ".base." in k or any(g in k for g in graft)
-                for k in hf
-            )
+            any("lora" in k or ".base." in k or any(g in k for g in graft) for k in hf)
         )
 
 

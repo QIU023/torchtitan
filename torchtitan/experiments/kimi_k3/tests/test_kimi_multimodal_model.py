@@ -50,8 +50,11 @@ class _DummyViT(nn.Module):
         # Deterministic placeholder: zero features of the right shape.
         # Tests validate shape / control flow, not feature fidelity.
         return torch.zeros(
-            B, self.num_patches, self.vision_hidden_size,
-            dtype=pixel_values.dtype, device=pixel_values.device,
+            B,
+            self.num_patches,
+            self.vision_hidden_size,
+            dtype=pixel_values.dtype,
+            device=pixel_values.device,
         )
 
 
@@ -112,9 +115,7 @@ class TestKimiLinearMultimodalModel(unittest.TestCase):
         model = KimiLinearMultimodalModel(cfg, vision_tower=None)
         input_ids = torch.randint(0, cfg.kimi_config.vocab_size, (2, 8))
         logits = model(input_ids=input_ids, pixel_values=None)
-        self.assertEqual(
-            logits.shape, (2, 8, cfg.kimi_config.vocab_size)
-        )
+        self.assertEqual(logits.shape, (2, 8, cfg.kimi_config.vocab_size))
 
     def test_vision_tower_frozen_by_default(self):
         cfg = _mm_cfg()
@@ -145,9 +146,7 @@ class TestKimiLinearMultimodalModel(unittest.TestCase):
         # Expanded length: original T=8 + num_patches - 1 (sentinel replaced
         # by num_patches feature slots → +num_patches-1 per sample).
         expected_T = T + num_patches - 1
-        self.assertEqual(
-            logits.shape, (B, expected_T, cfg.kimi_config.vocab_size)
-        )
+        self.assertEqual(logits.shape, (B, expected_T, cfg.kimi_config.vocab_size))
         self.assertTrue(torch.isfinite(logits).all())
 
     def test_rejects_more_vision_tokens_than_images(self):

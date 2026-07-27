@@ -143,9 +143,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             # q_proj.base.weight); the HF destination is the original
             # name, and the value stays a view of the same storage so
             # the online read path fills the real param in place.
-            key = key.replace(".base.weight", ".weight").replace(
-                ".base.bias", ".bias"
-            )
+            key = key.replace(".base.weight", ".weight").replace(".base.bias", ".bias")
             if (
                 "attn_res" in key
                 or "mlp_res" in key
@@ -169,19 +167,16 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 # block_sparse_moe.experts.{e}.w{1,2,3}.weight (w-naming),
                 # while shared experts use gate/up/down_proj naming.
                 hf_abstract_key = (
-                    "model.layers.{}.block_sparse_moe.experts.{}."
-                    + w_tag + ".weight"
+                    "model.layers.{}.block_sparse_moe.experts.{}." + w_tag + ".weight"
                 )
                 if isinstance(value, DTensor):
                     # Online (sharded) path: record placement metadata so
                     # from_hf can rebuild the DTensor, emit local experts.
-                    self.grouped_expert_weight_placements[abstract_key] = (
-                        value.placements
-                    )
+                    self.grouped_expert_weight_placements[
+                        abstract_key
+                    ] = value.placements
                     self.grouped_expert_weight_shape[abstract_key] = value.shape
-                    self.grouped_expert_weight_mesh[abstract_key] = (
-                        value.device_mesh
-                    )
+                    self.grouped_expert_weight_mesh[abstract_key] = value.device_mesh
                     hf_state_dict.update(
                         self._get_local_experts_weights(
                             hf_abstract_key, abstract_key, layer_num, value
@@ -190,9 +185,9 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 else:
                     split_values = self._split_experts_weights(value, num_experts)
                     for e in range(num_experts):
-                        hf_state_dict[hf_abstract_key.format(layer_num, e)] = (
-                            split_values[e].squeeze()
-                        )
+                        hf_state_dict[
+                            hf_abstract_key.format(layer_num, e)
+                        ] = split_values[e].squeeze()
                 continue
 
             if key.endswith("self_attn.A_log"):
@@ -269,9 +264,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 new_key = titan_abstract_key.format(layer_num)
 
                 layer_bucket = expert_weights_by_layer.setdefault(layer_num, {})
-                layer_bucket.setdefault(titan_abstract_key, {})[
-                    int(expert_num)
-                ] = value
+                layer_bucket.setdefault(titan_abstract_key, {})[int(expert_num)] = value
 
                 if titan_abstract_key in self.local_experts_indices:
                     # Online path: to_hf() ran first and recorded shards.

@@ -208,9 +208,7 @@ class KimiLoRALinear(nn.Module):
         )
         _, self._mx_ctx = mx.__tensor_flatten__()
         self._mx_scale_dtype = mx.scale.dtype
-        self.base_qdata = nn.Parameter(
-            mx.qdata.contiguous(), requires_grad=False
-        )
+        self.base_qdata = nn.Parameter(mx.qdata.contiguous(), requires_grad=False)
         self.base_scale = nn.Parameter(
             mx.scale.view(torch.uint8).contiguous(), requires_grad=False
         )
@@ -328,12 +326,20 @@ class KimiLoRALinear(nn.Module):
         la, lb = self.lora_a, self.lora_b
         if colwise:
             # lora_a Replicate (grads sum over tp), lora_b Shard(0) local.
-            la = la.to_local(grad_placements=(Partial(),)) if isinstance(la, DTensor) else la
+            la = (
+                la.to_local(grad_placements=(Partial(),))
+                if isinstance(la, DTensor)
+                else la
+            )
             lb = lb.to_local() if isinstance(lb, DTensor) else lb
         else:
             # lora_a Shard(1) local, lora_b Replicate (grads sum over tp).
             la = la.to_local() if isinstance(la, DTensor) else la
-            lb = lb.to_local(grad_placements=(Partial(),)) if isinstance(lb, DTensor) else lb
+            lb = (
+                lb.to_local(grad_placements=(Partial(),))
+                if isinstance(lb, DTensor)
+                else lb
+            )
         if la.dtype != x_loc.dtype:
             la = la.to(x_loc.dtype)
             lb = lb.to(x_loc.dtype)
@@ -461,9 +467,7 @@ def apply_lora(
                 )
                 num_wrapped += 1
     if num_wrapped == 0:
-        raise ValueError(
-            f"apply_lora matched no target Linears (targets={targets})."
-        )
+        raise ValueError(f"apply_lora matched no target Linears (targets={targets}).")
 
     if freeze_base:
         for name, p in model.named_parameters():
@@ -488,11 +492,7 @@ def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     This is the unit a veRL trainer->rollout weight sync ships when the
     base is frozen (LoRA-only DCP leg of the P0 trio).
     """
-    return {
-        name: p
-        for name, p in model.named_parameters()
-        if p.requires_grad
-    }
+    return {name: p for name, p in model.named_parameters() if p.requires_grad}
 
 
 _nf4_experts_cls_cache: dict[type, type] = {}
@@ -550,9 +550,7 @@ def quantize_grouped_experts_nf4(model: nn.Module) -> int:
                 if p is None:
                     continue
                 shapes[name] = tuple(p.shape)
-                packed = to_nf4(
-                    p.data.reshape(-1, p.shape[-1]).to(torch.bfloat16)
-                )
+                packed = to_nf4(p.data.reshape(-1, p.shape[-1]).to(torch.bfloat16))
                 # Store under a distinct name: the logical name becomes
                 # a dequant property, and FSDP shards the packed param.
                 del m._parameters[name]
@@ -628,16 +626,10 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
                 base_w = base_w.get_original_weight()
         else:
             base_w = module.base.weight
-        out_dtype = (
-            base_w.dtype if base_w.dtype != torch.uint8 else torch.bfloat16
-        )
+        out_dtype = base_w.dtype if base_w.dtype != torch.uint8 else torch.bfloat16
         # fp32 delta for deployable precision, cast back to base dtype.
-        delta = module._lora_scaling * (
-            module.lora_b.float() @ module.lora_a.float()
-        )
-        sd[f"{mod_name}.weight"] = (
-            (base_w.float() + delta).to(out_dtype).contiguous()
-        )
+        delta = module._lora_scaling * (module.lora_b.float() @ module.lora_a.float())
+        sd[f"{mod_name}.weight"] = (base_w.float() + delta).to(out_dtype).contiguous()
         for suffix in (
             ".base.weight",
             ".base.bias",

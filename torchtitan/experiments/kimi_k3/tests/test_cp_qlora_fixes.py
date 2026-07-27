@@ -21,10 +21,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate
 
-from torchtitan.experiments.kimi_k3.attn_res import (
-    AttnResProjection,
-    block_attn_res,
-)
+from torchtitan.experiments.kimi_k3.attn_res import AttnResProjection, block_attn_res
 from torchtitan.experiments.kimi_k3.lora import KimiLoRALinear
 
 

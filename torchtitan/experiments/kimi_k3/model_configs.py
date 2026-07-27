@@ -53,19 +53,20 @@ from torchtitan.experiments.kimi_k3.model import KimiLinearConfig
 # d_ff is the MoE per-expert intermediate size (moe_intermediate_size in our
 # config). L_b is the number of Kimi decoder layers (= num_hidden_layers).
 
+
 @dataclass(frozen=True)
 class _SweepSize:
     """One row of the tech report's scaling-law sweep (Table 2)."""
 
     name: str
-    activated_params: int   # M parameters (reported, non-embedding)
-    tokens: float           # B tokens
-    n_layers: int           # L_b in paper (= num_hidden_layers in our config)
-    num_heads: int          # H in paper (= num_attention_heads + kda_num_heads)
-    d_model: int            # d_model in paper
-    d_ff: int               # d_ff in paper (= moe_intermediate_size in our config)
-    lr: float               # peak learning rate
-    batch_size: int         # global batch size (sequences)
+    activated_params: int  # M parameters (reported, non-embedding)
+    tokens: float  # B tokens
+    n_layers: int  # L_b in paper (= num_hidden_layers in our config)
+    num_heads: int  # H in paper (= num_attention_heads + kda_num_heads)
+    d_model: int  # d_model in paper
+    d_ff: int  # d_ff in paper (= moe_intermediate_size in our config)
+    lr: float  # peak learning rate
+    batch_size: int  # global batch size (sequences)
 
 
 SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
@@ -80,7 +81,7 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     # extend kernels accept this layout on SM 12.0 (RTX 5090). d_ff
     # bumped 528 → 768 to keep activated-param count ~447M, roughly
     # matching the original 436M row's compute budget.
-    # Re-uses 436M's lr / batch_size / token_count from the same row.
+    # Reuses 436M's lr / batch_size / token_count from the same row.
     _SweepSize("447m_aligned", 447, 87.9, 16, 16, 1024, 768, 2.20e-3, 384),
     # Full Kimi Linear 48B-A3B target. From paper §"Training recipe":
     # "27 Transformer blocks (54 layers)" with Block AttnRes N=9
@@ -110,15 +111,11 @@ _BY_NAME: dict[str, _SweepSize] = {s.name: s for s in SCALING_LAW_TABLE}
 # table stays verbatim Table 2). 4 layers = 3 KDA + 1 MLA at the default
 # 3:1 ratio; d=256/H=4 -> head_dim 64, kv_lora 128; builds and runs a
 # forward on CPU in seconds with the bundled 2016-token test tokenizer.
-_BY_NAME["debugmodel"] = _SweepSize(
-    "debugmodel", 1, 0.01, 4, 4, 256, 128, 3e-4, 8
-)
+_BY_NAME["debugmodel"] = _SweepSize("debugmodel", 1, 0.01, 4, 4, 256, 128, 3e-4, 8)
 
 # 8-head debug size for deep tp x cp meshes: H=4 binds at tp*cp=4, so
 # tp2cp4 / tp4cp2 (8 ranks) need H=8. d=512 keeps head_dim 64.
-_BY_NAME["debugmodel8h"] = _SweepSize(
-    "debugmodel8h", 4, 0.01, 4, 8, 512, 128, 3e-4, 8
-)
+_BY_NAME["debugmodel8h"] = _SweepSize("debugmodel8h", 4, 0.01, 4, 8, 512, 128, 3e-4, 8)
 
 
 # ----- 48B-A3B reference (upscale target, kept for docs) ------------------ #
@@ -126,14 +123,37 @@ _BY_NAME["debugmodel8h"] = _SweepSize(
 # Listed here so the full scale sweep is visible in one file; the 48B
 # config needs multi-node to train.
 
-_KIMI_48B_A3B_KDA_LAYERS = (1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26)
+_KIMI_48B_A3B_KDA_LAYERS = (
+    1,
+    2,
+    3,
+    5,
+    6,
+    7,
+    9,
+    10,
+    11,
+    13,
+    14,
+    15,
+    17,
+    18,
+    19,
+    21,
+    22,
+    23,
+    25,
+    26,
+)
 _KIMI_48B_A3B_FULL_ATTN_LAYERS = (4, 8, 12, 16, 20, 24, 27)
 
 
 # ----- Sweep config builders ---------------------------------------------- #
 
+
 def _alternating_kda_mla_layers(
-    n_layers: int, kda_mla_ratio: int = 3,
+    n_layers: int,
+    kda_mla_ratio: int = 3,
 ) -> tuple[list[int], list[int]]:
     """Build 1-indexed kda_layers / full_attn_layers lists with given ratio.
 
@@ -184,9 +204,7 @@ def build_kimi_linear_config(
             (simplified); 48B-A3B uses True (matches HF config.json).
     """
     if size not in _BY_NAME:
-        raise ValueError(
-            f"Unknown size '{size}'. Valid: {sorted(_BY_NAME.keys())}"
-        )
+        raise ValueError(f"Unknown size '{size}'. Valid: {sorted(_BY_NAME.keys())}")
     spec = _BY_NAME[size]
     d = spec.d_model
     H = spec.num_heads
@@ -194,9 +212,9 @@ def build_kimi_linear_config(
     # Size-specific defaults that differ between scaling-law sweep and
     # full 48B-A3B. Each is overridable from the kwargs above.
     if size == "2p8t":
-        num_experts_default = 896       # K3 blog
+        num_experts_default = 896  # K3 blog
         tie_default = False
-        dense_d_ff_default = 18432      # scaled with d_model
+        dense_d_ff_default = 18432  # scaled with d_model
         use_grouped_topk_default = True
     elif size == "48b":
         num_experts_default = 256
@@ -255,7 +273,9 @@ def build_kimi_linear_config(
         # exact split instead of going through _alternating_kda_mla_layers
         # (which would miss layer 27 because 27 % 4 != 0).
         full_attn_layers = [4, 8, 12, 16, 20, 24, 27]
-        kda_layers = [i for i in range(1, spec.n_layers + 1) if i not in full_attn_layers]
+        kda_layers = [
+            i for i in range(1, spec.n_layers + 1) if i not in full_attn_layers
+        ]
     else:
         kda_layers, full_attn_layers = _alternating_kda_mla_layers(
             spec.n_layers, kda_mla_ratio=kda_mla_ratio
@@ -335,7 +355,8 @@ def resolve_num_blocks(size: str, variant: Variant) -> int | None:
 
 
 def build(
-    size: str, variant: Variant,
+    size: str,
+    variant: Variant,
 ) -> tuple[KimiLinearConfig, int | None]:
     """Top-level entrypoint: return ``(kimi_config, num_blocks)``.
 
@@ -350,6 +371,7 @@ def build(
 
 
 # ----- Convenience: which (size, variant) pairs exist -------------------- #
+
 
 def flavor_names() -> list[str]:
     """All registered flavor names: ``kimi_linear_{size}_{variant}``."""

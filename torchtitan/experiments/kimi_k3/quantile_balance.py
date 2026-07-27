@@ -48,9 +48,7 @@ def quantile_balance_delta(
     ranks = torch.empty_like(load)
     ranks[order] = torch.arange(E, device=load.device, dtype=load.dtype)
     # average ties
-    uniq, inv, counts = torch.unique(
-        load, return_inverse=True, return_counts=True
-    )
+    uniq, inv, counts = torch.unique(load, return_inverse=True, return_counts=True)
     csum = torch.cumsum(counts, 0)
     start = csum - counts
     avg_rank = (start + (counts - 1) / 2.0)[inv]
@@ -92,9 +90,7 @@ def register_quantile_balancing_hook(
                     if isinstance(tpe, torch.distributed.tensor.DTensor):
                         tpe = tpe.full_tensor()
                     if loss_mesh is not None:
-                        torch.distributed.all_reduce(
-                            tpe, group=loss_mesh.get_group()
-                        )
+                        torch.distributed.all_reduce(tpe, group=loss_mesh.get_group())
                     moe.expert_bias_E.add_(
                         quantile_balance_delta(tpe, coeff, target_quantile)
                     )
