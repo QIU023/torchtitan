@@ -27,6 +27,9 @@ master trains (STE via detach trick).
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
+
+from torchtitan.tools.logging import logger
 import torch.nn.functional as F
 
 _WEIGHT_ELEM = torch.float4_e2m1fn_x2  # MXFP4
@@ -81,27 +84,124 @@ class MXFP4QATLinear(nn.Module):
         return F.linear(x, w, self.base.bias)
 
 
+_qat_experts_cache: dict[type, type] = {}
+
+_EXPERT_WEIGHT_NAMES = ("w1_EFD", "w2_EDF", "w3_EFD")
+
+
+def _qat_grouped_experts_subclass(parent_cls: type) -> type:
+    """Subclass of a ``GroupedExperts`` variant with MXFP4/MXFP8 fake-quant.
+
+    Works for any GroupedExperts subclass, which matters because K3's routed
+    experts are ``KimiSiTUGroupedExperts``, not the core class.
+
+    The fake-quantized weights are installed into ``self.__dict__`` for the
+    duration of forward, which shadows ``_parameters`` for normal attribute
+    lookup, and removed afterwards. A class-level property would be simpler but
+    is wrong here: FSDP2's ``reset_sharded_param`` does ``getattr(module,
+    name)`` OUTSIDE forward and requires the DTensor parameter back, so a
+    permanent shadow fails with "'Tensor' object has no attribute
+    '_local_tensor'". Renaming the masters (as the NF4 packing path does) would
+    also work but would break the state-dict adapter and the expert TP/EP
+    layout, both of which key off these exact names.
+    """
+    if parent_cls in _qat_experts_cache:
+        return _qat_experts_cache[parent_cls]
+
+    class MXFP4QATGroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
+        def forward(self, x_RD, num_tokens_per_expert_E):
+            if self._qat_quantize_act:
+                x_RD = _fake_quant_mx(x_RD, _ACT_ELEM, _BLOCK)
+            for name in _EXPERT_WEIGHT_NAMES:
+                w = self._parameters.get(name)
+                if w is None:
+                    continue
+                if isinstance(w, DTensor):
+                    # Under EP/TP the master is a DTensor and the parent
+                    # forward would call to_local() itself; localize here so
+                    # MX quantization sees a plain tensor. Bare to_local
+                    # mirrors the parent: the gradient keeps the parameter's
+                    # own placement, correct because each rank quantizes
+                    # exactly its own shard and MX blocks run along the last
+                    # dim, which is never the sharded one for w1/w3.
+                    w = w.to_local()
+                self.__dict__[name] = _fake_quant_mx(w, _WEIGHT_ELEM, _BLOCK)
+            try:
+                return super().forward(x_RD, num_tokens_per_expert_E)
+            finally:
+                for name in _EXPERT_WEIGHT_NAMES:
+                    self.__dict__.pop(name, None)
+
+    MXFP4QATGroupedExperts.__name__ = f"MXFP4QAT{parent_cls.__name__}"
+    MXFP4QATGroupedExperts.__qualname__ = MXFP4QATGroupedExperts.__name__
+    _qat_experts_cache[parent_cls] = MXFP4QATGroupedExperts
+    return MXFP4QATGroupedExperts
+
+
+# The pre-release default: every MLA + dense/shared-FFN Linear. This is very
+# nearly the complement of what K3 quantizes, so it is available only as an
+# explicit ablation scope, never as the default.
+ALL_LINEAR_QAT_TARGETS: tuple[str, ...] = (
+    "q_proj",
+    "q_a_proj",
+    "q_b_proj",
+    "kv_b_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
 def apply_mxfp4_qat(
     model: nn.Module,
     *,
-    targets: tuple[str, ...] = (
-        "q_proj",
-        "kv_b_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ),
+    scope: str = "k3_official",
+    targets: tuple[str, ...] = ALL_LINEAR_QAT_TARGETS,
     quantize_act: bool = True,
 ) -> int:
-    """Wrap target Linears with MXFP4/MXFP8 fake-quant QAT.
+    """Attach MXFP4-weight / MXFP8-activation fake-quant QAT. Returns count.
 
-    KDA projections are excluded (fla reads .weight directly, bypassing
-    the module forward -- a wrapper there would be silently skipped).
-    GroupedExperts need a separate grouped path (not wrapped here; the
-    expert bulk QAT is future work, mirroring the NF4 experts hack but
-    with MX primitives).
+    ``scope="k3_official"`` (default) follows the released quantization_config
+    and report sec 4.1.4: routed experts only, everything else in higher
+    precision. See quant_scope.py for the derivation.
+
+    ``scope="all_linear"`` wraps ``targets`` instead -- the MLA and dense/shared
+    FFN projections. That is close to the complement of K3's scope, so it is an
+    ablation knob, not a faithful configuration. KDA projections are never
+    wrapped: fla reads ``.weight`` directly, bypassing module forward, so a
+    wrapper there would be silently dead.
     """
+    if scope == "k3_official":
+        from torchtitan.experiments.kimi_k3.quant_scope import quantizable_modules
+
+        candidates = quantizable_modules(model)
+        if not candidates:
+            raise ValueError(
+                "apply_mxfp4_qat(scope='k3_official') found no routed experts "
+                "to quantize; a dense model has nothing in K3's MXFP4 scope"
+            )
+        n = 0
+        for _fqn, experts in candidates:
+            if getattr(experts, "_mxfp4_qat", False):
+                continue  # idempotent: re-application is a no-op, not an error
+            experts._qat_quantize_act = quantize_act
+            experts.__class__ = _qat_grouped_experts_subclass(type(experts))
+            experts._mxfp4_qat = True
+            n += 1
+        logger.info(
+            "MXFP4 QAT (K3 official scope): %d routed-expert modules, "
+            "MXFP8 activations %s",
+            n,
+            "on" if quantize_act else "off",
+        )
+        return n
+
+    if scope != "all_linear":
+        raise ValueError(
+            f"Unknown scope {scope!r}; expected 'k3_official' or 'all_linear'"
+        )
+
     from torchtitan.experiments.kimi_k3.model import KimiDeltaAttention
 
     n = 0

@@ -44,19 +44,36 @@ import torch.nn.functional as F
 # KDA-internal projections are NOT targetable: KimiDeltaAttention reads
 # ``linear.weight`` directly for the fla kernels (module forward is
 # bypassed), so a wrapper there would be silently dead. apply_lora
-# skips the KDA subtree structurally; the name set below only needs to
-# cover MLA + dense/shared FFN.
+# skips the KDA subtree structurally, so the set below only needs to
+# cover MLA + dense/shared FFN + the latent MoE projections.
+#
+# Entries containing a dot match a qualified name suffix; bare entries
+# match a leaf module name. The latent projections are named ``down`` /
+# ``up``, which are too generic to match bare.
+#
+# Routed experts are absent by construction: they are GroupedExperts 3-D
+# parameters, not nn.Linear, and get adapted (or quantized) through the
+# grouped path instead -- see quant_scope.py.
 DEFAULT_LORA_TARGETS: tuple[str, ...] = (
+    # MLA, direct-Q path (48B-A3B, q_lora_rank=None)
     "q_proj",
+    # MLA, compressed-Q path (K3 ships q_lora_rank=1536)
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
     "kv_b_proj",
     "o_proj",
+    # K3's Gated MLA output gate (report Eq. 7). Grafting a gate onto a
+    # checkpoint that has none makes this a NEW param that must be
+    # full-param trainable instead -- pass fullparam_markers then.
+    "attn_gate_proj",
+    # dense FFN and shared experts
     "gate_proj",
     "up_proj",
     "down_proj",
-    # shared experts (common FeedForward leaf naming)
-    "w1",
-    "w2",
-    "w3",
+    # latent MoE projections (K3's Eq. 11 shared W_down / W_up)
+    "latent.down",
+    "latent.up",
 )
 
 # Params that stay full-param trainable under base-freeze: the AttnRes
@@ -433,6 +450,7 @@ def apply_lora(
     targets: tuple[str, ...] = DEFAULT_LORA_TARGETS,
     freeze_base: bool = True,
     quantize_base: str | None = None,
+    fullparam_markers: tuple[str, ...] = _FULLPARAM_EXCEPTION_MARKERS,
 ) -> int:
     """Swap target Linears for LoRA wrappers; optionally freeze the base.
 
@@ -442,13 +460,18 @@ def apply_lora(
     """
     from torchtitan.experiments.kimi_k3.model import KimiDeltaAttention
 
+    leaf_targets = frozenset(t for t in targets if "." not in t)
+    suffix_targets = tuple(f".{t}" for t in targets if "." in t)
+
     num_wrapped = 0
-    for module in model.modules():
+    for parent_fqn, module in model.named_modules():
         if isinstance(module, KimiDeltaAttention):
             # Structural skip -- see DEFAULT_LORA_TARGETS note.
             continue
         for child_name, child in list(module.named_children()):
-            if child_name in targets and isinstance(child, nn.Linear):
+            fqn = f"{parent_fqn}.{child_name}" if parent_fqn else child_name
+            matched = child_name in leaf_targets or fqn.endswith(suffix_targets)
+            if matched and isinstance(child, nn.Linear):
                 setattr(
                     module,
                     child_name,
@@ -469,7 +492,7 @@ def apply_lora(
         for name, p in model.named_parameters():
             if "lora_a" in name or "lora_b" in name:
                 continue
-            if any(m in name for m in _FULLPARAM_EXCEPTION_MARKERS):
+            if any(m in name for m in fullparam_markers):
                 continue
             p.requires_grad_(False)
             # Frozen params need no fp32 master copy: keep them bf16
@@ -565,6 +588,106 @@ def quantize_grouped_experts_nf4(model: nn.Module) -> int:
     return num_quantized
 
 
+_mxfp4_experts_cls_cache: dict[type, type] = {}
+
+
+def _mxfp4_experts_subclass(cls: type) -> type:
+    """Subclass with dequant properties over MXFP4-packed expert params."""
+    if cls in _mxfp4_experts_cls_cache:
+        return _mxfp4_experts_cls_cache[cls]
+
+    def _make_fget(name: str):
+        def fget(self):
+            from torch.distributed.tensor import DTensor
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            qdata = self._parameters[name + "_qdata"]
+            scale = self._parameters[name + "_scale"]
+            if isinstance(qdata, DTensor):
+                # Pre-unshard access (outside FSDP's forward window): gather
+                # explicitly. During forward FSDP2 exposes plain unsharded
+                # tensors, mirroring the NF4 path above.
+                qdata = qdata.full_tensor()
+                scale = scale.full_tensor()
+            mx = MXTensor.__tensor_unflatten__(
+                {"qdata": qdata, "scale": scale.view(self._mx_scale_dtype)},
+                self._mx_ctx,
+                None,
+                None,
+            )
+            return mx.dequantize().view(self._mxfp4_shapes[name])
+
+        return fget
+
+    sub = type(
+        f"MXFP4{cls.__name__}",
+        (cls,),
+        {n: property(_make_fget(n)) for n in ("w1_EFD", "w2_EDF", "w3_EFD")},
+    )
+    _mxfp4_experts_cls_cache[cls] = sub
+    return sub
+
+
+def quantize_grouped_experts_mxfp4(model: nn.Module) -> int:
+    """Pack routed-expert weights to MXFP4 -- K3's actual quantization scope.
+
+    This is the QLoRA counterpart of ``apply_mxfp4_qat``: real packing (the
+    memory win) rather than fake-quant, for a frozen base. Only modules in
+    K3's official scope are touched (see quant_scope.py), so the attention,
+    latent, shared-expert, router and lm_head weights the release keeps in
+    higher precision stay bf16.
+
+    A 3-D ``[E, A, B]`` param packs as a 2-D ``(E*A, B)`` MX view: MX blocks
+    run along the last dim, so flattening the leading dims is exact and the
+    per-expert boundary always falls on a block boundary. Split storage
+    (qdata uint8 + scale-as-uint8) matches ``KimiLoRALinear``: MXTensor's
+    packed qdata is half-width, so the logical view is non-contiguous and
+    FSDP2 rejects it as a param. Requires ``B % 32 == 0``; other params stay
+    bf16.
+    """
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+    from torchtitan.experiments.kimi_k3.quant_scope import (
+        MXFP4_GROUP_SIZE,
+        quantizable_modules,
+    )
+
+    num_quantized = 0
+    for _fqn, m in quantizable_modules(model):
+        if hasattr(m, "_mxfp4_shapes"):
+            continue  # idempotent
+        shapes: dict[str, tuple[int, ...]] = {}
+        for name in ("w1_EFD", "w2_EDF", "w3_EFD"):
+            p = m._parameters.get(name)
+            if p is None or p.shape[-1] % MXFP4_GROUP_SIZE != 0:
+                continue
+            shapes[name] = tuple(p.shape)
+            mx = MXTensor.to_mx(
+                p.data.reshape(-1, p.shape[-1]).to(torch.bfloat16),
+                elem_dtype=torch.float4_e2m1fn_x2,
+                block_size=MXFP4_GROUP_SIZE,
+            )
+            _, m._mx_ctx = mx.__tensor_flatten__()
+            m._mx_scale_dtype = mx.scale.dtype
+            del m._parameters[name]
+            m.register_parameter(
+                name + "_qdata",
+                nn.Parameter(mx.qdata.contiguous(), requires_grad=False),
+            )
+            m.register_parameter(
+                name + "_scale",
+                nn.Parameter(
+                    mx.scale.view(torch.uint8).contiguous(), requires_grad=False
+                ),
+            )
+        if not shapes:
+            continue
+        m._mxfp4_shapes = shapes
+        m.__class__ = _mxfp4_experts_subclass(type(m))
+        num_quantized += 1
+    return num_quantized
+
+
 def quantize_lora_bases(
     model: nn.Module, *, mode: str = "nf4", experts: bool = True
 ) -> int:
@@ -579,6 +702,14 @@ def quantize_lora_bases(
     option) or ``mxfp4`` (K3's native FP4 format). Idempotent; returns the
     number of bases packed (wrapped linears + grouped experts when
     ``experts``). Non-alignable dims stay bf16.
+
+    Scope note: this packs every LoRA base, which is BROADER than K3's own
+    scope (routed experts only -- quant_scope.py). That is deliberate. K3
+    quantizes as part of full-param QAT; QLoRA here is our memory-reduction
+    path for adapting a frozen base, and which projections are bases at all
+    is already the caller's choice via ``apply_lora(targets=...)``. For a
+    faithful reproduction of K3's quantization use ``apply_mxfp4_qat``, whose
+    default scope is the released one.
     """
     if mode not in ("nf4", "mxfp4"):
         raise ValueError(f"Unsupported quantize mode {mode!r}")
@@ -592,10 +723,12 @@ def quantize_lora_bases(
             else module.quantize_base_mxfp4()
         )
         packed += int(did)
-    if experts and mode == "nf4":
-        # GroupedExperts MXFP4 packing is a follow-up (3-D per-expert MX);
-        # nf4 experts remain the validated path.
-        packed += quantize_grouped_experts_nf4(model)
+    if experts:
+        packed += (
+            quantize_grouped_experts_nf4(model)
+            if mode == "nf4"
+            else quantize_grouped_experts_mxfp4(model)
+        )
     return packed
 
 

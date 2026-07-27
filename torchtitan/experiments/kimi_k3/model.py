@@ -1584,17 +1584,38 @@ class KimiLinearModel(nn.Module):
                 nn.init.zeros_(gate_proj.weight)
                 nn.init.constant_(gate_proj.bias, 6.0)  # sigmoid(6)=0.9975
 
-        # Pass 3: torchtitan MoE — GroupedExperts holds raw [E, ...]
+        # Pass 3: torchtitan MoE -- GroupedExperts holds raw [E, ...]
         # parameter tensors (not nn.Linear), and MoE/router carry
         # auxiliary-loss-free load-balance buffers that must start at 0.
+        #
+        # TODO(kimi-k3): upstream models declare per-parameter init functions
+        # instead (see deepseek_v3/__init__.py's _depth_experts_init, which maps
+        # "w1_EFD"/"w2_EDF"/"w3_EFD" to trunc_normal_ with depth-scaled std).
+        # That table makes a missing entry visible in one place, and it also
+        # gives the depth scaling this pass lacks. Migrating this whole
+        # hand-rolled init_weights to that mechanism is the right follow-up --
+        # a hand-maintained exhaustive walk is exactly what broke here.
+        #
+        # isinstance, not a class-name string: K3's routed experts are
+        # KimiSiTUGroupedExperts, and the QAT/packing paths install further
+        # subclasses. And the parameters are enumerated from _parameters
+        # rather than a hardcoded ("w1", "w2", "w3") tuple, because upstream
+        # renamed them to shape-suffixed w1_EFD / w2_EDF / w3_EFD -- a stale
+        # name list here leaves every routed expert at to_empty garbage, which
+        # trains to a plausible loss on the dense/shared/latent path alone
+        # while the routed experts contribute nothing. Both mistakes are
+        # silent, so test_expert_init_is_not_silently_skipped guards them.
+        from torchtitan.models.common.moe import GroupedExperts, MoE
+
         for m in self.modules():
-            cls_name = type(m).__name__
-            if cls_name == "GroupedExperts":
-                for name in ("w1", "w2", "w3"):
-                    p = getattr(m, name, None)
-                    if isinstance(p, nn.Parameter):
-                        nn.init.normal_(p, mean=0.0, std=std)
-            elif cls_name == "MoE":
+            if isinstance(m, GroupedExperts):
+                for name, p in m._parameters.items():
+                    if p is None or not p.is_floating_point():
+                        # uint8 packed MXFP4/NF4 expert bytes come from the
+                        # checkpoint, never from init.
+                        continue
+                    nn.init.normal_(p, mean=0.0, std=std)
+            elif isinstance(m, MoE):
                 for buf_name in ("expert_bias", "tokens_per_expert"):
                     buf = getattr(m, buf_name, None)
                     if buf is not None:
@@ -1646,6 +1667,10 @@ class KimiLinearSpec:
     lora_rank: int | None = None
     lora_alpha: float = 16.0
     lora_quantize_base: str | None = None  # 'nf4' => QLoRA
+    # K3's post-training QAT (report sec 4.1.4): MXFP4 routed-expert
+    # weights + MXFP8 expert activations, fake-quant with a bf16 master.
+    # Scope comes from quant_scope.py, not a name list.
+    mxfp4_qat: bool = False
 
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
@@ -1667,6 +1692,12 @@ class KimiLinearSpec:
                 model, rank=self.lora_rank, alpha=self.lora_alpha,
                 quantize_base=self.lora_quantize_base,
             )
+        if self.mxfp4_qat:
+            from torchtitan.experiments.kimi_k3.mxfp4_qat import apply_mxfp4_qat
+
+            # Disjoint from LoRA: QAT attaches to GroupedExperts (3-D params),
+            # LoRA wraps nn.Linear, and K3's scope contains no Linear at all.
+            apply_mxfp4_qat(model)
         return model
 
     def update_from_config(self, *, config, **kwargs) -> None:

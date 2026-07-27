@@ -409,6 +409,37 @@ def kimi_linear_k3mini_block_attn_res() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_qat_mxfp4() -> Trainer.Config:
+    """K3-faithful QAT: MXFP4 routed-expert weights, MXFP8 expert activations.
+
+    Report sec 4.1.4 runs QAT through the whole post-training stage (SFT and
+    RL), quantizing only the MoE expert weights while attention projections,
+    latent MoE projections, shared experts and routers stay in higher
+    precision. The scope comes from quant_scope.py, which derives it from the
+    released quantization_config rather than a hand-maintained name list.
+
+    Fake-quant (dequant(quant(w)) with an STE) so this runs on any GPU; FP4
+    hardware speeds deployment, not QAT.
+    """
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_qat_mxfp4"
+    cfg.model_spec.model.mxfp4_qat = True
+    return cfg
+
+
+def kimi_linear_k3mini_qlora() -> Trainer.Config:
+    """K3-faithful structure + LoRA rank 8 on the K3 module set.
+
+    Exercises the updated target set: the compressed-Q pair (q_a_proj /
+    q_b_proj), the Gated MLA output gate, and the latent MoE projections --
+    none of which existed when DEFAULT_LORA_TARGETS was written.
+    """
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_qlora"
+    cfg.model_spec.model.lora_rank = 8
+    return cfg
+
+
 def kimi_linear_k3_2p8t_block_attn_res() -> Trainer.Config:
     """Kimi K3 at full scale, from the official config.json (2026-07-27).
 
