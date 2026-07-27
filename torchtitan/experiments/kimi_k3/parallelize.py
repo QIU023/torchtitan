@@ -636,11 +636,27 @@ def apply_tp_kimi_linear(
             # convert to plain via use_local_output=True; o_proj emits
             # plain to match the rest of the model's plain-boundary
             # convention.
-            plan.update(
-                {
+            # Q: either the direct projection or K3's compression pair.
+            # The pair registers exactly like the KV pair below -- the
+            # compression stays replicated (its output is q_lora_rank, not a
+            # head-sharded axis) and only the expansion is Colwise.
+            if getattr(layer.self_attn, "q_lora_rank", None) is None:
+                q_plan = {
                     "self_attn.q_proj": ColwiseParallel(
                         use_local_output=False,
                     ),
+                }
+            else:
+                q_plan = {
+                    "self_attn.q_a_proj": NoParallel(),
+                    "self_attn.q_a_layernorm": NoParallel(),
+                    "self_attn.q_b_proj": ColwiseParallel(
+                        use_local_output=False,
+                    ),
+                }
+            plan.update(
+                {
+                    **q_plan,
                     # NoParallel (no local_output_grad_placements): output
                     # stays as a DTensor(Replicate) so the downstream
                     # split into [kv_lora, qk_rope] halves and the

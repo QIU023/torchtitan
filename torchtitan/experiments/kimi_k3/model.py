@@ -360,8 +360,10 @@ class KimiMLAAttention(nn.Module):
     Faithful port of ``reference:KimiMLAAttention``. Key differences
     vs. DSv3 MLA:
 
-    * ``q_lora_rank is None`` — no Q compression, Q is projected
-      directly to ``num_heads × q_head_dim``.
+    * ``q_lora_rank`` — when None, Q is projected directly to
+      ``num_heads x q_head_dim`` (the 48B-A3B path). When set (K3 ships
+      1536) Q goes through the compression pair
+      ``q_a_proj -> q_a_layernorm -> q_b_proj``, mirroring DSv3.
     * ``mla_use_nope=True`` — no RoPE applied; the "rot" split is
       vestigial naming. Position info carried by the KDA recurrence.
     * K is split into ``kv_lora_rank + qk_rope_head_dim`` halves from
@@ -391,18 +393,30 @@ class KimiMLAAttention(nn.Module):
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.scaling = self.q_head_dim ** -0.5
 
-        assert self.q_lora_rank is None, (
-            "This port targets Kimi 48B-A3B's q_lora_rank=null path; "
-            "q-compression not implemented yet."
-        )
         assert self.use_nope, (
             "Only mla_use_nope=True is currently supported (Kimi 48B-A3B "
             "config). RoPE-on-MLA is not ported."
         )
 
-        self.q_proj = Linear(
-            self.hidden_size, self.num_heads * self.q_head_dim, bias=False
-        )
+        if self.q_lora_rank is None:
+            # 48B-A3B path: Q straight to H * q_head_dim.
+            self.q_proj = Linear(
+                self.hidden_size, self.num_heads * self.q_head_dim, bias=False
+            )
+        else:
+            # K3 path (official config: q_lora_rank=1536). Same shape as
+            # DSv3's wq_a/wq_b pair, and the same structure this class
+            # already uses for KV (kv_a_proj_with_mqa -> kv_a_layernorm ->
+            # kv_b_proj), so the TP plan reuses that registration pattern.
+            self.q_a_proj = Linear(
+                self.hidden_size, self.q_lora_rank, bias=False
+            )
+            self.q_a_layernorm = nn.RMSNorm(
+                self.q_lora_rank, eps=config.rms_norm_eps
+            )
+            self.q_b_proj = Linear(
+                self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+            )
         self.kv_a_proj_with_mqa = Linear(
             self.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -432,6 +446,17 @@ class KimiMLAAttention(nn.Module):
         # use_local_output=True (DSv3 pattern). Has no parameters.
         self.inner_attention = KimiMLAInnerAttention()
 
+    def _project_q(self, x: torch.Tensor) -> torch.Tensor:
+        """Q projection, with or without the compression pair.
+
+        Returns the flat ``[..., num_heads * q_head_dim]`` tensor; callers
+        reshape. Kept as one method so the direct and CP forward paths cannot
+        drift apart.
+        """
+        if self.q_lora_rank is None:
+            return self.q_proj(x)
+        return self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward with causal mask; no KV cache.
 
@@ -450,7 +475,11 @@ class KimiMLAAttention(nn.Module):
         B, T, _ = x.shape
 
         # Q path: direct projection -> (B, T, H, q_head_dim) -> (B, H, T, q_head_dim)
-        q = self.q_proj(x).view(B, T, self.num_heads, self.q_head_dim).transpose(1, 2)
+        q = (
+            self._project_q(x)
+            .view(B, T, self.num_heads, self.q_head_dim)
+            .transpose(1, 2)
+        )
         q_pass, q_rot = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
@@ -532,7 +561,7 @@ class KimiMLAAttention(nn.Module):
         cp_size = dist.get_world_size(cp_group)
         B, t_loc, _ = x.shape
 
-        q_BLE = self.q_proj(x)
+        q_BLE = self._project_q(x)
         compressed_kv = self.kv_a_proj_with_mqa(x)
         k_pass, k_rot_BLR = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
