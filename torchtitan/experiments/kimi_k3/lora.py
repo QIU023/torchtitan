@@ -101,6 +101,7 @@ class KimiLoRALinear(nn.Module):
         rank: int,
         alpha: float,
         quantize_base: str | None = None,
+        quantize_act: bool = False,
     ) -> None:
         super().__init__()
         assert rank > 0
@@ -112,6 +113,14 @@ class KimiLoRALinear(nn.Module):
         # the forward matmul.
         pdtype = base.weight.dtype
         dev = base.weight.device
+        # K3 trains the BACKBONE in MXFP4 weights + MXFP8 activations
+        # (report sec 4.1.4); that is a property of the model, not of LoRA. When
+        # LoRA attaches to a base that is already packed MXFP4, the activations
+        # it sees should be MXFP8 too, or the adapter trains against numerics
+        # the deployed model never sees. Off by default because the released
+        # checkpoint is weights-only (input_activations: null), so a frozen-base
+        # load without QAT semantics is also a legitimate configuration.
+        self._quantize_act = quantize_act
         self._quantize_base = None
         if quantize_base == "nf4":
             self.quantize_base_nf4()
@@ -278,6 +287,22 @@ class KimiLoRALinear(nn.Module):
         self._tp_style = "colwise" if colwise else "rowwise"
         self._tp_mesh = tp_mesh
 
+    def _maybe_quantize_act(self, x: torch.Tensor) -> torch.Tensor:
+        """MXFP8 fake-quant on the input, when the base is packed MXFP4.
+
+        Shares ``mxfp4_qat``'s emulated MX rounding so the QAT path and the
+        packed-base path cannot drift apart.
+        """
+        if not self._quantize_act or self._quantize_base != "mxfp4":
+            return x
+        from torchtitan.experiments.kimi_k3.mxfp4_qat import (
+            _ACT_ELEM,
+            _BLOCK,
+            _fake_quant_mx,
+        )
+
+        return _fake_quant_mx(x, _ACT_ELEM, _BLOCK)
+
     def _dequant_base_mxfp4(self) -> torch.Tensor:
         from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
@@ -357,6 +382,7 @@ class KimiLoRALinear(nn.Module):
         else:
             x_loc = x
 
+        x_loc = self._maybe_quantize_act(x_loc)
         w_loc = self._dequant_base_mxfp4().to(x_loc.dtype)
 
         la, lb = self.lora_a, self.lora_b
@@ -398,6 +424,7 @@ class KimiLoRALinear(nn.Module):
                 return self._forward_packed_tp(x)
             # No weight-only MXFP4 linear in torchao yet: dequant then
             # matmul (memory/comms win from the packed base still holds).
+            x = self._maybe_quantize_act(x)
             w = self._dequant_base_mxfp4().to(x.dtype)
             if x_is_dt:
                 # Dequant densifies the packed params, but a NoParallel
@@ -480,6 +507,7 @@ def apply_lora(
     targets: tuple[str, ...] = DEFAULT_LORA_TARGETS,
     freeze_base: bool = True,
     quantize_base: str | None = None,
+    quantize_act: bool = False,
     fullparam_markers: tuple[str, ...] = _FULLPARAM_EXCEPTION_MARKERS,
 ) -> int:
     """Swap target Linears for LoRA wrappers; optionally freeze the base.
@@ -510,6 +538,7 @@ def apply_lora(
                         rank=rank,
                         alpha=alpha,
                         quantize_base=quantize_base,
+                        quantize_act=quantize_act,
                     ),
                 )
                 num_wrapped += 1

@@ -37,6 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -244,6 +246,16 @@ class KimiLinearConfig:
 # wrapper around ``nn.RMSNorm``; we don't need the Config plumbing here
 # since we're not going through the torchtitan Config.build() chain for
 # the ported Kimi Linear backbone.
+
+
+def _leave_for_checkpoint(tensor: torch.Tensor) -> torch.Tensor:
+    """Init function for packed quantized bytes: deliberately does nothing.
+
+    Present so the declarative init map covers every parameter name a packed
+    module can carry. A missing name raises; this says "the checkpoint owns
+    these bytes" out loud instead.
+    """
+    return tensor
 
 
 # ----- SiTU activation ---------------------------------------------------- #
@@ -1299,10 +1311,32 @@ class KimiMoE(nn.Module):
         else:
             experts_config_cls = GroupedExperts.Config
             experts_act_kwargs = {}
+        # Declarative per-parameter init, the mechanism upstream models use
+        # (deepseek_v3/__init__.py::_depth_experts_init). This is not cosmetic:
+        # Module._init_param RAISES when a parameter name is absent from the
+        # map, whereas the hand-rolled walk in init_weights silently skipped
+        # anything it did not recognize -- which is how the routed experts ran
+        # on to_empty garbage after upstream renamed them.
+        expert_init = {
+            name: partial(nn.init.trunc_normal_, std=config.initializer_range)
+            for name in ("w1_EFD", "w2_EDF", "w3_EFD")
+        }
+        # Packed MXFP4/NF4 expert bytes replace the float parameters and come
+        # from the checkpoint, so init must leave them untouched. Named
+        # explicitly rather than skipped by dtype, so the map still fails loudly
+        # on a name nobody has thought about.
+        expert_init.update(
+            {
+                f"{n}_{part}": _leave_for_checkpoint
+                for n in ("w1_EFD", "w2_EDF", "w3_EFD")
+                for part in ("qdata", "scale", "nf4")
+            }
+        )
         experts_cfg = experts_config_cls(
             dim=expert_dim,
             hidden_dim=config.moe_intermediate_size,
             num_experts=config.num_experts,
+            param_init=expert_init,
             **experts_act_kwargs,
             # torch._grouped_mm fuses all expert GEMMs into one batched call.
             # For-loop path (use_grouped_mm=False) launches one GEMM per
@@ -1691,21 +1725,15 @@ class KimiLinearModel(nn.Module):
         # trains to a plausible loss on the dense/shared/latent path alone
         # while the routed experts contribute nothing. Both mistakes are
         # silent, so test_expert_init_is_not_silently_skipped guards them.
-        from torchtitan.models.common.moe import GroupedExperts, MoE
+        from torchtitan.models.common.moe import MoE
 
         for m in self.modules():
-            if isinstance(m, GroupedExperts):
-                for name, p in m._parameters.items():
-                    if p is None or not p.is_floating_point():
-                        # uint8 packed MXFP4/NF4 expert bytes come from the
-                        # checkpoint, never from init.
-                        continue
-                    nn.init.normal_(p, mean=0.0, std=std)
-            elif isinstance(m, MoE):
-                for buf_name in ("expert_bias", "tokens_per_expert"):
-                    buf = getattr(m, buf_name, None)
-                    if buf is not None:
-                        buf.zero_()
+            if isinstance(m, MoE):
+                # The protocol recurses into the experts and the router and
+                # dispatches through the param_init maps declared in KimiMoE,
+                # raising on any parameter no map covers. It also zeroes the
+                # load-balance buffers via _init_self_buffers.
+                m.init_states(buffer_device=kwargs.get("buffer_device"))
 
 
 # ----- ModelSpec shim: BaseModel.Config wrapper --------------------------- #
@@ -1753,6 +1781,10 @@ class KimiLinearSpec:
     lora_rank: int | None = None
     lora_alpha: float = 16.0
     lora_quantize_base: str | None = None  # 'nf4' => QLoRA
+    # MXFP8 activations on a packed-MXFP4 LoRA base, so the adapter trains
+    # against the numerics the deployed model runs. Independent of mxfp4_qat,
+    # which is the BACKBONE's training precision.
+    lora_quantize_act: bool = False
     # K3's post-training QAT (report sec 4.1.4): MXFP4 routed-expert
     # weights + MXFP8 expert activations, fake-quant with a bf16 master.
     # Scope comes from quant_scope.py, not a name list.
@@ -1777,6 +1809,7 @@ class KimiLinearSpec:
             apply_lora(
                 model, rank=self.lora_rank, alpha=self.lora_alpha,
                 quantize_base=self.lora_quantize_base,
+                quantize_act=self.lora_quantize_act,
             )
         if self.mxfp4_qat:
             from torchtitan.experiments.kimi_k3.mxfp4_qat import apply_mxfp4_qat
