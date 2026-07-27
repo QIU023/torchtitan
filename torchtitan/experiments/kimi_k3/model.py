@@ -185,6 +185,18 @@ class KimiLinearConfig:
     routed_expert_hidden_size: int | None = None
     latent_moe_use_norm: bool = True
 
+    # ---- KDA parameterization (K3 tech report sec 2.1.1) ----
+    # Eq. 5, lower-bounded decay. Kimi Linear used the unbounded
+    # g = -exp(A) * Softplus(z); K3 bounds it from below with a scaled
+    # sigmoid, g = g_min * Sigmoid(exp(A) z) in (g_min, 0), which keeps the
+    # reciprocal chunk rescaling inside the bf16 range and lets every causal
+    # tile use dense Tensor Core matmuls. Official value: -5.0. None keeps
+    # the Kimi Linear form. fla-core implements both (ops/kda/gate.py).
+    kda_gate_lower_bound: float | None = None
+    # Eq. 6, output gate. Kimi Linear used a low-rank projection; K3 uses an
+    # input-dependent FULL-RANK one: y = W_o[Sigmoid(W_g x) (.) RMSNorm(o~)].
+    kda_use_full_rank_gate: bool = False
+
     # ---- init ----
     initializer_range: float = 0.02
 
@@ -782,8 +794,16 @@ class KimiDeltaAttention(nn.Module):
         # Low-rank forget-gate and output-gate projections
         self.f_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
         self.f_b_proj = Linear(self.head_dim, projection_size, bias=False)
-        self.g_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
-        self.g_b_proj = Linear(self.head_dim, projection_size, bias=False)
+        # Output gate. K3 (report Eq. 6) makes W_g full rank; Kimi Linear
+        # factored it through head_dim. Both feed the same
+        # FusedRMSNormGated(o, g) = Sigmoid(g) (.) RMSNorm(o~) below.
+        self.use_full_rank_gate = config.kda_use_full_rank_gate
+        if self.use_full_rank_gate:
+            self.g_proj = Linear(self.hidden_size, projection_size, bias=False)
+        else:
+            self.g_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
+            self.g_b_proj = Linear(self.head_dim, projection_size, bias=False)
+        self.gate_lower_bound = config.kda_gate_lower_bound
 
         # Beta: per-head, per-token scalar (delta-rule learning rate)
         self.b_proj = Linear(self.hidden_size, self.num_heads, bias=False)
@@ -793,6 +813,16 @@ class KimiDeltaAttention(nn.Module):
             self.head_dim, eps=config.rms_norm_eps, activation="sigmoid",
         )
         self.o_proj = Linear(projection_size, self.hidden_size, bias=False)
+
+    def _output_gate_raw(self, x: torch.Tensor) -> torch.Tensor:
+        """Pre-sigmoid output-gate logits, flat ``[..., H * head_dim]``.
+
+        Full rank is K3's (report Eq. 6); the low-rank pair is Kimi Linear's.
+        The sigmoid itself lives in FusedRMSNormGated.
+        """
+        if self.use_full_rank_gate:
+            return _local_linear(self.g_proj, x)
+        return _local_linear(self.g_b_proj, _local_linear(self.g_a_proj, x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward without KV cache, fixed seq_len.
@@ -864,6 +894,7 @@ class KimiDeltaAttention(nn.Module):
             g_raw,
             _to_local_if_dtensor(self.A_log),
             dt_bias=_to_local_if_dtensor(self.dt_bias),
+            lower_bound=self.gate_lower_bound,
         )
 
         # 3) Beta: per-head, per-token learning-rate (delta-rule)
@@ -876,7 +907,7 @@ class KimiDeltaAttention(nn.Module):
 
         # 6) Output gate (computed before the head-shard so the slice below
         # covers it too).
-        g_out = _local_linear(self.g_b_proj, _local_linear(self.g_a_proj, x))
+        g_out = self._output_gate_raw(x)
         g_out = rearrange(g_out, "... (h d) -> ... h d", d=self.head_dim)
 
         # 5) Run KDA op
@@ -960,9 +991,9 @@ class KimiDeltaAttention(nn.Module):
         g_raw_BLHK = _local_linear(
             self.f_b_proj, _local_linear(self.f_a_proj, x)
         ).view(B, t_loc, num_heads, head_dim)
-        g_out_BLHK = _local_linear(
-            self.g_b_proj, _local_linear(self.g_a_proj, x)
-        ).view(B, t_loc, num_heads, head_dim)
+        g_out_BLHK = self._output_gate_raw(x).view(
+            B, t_loc, num_heads, head_dim
+        )
         beta_BLH1 = _local_linear(self.b_proj, x).unsqueeze(-1)
 
         # 2) One fused all-to-all: seq-shard -> full-seq head-subset.
@@ -1019,6 +1050,7 @@ class KimiDeltaAttention(nn.Module):
             dt_bias=_to_local_if_dtensor(self.dt_bias)
             .view(num_heads, head_dim)[h0 : h0 + h_cp]
             .reshape(-1),
+            lower_bound=self.gate_lower_bound,
         )
         beta_BTG = beta_BTG1.squeeze(-1).float().sigmoid()
 
