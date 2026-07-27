@@ -173,6 +173,18 @@ class KimiLinearConfig:
     # full_rank for K3 fidelity, per_head_graft for grafting experiments.
     attn_gate_param: Literal["full_rank", "per_head_graft"] = "full_rank"
 
+    # ---- Stable LatentMoE (K3 tech report sec 2.3, Eq. 11) ----
+    # Routed experts operate in a compact latent space of width
+    # ``routed_expert_hidden_size`` (K3: 3584 against hidden 7168), entered and
+    # left through two SHARED projections, with an RMSNorm on the aggregated
+    # routed representation before the up-projection:
+    #     u = sum_{i in Tk(x)} p_i * E_i^routed(W_down x)
+    #     y = sum_j E_j^shared(x) + W_up RMSNorm(u)
+    # Shared experts stay full width. None disables the latent path (the
+    # conventional MoE this repo shipped before the official release).
+    routed_expert_hidden_size: int | None = None
+    latent_moe_use_norm: bool = True
+
     # ---- init ----
     initializer_range: float = 0.02
 
@@ -1035,6 +1047,40 @@ class KimiDeltaAttention(nn.Module):
 
 # ----- MoE (training-capable via torchtitan.models.common.moe) ------------ #
 
+class KimiLatentMoEProjection(nn.Module):
+    """The latent entry/exit of Stable LatentMoE (report Eq. 11).
+
+    ``down`` maps a token from full width ``d`` into the routed-expert latent
+    ``l``; ``norm`` (RMSNorm, report sec 2.3.1 "Normalized LatentMoE") is
+    applied to the AGGREGATED routed representation ``u`` -- after the weighted
+    expert combine, not per expert -- and ``up`` maps back to ``d``.
+
+    Kept as a separate module because both projections are shared across all
+    routed experts: they are applied once per token, which is what makes the
+    896-expert routing affordable (dispatch traffic is O(l), not O(d)).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        latent_size: int,
+        use_norm: bool = True,
+        rms_norm_eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.down = Linear(hidden_size, latent_size, bias=False)
+        self.up = Linear(latent_size, hidden_size, bias=False)
+        self.norm = (
+            nn.RMSNorm(latent_size, eps=rms_norm_eps) if use_norm else None
+        )
+
+    def to_latent(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(x)
+
+    def from_latent(self, u: torch.Tensor) -> torch.Tensor:
+        return self.up(self.norm(u) if self.norm is not None else u)
+
+
 class KimiMoE(nn.Module):
     """Kimi's sigmoid-gated grouped-topk MoE, implemented via
     torchtitan's training-capable MoE primitives.
@@ -1081,6 +1127,25 @@ class KimiMoE(nn.Module):
         )
 
         assert config.num_experts is not None and config.num_experts > 0
+        if config.routed_expert_hidden_size is not None:
+            # Eq. 11 routes on the FULL-WIDTH token (sec 2.3.3: s_i =
+            # Sigmoid(W_r x_i)) while the experts consume W_down x. Upstream's
+            # MoE.forward feeds one tensor to both the router and the experts,
+            # so a faithful wiring needs either an upstream MoE that accepts a
+            # separate router input, or a folder-local reimplementation of its
+            # routing bookkeeping (SP padding, the routing-map scatter, token
+            # counts, load-balance bias). Refuse rather than silently train a
+            # rank-constrained router or a non-latent MoE.
+            raise NotImplementedError(
+                "Stable LatentMoE (routed_expert_hidden_size="
+                f"{config.routed_expert_hidden_size}) is not wired into the "
+                "training MoE yet: K3 routes on the full-width token but "
+                "dispatches W_down x to the experts, and torchtitan's MoE "
+                "passes a single tensor to both. KimiLatentMoEProjection "
+                "holds the entry/exit halves; see "
+                "phase13_k3like_48b_posttrain/K3_RECONCILIATION_2026-07-27.md "
+                "sec 3.1 for the two integration options."
+            )
 
         router_cfg = TokenChoiceTopKRouter.Config(
             num_experts=config.num_experts,
