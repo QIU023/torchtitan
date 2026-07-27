@@ -126,6 +126,12 @@ class KimiLinearConfig:
     # reconciles at 7.27. Off by default (plain MLA = validated path).
     mla_gated: bool = False
     rope_theta: float = 10000.0
+    # Declared context length. Nothing in the forward consumes it -- the model
+    # is NoPE (MLA applies no positional encoding; KDA carries position in its
+    # recurrence), which is exactly why K3 can state 1M without retuning a RoPE
+    # base or applying YaRN (report sec 2.1.2). Kept so a flavor records the
+    # official 1048576 and downstream tooling (dataloader, eval) can read it.
+    max_position_embeddings: int = 4096
 
     # ---- KDA (linear-attn layers) ----
     # linear_attn_config structure preserved from HF config.json

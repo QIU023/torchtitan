@@ -95,13 +95,13 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     # 400B mid-train; "global batch size of 8M tokens" → 8M/4096
     # context = 1953 seqs ≈ 2048).
     _SweepSize("48b", 3000, 1400.0, 27, 32, 2304, 1024, 1.0e-3, 2048),
-    # PROVISIONAL K3 2.8T-A50B target (blog: 2.8T total / A50B active,
-    # 896 experts / 16 active). Layer count + d_model are PLACEHOLDERS
-    # pending the 7.27 config: chosen to land near ~2.8T params with 896
-    # experts (61 layers x d=7168 x 896 experts, moe_ff=2048). This row
-    # exists ONLY for config-level construction + EP@896 mesh validation
-    # (nobody single-node-trains 2.8T); numbers reconcile at 7.27.
-    _SweepSize("2p8t", 50000, 1400.0, 61, 64, 7168, 2048, 4.0e-4, 4096),
+    # Kimi K3, VERBATIM from the official config.json (2026-07-27) -- no
+    # longer provisional. 93 layers, hidden 7168, 96 heads (head_dim 128),
+    # moe_intermediate 3072. activated_params 104B per the model card; the
+    # tokens/lr/batch entries remain OUR training-recipe choice, not the
+    # paper's (the report does not publish the 2.8T optimizer schedule).
+    # Reference: phase13_k3like_48b_posttrain/official_k3/config.json
+    _SweepSize("2p8t", 104000, 1400.0, 93, 96, 7168, 3072, 4.0e-4, 4096),
 )
 
 _BY_NAME: dict[str, _SweepSize] = {s.name: s for s in SCALING_LAW_TABLE}
@@ -120,6 +120,21 @@ _BY_NAME["debugmodel8h"] = _SweepSize(
     "debugmodel8h", 4, 0.01, 4, 8, 512, 128, 3e-4, 8
 )
 
+# K3-FAITHFUL downscale. Every structural choice is K3's, only the extents
+# shrink, so it is the carrier for anything that must behave like K3 rather
+# than merely run:
+#   * head_dim 128 exactly (d=512, H=4) -- required by FlashKDA (K=V=128), so
+#     this is the only debug row that can exercise the official inference
+#     kernel at all;
+#   * 21 layers with K3's own attn_res_block_size 12 -> 2 blocks with a
+#     9-layer tail, which mirrors the SHAPE of K3's 93 = 7*12 + 9 (same block
+#     size, same tail length) instead of just being small;
+#   * KDA:MLA 3:1 with the final layer forced global (layers 4, 8, 12);
+#   * latent ratio 0.5 (routed_expert_hidden_size = d/2), Ns = 2 shared.
+_BY_NAME["k3mini"] = _SweepSize(
+    "k3mini", 70, 0.01, 21, 4, 512, 224, 3e-4, 8
+)
+
 
 # ----- 48B-A3B reference (upscale target, kept for docs) ------------------ #
 # Faithful to the HF config.json at moonshotai/Kimi-Linear-48B-A3B-Base.
@@ -133,12 +148,21 @@ _KIMI_48B_A3B_FULL_ATTN_LAYERS = (4, 8, 12, 16, 20, 24, 27)
 # ----- Sweep config builders ---------------------------------------------- #
 
 def _alternating_kda_mla_layers(
-    n_layers: int, kda_mla_ratio: int = 3,
+    n_layers: int,
+    kda_mla_ratio: int = 3,
+    *,
+    force_final_full_attn: bool = False,
 ) -> tuple[list[int], list[int]]:
     """Build 1-indexed kda_layers / full_attn_layers lists with given ratio.
 
-    Default ratio 3:1 matches paper + 48B-A3B (3 KDA, 1 MLA, repeat).
-    MLA lands every ``kda_mla_ratio+1``-th layer (1-indexed).
+    Default ratio 3:1 matches the paper + 48B-A3B (3 KDA, 1 MLA, repeat); MLA
+    lands every ``kda_mla_ratio+1``-th layer (1-indexed).
+
+    ``force_final_full_attn`` adds the last layer to the MLA set even when the
+    period would not select it. K3 does this -- report sec 2.1: "An additional
+    Gated MLA layer is placed at the end of the backbone, ensuring that the
+    final layer always performs global attention" -- which is why its official
+    full_attn_layers is [4, 8, ..., 88, 92, 93], with 92 AND 93 both global.
     """
     period = kda_mla_ratio + 1
     kda, mla = [], []
@@ -147,7 +171,10 @@ def _alternating_kda_mla_layers(
             mla.append(i)
         else:
             kda.append(i)
-    return kda, mla
+    if force_final_full_attn and n_layers not in mla:
+        mla.append(n_layers)
+        kda.remove(n_layers)
+    return kda, sorted(mla)
 
 
 def build_kimi_linear_config(
@@ -194,9 +221,15 @@ def build_kimi_linear_config(
     # Size-specific defaults that differ between scaling-law sweep and
     # full 48B-A3B. Each is overridable from the kwargs above.
     if size == "2p8t":
-        num_experts_default = 896       # K3 blog
+        # official config.json
+        num_experts_default = 896
         tie_default = False
-        dense_d_ff_default = 18432      # scaled with d_model
+        dense_d_ff_default = 33792      # intermediate_size (dense layer 0)
+        use_grouped_topk_default = True
+    elif size == "k3mini":
+        num_experts_default = 8
+        tie_default = False
+        dense_d_ff_default = spec.d_ff * 4
         use_grouped_topk_default = True
     elif size == "48b":
         num_experts_default = 256
@@ -224,8 +257,9 @@ def build_kimi_linear_config(
     # qk_nope=128, qk_rope=64, v_head=128 at d=2304, num_heads=32, so each
     # head takes 128 (nope) + 64 (rope, broadcast) + 128 (v) units. We keep
     # qk_rope proportional to d/num_heads * 0.5 (half of nope).
-    if size == "48b":
-        # Match HF config.json/moonshotai/Kimi-Linear-48B-A3B-Base verbatim.
+    if size in ("48b", "2p8t", "k3mini"):
+        # Verbatim from the official config.json -- Kimi-Linear-48B-A3B-Base
+        # and Kimi-K3 happen to share all five of these.
         head_dim_mla_nope = 128
         head_dim_mla_rope = 64
         head_dim_mla_v = 128
@@ -257,10 +291,19 @@ def build_kimi_linear_config(
         full_attn_layers = [4, 8, 12, 16, 20, 24, 27]
         kda_layers = [i for i in range(1, spec.n_layers + 1) if i not in full_attn_layers]
     else:
+        # K3 places an extra Gated MLA at the very end (report sec 2.1), so its
+        # official full_attn_layers is [4, 8, ..., 88, 92, 93] -- 92 AND 93 both
+        # global. Without force_final_full_attn we would put 93 on KDA.
         kda_layers, full_attn_layers = _alternating_kda_mla_layers(
-            spec.n_layers, kda_mla_ratio=kda_mla_ratio
+            spec.n_layers,
+            kda_mla_ratio=kda_mla_ratio,
+            force_final_full_attn=is_k3_shaped(size),
         )
 
+    # ---- K3 structural deltas (official config.json, 2026-07-27) ----
+    # Every one of these is a real architectural choice, not a hyperparameter,
+    # so they key off the size rather than being global defaults.
+    is_k3 = is_k3_shaped(size)
     return KimiLinearConfig(
         # Vocabulary / embedding
         vocab_size=vocab_size,
@@ -272,7 +315,7 @@ def build_kimi_linear_config(
         # MLA
         num_attention_heads=H,
         num_key_value_heads=H,  # no GQA
-        q_lora_rank=None,
+        q_lora_rank=(1536 if size == "2p8t" else d // 4) if is_k3 else None,
         kv_lora_rank=kv_lora_rank,
         qk_nope_head_dim=head_dim_mla_nope,
         qk_rope_head_dim=head_dim_mla_rope,
@@ -287,12 +330,14 @@ def build_kimi_linear_config(
         full_attn_layers=list(full_attn_layers),
         # MoE
         num_experts=num_experts,
-        num_experts_per_token=(16 if size == "2p8t" else 8),
+        num_experts_per_token=(
+            16 if size == "2p8t" else (2 if size == "k3mini" else 8)
+        ),
         moe_intermediate_size=spec.d_ff,
         moe_renormalize=True,
         moe_router_activation_func="sigmoid",
-        num_shared_experts=1,
-        routed_scaling_factor=2.446,
+        num_shared_experts=2 if is_k3 else 1,
+        routed_scaling_factor=1.0 if is_k3 else 2.446,
         first_k_dense_replace=1,
         moe_layer_freq=1,
         use_grouped_topk=use_grouped_topk,
@@ -300,21 +345,70 @@ def build_kimi_linear_config(
         topk_group=1,
         # Norm / init
         rms_norm_eps=rms_norm_eps,
-        hidden_act="silu",
+        hidden_act="situ" if is_k3 else "silu",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
         initializer_range=0.02,
+        # Gated MLA (Eq. 7) and KDA's Eq. 5 / Eq. 6 parameterization.
+        # kda_gate_lower_bound is not optional for K3 fidelity: FlashKDA, the
+        # official inference kernel, refuses to run without safe_gate.
+        mla_gated=is_k3,
+        attn_gate_param="full_rank",
+        kda_gate_lower_bound=-5.0 if is_k3 else None,
+        kda_use_full_rank_gate=is_k3,
+        # Stable LatentMoE (Eq. 11): routed experts in a 3584 latent.
+        routed_expert_hidden_size=(
+            (3584 if size == "2p8t" else d // 2) if is_k3 else None
+        ),
+        latent_moe_use_norm=True,
+        # 1M context.
+        max_position_embeddings=1048576 if size == "2p8t" else 4096,
     )
 
 
 Variant = Literal["baseline", "block_attn_res", "full_attn_res"]
 
 
+def is_k3_shaped(size: str) -> bool:
+    """True for rows that reproduce K3's architecture rather than the sweep's.
+
+    One predicate so the K3 deltas (SiTU, both full-rank gates, the lower-bounded
+    decay, q-compression, LatentMoE, the extra final global-attention layer,
+    block size 12) cannot drift apart across the builder.
+    """
+    return size in ("2p8t", "k3mini")
+
+
+def attn_res_block_size(size: str) -> int:
+    """Layers per AttnRes block.
+
+    One rule for every row: the size that lands the block count nearest the
+    paper's "N ~= 8 recovers most of the benefit" (report sec 2.2), i.e.
+    ``round(n_layers / 8)``.
+
+    Worth noting that this reproduces K3's official value without being told:
+    93 layers -> round(93/8) = 12 = ``attn_res_block_size`` in the shipped
+    config, giving 8 blocks with a 9-layer tail. The N ~= 8 heuristic this repo
+    has used since before the release derives the official partition exactly.
+    """
+    if is_k3_shaped(size):
+        return 12  # K3's official attn_res_block_size, kept verbatim
+    return max(1, round(_BY_NAME[size].n_layers / 8))
+
+
 def resolve_num_blocks(size: str, variant: Variant) -> int | None:
     """Pick ``num_blocks`` for the given (size, variant) combo.
 
     Returns ``None`` for the baseline (no AttnRes). ``n_layers`` for
-    Full AttnRes. A divisor of ``n_layers`` near 8 for Block AttnRes
-    (paper's "N≈8" shorthand; when ``n_layers`` is prime we fall back
-    to Full AttnRes since no non-trivial divisor exists).
+    Full AttnRes.
+
+    For Block AttnRes the partition is driven by BLOCK SIZE, not by an equal
+    split -- K3 uses ``attn_res_block_size = 12`` over 93 layers, giving 7 full
+    blocks plus a 9-layer tail (report sec 2.2). So ``num_blocks =
+    ceil(n_layers / block_size)`` and no divisibility is required. Block size
+    defaults to 12 for K3-shaped depths and otherwise to whatever lands nearest
+    the paper's "N ~= 8" shorthand, which for the shallow sweep rows means a
+    small size rather than a contrived divisor.
     """
     if size not in _BY_NAME:
         raise ValueError(f"Unknown size '{size}'")
@@ -324,13 +418,8 @@ def resolve_num_blocks(size: str, variant: Variant) -> int | None:
     if variant == "full_attn_res":
         return n_layers
     if variant == "block_attn_res":
-        # Nearest divisor of n_layers to 8
-        divisors = [d for d in range(2, n_layers + 1) if n_layers % d == 0]
-        if not divisors:
-            # n_layers == 1, degenerate
-            return n_layers
-        # Pick divisor minimizing |d - 8|
-        return min(divisors, key=lambda d: (abs(d - 8), d))
+        block_size = attn_res_block_size(size)
+        return max(1, -(-n_layers // block_size))  # ceil
     raise ValueError(f"Unknown variant '{variant}'")
 
 

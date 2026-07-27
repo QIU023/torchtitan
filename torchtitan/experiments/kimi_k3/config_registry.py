@@ -373,6 +373,57 @@ def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_block_attn_res() -> Trainer.Config:
+    """K3-FAITHFUL downscale: every structural choice is K3's, extents shrink.
+
+    SiTU-GLU, Gated MLA with q-compression and a full-rank output gate, KDA with
+    the lower-bounded decay (g_min = -5) and a full-rank output gate, Stable
+    LatentMoE with 2 shared experts, AttnRes with K3's block size 12 over 21
+    layers (2 blocks + a 9-layer tail, mirroring 93 = 7*12 + 9), and head_dim
+    128 -- the last one deliberately, since FlashKDA requires K = V = 128, so
+    this is the only small flavor that can exercise the official inference
+    kernel.
+
+    Use this, not debugmodel, whenever the question is "does it behave like K3".
+
+    One deliberate deviation: vocab is the bundled 2016-token test tokenizer's,
+    not K3's 163840, so the flavor runs without downloading assets. Vocab is an
+    embedding EXTENT, not a mechanism -- nothing in the architecture branches on
+    it -- whereas every structural choice above is K3's verbatim.
+    """
+    import dataclasses as _dc
+
+    from torchtitan.components.loss import CrossEntropyLoss
+    from torchtitan.experiments.kimi_k3.model_configs import (
+        build_kimi_linear_config,
+    )
+
+    cfg = _flavor_trainer_config("k3mini", "block_attn_res")
+    cfg.model_spec.flavor = "kimi_linear_k3mini_block_attn_res"
+    m = cfg.model_spec.model
+    m.kimi_config = _dc.replace(
+        build_kimi_linear_config("k3mini", vocab_size=2016),
+    )
+    cfg.loss = CrossEntropyLoss.Config(global_vocab_size=2016)
+    cfg.hf_assets_path = "./tests/assets/tokenizer"
+    return cfg
+
+
+def kimi_linear_k3_2p8t_block_attn_res() -> Trainer.Config:
+    """Kimi K3 at full scale, from the official config.json (2026-07-27).
+
+    93 layers / hidden 7168 / 96 heads (head_dim 128) / 896 experts, top-16, 2
+    shared / moe_intermediate 3072 in a 3584 latent / q_lora 1536 / kv_lora 512
+    / vocab 163840 / 1M positions / dense FFN 33792 at layer 0 / full attention
+    on [4, 8, ..., 88, 92, 93]. All 29 structural fields are asserted against
+    the stored artifact in tests/test_k3_official_config.py.
+
+    Needs >= 16 ranks and real hardware; it exists so scale-up is a config
+    selection rather than a code change.
+    """
+    return _flavor_trainer_config("2p8t", "block_attn_res")
+
+
 def kimi_linear_debugmodel_latentmoe() -> Trainer.Config:
     """Debug flavor with K3's Stable LatentMoE (report Eq. 11).
 
