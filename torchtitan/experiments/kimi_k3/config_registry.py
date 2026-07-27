@@ -459,6 +459,30 @@ def kimi_linear_k3mini_quantile_balance() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_kcp() -> Trainer.Config:
+    """K3-faithful structure with KDA Context Parallelism (report sec 5.1.2).
+
+    The sequence stays sharded across CP ranks end to end: a fixed-size halo for
+    the short convolutions plus fla's prefix scan for the delta-rule state. The
+    default kda_cp_mode is "ulysses", which all-to-alls the head axis instead
+    and is kept as the A/B; see kcp.py for why both exist.
+
+    Requires local_batch_size 1, because fla's cp_context packs a single varlen
+    sequence.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_kcp"
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            cfg.model_spec.model.kimi_config, kda_cp_mode="kcp"
+        ),
+    )
+    return cfg
+
+
 def kimi_linear_k3_2p8t_block_attn_res() -> Trainer.Config:
     """Kimi K3 at full scale, from the official config.json (2026-07-27).
 

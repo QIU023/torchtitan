@@ -199,6 +199,12 @@ class KimiLinearConfig:
     # tile use dense Tensor Core matmuls. Official value: -5.0. None keeps
     # the Kimi Linear form. fla-core implements both (ops/kda/gate.py).
     kda_gate_lower_bound: float | None = None
+    # Which CP scheme KDA uses. "ulysses" all-to-alls the head axis so each
+    # rank sees the whole sequence for its heads; "kcp" keeps the sequence
+    # sharded end to end via the prefix scan of report sec 5.1.2 plus a conv
+    # halo (see kcp.py). KCP is what a 1M-token context needs; ulysses is the
+    # validated A/B.
+    kda_cp_mode: str = "ulysses"
     # Eq. 6, output gate. Kimi Linear used a low-rank projection; K3 uses an
     # input-dependent FULL-RANK one: y = W_o[Sigmoid(W_g x) (.) RMSNorm(o~)].
     kda_use_full_rank_gate: bool = False
@@ -810,6 +816,11 @@ class KimiDeltaAttention(nn.Module):
             self.g_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
             self.g_b_proj = Linear(self.head_dim, projection_size, bias=False)
         self.gate_lower_bound = config.kda_gate_lower_bound
+        self.cp_mode = config.kda_cp_mode
+        if self.cp_mode not in ("ulysses", "kcp"):
+            raise ValueError(
+                f"kda_cp_mode must be 'ulysses' or 'kcp', got {self.cp_mode!r}"
+            )
 
         # Beta: per-head, per-token scalar (delta-rule learning rate)
         self.b_proj = Linear(self.hidden_size, self.num_heads, bias=False)
@@ -862,7 +873,11 @@ class KimiDeltaAttention(nn.Module):
         # MLA layers get the same treatment in KimiMLAAttention.
         cp_group = getattr(self, "_cp_group", None)
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            out = self._forward_cp(x, cp_group)
+            out = (
+                self._forward_kcp(x, cp_group)
+                if self.cp_mode == "kcp"
+                else self._forward_cp(x, cp_group)
+            )
             if in_mesh is not None and in_placements is not None:
                 out = DTensor.from_local(
                     out, in_mesh, in_placements, run_check=False,
@@ -947,6 +962,77 @@ class KimiDeltaAttention(nn.Module):
                 out, in_mesh, in_placements, run_check=False,
             )
         return out
+
+    def _forward_kcp(self, x: torch.Tensor, cp_group) -> torch.Tensor:
+        """KCP forward: the sequence stays sharded (report sec 5.1.2).
+
+        Unlike the Ulysses path, no rank ever holds the full sequence. The two
+        cross-rank dependencies are handled separately because they have
+        different structure:
+
+        * the short convolutions need only the previous rank's tail, since their
+          support is finite -- one fixed-size halo, no scan (see kcp.py);
+        * the delta-rule recurrence needs the true incoming state, which does
+          NOT decompose by summation, so fla's cp_context does a prefix scan
+          over (cumulative transition, zero-started state) fragments.
+
+        Constraints this path inherits from fla: ``output_final_state`` is
+        unsupported under cp_context, which is fine for training (the final
+        state is only needed for decoding), and the sequence must divide evenly
+        across the CP ranks.
+        """
+        from torchtitan.experiments.kimi_k3.kcp import (
+            build_kcp_context,
+            conv_with_halo,
+        )
+
+        B, t_loc, _ = x.shape
+        if B != 1:
+            raise ValueError(
+                "KCP uses fla's varlen cp_context, which packs a single "
+                f"sequence; got batch size {B}. Flatten the batch into the "
+                "packed layout or use kda_cp_mode='ulysses'."
+            )
+
+        # Projections are seq-local: nothing to exchange yet.
+        q = conv_with_halo(self.q_conv1d, _local_linear(self.q_proj, x), cp_group)
+        k = conv_with_halo(self.k_conv1d, _local_linear(self.k_proj, x), cp_group)
+        v = conv_with_halo(self.v_conv1d, _local_linear(self.v_proj, x), cp_group)
+
+        g_raw = _local_linear(self.f_b_proj, _local_linear(self.f_a_proj, x))
+        g_raw = rearrange(g_raw, "... (h d) -> ... h d", d=self.head_dim)
+        g = fused_kda_gate(
+            g_raw,
+            _to_local_if_dtensor(self.A_log),
+            dt_bias=_to_local_if_dtensor(self.dt_bias),
+            lower_bound=self.gate_lower_bound,
+        )
+        beta = _local_linear(self.b_proj, x).float().sigmoid()
+
+        q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+        k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
+        v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
+        g_out = rearrange(
+            self._output_gate_raw(x), "... (h d) -> ... h d", d=self.head_dim
+        )
+
+        ctx = build_kcp_context(t_loc, cp_group, x.device)
+        o, _ = chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            # fla asserts this is unsupported under cp_context.
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=ctx.cu_seqlens,
+            cp_context=ctx,
+        )
+        o = self.o_norm(o, g_out)
+        o = rearrange(o, "b t h d -> b t (h d)")
+        return _local_linear(self.o_proj, o)
 
     def _forward_cp(self, x: torch.Tensor, cp_group) -> torch.Tensor:
         """Ulysses CP forward for KDA.
