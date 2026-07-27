@@ -440,6 +440,25 @@ def kimi_linear_k3mini_qlora() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_quantile_balance() -> Trainer.Config:
+    """K3-faithful structure with Quantile Balancing driving the router bias.
+
+    Replaces the auxiliary-loss-free sign rule with the solved-bias rule of
+    report sec 2.3.3 (Eqs. 13-14). The hook goes on via post_optimizer_build_fn,
+    the same extension point upstream models use for their own load-balancing
+    hook; core's sign-rule hook stays registered because it is what keeps the
+    expert_bias_E buffer allocated, and QB overwrites the bias afterwards.
+    """
+    from torchtitan.experiments.kimi_k3.quantile_balance import (
+        register_quantile_balancing,
+    )
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_quantile_balance"
+    cfg.model_spec.post_optimizer_build_fn = register_quantile_balancing
+    return cfg
+
+
 def kimi_linear_k3_2p8t_block_attn_res() -> Trainer.Config:
     """Kimi K3 at full scale, from the official config.json (2026-07-27).
 
