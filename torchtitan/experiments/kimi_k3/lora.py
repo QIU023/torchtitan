@@ -451,11 +451,24 @@ class KimiLoRALinear(nn.Module):
             la = la.to(x.dtype)
             lb = lb.to(x.dtype)
         lora_out = F.linear(F.linear(x, la), lb)
-        # DTensor input but a plain (all-reduced/local) base output
-        # (rowwise use_local_output): densify the adapter's DTensor output
-        # (Partial full_tensor all-reduces, Shard all-gathers) to match.
+        # DTensor adapter output but a plain base output (a use_local_output
+        # style). Match the base's locality -- which of the two ways depends on
+        # the style, and getting it backwards is a shape error, not a silent
+        # one:
+        #   Rowwise: base_out is the FULL width (already all-reduced), and the
+        #     adapter is Partial, so full_tensor() to all-reduce it.
+        #   Colwise: base_out is this rank's SHARD, and the adapter is Shard on
+        #     the output features, so to_local() to take the matching shard.
+        #     full_tensor() here all-gathers to the global width and fails
+        #     against the narrower base (e.g. 512 vs 256 at tp=2, which is what
+        #     attn_gate_proj hit once it became a LoRA target).
         if isinstance(lora_out, DTensor) and not isinstance(base_out, DTensor):
-            lora_out = lora_out.full_tensor()
+            from torch.distributed.tensor import Shard
+
+            if any(isinstance(p, Shard) for p in lora_out.placements):
+                lora_out = lora_out.to_local()
+            else:
+                lora_out = lora_out.full_tensor()
         return base_out + self._lora_scaling * lora_out
 
 

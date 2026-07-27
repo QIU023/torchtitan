@@ -132,3 +132,141 @@ class TestHistogramEstimator(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuantileBalancerRuntime(unittest.TestCase):
+    """The runtime driver, tested on the property QB is defined by: after the
+    bias is installed, the per-expert loads must sit at the target m*k/n."""
+
+    def _fake_moe(self, num_experts=16, top_k=2):
+        """A stand-in with the two attributes the balancer touches: a router
+        that returns core's 3-tuple, and an expert_bias_E buffer."""
+        import torch.nn as nn
+
+        from torchtitan.models.common.moe import MoE
+
+        class Router(nn.Module):
+            def __init__(self, e, k):
+                super().__init__()
+                self.top_k = k
+                self.gate = nn.Linear(8, e, bias=False)
+
+            def forward(self, x_BLD, expert_bias_E=None):
+                scores = torch.sigmoid(self.gate(x_BLD))
+                biased = scores if expert_bias_E is None else scores + expert_bias_E
+                _, ids = torch.topk(biased, self.top_k, dim=-1)
+                return scores.gather(-1, ids), ids, scores
+
+        moe = MoE.__new__(MoE)  # skip MoE.__init__, which needs a full config
+        nn.Module.__init__(moe)
+        moe.router = Router(num_experts, top_k)
+        moe.register_buffer("expert_bias_E", torch.zeros(num_experts))
+        return moe
+
+    def test_installed_bias_moves_loads_toward_the_target(self):
+        from torchtitan.experiments.kimi_k3.quantile_balance import (
+            expert_loads,
+            QuantileBalancer,
+        )
+
+        torch.manual_seed(0)
+        E, K, T = 16, 2, 4096
+        moe = self._fake_moe(E, K)
+        # skew the gate so routing starts badly imbalanced
+        with torch.no_grad():
+            moe.router.gate.weight.normal_(std=1.0)
+            moe.router.gate.weight[:4] += 2.0
+
+        class Part(torch.nn.Module):
+            def __init__(self, moe):
+                super().__init__()
+                self.moe = moe
+
+        balancer = QuantileBalancer([Part(moe)], num_bins=1024)
+        x = torch.randn(1, T, 8)
+
+        with torch.no_grad():
+            scores = torch.sigmoid(moe.router.gate(x)).reshape(-1, E)
+        def cv():
+            loads = expert_loads(scores, moe.expert_bias_E, K).float()
+            return (loads.std() / loads.mean()).item(), loads
+
+        # QB solves for the bias from margins measured at the CURRENT bias, so
+        # applying it shifts every token's cutoff and one shot cannot land on
+        # the fixed point. In training the update runs every step; this mirrors
+        # that and checks it converges rather than oscillating.
+        history = [cv()[0]]
+        for _ in range(30):
+            moe.router(x, moe.expert_bias_E)  # the hook fills the histogram
+            balancer.step()
+            history.append(cv()[0])
+
+        # The histogram estimator reaches a resolution-limited fixed point
+        # (module docstring has the bins-vs-plateau table); assert it gets a
+        # large fraction of the way there and then stays put, which is the
+        # behaviour that distinguishes it from the sign rule's oscillation.
+        self.assertLess(
+            history[-1],
+            history[0] / 3,
+            f"QB did not converge: cv trajectory {[round(c, 3) for c in history]}",
+        )
+        self.assertLess(abs(history[-1] - history[-2]), 1e-6, "not at a fixed point")
+        _, loads = cv()
+        self.assertLess(abs(loads.mean().item() - T * K / E), 1e-6)
+        balancer.remove()
+
+    def test_bias_is_overwritten_not_accumulated(self):
+        from torchtitan.experiments.kimi_k3.quantile_balance import QuantileBalancer
+
+        torch.manual_seed(0)
+        moe = self._fake_moe()
+
+        class Part(torch.nn.Module):
+            def __init__(self, moe):
+                super().__init__()
+                self.moe = moe
+
+        balancer = QuantileBalancer([Part(moe)], num_bins=256)
+        x = torch.randn(1, 512, 8)
+
+        moe.router(x, moe.expert_bias_E)
+        balancer.step()
+        first = moe.expert_bias_E.clone()
+        moe.router(x, moe.expert_bias_E)
+        balancer.step()
+        second = moe.expert_bias_E.clone()
+
+        # QB solves for the bias, so repeating an identical batch must not
+        # drift it the way an accumulating sign rule would.
+        self.assertLess((second - first).abs().max().item(), 0.05)
+        balancer.remove()
+
+    def test_step_without_a_forward_is_a_noop(self):
+        from torchtitan.experiments.kimi_k3.quantile_balance import QuantileBalancer
+
+        moe = self._fake_moe()
+
+        class Part(torch.nn.Module):
+            def __init__(self, moe):
+                super().__init__()
+                self.moe = moe
+
+        balancer = QuantileBalancer([Part(moe)], num_bins=64)
+        before = moe.expert_bias_E.clone()
+        balancer.step()
+        self.assertTrue(torch.equal(before, moe.expert_bias_E))
+        balancer.remove()
+
+    def test_missing_expert_bias_buffer_is_rejected(self):
+        from torchtitan.experiments.kimi_k3.quantile_balance import QuantileBalancer
+
+        moe = self._fake_moe()
+        moe.expert_bias_E = None
+
+        class Part(torch.nn.Module):
+            def __init__(self, moe):
+                super().__init__()
+                self.moe = moe
+
+        with self.assertRaisesRegex(ValueError, "expert_bias_E"):
+            QuantileBalancer([Part(moe)])
