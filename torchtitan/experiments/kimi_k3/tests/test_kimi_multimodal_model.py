@@ -6,7 +6,7 @@
 
 """CPU smoke tests for KimiLinearMultimodalModel scaffolding.
 
-Phase 4e scope: verify the module layout + forward path compose
+Scaffolding scope: verify the module layout + forward path compose
 cleanly on CPU without requiring a real vision tower / pretrained
 SigLIP or CLIP weights. A ``_DummyViT`` stand-in produces
 deterministic features so we can validate projector shapes +
@@ -17,7 +17,7 @@ only (``first_k_dense_replace=n_layers``) so every layer uses
 :class:`KimiMLP` not :class:`KimiMoE`.
 
 Actual multimodal pretraining infra (data loader, image preprocessing,
-loss masking, real ViT integration) is Phase 5 work.
+loss masking, real ViT integration) is follow-up work.
 """
 
 from __future__ import annotations

@@ -6,9 +6,8 @@
 
 """HF <-> torchtitan state-dict adapter for the Kimi Linear (+AttnRes) LM.
 
-Promotion of the phase10/phase11 logbook converters
-(``dcp_to_hf_kimi_attn_res.py`` / ``hf_to_dcp_kimi_attn_res.py``,
-424/424 keys validated at meta-49.12B) into the titan folder, wired as
+Promotion of the standalone HF<->DCP converters (424/424 keys
+validated at meta-49.12B) into the titan folder, wired as
 ``ModelSpec.state_dict_adapter`` so both offline conversion and the
 Trainer's ``initial_load_in_hf`` path (and veRL's torchtitan engine,
 which sets ``initial_load_in_hf=True``) work.
@@ -35,7 +34,7 @@ Quantized (packed) checkpoints: NOT silently accepted. K3 official
 weights are expected to ship packed MXFP4 + scales; until the exact
 packing is known (2026-07-27 report), any quantization sidecar key or
 sub-byte dtype raises with an explicit message instead of being treated
-as an ordinary value. See PLAN 0b gap (1).
+as an ordinary value.
 """
 
 import re

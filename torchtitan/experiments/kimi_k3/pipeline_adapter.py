@@ -28,8 +28,8 @@ Per-block backward grads ride the normal autograd + PP SEND_B path:
   producer's wrapped model. Detach is what guarantees the consumer's
   backward physically cannot traverse into the producer's forward
   graph -- a tensor-grad hook + ``Function.backward returning None``
-  alone did NOT suffice under real PP + FSDP + AC rerun (see
-  ``handoff_status_20260420_part3.md`` and the part-3 follow-up).
+  alone did NOT suffice under real PP + FSDP + AC rerun (PP8xVP4
+  pressure-test reports: https://github.com/QIU023/torchtitan_attention_residual).
 
 Both bridge mechanisms are pure local Python + a dict -- zero NCCL,
 zero cross-rank state. The grad walks backwards hop-by-hop along the
@@ -317,8 +317,8 @@ def _install_augment_hook(
 
     Replaces the prior ``_LocalCacheAugment`` autograd.Function pattern:
     under real PP scheduling the Function's output-view trick did not
-    reliably sever the consumer->producer autograd chain (see
-    handoff_status_20260420_part3.md), so the producer's own backward
+    reliably sever the consumer->producer autograd chain under the
+    PP8xVP4 pressure tests, so the producer's own backward
     was being triggered during the CONSUMER's backward traversal,
     freeing the producer's saved tensors before the producer's own
     backward ran.
@@ -1234,7 +1234,7 @@ def pipeline_kimi_linear_with_cache_adapter(model: nn.Module, **kwargs):
     * When ``TORCHTITAN_ATTNRES_CACHE=1`` AND the schedule is
       Interleaved1F1B AND the wrapped model is AttnRes (has
       ``num_blocks`` + ``layers_per_block`` attrs): wrap each stage's
-      ``submod`` in ``CrossStageCacheAdapter`` (Phase 3's
+      ``submod`` in ``CrossStageCacheAdapter`` (the
       implementation, reused unchanged — it duck-types the wrapped
       model's forward signature).
     * Otherwise: pass through (plain PP, no cache adapter).

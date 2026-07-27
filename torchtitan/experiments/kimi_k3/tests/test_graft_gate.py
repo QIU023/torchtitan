@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Graft-gate identity tests (HANDOFF sec 5 anchor).
+"""Graft-gate identity tests: alpha=0 must be an exact no-op.
 
 alpha-gated zero-init AttnRes must EXACTLY reproduce the plain
 backbone's function at step 0; the ungated zero-init read is a uniform

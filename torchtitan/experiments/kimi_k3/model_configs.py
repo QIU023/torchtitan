@@ -33,16 +33,11 @@ shape, just scaled by ``d_model``. Specifically:
 The :attr:`scaling_law_sizes` dict maps size-name → Python constructor;
 callers pass a ``num_blocks`` kwarg to pick the AttnRes variant.
 
-This module does NOT yet return torchtitan ``Trainer.Config`` nor
-``ModelSpec``. ModelSpec integration is Phase 4c: it requires
-refactoring :class:`KimiLinearModel` to inherit from
-``torchtitan.protocols.model.BaseModel`` and wrapping
-:class:`KimiLinearConfig` inside a ``BaseModel.Config`` shim that
-implements ``build()``, ``update_from_config()``, and
-``get_nparams_and_flops()``. Until then, use this module to
-instantiate models directly for CPU tests / ad-hoc experiments, and
-use the Llama3-backed ``attn_res/config_registry.py`` flavors for
-actual training (see ``phase4/launch_fsdp_llama3_528m.sh``).
+These builders return ``(kimi_config, num_blocks)`` tuples for direct
+model construction (CPU tests, ad-hoc experiments). The torchtitan
+integration lives elsewhere: ``KimiLinearSpec`` in ``model.py`` is the
+``BaseModel.Config`` shim, and ``config_registry.py`` holds the
+``Trainer.Config`` flavors the ConfigManager resolves by name.
 """
 
 from __future__ import annotations
@@ -79,7 +74,7 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     _SweepSize("296m", 296, 62.1, 14, 14, 1024, 464, 2.50e-3, 320),
     _SweepSize("436m", 436, 87.9, 16, 16, 1168, 528, 2.20e-3, 384),
     _SweepSize("528m", 528, 119.0, 17, 17, 1264, 560, 2.02e-3, 432),
-    # Phase 11: SGLang-friendly aligned-dim variant of the 436M row.
+    # SGLang-friendly aligned-dim variant of the 436M row.
     # d=1024 (vs 1168) → head_dim=64 is multiple of 16; qk_rope=32, v=64,
     # kv_lora=512 all 8/16/32-aligned; flashinfer / cublas / triton
     # extend kernels accept this layout on SM 12.0 (RTX 5090). d_ff
@@ -129,7 +124,7 @@ _BY_NAME["debugmodel8h"] = _SweepSize(
 # ----- 48B-A3B reference (upscale target, kept for docs) ------------------ #
 # Faithful to the HF config.json at moonshotai/Kimi-Linear-48B-A3B-Base.
 # Listed here so the full scale sweep is visible in one file; the 48B
-# config needs multi-node to train and is OUT OF SCOPE for Phase 4a-d.
+# config needs multi-node to train.
 
 _KIMI_48B_A3B_KDA_LAYERS = (1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26)
 _KIMI_48B_A3B_FULL_ATTN_LAYERS = (4, 8, 12, 16, 20, 24, 27)
@@ -237,7 +232,7 @@ def build_kimi_linear_config(
         kda_head_dim = 128
         kv_lora_rank = 512
     elif size.endswith("_aligned"):
-        # Phase 11: SGLang flashinfer / cuBLAS / triton extend kernels on
+        # SGLang flashinfer / cuBLAS / triton extend kernels on
         # SM 12.0 (RTX 5090) require head_dim multiple of 8 (16 preferred
         # so qk_rope = head_dim/2 is also 8-aligned). Round head_dim down
         # to multiple of 16, kv_lora_rank to multiple of 64.

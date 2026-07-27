@@ -10,7 +10,7 @@ Exercises the AttnRes weave end-to-end on a tiny config with dense
 FFN only (no MoE, to dodge the ``torch.histc(Long)`` CPU limitation
 in torchtitan's router). MoE path lives on GPU — see
 ``test_layers.py::TestKimiDeltaAttention::test_forward_shape_chunk_mode_cuda``
-for the fla-core + CUDA side, and Phase 4b will add a full GPU model
+for the fla-core + CUDA side, and a follow-up adds a full GPU model
 integration test once the adapter training run frees the box.
 """
 

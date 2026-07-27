@@ -21,8 +21,8 @@ sign, giving a smooth, magnitude-aware balancing signal.
 Underused experts (low load -> low CDF rank) get boosted proportionally
 to how deep in the low-load tail they sit; overused experts (high rank)
 are suppressed. Graftable (training-time bias, no weight-structure
-change; PLAN 1 lists Quantile Balancing graftable=YES). Exact form
-reconciles at 7.27.
+change, so it is graftable onto pretrained weights). Exact form
+reconciles at the official config release.
 """
 
 import torch

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Smoke tests for Phase 4c ModelSpec integration.
+"""Smoke tests for ModelSpec integration.
 
 Covers:
 * ``KimiLinearSpec.build()`` dispatches to baseline vs AttnRes variant.
@@ -77,7 +77,7 @@ class TestModelRegistry(unittest.TestCase):
             self.assertIsInstance(spec, ModelSpec)
             self.assertEqual(spec.name, "kimi_linear")
             self.assertEqual(spec.flavor, flavor)
-            # pipelining_fn is wired as of Phase 4d (runtime-dispatches
+            # pipelining_fn is wired (runtime-dispatches
             # to cache adapter when AttnRes+Interleaved1F1B, else PP passthrough).
             self.assertIsNotNone(spec.pipelining_fn)
             self.assertIsNotNone(spec.parallelize_fn)

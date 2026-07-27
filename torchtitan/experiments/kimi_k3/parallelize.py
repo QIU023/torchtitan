@@ -6,34 +6,34 @@
 
 """Parallelism application for Kimi Linear models.
 
-Supported parallelism dimensions (as of Phase 6):
+Supported parallelism dimensions:
 
-* **FSDP2 full-shard** — primary path, modeled on
+* **FSDP2 full-shard** -- primary path, modeled on
   ``torchtitan.models.llama3.parallelize.apply_fsdp``. Adapted to Kimi's
   module names (``embed_tokens``, ``norm``, ``lm_head``, ``layers`` as
   ``nn.ModuleList``).
-* **TP** (Phase 6 A3) — DSv3-style plan in ``apply_tp_kimi_linear``,
-  matched to Kimi's MLA + KDA + MoE layout. All boundary tensors
-  use_local_output so PP send/recv, AttnRes stacking, and fla-core
-  triton kernels see plain tensors.
-* **EP** (Phase 6 A6) — Expert Parallel for KimiMoE via
-  ``apply_ep_kimi_linear``; all-to-all dispatch/combine on the EP mesh.
-* **PP** — via the Phase 3 cache adapter in ``pipeline_adapter.py``;
+* **TP** -- DSv3-style plan in ``apply_tp_kimi_linear``, matched to
+  Kimi's MLA + KDA + MoE layout. All boundary tensors use_local_output
+  so PP send/recv, AttnRes stacking, and fla-core triton kernels see
+  plain tensors.
+* **CP** -- Ulysses-style (seq-local projections, one fused all-to-all
+  seq<->head, full-sequence attention on the local head subset) inside
+  each KDA/MLA module. The module boundary stays a seq-sharded plain
+  tensor, which is what keeps CP composable with FSDP/TP/PP/EP. Requires
+  ``context_parallel_load_balancer=None`` (enforced with a ValueError).
+* **EP** -- Expert Parallel for KimiMoE via ``apply_ep_kimi_linear``;
+  all-to-all dispatch/combine on the EP mesh.
+* **PP** -- via the cross-stage cache adapter in ``pipeline_adapter.py``;
   PP rank assignment is in torchtitan core, scheduling in the
   ``pipeline_kimi_linear_with_cache_adapter`` wrapper.
-* **torch.compile** (Phase 4 onwards) — per-decoder-layer compile via
+* **torch.compile** -- per-decoder-layer compile via
   ``_apply_compile_kimi_linear``; MoE for-loop and fla-core triton ops
   are carved out.
-* **Activation checkpointing** — applied via shared
-  ``torchtitan.distributed.activation_checkpoint.apply_ac`` since the
-  Kimi decoder layer registry matches the llama3 ``model.layers``
-  iteration pattern. Honors all upstream modes (``selective``,
-  ``full``, ``memory_budget``, ``none``).
-
-**Not supported**:
-
-* **CP** — blocked on fla-core's ``chunk_kda`` triton kernel lacking
-  ring-recurrence over CP shards; see comment near the CP guard below.
+* **Activation checkpointing** -- applied via the shared
+  ``ActivationCheckpointingConfig.build().apply()`` path since the Kimi
+  decoder layer registry matches the llama3 ``model.layers`` iteration
+  pattern. Honors all upstream modes (``selective``, ``full``,
+  ``memory_budget``, ``none``).
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def parallelize_kimi_linear(
     torch.set_float32_matmul_precision("high")
 
     if parallel_dims.tp_enabled:
-        # Phase 6 A3: TP plan modeled on ``deepseek_v3/parallelize.py``.
+        # TP plan modeled on ``deepseek_v3/parallelize.py``.
         # Key idea: every module boundary in the forward emits a plain
         # Tensor (use_local_output=True / output_layouts=Replicate())
         # so:
@@ -161,7 +161,8 @@ def parallelize_kimi_linear(
         # sub-mesh, and runs conv/scan/SDPA on its head subset over the
         # full sequence (see KimiDeltaAttention/KimiMLAAttention
         # ._forward_cp). chunk_kda is bit-exactly per-head independent
-        # (phase13/kda_ulysses_cp_probe.py), so head sharding is exact.
+        # (verified bit-exact against a single-rank reference), so
+        # head sharding is exact.
         # KDA can't ring (fla-core scan) and the custom MLA
         # inner_attention isn't the torchtitan SDPA type
         # apply_cp_to_forward expects -- hence this module-internal CP
@@ -203,7 +204,7 @@ def parallelize_kimi_linear(
             cp_degree, n_attn,
         )
     if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
-        # Phase 6 A6: Expert Parallel for Kimi MoE layers. The
+        # Expert Parallel for Kimi MoE layers. The
         # KimiMoE module wraps torchtitan.models.common.moe.MoE as
         # self._moe; the expert ModuleList is at self._moe.experts.
         # Apply standard ExpertParallel() to that experts container,
@@ -432,7 +433,7 @@ def apply_tp_kimi_linear(
     skip_expert_params: bool = False,
     moe_module_parallel: bool = False,
 ) -> None:
-    """Phase 6 A3 TP plan for kimi_linear, modeled on
+    """TP plan for kimi_linear, modeled on
     ``deepseek_v3/parallelize.py``.
 
     Design constraint: every module-boundary tensor in this model is a
@@ -935,7 +936,7 @@ def apply_tp_kimi_linear(
 
 
 def apply_ep_kimi_linear(model: nn.Module, parallel_dims) -> None:
-    """Phase 6 A6 Expert Parallel plan for kimi_linear MoE flavors.
+    """Expert Parallel plan for kimi_linear MoE flavors.
 
     Calls ``_moe.parallelize(parallel_dims)`` on every MoE layer: the
     upstream common MoE distributes its GroupedExperts states over the

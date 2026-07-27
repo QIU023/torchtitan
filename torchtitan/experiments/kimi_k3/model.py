@@ -28,8 +28,8 @@ Architectural faithfulness (per Kimi Linear tech report §5):
 * Pre-norm + residual structure identical to Kimi's reference.
 
 AttnRes weaving is implemented as a separate subclass in
-``attn_res_model.py`` (Phase 4c), matching the
-``AttnResLlama3Model`` pattern in ``../attn_res/``.
+``attn_res_model.py``, matching the ``AttnResLlama3Model`` pattern
+this experiment grew out of.
 """
 
 from __future__ import annotations
@@ -121,7 +121,8 @@ class KimiLinearConfig:
     mla_use_nope: bool = True
     # Gated MLA (K3 delta): sigmoid output gate, near-identity init so a
     # non-gated-MLA-pretrained checkpoint's function is ~preserved at
-    # step 0 (graft-viable per PLAN 0a #4). PROVISIONAL: exact gate form
+    # step 0 (graft-viable: a near-identity gate init keeps the
+    # pretrained function intact). PROVISIONAL: exact gate form
     # reconciles at 7.27. Off by default (plain MLA = validated path).
     mla_gated: bool = False
     rope_theta: float = 10000.0
@@ -264,7 +265,7 @@ def _cp_all_to_all_headseq(
     seq_to_head=False: ``[B, T, H/cp, K]`` -> ``[B, T/cp, H, K]``.
 
     Numerics (round-trip and per-head chunk_kda parity) validated
-    bit-exact in phase13 kda_ulysses_cp_probe.py; backward is the
+    bit-exact against a single-rank reference; backward is the
     transposed all-to-all via torch.distributed.nn.functional.
     """
     import torch.distributed.nn.functional as dist_nn
@@ -1164,7 +1165,7 @@ class KimiLinearModel(nn.Module):
     wired by the torchtitan trainer (cross-entropy over logits).
 
     ``_return_only_new_blocks`` and ``layers_per_block`` attributes
-    are defined here so the Phase-3 PP cache adapter can toggle
+    are defined here so the cross-stage cache adapter can toggle
     forward output shape once ``KimiLinearAttnResModel`` subclass
     adds the AttnRes block machinery. In the base (non-AttnRes) class
     the flag is ignored — forward always returns full hidden_states.

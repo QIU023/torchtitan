@@ -6,9 +6,9 @@
 
 """LLaVA-style multimodal wrapper around Kimi Linear.
 
-Phase 4e scope: architecture scaffolding only. No training recipe,
-no image data pipeline, no vision tower pretrained weights loading
-— those are Phase 5 deliverables. This module lands the module
+Scaffolding scope: architecture only. No training recipe, no image
+data pipeline, no vision tower pretrained weights loading -- those are
+follow-up work. This module lands the module
 layout + forward signature so a CPU smoke can walk through the
 image→projector→LLM hidden-state interleaving without crashing.
 
@@ -31,7 +31,7 @@ Reference pattern (LLaVA 1.5 / LLaVA-NeXT):
 This class implements steps 2 and 3 + the interleaving logic.
 Step 1 (ViT) is pluggable — constructor takes a pre-built
 vision module, leaving HF-download / preprocessing policy to the
-caller. Phase 5 adds a concrete SigLIP integration.
+caller. A concrete SigLIP integration is follow-up work.
 """
 
 from __future__ import annotations

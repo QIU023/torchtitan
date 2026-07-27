@@ -6,7 +6,7 @@
 
 """Gated MLA (K3 delta, provisional) tests.
 
-Per PLAN 0a #4: Gated MLA is graft-viable via near-identity gate init.
+Gated MLA is graft-viable via near-identity gate init.
 This locks that a checkpoint pretrained WITHOUT gated MLA is ~preserved
 at step 0 when the gate is enabled (near-identity, not bit-exact -- the
 sigmoid(6)=0.9975 leak distinguishes it from the alpha graft gate which

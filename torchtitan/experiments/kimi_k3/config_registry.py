@@ -13,9 +13,8 @@ SGLang-aligned 447m carrier (+ fp8 variant), and the 48B-A3B layout
 carriers. Architecture-side builders live in ``model_configs.py``.
 
 The dense Llama3-shape / DSv3-shape AttnRes test carrier that previously
-shared this registry lives in the logbook repo
-(``phase3_attnres_pp_integration/dense_carrier/``); it remains runnable
-against fork history (<= 666cf7ad6).
+shared this registry lives outside this folder; it remains runnable
+against earlier history (<= 666cf7ad6).
 """
 
 from collections.abc import Callable
@@ -121,7 +120,8 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
             keep_latest_k=2,  # disk-discipline: at most 2x model size
             last_save_model_only=False,
         ),
-        # AC off — kimi_linear/parallelize.py Phase 4c doesn't implement it.
+        # AC off by default: the debug/scaling flavors fit without it.
+        # (AC itself is supported -- see parallelize_kimi_linear.)
         activation_checkpoint=None,
         validator=Validator.Config(freq=500, steps=50),
         # Kimi CP reassembles contiguous rank-ordered seq shards inside
@@ -237,7 +237,7 @@ def kimi_linear_436m_block_attn_res_n4() -> Trainer.Config:
 
 
 def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
-    """447M Block AttnRes with SGLang-friendly head dims (phase 11).
+    """447M Block AttnRes with SGLang-friendly head dims.
 
     Same scale as ``kimi_linear_436m_block_attn_res_n4`` — 16 layers,
     16 attention heads, 32 routed experts top-8, 1 shared expert,
@@ -259,8 +259,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
     (384 sequences global), and total tokens budget (87.9B) inherited
     from the 436M row in SCALING_LAW_TABLE.
 
-    Trains with the same launcher
-    (``phase4/launch_paperhparams_break3.sh``) by setting
+    Selected with
     ``CONFIG=kimi_linear_447m_aligned_block_attn_res_n4``. Runs through
     the same parallelize_fn / pipelining_fn / loss_fn as 436M.
     """
@@ -396,7 +395,7 @@ def kimi_linear_debugmodel_gated_qlora_mxfp4() -> Trainer.Config:
     Meta-first trainer flow: the model builds with the PACKED layout
     (base_qdata/base_scale, no base.weight), FSDP shards the packed
     bytes, and the quantized values load from a DCP checkpoint produced
-    by phase13 stream_quantize_mxfp4_dcp.py from a bf16 run. CI-scale
+    by an offline streaming quantizer from a bf16 run. CI-scale
     rehearsal of 48B QLoRA on small-VRAM fleets (no rank ever holds the
     full bf16 model).
     """

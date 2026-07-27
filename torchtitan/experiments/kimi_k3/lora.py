@@ -13,7 +13,7 @@ directly-built modules -- same situation as Float8 (see
 ``apply_lora`` swaps target ``nn.Linear`` projections for
 :class:`KimiLoRALinear` wrappers after build.
 
-P0 semantics (HANDOFF LoRA trio):
+Semantics:
 
 * ``lora_b`` zero-init -> the wrapped model is BIT-IDENTICAL to the
   base model at step 0 (composes with the alpha graft gate: gated

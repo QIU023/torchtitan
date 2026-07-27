@@ -6,7 +6,7 @@
 
 """Layer-level CPU smoke tests for Kimi Linear.
 
-Phase 4a scope: verify that the torchtitan-idiom port produces
+Scope: verify that the torchtitan-idiom port produces
 forward outputs with the right shapes, on CPU, for:
 
 * :class:`KimiRMSNorm` — trivial
@@ -15,7 +15,7 @@ forward outputs with the right shapes, on CPU, for:
 * :class:`KimiDeltaAttention` — KDA via fla-core
 
 MoE path (:class:`KimiMoE`) and full-model integration tests land in
-Phase 4b once torchtitan's ``GroupedExperts.forward`` signature is
+a follow-up once torchtitan's ``GroupedExperts.forward`` signature is
 validated against our call site.
 
 These tests require fla-core (for KDA) and run on CPU only. The
@@ -61,7 +61,7 @@ def _tiny_config(num_hidden_layers: int = 2) -> KimiLinearConfig:
         kda_short_conv_kernel_size=4,
         kda_layers=[1],  # 1-indexed: layer 0 is KDA
         full_attn_layers=[2],  # 1-indexed: layer 1 is MLA
-        # MoE off for Phase-4a smoke
+        # MoE off for this smoke
         num_experts=None,
         num_experts_per_token=1,
         num_shared_experts=0,

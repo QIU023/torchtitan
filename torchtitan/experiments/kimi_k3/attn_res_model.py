@@ -26,8 +26,8 @@ Per-layer AttnRes (matching ``AttnResTransformerBlock`` in the
   RMSNorm) runs before ``norm`` + ``lm_head``, mirroring the reference.
 
 ``_return_only_new_blocks`` flag is respected on forward so the
-Phase-3 PP cache adapter can drive this model unchanged at multi-node
-scale. Local FSDP-only training leaves the flag ``False`` and passes
+cross-stage cache adapter (``pipeline_adapter.py``) can drive this model
+unchanged at multi-node scale. Local FSDP-only training leaves the flag ``False`` and passes
 the full accumulated block stack forward.
 
 Paper (Kimi Linear tech report §5):
@@ -139,7 +139,8 @@ class KimiAttnResDecoderLayer(nn.Module):
         self.mlp_res_proj = AttnResProjection(proj_cfg)
         self.attn_res_norm = nn.RMSNorm(d, eps=config.rms_norm_eps)
         self.mlp_res_norm = nn.RMSNorm(d, eps=config.rms_norm_eps)
-        # Graft gate (HANDOFF sec 5 anchor): per-read scalar alpha, zero-init.
+        # Graft gate: per-read scalar alpha, zero-init, so at step 0 the
+        # model is exactly the plain backbone (adapter-correctness anchor).
         # h = partial + alpha * (mix - partial): alpha=0 makes the read the
         # plain residual stream, so a pretrained backbone's step-0 function
         # is EXACTLY preserved; alpha then trains away from identity.
@@ -207,7 +208,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
       * one final aggregation (``final_attn_res_proj`` + norm) before
         ``norm`` + ``lm_head`` on the last stage
       * ``layers_per_block`` attribute so block-start detection is
-        layout-table-compatible with the Phase-3 PP cache adapter.
+        layout-table-compatible with the cross-stage cache adapter.
 
     ``num_blocks`` chooses between Full AttnRes (``num_blocks == L``,
     1 layer per block → every layer is block-start) and Block AttnRes
@@ -283,8 +284,8 @@ class KimiLinearAttnResModel(KimiLinearModel):
         self._return_only_new_blocks: bool = False
 
     # Default sentinel token id used to mark image-token positions in input_ids
-    # when ``image_mask`` is not supplied alongside ``vision_embeds``. Phase 5
-    # multimodal pretraining picks 32000 (a Llama-3.1 reserved special token);
+    # when ``image_mask`` is not supplied alongside ``vision_embeds``. The
+    # multimodal path picks 32000 (a Llama-3.1 reserved special token);
     # any caller can override by passing ``image_token_id`` as a kwarg.
     _DEFAULT_IMAGE_TOKEN_ID = 32_000
 
@@ -302,7 +303,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
         """AttnRes forward with PP-split awareness + block threading.
 
         The dispatch mirrors ``attn_res/model.py:AttnResModel.forward`` so
-        the Phase-3 ``CrossStageCacheAdapter`` can drive this class via
+        the ``CrossStageCacheAdapter`` can drive this class via
         duck-typing on ``self.embed_tokens`` / ``self.lm_head`` /
         ``self.norm`` presence (pipeline_module_split strips these off
         non-first / non-last stages).

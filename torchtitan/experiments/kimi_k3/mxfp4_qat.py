@@ -12,7 +12,7 @@ activations, OCP microscaling, block 32). This module provides an
 EMULATED fake-quant so QAT runs on any GPU (fake-quant is bf16 compute;
 FP4 hardware only speeds deployment, not QAT).
 
-Fidelity scope (honest, matches PLAN 3b):
+Fidelity scope (honest):
 - Emulated MX rounding targets the OCP spec but is NOT verified
   bit-identical to Moonshot's kernels -> "MX-deployable", not
   "K3-QAT-bit-parity".
