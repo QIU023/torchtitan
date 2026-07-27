@@ -680,6 +680,10 @@ def apply_tp_kimi_linear(
             # q_proj so the local gate matches the local attn heads in
             # both the TP-only and the CP+TP forward. Without this the
             # plain-tensor gate param meets DTensor x (mixed-op crash).
+            # Both gate parameterizations shard on the head axis: the
+            # per-head variant is [num_heads] and K3's full-rank variant is
+            # [num_heads * v_head_dim], so Colwise keeps the local gate width
+            # matched to the local attention output in both cases.
             if getattr(layer.self_attn, "attn_gate_proj", None) is not None:
                 plan["self_attn.attn_gate_proj"] = ColwiseParallel(
                     use_local_output=True,

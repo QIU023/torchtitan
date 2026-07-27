@@ -4,13 +4,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Gated MLA (K3 delta, provisional) tests.
+"""Gated MLA tests.
 
-Gated MLA is graft-viable via near-identity gate init.
-This locks that a checkpoint pretrained WITHOUT gated MLA is ~preserved
-at step 0 when the gate is enabled (near-identity, not bit-exact -- the
-sigmoid(6)=0.9975 leak distinguishes it from the alpha graft gate which
-IS bit-exact). Exact gate form is PROVISIONAL, reconciles at 7.27.
+Two parameterizations, two different promises (see
+KimiLinearConfig.attn_gate_param):
+
+* ``per_head_graft`` -- this repo's graft-viable variant. A checkpoint
+  pretrained WITHOUT the gate is ~preserved at step 0 (near-identity, not
+  bit-exact: the sigmoid(6)=0.9975 leak distinguishes it from the alpha graft
+  gate, which IS bit-exact). That is what this test locks.
+* ``full_rank`` -- K3's form, tech report Eq. 7. Channel-wise, no bias, no
+  near-identity claim; covered by tests/test_attn_gate.py.
 """
 
 import dataclasses
@@ -40,7 +44,12 @@ class TestGatedMLA(unittest.TestCase):
         with torch.device("cuda"):
             plain = KimiLinearModel(cfg)
             plain.init_weights()
-            gated = KimiLinearModel(dataclasses.replace(cfg, mla_gated=True))
+            # near-identity is the per_head_graft promise, not K3's
+            gated = KimiLinearModel(
+                dataclasses.replace(
+                    cfg, mla_gated=True, attn_gate_param="per_head_graft"
+                )
+            )
             gated.init_weights()
         gated.load_state_dict(plain.state_dict(), strict=False)
         tok = torch.randint(0, 2016, (2, 96), device="cuda")

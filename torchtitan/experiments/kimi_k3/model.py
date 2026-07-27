@@ -164,6 +164,14 @@ class KimiLinearConfig:
     # only read when hidden_act == "situ".
     activation_situ_beta: float = 4.0
     activation_situ_linear_beta: float | None = 25.0
+    # Output-gate parameterization for the gated MLA / KDA paths.
+    # "full_rank" is K3's (tech report Eq. 6/7): an input-dependent
+    # channel-wise projection, sigmoid, applied to the attention output
+    # before W_o. "per_head_graft" is this repo's near-identity variant:
+    # one scalar per head with a +LARGE bias so sigmoid(.) ~= 1, which makes
+    # a graft onto pretrained weights an exact no-op at step 0. Use
+    # full_rank for K3 fidelity, per_head_graft for grafting experiments.
+    attn_gate_param: Literal["full_rank", "per_head_graft"] = "full_rank"
 
     # ---- init ----
     initializer_range: float = 0.02
@@ -432,19 +440,43 @@ class KimiMLAAttention(nn.Module):
             self.num_heads * self.v_head_dim, self.hidden_size, bias=False
         )
 
-        # Gated MLA (K3 delta, provisional): per-head sigmoid gate on the
-        # attention output before o_proj. Near-identity init: the gate
-        # projection is zero-init and a +LARGE bias makes sigmoid(.)~=1,
-        # so at step 0 gated_out ~= plain attn_out (graft-preserving).
+        # Gated MLA. K3 (tech report Eq. 7):
+        #     y_t = W_o [ Sigmoid(W_g x_t) (.) o~_t ]
+        # with W_g FULL RANK, i.e. one gate value per output channel of the
+        # ungated attention output (num_heads * v_head_dim), applied before
+        # W_o. The per-head variant is this repo's graft-preserving
+        # alternative -- see KimiLinearConfig.attn_gate_param.
         self.mla_gated = config.mla_gated
+        self.attn_gate_param = config.attn_gate_param
         if self.mla_gated:
-            self.attn_gate_proj = Linear(
-                self.hidden_size, self.num_heads, bias=True
-            )
+            if self.attn_gate_param == "full_rank":
+                self.attn_gate_proj = Linear(
+                    self.hidden_size,
+                    self.num_heads * self.v_head_dim,
+                    bias=False,
+                )
+            else:
+                self.attn_gate_proj = Linear(
+                    self.hidden_size, self.num_heads, bias=True
+                )
 
         # SDPA-only sub-module so the TP plan can wrap it with
         # use_local_output=True (DSv3 pattern). Has no parameters.
         self.inner_attention = KimiMLAInnerAttention()
+
+    def _attn_gate(self, x: torch.Tensor, width: int) -> torch.Tensor:
+        """Sigmoid output gate, broadcastable onto ``[..., width]``.
+
+        full_rank (K3): one value per output channel, so the projection
+        already has the right width. per_head_graft: one value per head,
+        expanded across that head's v_head_dim.
+        """
+        g = torch.sigmoid(self.attn_gate_proj(x))
+        if self.attn_gate_param == "full_rank":
+            return g
+        return g.unsqueeze(-1).expand(*g.shape, width // g.shape[-1]).reshape(
+            *g.shape[:-1], width
+        )
 
     def _project_q(self, x: torch.Tensor) -> torch.Tensor:
         """Q projection, with or without the compression pair.
@@ -529,11 +561,9 @@ class KimiMLAAttention(nn.Module):
         )  # (B, H, T, v_head_dim)
 
         attn_out = attn_out.transpose(1, 2)  # (B, T, H, Dv)
+        attn_out = attn_out.reshape(B, T, -1)  # (B, T, H*Dv)
         if self.mla_gated:
-            # Per-head sigmoid gate from x; near-identity at init.
-            gate = torch.sigmoid(self.attn_gate_proj(x))  # (B, T, H)
-            attn_out = attn_out * gate.unsqueeze(-1)
-        attn_out = attn_out.reshape(B, T, -1)
+            attn_out = attn_out * self._attn_gate(x, attn_out.shape[-1])
         out = self.o_proj(attn_out)
         return out
 
@@ -624,16 +654,16 @@ class KimiMLAAttention(nn.Module):
         attn_BLHV = _cp_all_to_all_headseq(
             attn_BGTV.transpose(1, 2).contiguous(), cp_group, seq_to_head=False
         )
+        attn_BLE = attn_BLHV.reshape(B, t_loc, h_loc * self.v_head_dim)
         if self.mla_gated:
-            # Per-head sigmoid gate from the seq-local x; pointwise per
-            # (b, t, h), so it applies after the heads return seq-local.
-            gate_BLH = torch.sigmoid(
-                _to_local_if_dtensor(self.attn_gate_proj(x))
+            # Gate from the seq-local x; pointwise, so it applies after the
+            # heads return seq-local. Under TP the gate projection is
+            # head-sharded exactly like the attention output, so the local
+            # widths line up.
+            attn_BLE = attn_BLE * _to_local_if_dtensor(
+                self._attn_gate(x, attn_BLE.shape[-1])
             )
-            attn_BLHV = attn_BLHV * gate_BLH.unsqueeze(-1)
-        out = self.o_proj(
-            attn_BLHV.reshape(B, t_loc, h_loc * self.v_head_dim)
-        )
+        out = self.o_proj(attn_BLE)
         return out
 
 
@@ -1403,11 +1433,13 @@ class KimiLinearModel(nn.Module):
                 attn.A_log.data.uniform_(1.0, 16.0).log_()
             if hasattr(attn, "dt_bias"):
                 nn.init.zeros_(attn.dt_bias)
-            # Gated MLA near-identity init: zero the gate projection
-            # weight and set a large positive bias so sigmoid(gate)~=1
-            # at step 0 (gated_out ~= plain attn_out; graft-preserving).
+            # Output gate init. The graft variant is near-identity: zero
+            # the projection and set a large positive bias so
+            # sigmoid(gate) ~= 1 at step 0 (gated_out ~= plain attn_out).
+            # K3's full_rank gate has no bias and is initialized normally,
+            # so it is left to the generic Linear init above.
             gate_proj = getattr(attn, "attn_gate_proj", None)
-            if gate_proj is not None:
+            if gate_proj is not None and gate_proj.bias is not None:
                 nn.init.zeros_(gate_proj.weight)
                 nn.init.constant_(gate_proj.bias, 6.0)  # sigmoid(6)=0.9975
 

@@ -351,7 +351,12 @@ def kimi_linear_debugmodel_k3faithful() -> Trainer.Config:
     cfg = kimi_linear_debugmodel()
     cfg.model_spec.flavor = "kimi_linear_debugmodel_k3faithful"
     m = cfg.model_spec.model
-    m.kimi_config = _dc.replace(m.kimi_config, mla_gated=True)  # Gated MLA
+    # Gated MLA in K3's own parameterization (tech report Eq. 7: full-rank
+    # channel-wise sigmoid gate, no bias). The graft flavors below keep
+    # per_head_graft instead, where a step-0 no-op is the point.
+    m.kimi_config = _dc.replace(
+        m.kimi_config, mla_gated=True, attn_gate_param="full_rank"
+    )
     m.attn_res_gated = True                                     # alpha graft
     return cfg
 
