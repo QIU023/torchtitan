@@ -1159,24 +1159,21 @@ class KimiMoE(nn.Module):
         )
 
         assert config.num_experts is not None and config.num_experts > 0
-        if config.routed_expert_hidden_size is not None:
-            # Eq. 11 routes on the FULL-WIDTH token (sec 2.3.3: s_i =
-            # Sigmoid(W_r x_i)) while the experts consume W_down x. Upstream's
-            # MoE.forward feeds one tensor to both the router and the experts,
-            # so a faithful wiring needs either an upstream MoE that accepts a
-            # separate router input, or a folder-local reimplementation of its
-            # routing bookkeeping (SP padding, the routing-map scatter, token
-            # counts, load-balance bias). Refuse rather than silently train a
-            # rank-constrained router or a non-latent MoE.
-            raise NotImplementedError(
-                "Stable LatentMoE (routed_expert_hidden_size="
-                f"{config.routed_expert_hidden_size}) is not wired into the "
-                "training MoE yet: K3 routes on the full-width token but "
-                "dispatches W_down x to the experts, and torchtitan's MoE "
-                "passes a single tensor to both. KimiLatentMoEProjection "
-                "holds the entry/exit halves; see "
-                "phase13_k3like_48b_posttrain/K3_RECONCILIATION_2026-07-27.md "
-                "sec 3.1 for the two integration options."
+        # Stable LatentMoE (report Eq. 11): routed experts live in a compact
+        # latent of width l, entered/left through two SHARED projections with
+        # an RMSNorm on the aggregate. The router still reads the FULL-WIDTH
+        # token (sec 2.3.3: s_i = Sigmoid(W_r x_i)), which is why MoE.forward
+        # takes a separate router_input.
+        self.latent_size = config.routed_expert_hidden_size
+        expert_dim = (
+            config.hidden_size if self.latent_size is None else self.latent_size
+        )
+        if self.latent_size is not None:
+            self.latent = KimiLatentMoEProjection(
+                config.hidden_size,
+                self.latent_size,
+                use_norm=config.latent_moe_use_norm,
+                rms_norm_eps=config.rms_norm_eps,
             )
 
         router_cfg = TokenChoiceTopKRouter.Config(
@@ -1198,7 +1195,7 @@ class KimiMoE(nn.Module):
             route_scale=config.routed_scaling_factor,
         )
         experts_cfg = GroupedExperts.Config(
-            dim=config.hidden_size,
+            dim=expert_dim,
             hidden_dim=config.moe_intermediate_size,
             num_experts=config.num_experts,
             # torch._grouped_mm fuses all expert GEMMs into one batched call.
@@ -1214,7 +1211,7 @@ class KimiMoE(nn.Module):
         # torchtitan's FeedForward for consistency with MoE.Config;
         # the SwiGLU math is identical.
         shared_cfg = None
-        if config.num_shared_experts > 0:
+        if config.num_shared_experts > 0 and self.latent_size is None:
             shared_dim = config.moe_intermediate_size * config.num_shared_experts
             shared_cfg = FeedForward.Config(
                 w1=Linear.Config(
@@ -1246,7 +1243,7 @@ class KimiMoE(nn.Module):
                     num_experts=config.num_experts,
                     top_k=config.num_experts_per_token,
                     comm_backend="standard",
-                    hidden_dim=config.hidden_size,
+                    hidden_dim=expert_dim,
                 ),
             ),
             router=router_cfg,
@@ -1276,9 +1273,25 @@ class KimiMoE(nn.Module):
                 },
             )
         self._moe = moe_cfg.build()
+        # Under the latent path the shared experts are ours, at full width.
+        self.shared_experts = None
+        if config.num_shared_experts > 0 and self.latent_size is not None:
+            shared_dim = config.moe_intermediate_size * config.num_shared_experts
+            self.shared_experts = KimiMLP(
+                config.hidden_size,
+                shared_dim,
+                hidden_act=config.hidden_act,
+                situ_beta=config.activation_situ_beta,
+                situ_linear_beta=config.activation_situ_linear_beta,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self._moe(x)
+        if self.latent_size is None:
+            out = self._moe(x)
+        else:
+            # y = sum_j E_j^shared(x) + W_up RMSNorm( sum_i p_i E_i(W_down x) )
+            # Router reads x; experts consume W_down x.
+            out = self._moe(self.latent.to_latent(x), router_input_BLD=x)
         if isinstance(out, DTensor):
             # Module-internal MoE parallelization (EP/TP) emits DTensor
             # (Partial on the TP axis before reduction). This model's
@@ -1291,6 +1304,10 @@ class KimiMoE(nn.Module):
                     placements=[Replicate()] * len(out.placements)
                 )
             out = out.to_local()
+        if self.latent_size is not None:
+            out = self.latent.from_latent(out)
+            if self.shared_experts is not None:
+                out = out + self.shared_experts(x)
         return out
 
 

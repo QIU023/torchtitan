@@ -400,10 +400,23 @@ class MoE(Module):
             persistent=False,
         )
 
-    def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x_BLD: torch.Tensor,
+        *,
+        router_input_BLD: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
-            x_BLD: Input ``(B, L, D)``.
+            x_BLD: Input ``(B, L, D)`` -- what the experts consume.
+            router_input_BLD: Keyword-only. Optional ``(B, L, D_r)`` routed-on
+                tensor -- keyword-only because ``Module._redistribute_inputs``
+                enumerates the positional parameters. When
+                None (the default) the router reads ``x_BLD``, which is the
+                conventional MoE. Latent-expert designs route on the
+                full-width token while dispatching a projected, narrower
+                tensor to the experts, so they need the two to differ; only
+                the leading ``(B, L)`` must match.
 
         Returns:
             Output ``(B, L, D)``.
@@ -456,7 +469,10 @@ class MoE(Module):
             topk_scores_BLK,
             topk_expert_ids_BLK,
             scores_BLE,
-        ) = self.router(x_BLD, self.expert_bias_E)
+        ) = self.router(
+            x_BLD if router_input_BLD is None else router_input_BLD,
+            self.expert_bias_E,
+        )
 
         # Build a one-hot routing map (B, L, E) marking the experts each token
         # is routed to. Under TP+EP the router outputs are DTensors sharded on

@@ -764,6 +764,23 @@ def apply_tp_kimi_linear(
                 # gate(DTensor x), gate.weight is DTensor, gate forward
                 # produces DTensor, exits as plain via local_output.
                 plan["ffn._moe.router.gate"] = no_par_local
+            # Stable LatentMoE: the shared down/up pair and the latent
+            # RMSNorm are full-width<->latent maps with no head axis, so they
+            # are Replicate-on-tp like the router gate. Registering them keeps
+            # their params on the tp mesh (clip_grad_norm_ needs one mesh) and
+            # keeps the plain-tensor boundary convention -- without this the
+            # promoted DTensor weights meet a plain activation inside the
+            # RMSNorm (mixed-operand crash).
+            latent = getattr(layer.ffn, "latent", None)
+            if latent is not None:
+                for n in ("down", "up", "norm"):
+                    if getattr(latent, n, None) is not None:
+                        plan[f"ffn.latent.{n}"] = no_par_local
+            # Under the latent path the shared experts hang off KimiMoE
+            # itself (Eq. 11 adds them at full width), not off ffn._moe.
+            if getattr(layer.ffn, "shared_experts", None) is not None:
+                for n in ("gate_proj", "up_proj", "down_proj"):
+                    plan[f"ffn.shared_experts.{n}"] = no_par_local
             # experts (GroupedExperts): the forward already to_local's
             # its DTensor params before the grouped_mm kernel call (see
             # moe.py:100-111). Wrapping the module with NoParallel

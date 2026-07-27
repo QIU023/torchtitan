@@ -69,7 +69,7 @@ class TestLatentProjection(unittest.TestCase):
         self.assertEqual(names, {"down.weight", "up.weight", "norm.weight"})
 
 
-class TestLatentMoEGuard(unittest.TestCase):
+class TestLatentMoEWiring(unittest.TestCase):
     def _cfg(self, latent):
         return KimiLinearConfig(
             vocab_size=128,
@@ -87,12 +87,31 @@ class TestLatentMoEGuard(unittest.TestCase):
             routed_expert_hidden_size=latent,
         )
 
-    def test_unwired_latent_path_fails_loudly(self):
-        with self.assertRaises(NotImplementedError) as cm:
-            KimiMoE(self._cfg(48))
-        msg = str(cm.exception)
-        self.assertIn("full-width token", msg)
-        self.assertIn("K3_RECONCILIATION", msg)
+    def test_latent_path_builds_with_the_right_widths(self):
+        moe = KimiMoE(self._cfg(48))
+        self.assertEqual(moe.latent_size, 48)
+        # entry/exit are full-width <-> latent
+        self.assertEqual(moe.latent.down.weight.shape, (48, 64))
+        self.assertEqual(moe.latent.up.weight.shape, (64, 48))
+        # experts live in the latent: w1 is [E, moe_intermediate, latent]
+        experts = moe._moe.routed_experts.inner_experts
+        self.assertEqual(tuple(experts.w1_EFD.shape), (8, 32, 48))
+        self.assertEqual(tuple(experts.w2_EDF.shape), (8, 48, 32))
+        # the router still reads the FULL-WIDTH token (report sec 2.3.3)
+        self.assertEqual(moe._moe.router.gate.weight.shape[-1], 64)
+
+    def test_shared_experts_are_full_width_and_ours(self):
+        moe = KimiMoE(self._cfg(48))
+        # Eq. 11 adds the shared branch at full width, outside the latent
+        self.assertIsNotNone(moe.shared_experts)
+        self.assertEqual(moe.shared_experts.gate_proj.weight.shape[-1], 64)
+        self.assertIsNone(moe._moe.shared_experts)
+
+    def test_non_latent_keeps_shared_inside_the_inner_moe(self):
+        moe = KimiMoE(self._cfg(None))
+        self.assertIsNone(moe.latent_size)
+        self.assertIsNone(moe.shared_experts)
+        self.assertIsNotNone(moe._moe.shared_experts)
 
     def test_none_keeps_the_conventional_path_constructible(self):
         # not asserting a forward (routed dispatch is GPU-only), only that the

@@ -373,6 +373,29 @@ def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_debugmodel_latentmoe() -> Trainer.Config:
+    """Debug flavor with K3's Stable LatentMoE (report Eq. 11).
+
+    Routed experts run in a latent of width ``routed_expert_hidden_size``
+    (half of hidden here, mirroring K3's 3584-of-7168), entered/left through
+    the shared down/up pair with an RMSNorm on the aggregate; the router
+    still reads the full-width token. Shared experts stay full width.
+    Carrier for the latent path at CI scale.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_debugmodel()
+    cfg.model_spec.flavor = "kimi_linear_debugmodel_latentmoe"
+    m = cfg.model_spec.model
+    m.kimi_config = _dc.replace(
+        m.kimi_config,
+        routed_expert_hidden_size=m.kimi_config.hidden_size // 2,
+        latent_moe_use_norm=True,
+        num_shared_experts=2,  # K3 fixes Ns = 2
+    )
+    return cfg
+
+
 def kimi_linear_debugmodel8h() -> Trainer.Config:
     """8-head debug flavor (d=512, H=8) for deep tp x cp meshes.
 
