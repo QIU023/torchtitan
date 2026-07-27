@@ -97,7 +97,9 @@ class TestKimiAttnResDecoderLayer(unittest.TestCase):
         self.assertEqual(new_partial.shape, (B, T, D))
 
         # Non-block-start: blocks unchanged, partial accumulates.
-        new_blocks2, new_partial2, _ = layer(new_blocks, new_partial, is_block_start=False)
+        new_blocks2, new_partial2, _ = layer(
+            new_blocks, new_partial, is_block_start=False
+        )
         self.assertEqual(len(new_blocks2), 3)
         self.assertEqual(new_partial2.shape, (B, T, D))
 

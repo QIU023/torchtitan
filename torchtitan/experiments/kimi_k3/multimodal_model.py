@@ -43,13 +43,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.experiments.kimi_k3.attn_res_model import (
-    KimiLinearAttnResModel,
-)
-from torchtitan.experiments.kimi_k3.model import (
-    KimiLinearConfig,
-    KimiLinearModel,
-)
+from torchtitan.experiments.kimi_k3.attn_res_model import KimiLinearAttnResModel
+from torchtitan.experiments.kimi_k3.model import KimiLinearConfig, KimiLinearModel
 
 
 @dataclass(kw_only=True, slots=True)
@@ -89,7 +84,10 @@ class KimiVisionProjector(nn.Module):
     """
 
     def __init__(
-        self, *, vision_hidden_size: int, projector_hidden_size: int,
+        self,
+        *,
+        vision_hidden_size: int,
+        projector_hidden_size: int,
         llm_hidden_size: int,
     ) -> None:
         super().__init__()
@@ -130,7 +128,9 @@ class KimiLinearMultimodalModel(nn.Module):
     """
 
     def __init__(
-        self, config: KimiMultimodalConfig, *,
+        self,
+        config: KimiMultimodalConfig,
+        *,
         vision_tower: nn.Module | None = None,
     ) -> None:
         super().__init__()
@@ -179,7 +179,9 @@ class KimiLinearMultimodalModel(nn.Module):
         return projected.view(B, num_images, N_vision, D_llm)
 
     def _inject_vision_features(
-        self, input_ids: torch.Tensor, vision_features: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
+        vision_features: torch.Tensor,
     ) -> torch.Tensor:
         """Build the interleaved embedding sequence.
 
@@ -255,7 +257,8 @@ class KimiLinearMultimodalModel(nn.Module):
         return padded
 
     def forward(
-        self, input_ids: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Multimodal forward.
@@ -281,9 +284,7 @@ class KimiLinearMultimodalModel(nn.Module):
                 "construct with a vision module or drop pixel_values."
             )
             vision_features = self._encode_images(pixel_values)
-            inputs_embeds = self._inject_vision_features(
-                input_ids, vision_features
-            )
+            inputs_embeds = self._inject_vision_features(input_ids, vision_features)
             # LLM was designed to take token ids via embed_tokens.
             # Bypass the embedding by passing hidden states directly.
             # This works because forward(tokens) dispatches based on

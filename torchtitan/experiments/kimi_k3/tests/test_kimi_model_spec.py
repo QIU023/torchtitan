@@ -28,9 +28,9 @@ from torchtitan.experiments.kimi_k3 import (
     model_registry,
 )
 from torchtitan.experiments.kimi_k3.config_registry import (
+    build_kimi_linear_config,
     kimi_linear_194m_baseline,
     kimi_linear_528m_block_attn_res,
-    build_kimi_linear_config,
     SCALING_LAW_TABLE,
 )
 from torchtitan.protocols.model_spec import ModelSpec

@@ -65,16 +65,16 @@ class TestPipeliningFnInModelSpec(unittest.TestCase):
         (baseline vs AttnRes) happens inside that function via
         ``num_blocks`` attr check, not at registration time.
         """
-        from torchtitan.experiments.kimi_k3 import (
-            flavor_names, model_registry,
-        )
+        from torchtitan.experiments.kimi_k3 import flavor_names, model_registry
         from torchtitan.experiments.kimi_k3.pipeline_adapter import (
             pipeline_kimi_linear_with_cache_adapter,
         )
+
         for flavor in flavor_names():
             spec = model_registry(flavor)
             self.assertEqual(
-                spec.pipelining_fn, pipeline_kimi_linear_with_cache_adapter,
+                spec.pipelining_fn,
+                pipeline_kimi_linear_with_cache_adapter,
                 f"{flavor}: pipelining_fn not wired",
             )
 

@@ -136,7 +136,7 @@ class Muon(Optimizer):
         st["exp_avg_sq"].mul_(b2).addcmul_(g, g, value=1 - b2)
         bc1 = 1 - b1 ** st["step"]
         bc2 = 1 - b2 ** st["step"]
-        denom = (st["exp_avg_sq"].sqrt() / (bc2 ** 0.5)).add_(group["adamw_eps"])
+        denom = (st["exp_avg_sq"].sqrt() / (bc2**0.5)).add_(group["adamw_eps"])
         if group["weight_decay"]:
             p.mul_(1 - group["adamw_lr"] * group["weight_decay"])
         p.addcdiv_(st["exp_avg"], denom, value=-group["adamw_lr"] / bc1)

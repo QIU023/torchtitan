@@ -28,14 +28,20 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, OptimizersContainer
 from torchtitan.components.validate import Validator
-from torchtitan.config import (
-    CompileConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.kimi_k3 import model_registry as attn_res_model_registry
+from torchtitan.experiments.kimi_k3.model_configs import (  # noqa: F401
+    _alternating_kda_mla_layers,
+    _BY_NAME,
+    build,
+    build_kimi_linear_config,
+    flavor_names,
+    resolve_num_blocks,
+    SCALING_LAW_TABLE,
+    Variant,
+)
 
 # Re-export every Kimi Linear + AttnRes trainer-config flavor so they are
 # discoverable via ``--module kimi_k3 --config kimi_linear_<...>``.
@@ -43,19 +49,7 @@ from torchtitan.experiments.kimi_k3 import model_registry as attn_res_model_regi
 # so the kimi flavor functions must be module-level attributes here. The
 # ``kimi_linear_`` config-name prefix is preserved for backward compatibility
 # with production launch scripts (only the ``--module`` value changed).
-from torchtitan.experiments.kimi_k3.state_dict_adapter import (
-    KimiLinearStateDictAdapter,
-)
-from torchtitan.experiments.kimi_k3.model_configs import (  # noqa: F401
-    _BY_NAME,
-    build,
-    build_kimi_linear_config,
-    flavor_names,
-    resolve_num_blocks,
-    _alternating_kda_mla_layers,
-    SCALING_LAW_TABLE,
-    Variant,
-)
+from torchtitan.experiments.kimi_k3.state_dict_adapter import KimiLinearStateDictAdapter
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common import (
     ComplexRoPE,
@@ -78,6 +72,7 @@ from torchtitan.trainer import Trainer
 
 # ----- Kimi Linear / K3 trainer configs (merged from kimi_linear/) ----- #
 
+
 def _base_trainer_config(size_name: str) -> Trainer.Config:
     """Shared Trainer.Config template for a given paper Table-2 size.
 
@@ -98,7 +93,8 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
         loss=CrossEntropyLoss.Config(global_vocab_size=163840),
         hf_assets_path="./assets/hf/Llama-3.1-8B",
         metrics=MetricsProcessor.Config(
-            enable_tensorboard=True, log_freq=10,
+            enable_tensorboard=True,
+            log_freq=10,
         ),
         model_spec=None,  # filled in by the per-flavor wrapper
         optimizer=default_adamw(lr=spec.lr),
@@ -111,7 +107,7 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
         training=TrainingConfig(
             local_batch_size=max(1, spec.batch_size // 8),  # default 8 DP ranks
             seq_len=8192,  # paper uses 8192 context
-            steps=20000,   # placeholder; caller overrides via --training.steps
+            steps=20000,  # placeholder; caller overrides via --training.steps
         ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
         checkpoint=CheckpointManager.Config(
@@ -148,6 +144,7 @@ def _flavor_trainer_config(size: str, variant: Variant) -> Trainer.Config:
 
 
 # ----- Explicit per-flavor entry points (tyro discovers these) ----------- #
+
 
 def kimi_linear_194m_baseline() -> Trainer.Config:
     return _flavor_trainer_config("194m", "baseline")
@@ -348,11 +345,12 @@ def kimi_linear_debugmodel_k3faithful() -> Trainer.Config:
     module/optimizer hooks (not config flags), see mxfp4_qat.py / muon.py.
     """
     import dataclasses as _dc
+
     cfg = kimi_linear_debugmodel()
     cfg.model_spec.flavor = "kimi_linear_debugmodel_k3faithful"
     m = cfg.model_spec.model
     m.kimi_config = _dc.replace(m.kimi_config, mla_gated=True)  # Gated MLA
-    m.attn_res_gated = True                                     # alpha graft
+    m.attn_res_gated = True  # alpha graft
     return cfg
 
 
@@ -379,7 +377,9 @@ def kimi_linear_debugmodel8h() -> Trainer.Config:
     cfg = kimi_linear_debugmodel()
     cfg.model_spec.flavor = "kimi_linear_debugmodel8h"
     kimi_config = build_kimi_linear_config(
-        "debugmodel8h", num_experts=8, vocab_size=2016,
+        "debugmodel8h",
+        num_experts=8,
+        vocab_size=2016,
     )
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model,
@@ -450,7 +450,9 @@ def kimi_linear_debugmodel() -> Trainer.Config:
     from torchtitan.protocols.model_spec import ModelSpec
 
     kimi_config = build_kimi_linear_config(
-        "debugmodel", num_experts=8, vocab_size=2016,
+        "debugmodel",
+        num_experts=8,
+        vocab_size=2016,
     )
     spec_config = KimiLinearSpec(
         kimi_config=kimi_config,
@@ -553,9 +555,7 @@ def _kimi_linear_48b_attnres_downscale(
     deviate (e.g. n_layers=24, num_blocks=8 keeps the paper 3:1 ratio
     while making the depth divisible by PP=8 × VP=3 = 24 chunks).
     """
-    from torchtitan.experiments.kimi_k3 import (
-        parallelize_kimi_linear, KimiLinearSpec,
-    )
+    from torchtitan.experiments.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
     from torchtitan.experiments.kimi_k3.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )
@@ -578,7 +578,8 @@ def _kimi_linear_48b_attnres_downscale(
         kcfg.num_hidden_layers = n_layers
         # Re-derive KDA/MLA pattern with 3:1 ratio.
         kda_layers, full_attn_layers = _alternating_kda_mla_layers(
-            n_layers, kda_mla_ratio=3,
+            n_layers,
+            kda_mla_ratio=3,
         )
         kcfg.kda_layers = kda_layers
         kcfg.full_attn_layers = full_attn_layers
@@ -651,7 +652,10 @@ def kimi_linear_48b_block_attn_res_d1280_e32_L24_N8() -> Trainer.Config:
     per AttnRes-block (24/8 = 3). dim=1280, num_experts=32. seq=2048.
     """
     return _kimi_linear_48b_attnres_downscale(
-        num_experts=32, dim=1280, n_layers=24, num_blocks=8,
+        num_experts=32,
+        dim=1280,
+        n_layers=24,
+        num_blocks=8,
     )
 
 
@@ -664,7 +668,10 @@ def kimi_linear_48b_block_attn_res_d1280_e32_L32_N8() -> Trainer.Config:
     accumulation). Use the e16 variant below instead.
     """
     return _kimi_linear_48b_attnres_downscale(
-        num_experts=32, dim=1280, n_layers=32, num_blocks=8,
+        num_experts=32,
+        dim=1280,
+        n_layers=32,
+        num_blocks=8,
     )
 
 
@@ -674,7 +681,10 @@ def kimi_linear_48b_block_attn_res_d1280_e16_L32_N8() -> Trainer.Config:
     ratio off by 1.33×.
     """
     return _kimi_linear_48b_attnres_downscale(
-        num_experts=16, dim=1280, n_layers=32, num_blocks=8,
+        num_experts=16,
+        dim=1280,
+        n_layers=32,
+        num_blocks=8,
     )
 
 
@@ -685,6 +695,7 @@ def kimi_linear_48b_block_attn_res_d1280_e16_L32_N8() -> Trainer.Config:
 # All other 528M paper hyperparameters retained (d=1264, d_ff=560,
 # lr=2.02e-3, batch=432). The KDA/MLA 3:1 alternation is re-derived for
 # L=16 so 4 MLA layers land at the same relative positions.
+
 
 def _build_528m_l16_config():
     """528M-like Kimi Linear config with n_layers=16 for PP=4 V=2 lps=2
@@ -709,9 +720,7 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
     retained; only depth reduced by 1 to satisfy the Interleaved1F1B
     divisibility requirement.
     """
-    from torchtitan.experiments.kimi_k3 import (
-        parallelize_kimi_linear, KimiLinearSpec,
-    )
+    from torchtitan.experiments.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
     from torchtitan.experiments.kimi_k3.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )
@@ -734,9 +743,7 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
 
 def kimi_linear_528m_l16_full_attn_res() -> Trainer.Config:
     """528M-scale Kimi Linear Full AttnRes (num_blocks = n_layers = 16)."""
-    from torchtitan.experiments.kimi_k3 import (
-        parallelize_kimi_linear, KimiLinearSpec,
-    )
+    from torchtitan.experiments.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
     from torchtitan.experiments.kimi_k3.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )
@@ -761,9 +768,7 @@ def kimi_linear_528m_l16_baseline() -> Trainer.Config:
     """528M-scale Kimi Linear baseline (no AttnRes) with n_layers=16.
     Paired control for the two AttnRes variants above.
     """
-    from torchtitan.experiments.kimi_k3 import (
-        parallelize_kimi_linear, KimiLinearSpec,
-    )
+    from torchtitan.experiments.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
     from torchtitan.experiments.kimi_k3.pipeline_adapter import (
         pipeline_kimi_linear_with_cache_adapter,
     )

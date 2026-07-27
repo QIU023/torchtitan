@@ -30,8 +30,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _WEIGHT_ELEM = torch.float4_e2m1fn_x2  # MXFP4
-_ACT_ELEM = torch.float8_e4m3fn        # MXFP8
-_BLOCK = 32                        # OCP microscaling block
+_ACT_ELEM = torch.float8_e4m3fn  # MXFP8
+_BLOCK = 32  # OCP microscaling block
 
 
 def _fake_quant_mx(t: torch.Tensor, elem_dtype, block_size: int) -> torch.Tensor:

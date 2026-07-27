@@ -16,9 +16,7 @@ import unittest
 
 import torch
 
-from torchtitan.experiments.kimi_k3.quantile_balance import (
-    quantile_balance_delta,
-)
+from torchtitan.experiments.kimi_k3.quantile_balance import quantile_balance_delta
 
 
 class TestQuantileBalance(unittest.TestCase):
@@ -41,8 +39,8 @@ class TestQuantileBalance(unittest.TestCase):
         d = quantile_balance_delta(load, coeff=1.0)
         # the extreme low (rank 0) and extreme high (rank 1.0) get the
         # largest-magnitude corrections
-        self.assertEqual(d.argmax().item(), 0)   # most boosted = lowest load
-        self.assertEqual(d.argmin().item(), 4)   # most suppressed = highest
+        self.assertEqual(d.argmax().item(), 0)  # most boosted = lowest load
+        self.assertEqual(d.argmin().item(), 4)  # most suppressed = highest
 
     def test_ties_equal_bias(self):
         load = torch.tensor([10.0, 10.0, 10.0, 10.0])

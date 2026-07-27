@@ -14,9 +14,7 @@ import unittest
 import torch
 
 from torchtitan.experiments.kimi_k3 import model_registry
-from torchtitan.experiments.kimi_k3.state_dict_adapter import (
-    KimiLinearStateDictAdapter,
-)
+from torchtitan.experiments.kimi_k3.state_dict_adapter import KimiLinearStateDictAdapter
 
 
 def _build_state_dict(flavor: str):
@@ -40,9 +38,7 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         # the HF key space (official checkpoints must load into graft
         # flavors without phantom read keys); the round trip covers the
         # backbone exactly.
-        backbone = {
-            k for k in sd if "attn_res" not in k and "mlp_res" not in k
-        }
+        backbone = {k for k in sd if "attn_res" not in k and "mlp_res" not in k}
         self.assertEqual(set(back), backbone)
         for k in backbone:
             self.assertEqual(
@@ -66,9 +62,7 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         self.assertTrue(moe_keys)
         self.assertEqual(
             len(moe_keys),
-            3 * num_experts * sum(
-                1 for k in sd if k.endswith("w1_EFD")
-            ),
+            3 * num_experts * sum(1 for k in sd if k.endswith("w1_EFD")),
         )
 
     def test_a_log_reshape_from_hf(self):
@@ -78,14 +72,11 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         self.assertTrue(a_log_keys)
         h = sd[a_log_keys[0]].shape[0]
         hf_style = {
-            "model." + a_log_keys[0].replace("layers.", "layers.", 1): torch.zeros(
-                1, 1, h, 1
-            )
+            "model."
+            + a_log_keys[0].replace("layers.", "layers.", 1): torch.zeros(1, 1, h, 1)
         }
         # from_hf must flatten [1,1,H,1] -> [H]
-        out = adapter.from_hf(
-            {f"model.{a_log_keys[0]}": torch.zeros(1, 1, h, 1)}
-        )
+        out = adapter.from_hf({f"model.{a_log_keys[0]}": torch.zeros(1, 1, h, 1)})
         self.assertEqual(tuple(out[a_log_keys[0]].shape), (h,))
 
     def test_packed_weights_rejected(self):

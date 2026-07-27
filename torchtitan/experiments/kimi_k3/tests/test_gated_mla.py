@@ -23,12 +23,22 @@ from torchtitan.experiments.kimi_k3.model import KimiLinearConfig, KimiLinearMod
 
 def _cfg():
     return KimiLinearConfig(
-        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
-        num_key_value_heads=4, vocab_size=2016, intermediate_size=512,
-        moe_intermediate_size=256, num_experts=8, kv_lora_rank=128,
-        qk_nope_head_dim=64, qk_rope_head_dim=32, v_head_dim=64,
-        kda_head_dim=64, kda_num_heads=4,
-        kda_layers=[1], full_attn_layers=[2],
+        hidden_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=2016,
+        intermediate_size=512,
+        moe_intermediate_size=256,
+        num_experts=8,
+        kv_lora_rank=128,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        kda_head_dim=64,
+        kda_num_heads=4,
+        kda_layers=[1],
+        full_attn_layers=[2],
     )
 
 

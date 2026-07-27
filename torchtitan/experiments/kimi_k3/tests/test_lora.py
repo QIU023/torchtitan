@@ -48,16 +48,12 @@ class TestKimiLoRA(unittest.TestCase):
                 lora_rank=8,
             )
         )
-        base = _build(
-            KimiLinearSpec(kimi_config=self.kimi_config, num_blocks=None)
-        )
+        base = _build(KimiLinearSpec(kimi_config=self.kimi_config, num_blocks=None))
         bsd = base.state_dict()
         # base weights live under .base after wrapping; strip for sharing
         shared = {}
         for k, v in lora.state_dict().items():
-            k2 = k.replace(".base.weight", ".weight").replace(
-                ".base.bias", ".bias"
-            )
+            k2 = k.replace(".base.weight", ".weight").replace(".base.bias", ".bias")
             if k2 in bsd:
                 shared[k2] = v
         self.assertEqual(set(shared), set(bsd))
@@ -99,18 +95,12 @@ class TestKimiLoRA(unittest.TestCase):
             self.assertTrue(named[k].requires_grad, k)
             self.assertIsNotNone(named[k].grad, k)
         # AttnRes graft params train full-param (alpha exception).
-        graft_keys = [
-            k for k in named if "attn_res" in k or "mlp_res" in k
-        ]
+        graft_keys = [k for k in named if "attn_res" in k or "mlp_res" in k]
         self.assertTrue(graft_keys)
         for k in graft_keys:
             self.assertTrue(named[k].requires_grad, k)
         # Frozen base: no requires_grad, no grads.
-        frozen = [
-            k
-            for k in named
-            if k not in lora_keys and k not in graft_keys
-        ]
+        frozen = [k for k in named if k not in lora_keys and k not in graft_keys]
         self.assertTrue(frozen)
         for k in frozen:
             self.assertFalse(named[k].requires_grad, k)
@@ -133,10 +123,7 @@ class TestKimiLoRA(unittest.TestCase):
         self.assertLess(trainable / total, 0.2)
         for k in payload:
             self.assertTrue(
-                "lora_a" in k
-                or "lora_b" in k
-                or "attn_res" in k
-                or "mlp_res" in k,
+                "lora_a" in k or "lora_b" in k or "attn_res" in k or "mlp_res" in k,
                 k,
             )
 
