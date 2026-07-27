@@ -4,46 +4,62 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""MoonViT-V2: Kimi K3's vision tower (report sec 2.4).
+"""MoonViT-V2: Kimi K3's vision tower.
 
-Every structural choice below is pinned to the released ``vision_config`` or to
-the report's architecture paragraph, both quoted at the field that encodes them:
+Reconciled against the RELEASED reference implementation
+(``modeling_kimi_k3.py`` in the HF model repo) and against the shipped
+checkpoint's key list, not against the report's prose. That distinction
+matters here, because the two disagree.
 
-    vt_num_hidden_layers   27      vt_hidden_size      1024
-    vt_num_attention_heads 12      qkv_hidden_size     1536
-    vt_intermediate_size   4096    patch_size          14
-    norm_type              rmsnorm activation_func     gelu_pytorch_tanh
-    attn_bias / linear_bias / patch_embed_proj_bias    all False
-    pos_emb_type    divided_fixed  init_pos_emb_{time,height,width}  4, 64, 64
-    pos_emb_interpolation_mode     bilinear
-    merge_type      sd2_tpool      merge_kernel_size   [2, 2]
-    mm_projector_type patchmergerv2  mm_hidden_size    1024
-    projector_hidden_act gelu       projector_ln_eps   1e-05
-    text_hidden_size       7168
+Report sec 2.4 says "attention is factorized into intra-frame spatial and
+inter-frame temporal passes". The shipped tower does NOT do that: each block has
+exactly one ``wqkv`` and one ``wo`` (27 of each in
+``model.safetensors.index.json``), and ``MoonViTEncoderLayer.forward`` runs a
+single varlen attention whose ``cu_seqlens`` spans a sample's whole ``t*h*w``
+token set. So frames interact through one joint 3-D attention, not two passes.
+An earlier version of this file implemented the factorized reading and matched
+the reported 0.4B parameter count -- which proves only that parameter count
+cannot distinguish "one projection set used twice" from "one projection set used
+once".
 
-Two things are inferences rather than transcriptions, flagged because they are
-the places this could be wrong:
+Layout, from the checkpoint keys::
 
-* ``qkv_hidden_size`` (1536) is wider than ``vt_hidden_size`` (1024), giving
-  head_dim = 1536 / 12 = 128 and an output projection that CONTRACTS 1536 ->
-  1024. That is unusual for a ViT but is the only reading consistent with both
-  fields.
-* The report says attention "is factorized into intra-frame spatial and
-  inter-frame temporal passes" and that the tower is "roughly 0.4B parameters".
-  Those two only reconcile if the spatial and temporal passes SHARE one set of
-  qkv/out projections: 27 x (3*1024*1536 + 1536*1024 + 2*1024*4096) = 396M,
-  whereas separate per-pass projections would give 566M. So the passes here
-  share parameters and differ only in which axis they attend over. See
-  ``test_moonvit.py::test_parameter_count_matches_the_reported_0p4b``.
+    vision_tower.patch_embed.proj.weight            Conv2d, no bias
+    vision_tower.patch_embed.pos_emb.weight         learned 2-D spatial table
+    vision_tower.encoder.blocks.{i}.norm0.weight    27x, RMSNorm
+    vision_tower.encoder.blocks.{i}.wqkv.weight     27x, no bias
+    vision_tower.encoder.blocks.{i}.wo.weight       27x, no bias
+    vision_tower.encoder.blocks.{i}.norm1.weight    27x
+    vision_tower.encoder.blocks.{i}.mlp.fc0.weight  27x
+    vision_tower.encoder.blocks.{i}.mlp.fc1.weight  27x
+    vision_tower.encoder.final_layernorm.weight
+    mm_projector.proj.{0,2}.weight                  2 Linears, no bias
+    mm_projector.post_norm.weight                   RMSNorm AFTER the projection
 
-Shape suffixes: B batch, F frames, H patch rows, W patch cols, N tokens per
-frame (H*W), D model dim (vt_hidden_size), Q qkv_hidden_size, A heads,
-K head_dim, C text_hidden_size.
+Two details the key list settles that the config alone does not:
+
+* There is no ``pos_emb.time_weight`` key. The time component is a FIXED 1-D
+  sincos table registered as a non-persistent buffer -- that is what the
+  "fixed" in ``pos_emb_type: divided_fixed`` refers to. Only the 2-D spatial
+  table is learned, and it is interpolated to the input's patch grid.
+* ``mm_projector`` has ``post_norm`` and no pre-norm, matching
+  ``PatchMergerMLPV2`` rather than ``PatchMergerMLP``.
+
+Positional information is therefore carried twice: the absolute divided_fixed
+embedding added at the patch embed, AND 2-D RoPE applied to q/k inside every
+block.
+
+Shape suffixes: L packed tokens across the whole batch, D model dim
+(vt_hidden_size), Q qkv_hidden_size, A heads, K head_dim, C text_hidden_size.
+Inputs are NaViT-style packed -- a flat ``(L, ...)`` token stream plus a
+``grid_thws`` table of ``(t, h, w)`` per sample -- so one batch can mix
+resolutions and frame counts, which is what native-resolution training needs.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -52,7 +68,7 @@ import torch.nn.functional as F
 
 @dataclass(kw_only=True)
 class MoonViTConfig:
-    """MoonViT-V2 config. Defaults are K3's released values."""
+    """MoonViT-V2 config. Defaults are K3's released ``vision_config``."""
 
     num_hidden_layers: int = 27
     hidden_size: int = 1024
@@ -62,18 +78,17 @@ class MoonViTConfig:
     patch_size: int = 14
     in_channels: int = 3
     rms_norm_eps: float = 1e-5
-    # Learned factorized position tables, interpolated to the real grid.
     init_pos_emb_time: int = 4
     init_pos_emb_height: int = 64
     init_pos_emb_width: int = 64
     pos_emb_interpolation_mode: str = "bilinear"
-    # Token merging before projection: 2x2 pixel shuffle + temporal pooling.
     merge_kernel_size: tuple[int, int] = (2, 2)
-    temporal_pool_size: int = 2
-    # Projector target width (the LLM's hidden size).
     text_hidden_size: int = 7168
     projector_ln_eps: float = 1e-5
     initializer_range: float = 0.02
+    # 2-D RoPE grid bound; the reference builds it at 512 x 512 patches, which
+    # covers 7168 x 7168 pixels at patch_size 14.
+    rope_max_grid: int = 512
 
     @property
     def head_dim(self) -> int:
@@ -90,16 +105,37 @@ def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
-class MoonViTPatchEmbed(nn.Module):
-    """Non-overlapping patch projection, no bias.
+def sincos_1d(dim: int, length: int, device=None) -> torch.Tensor:
+    """Fixed 1-D sincos table, ``[length, dim]``.
 
-    A Conv2d with stride == kernel is the same linear map as flattening each
-    patch, but keeps the spatial layout explicit for the position tables.
+    The time half of ``divided_fixed``. Fixed rather than learned, which is why
+    the checkpoint carries no time-embedding key.
+    """
+    if dim % 2:
+        raise ValueError(f"sincos dim must be even, got {dim}")
+    pos = torch.arange(length, dtype=torch.float32, device=device)
+    omega = torch.arange(dim // 2, dtype=torch.float32, device=device)
+    omega = 1.0 / (10000 ** (omega / (dim / 2.0)))
+    out = pos[:, None] * omega[None, :]
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+
+
+class MoonViTPatchEmbed(nn.Module):
+    """Patch projection plus the divided_fixed absolute position embedding.
+
+    The spatial table is learned at a fixed 64 x 64 patch grid and interpolated
+    to whatever grid an input has; the time table is fixed sincos. A single
+    frame (``t == 1``) gets NO time component at all -- matching the reference,
+    which returns the 2-D embedding untouched in that case rather than adding
+    the t=0 entry.
     """
 
     def __init__(self, config: MoonViTConfig) -> None:
         super().__init__()
+        self.config = config
         self.patch_size = config.patch_size
+        self.mode = config.pos_emb_interpolation_mode
+        self.num_frames = config.init_pos_emb_time
         self.proj = nn.Conv2d(
             config.in_channels,
             config.hidden_size,
@@ -107,241 +143,340 @@ class MoonViTPatchEmbed(nn.Module):
             stride=config.patch_size,
             bias=False,
         )
+        # Named to match the checkpoint's vision_tower.patch_embed.pos_emb.weight
+        self.pos_emb = nn.Module()
+        self.pos_emb.weight = nn.Parameter(
+            torch.empty(
+                config.init_pos_emb_height,
+                config.init_pos_emb_width,
+                config.hidden_size,
+            )
+        )
+        self.register_buffer(
+            "time_weight",
+            sincos_1d(config.hidden_size, config.init_pos_emb_time),
+            persistent=False,
+        )
 
-    def forward(self, pixels_BFCHW: torch.Tensor) -> torch.Tensor:
-        """``[B, F, C, H, W]`` pixels -> ``[B, F, H/p, W/p, D]`` patches."""
-        B, Fr = pixels_BFCHW.shape[:2]
-        x = self.proj(pixels_BFCHW.flatten(0, 1))  # [B*F, D, H/p, W/p]
-        x = x.permute(0, 2, 3, 1)  # [B*F, H/p, W/p, D]
-        return x.unflatten(0, (B, Fr))
+    def _spatial(self, h: int, w: int) -> torch.Tensor:
+        weight = self.pos_emb.weight
+        if (h, w) == weight.shape[:-1]:
+            return weight.flatten(0, 1)
+        # [H, W, D] -> [1, D, H, W] for interpolate, back to [h*w, D]
+        resized = F.interpolate(
+            weight.permute(2, 0, 1).unsqueeze(0).float(),
+            size=(h, w),
+            mode=self.mode,
+            align_corners=False,
+        )
+        return resized.squeeze(0).permute(1, 2, 0).reshape(h * w, -1).to(weight.dtype)
+
+    def add_pos_emb(self, x_LD: torch.Tensor, grid_thws: torch.Tensor):
+        embs = []
+        for t, h, w in grid_thws.tolist():
+            if t > self.num_frames:
+                raise ValueError(
+                    f"t={t} exceeds init_pos_emb_time={self.num_frames}; the "
+                    "time table is fixed sincos and is not interpolated"
+                )
+            pos_2d = self._spatial(h, w)
+            if t == 1:
+                embs.append(pos_2d)
+            else:
+                pos_3d = pos_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
+                    :t
+                ].to(pos_2d.dtype).unsqueeze(1)
+                embs.append(pos_3d.reshape(-1, pos_3d.shape[-1]))
+        return x_LD + torch.cat(embs, dim=0)
+
+    def forward(self, patches_LCHW: torch.Tensor, grid_thws: torch.Tensor):
+        """``[L, C, p, p]`` patch pixels -> ``[L, D]`` tokens.
+
+        ``L`` is the total token count over the batch, i.e.
+        ``sum_i t_i * h_i * w_i``.
+        """
+        x = self.proj(patches_LCHW).view(patches_LCHW.size(0), -1)
+        return self.add_pos_emb(x, grid_thws)
 
 
-class MoonViTPositionEmbedding(nn.Module):
-    """``divided_fixed``: separate time / height / width tables, summed.
+class MoonViTRope2D(nn.Module):
+    """2-D RoPE over the patch grid, repeated across frames.
 
-    "Divided" because the position signal factorizes over the three axes rather
-    than being a single joint table; "fixed" because the tables are learned at a
-    FIXED grid (4 x 64 x 64) and bilinearly interpolated to whatever resolution
-    an input actually has. That is what lets one set of weights serve inputs
-    from a single small image up to 3584 x 3584 (256 x 256 patches at
-    patch_size 14) without retraining or padding to a canonical size.
+    Applied to q/k in every block, ON TOP of the absolute embedding above. Half
+    the head dim encodes the row index and half the column index; a video
+    repeats the same 2-D frequencies for every frame, so RoPE carries no
+    temporal signal -- that is the fixed sincos table's job.
     """
+
+    def __init__(self, head_dim: int, max_grid: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        if head_dim % 4:
+            raise ValueError(
+                f"2-D RoPE needs head_dim divisible by 4, got {head_dim}"
+            )
+        self.head_dim = head_dim
+        self.max_grid = max_grid
+        self.theta = theta
+        self._cache: torch.Tensor | None = None
+
+    def _freqs(self, device) -> torch.Tensor:
+        if self._cache is not None and self._cache.device == device:
+            return self._cache
+        quarter = self.head_dim // 4
+        freqs = 1.0 / (
+            self.theta
+            ** (torch.arange(quarter, dtype=torch.float32, device=device) / quarter)
+        )
+        pos = torch.arange(self.max_grid, dtype=torch.float32, device=device)
+        angles = torch.outer(pos, freqs)  # [max_grid, quarter]
+        self._cache = torch.polar(torch.ones_like(angles), angles)
+        return self._cache
+
+    def freqs_cis(self, grid_thws: torch.Tensor, device) -> torch.Tensor:
+        """``[L, head_dim // 2]`` complex rotations for the packed stream."""
+        table = self._freqs(device)
+        out = []
+        for t, h, w in grid_thws.tolist():
+            if max(h, w) > self.max_grid:
+                raise ValueError(
+                    f"grid {h}x{w} exceeds rope_max_grid={self.max_grid}"
+                )
+            rows = table[:h].unsqueeze(1).expand(h, w, -1)
+            cols = table[:w].unsqueeze(0).expand(h, w, -1)
+            frame = torch.cat([rows, cols], dim=-1).reshape(h * w, -1)
+            out.append(frame.repeat(t, 1))
+        return torch.cat(out, dim=0)
+
+    @staticmethod
+    def apply(x_LAK: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        """Rotate ``[L, A, K]`` by ``[L, K // 2]`` complex factors."""
+        L, A, K = x_LAK.shape
+        xc = torch.view_as_complex(x_LAK.float().reshape(L, A, K // 2, 2))
+        rotated = xc * freqs_cis.unsqueeze(1)
+        return torch.view_as_real(rotated).reshape(L, A, K).to(x_LAK.dtype)
+
+
+class MoonViTMLP(nn.Module):
+    """``mlp2``. Named fc0/fc1 to match the checkpoint."""
 
     def __init__(self, config: MoonViTConfig) -> None:
         super().__init__()
-        self.mode = config.pos_emb_interpolation_mode
-        D = config.hidden_size
-        self.time = nn.Parameter(torch.empty(config.init_pos_emb_time, D))
-        # Height and width are interpolated together as one 2-D grid, so a
-        # non-square target keeps the aspect handling of a true 2-D resize
-        # rather than two independent 1-D stretches.
-        self.spatial = nn.Parameter(
-            torch.empty(D, config.init_pos_emb_height, config.init_pos_emb_width)
+        self.fc0 = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.fc1 = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
         )
 
-    def forward(self, patches_BFHWD: torch.Tensor) -> torch.Tensor:
-        B, Fr, H, W, D = patches_BFHWD.shape
-        spatial = self.spatial
-        if (H, W) != spatial.shape[1:]:
-            spatial = F.interpolate(
-                spatial.unsqueeze(0).float(),
-                size=(H, W),
-                mode=self.mode,
-                align_corners=False,
-            ).squeeze(0).to(spatial.dtype)
-        pos = spatial.permute(1, 2, 0)  # [H, W, D]
-
-        time = self.time
-        if Fr != time.shape[0]:
-            # 1-D resize over the time axis; a single frame takes table entry 0
-            # so an image is not an interpolation of the video tables.
-            if Fr == 1:
-                time = time[:1]
-            else:
-                time = F.interpolate(
-                    time.t().unsqueeze(0).float(),
-                    size=Fr,
-                    mode="linear",
-                    align_corners=False,
-                ).squeeze(0).t().to(time.dtype)
-        return patches_BFHWD + pos.view(1, 1, H, W, D) + time.view(1, Fr, 1, 1, D)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc1(_gelu_tanh(self.fc0(x)))
 
 
-class MoonViTAttention(nn.Module):
-    """Factorized space-time attention with SHARED projections.
-
-    One qkv/out projection set is applied twice per block: once over the tokens
-    within each frame (spatial), once over frames at each spatial position
-    (temporal). Sharing is what makes the reported 0.4B add up -- see the module
-    docstring. For a single frame the temporal pass is over length 1, which is
-    the identity up to the projections, so it is skipped.
-    """
+class MoonViTEncoderLayer(nn.Module):
+    """Pre-norm block: RMSNorm, one varlen attention, RMSNorm, MLP. No biases."""
 
     def __init__(self, config: MoonViTConfig) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.qkv_proj = nn.Linear(
+        self.norm0 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.wqkv = nn.Linear(
             config.hidden_size, 3 * config.qkv_hidden_size, bias=False
         )
-        self.out_proj = nn.Linear(
-            config.qkv_hidden_size, config.hidden_size, bias=False
-        )
-
-    def _attend(self, x_BTD: torch.Tensor) -> torch.Tensor:
-        """Bidirectional attention over dim 1 of a ``[B', T, D]`` tensor."""
-        B, T, _ = x_BTD.shape
-        qkv = self.qkv_proj(x_BTD)
-        q, k, v = qkv.chunk(3, dim=-1)
-        shape = (B, T, self.num_heads, self.head_dim)
-        q = q.view(shape).transpose(1, 2)
-        k = k.view(shape).transpose(1, 2)
-        v = v.view(shape).transpose(1, 2)
-        # No causal mask: a vision encoder sees the whole image.
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        out = out.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim)
-        return self.out_proj(out)
-
-    def forward(self, x_BFHWD: torch.Tensor) -> torch.Tensor:
-        B, Fr, H, W, D = x_BFHWD.shape
-        # Spatial: each frame independently, over its H*W tokens.
-        spatial = self._attend(x_BFHWD.reshape(B * Fr, H * W, D))
-        x = spatial.view(B, Fr, H, W, D)
-        if Fr == 1:
-            return x
-        # Temporal: each spatial position independently, over its F frames.
-        temporal_in = x.permute(0, 2, 3, 1, 4).reshape(B * H * W, Fr, D)
-        temporal = self._attend(temporal_in)
-        return temporal.view(B, H, W, Fr, D).permute(0, 3, 1, 2, 4)
-
-
-class MoonViTMLP(nn.Module):
-    """``mlp2``: two layers, gelu_pytorch_tanh, no bias."""
-
-    def __init__(self, config: MoonViTConfig) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.fc2 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(_gelu_tanh(self.fc1(x)))
-
-
-class MoonViTBlock(nn.Module):
-    """Pre-norm block with RMSNorm and no biases (report sec 2.4)."""
-
-    def __init__(self, config: MoonViTConfig) -> None:
-        super().__init__()
-        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = MoonViTAttention(config)
-        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.wo = nn.Linear(config.qkv_hidden_size, config.hidden_size, bias=False)
+        self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = MoonViTMLP(config)
 
-    def forward(self, x_BFHWD: torch.Tensor) -> torch.Tensor:
-        x_BFHWD = x_BFHWD + self.attn(self.attn_norm(x_BFHWD))
-        return x_BFHWD + self.mlp(self.mlp_norm(x_BFHWD))
+    def _attend(
+        self,
+        x_LD: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        L = x_LD.size(0)
+        qkv = self.wqkv(x_LD).view(L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=1)
+        q = MoonViTRope2D.apply(q, freqs_cis)
+        k = MoonViTRope2D.apply(k, freqs_cis)
+
+        # Block-diagonal attention over the packed stream: each sample attends
+        # only within itself. Done as a per-sample loop over SDPA rather than a
+        # flash varlen kernel so this runs anywhere; the segment boundaries are
+        # the same either way.
+        out = torch.empty_like(q)
+        bounds = cu_seqlens.tolist()
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            seg = slice(start, end)
+            out[seg] = F.scaled_dot_product_attention(
+                q[seg].transpose(0, 1).unsqueeze(0),
+                k[seg].transpose(0, 1).unsqueeze(0),
+                v[seg].transpose(0, 1).unsqueeze(0),
+                is_causal=False,
+            ).squeeze(0).transpose(0, 1)
+        return self.wo(out.reshape(L, self.num_heads * self.head_dim))
+
+    def forward(
+        self,
+        x_LD: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        x_LD = x_LD + self._attend(self.norm0(x_LD), cu_seqlens, freqs_cis)
+        return x_LD + self.mlp(self.norm1(x_LD))
 
 
-class PatchMergerV2(nn.Module):
-    """``patchmergerv2`` + ``sd2_tpool``: 2x2 pixel shuffle, temporal pool, MLP.
+def tpool_patch_merger(
+    x_LD: torch.Tensor,
+    grid_thws: torch.Tensor,
+    merge_kernel_size: tuple[int, int] = (2, 2),
+) -> list[torch.Tensor]:
+    """``sd2_tpool``: mean over ALL frames, then a 2x2 space-to-depth.
 
-    The pixel shuffle is space-to-depth, not pooling: a 2x2 neighbourhood
-    becomes 4D channels, so nothing is averaged away before the projector sees
-    it. That is the 4x token reduction the report cites for keeping 3584x3584
-    inputs affordable in a 1M context. Temporal pooling then averages adjacent
-    frames, which does discard information -- it is the cheaper axis to
-    compress because adjacent video frames are highly redundant.
+    The temporal axis is collapsed completely -- ``mean(dim=0)`` over every
+    frame, not a pairwise pool -- so a video and a single image both leave one
+    frame's worth of tokens. The spatial merge is space-to-depth: a 2x2
+    neighbourhood becomes ``kh*kw`` channels, so the 4x token reduction discards
+    nothing before the projector.
+
+    Returns one ``[h/kh * w/kw, kh*kw, D]`` tensor per sample; lengths differ
+    across samples, which is why this is a list.
+    """
+    d_model = x_LD.size(-1)
+    kh, kw = merge_kernel_size
+    outputs, offset = [], 0
+    for t, h, w in grid_thws.tolist():
+        if h % kh or w % kw:
+            raise ValueError(
+                f"patch grid {h}x{w} must divide the merge kernel {kh}x{kw}"
+            )
+        seq = x_LD[offset : offset + t * h * w]
+        nh, nw = h // kh, w // kw
+        seq = seq.view(t, nh, kh, nw, kw, d_model)
+        seq = seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
+        outputs.append(seq.view(nh * nw, kh * kw, d_model))
+        offset += t * h * w
+    return outputs
+
+
+class PatchMergerMLPV2(nn.Module):
+    """``patchmergerv2``: two bias-free Linears, GELU, RMSNorm AFTER.
+
+    The post-norm placement (and the absence of a pre-norm) is what
+    distinguishes v2 from ``PatchMergerMLP``, and the checkpoint's
+    ``mm_projector.post_norm.weight`` with no pre_norm key confirms which one
+    shipped.
     """
 
     def __init__(self, config: MoonViTConfig) -> None:
         super().__init__()
         kh, kw = config.merge_kernel_size
-        self.kh, self.kw = kh, kw
-        self.temporal_pool_size = config.temporal_pool_size
         merged = config.hidden_size * kh * kw
-        self.norm = nn.LayerNorm(merged, eps=config.projector_ln_eps)
-        self.fc1 = nn.Linear(merged, merged, bias=False)
-        self.fc2 = nn.Linear(merged, config.text_hidden_size, bias=False)
-
-    def forward(self, x_BFHWD: torch.Tensor) -> torch.Tensor:
-        """``[B, F, H, W, D]`` -> ``[B, F', H/kh * W/kw, text_hidden]``."""
-        B, Fr, H, W, D = x_BFHWD.shape
-        if H % self.kh or W % self.kw:
-            raise ValueError(
-                f"patch grid {H}x{W} must divide the merge kernel "
-                f"{self.kh}x{self.kw}; pad or resize the input"
-            )
-        # Space-to-depth: [B, F, H/kh, kh, W/kw, kw, D] -> channels last.
-        x = x_BFHWD.view(B, Fr, H // self.kh, self.kh, W // self.kw, self.kw, D)
-        x = x.permute(0, 1, 2, 4, 3, 5, 6).reshape(
-            B, Fr, (H // self.kh) * (W // self.kw), self.kh * self.kw * D
+        self.merged_size = merged
+        self.proj = nn.Sequential(
+            nn.Linear(merged, merged, bias=False),
+            nn.GELU(),
+            nn.Linear(merged, config.text_hidden_size, bias=False),
         )
-        if Fr > 1 and self.temporal_pool_size > 1:
-            pool = min(self.temporal_pool_size, Fr)
-            usable = (Fr // pool) * pool
-            if usable:
-                pooled = x[:, :usable].view(B, usable // pool, pool, *x.shape[2:])
-                pooled = pooled.mean(dim=2)
-                # A trailing partial group is kept unpooled rather than dropped:
-                # silently discarding frames would change the token count in a
-                # way the caller cannot see.
-                x = (
-                    pooled
-                    if usable == Fr
-                    else torch.cat([pooled, x[:, usable:]], dim=1)
-                )
-        return self.fc2(_gelu_tanh(self.fc1(self.norm(x))))
+        self.post_norm = nn.RMSNorm(config.text_hidden_size, eps=config.projector_ln_eps)
+
+    def forward(self, merged: list[torch.Tensor] | torch.Tensor):
+        if isinstance(merged, (list, tuple)):
+            return [
+                self.post_norm(self.proj(item.reshape(item.shape[0], -1)))
+                for item in merged
+            ]
+        return self.post_norm(self.proj(merged.reshape(*merged.shape[:-2], -1)))
+
+    def init_weights(self) -> None:
+        # The reference initializes the projector with trunc_normal_ scaled by
+        # fan-in rather than the tower's global init_range.
+        for m in self.proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=math.sqrt(2 / m.in_features))
+        nn.init.ones_(self.post_norm.weight)
+
+
+class MoonViTEncoder(nn.Module):
+    """The 27 blocks plus the final norm."""
+
+    def __init__(self, config: MoonViTConfig) -> None:
+        super().__init__()
+        self.rope_2d = MoonViTRope2D(config.head_dim, config.rope_max_grid)
+        self.blocks = nn.ModuleList(
+            MoonViTEncoderLayer(config) for _ in range(config.num_hidden_layers)
+        )
+        self.final_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(self, x_LD: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+        freqs_cis = self.rope_2d.freqs_cis(grid_thws, x_LD.device)
+        lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
+        cu_seqlens = torch.cat(
+            [torch.zeros(1, dtype=lengths.dtype, device=lengths.device), lengths]
+        ).cumsum(0, dtype=torch.int32)
+        for block in self.blocks:
+            x_LD = block(x_LD, cu_seqlens, freqs_cis)
+        return self.final_layernorm(x_LD)
 
 
 class MoonViT(nn.Module):
-    """MoonViT-V2 encoder + PatchMergerV2 projector.
+    """MoonViT-V2 tower + PatchMergerMLPV2 projector.
 
-    Images and videos share every parameter, as the report specifies: an image
-    is a 1-frame video, which takes the time table's first entry and skips the
-    temporal attention pass and the temporal pool.
+    Submodule names (``patch_embed``, ``encoder``, and the projector held
+    separately as ``mm_projector``) mirror the checkpoint so the state-dict
+    adapter is a prefix rename rather than a structural remap.
     """
 
     def __init__(self, config: MoonViTConfig) -> None:
         super().__init__()
         self.config = config
         self.patch_embed = MoonViTPatchEmbed(config)
-        self.pos_emb = MoonViTPositionEmbedding(config)
-        self.layers = nn.ModuleList(
-            MoonViTBlock(config) for _ in range(config.num_hidden_layers)
-        )
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.projector = PatchMergerV2(config)
+        self.encoder = MoonViTEncoder(config)
+        self.mm_projector = PatchMergerMLPV2(config)
 
-    def forward(self, pixels_BFCHW: torch.Tensor) -> torch.Tensor:
-        """``[B, F, C, H, W]`` pixels -> ``[B, F', N', text_hidden_size]``.
+    @staticmethod
+    def patchify(pixels_BFCHW: torch.Tensor, patch_size: int):
+        """Rectangular ``[B, F, C, H, W]`` video -> packed patches + grid_thws.
 
-        Accepts ``[B, C, H, W]`` too, treating it as a single frame.
+        A convenience for uniform batches. Native-resolution training packs
+        variable-sized samples itself and calls :meth:`forward` directly.
         """
         if pixels_BFCHW.dim() == 4:
             pixels_BFCHW = pixels_BFCHW.unsqueeze(1)
-        x = self.patch_embed(pixels_BFCHW)
-        x = self.pos_emb(x)
-        for layer in self.layers:
-            x = layer(x)
-        return self.projector(self.norm(x))
+        B, Fr, C, H, W = pixels_BFCHW.shape
+        if H % patch_size or W % patch_size:
+            raise ValueError(
+                f"{H}x{W} is not divisible by patch_size {patch_size}"
+            )
+        h, w = H // patch_size, W // patch_size
+        x = pixels_BFCHW.reshape(B * Fr, C, h, patch_size, w, patch_size)
+        x = x.permute(0, 2, 4, 1, 3, 5).reshape(
+            B * Fr * h * w, C, patch_size, patch_size
+        )
+        grid = torch.tensor(
+            [[Fr, h, w]] * B, dtype=torch.long, device=pixels_BFCHW.device
+        )
+        return x, grid
+
+    def forward(self, patches_LCHW: torch.Tensor, grid_thws: torch.Tensor):
+        """Packed patches -> a list of ``[N_i, text_hidden_size]`` per sample."""
+        x = self.patch_embed(patches_LCHW, grid_thws)
+        x = self.encoder(x, grid_thws)
+        merged = tpool_patch_merger(x, grid_thws, self.config.merge_kernel_size)
+        return self.mm_projector(merged)
 
     def encoder_num_parameters(self) -> int:
         """Parameters in the tower proper, excluding the projector.
 
-        The report's "roughly 0.4B" is the encoder; the projector is called out
-        separately as "a lightweight MLP projector", and at text_hidden_size
-        7168 it is not lightweight relative to a 0.4B tower, so counting it in
-        would make the figure unrecognizable.
+        The model card's 401M figure is the encoder; the projector is described
+        separately as "a lightweight MLP projector" and at text_hidden_size 7168
+        it is not lightweight relative to the tower.
         """
-        proj = set(id(p) for p in self.projector.parameters())
+        proj = {id(p) for p in self.mm_projector.parameters()}
         return sum(p.numel() for p in self.parameters() if id(p) not in proj)
 
     def init_weights(self, init_range: float | None = None) -> None:
-        """Exhaustive init, for the same meta-device reason as the LLM's."""
         std = init_range if init_range is not None else self.config.initializer_range
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.Conv2d)):
@@ -352,5 +487,5 @@ class MoonViT(nn.Module):
                 nn.init.ones_(m.weight)
                 if getattr(m, "bias", None) is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.normal_(self.pos_emb.time, mean=0.0, std=std)
-        nn.init.normal_(self.pos_emb.spatial, mean=0.0, std=std)
+        nn.init.normal_(self.patch_embed.pos_emb.weight, mean=0.0, std=std)
+        self.mm_projector.init_weights()
