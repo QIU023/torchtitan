@@ -282,3 +282,70 @@ class TestLoRAMerge(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLoRAWrapperTransparency(unittest.TestCase):
+    """The wrapper must look enough like an nn.Linear for callers that
+    inspect it. init_weights reads ``attn_gate_proj.bias`` to detect the
+    near-identity graft gate, and attn_gate_proj is a LoRA target, so a
+    missing passthrough crashes model construction rather than degrading
+    quietly."""
+
+    def _wrapped(self, bias: bool):
+        from torchtitan.experiments.kimi_k3.lora import KimiLoRALinear
+
+        import torch.nn as nn
+
+        base = nn.Linear(32, 16, bias=bias)
+        return base, KimiLoRALinear(base, rank=4, alpha=8.0)
+
+    def test_bias_and_weight_passthrough(self):
+        for bias in (True, False):
+            base, w = self._wrapped(bias)
+            self.assertIs(w.weight, base.weight)
+            if bias:
+                self.assertIs(w.bias, base.bias)
+            else:
+                self.assertIsNone(w.bias)
+            self.assertEqual(w.in_features, 32)
+            self.assertEqual(w.out_features, 16)
+
+    def test_weight_is_none_when_base_is_packed(self):
+        base, w = self._wrapped(False)
+        w.quantize_base_mxfp4()
+        # packed bases have no base.weight; None is the signal init_weights
+        # already uses to skip them
+        self.assertIsNone(w.weight)
+
+    def test_k3_lora_targets_cover_the_compressed_q_and_latent_paths(self):
+        from torchtitan.experiments.kimi_k3.lora import (
+            apply_lora,
+            DEFAULT_LORA_TARGETS,
+            KimiLoRALinear,
+        )
+        from torchtitan.experiments.kimi_k3.model import KimiLinearModel
+        from torchtitan.experiments.kimi_k3.model_configs import (
+            build_kimi_linear_config,
+        )
+
+        with torch.device("meta"):
+            model = KimiLinearModel(
+                build_kimi_linear_config("k3mini", vocab_size=256)
+            )
+        apply_lora(model, rank=8, alpha=16.0)
+        leaves = {
+            fqn.rsplit(".", 1)[1]
+            for fqn, m in model.named_modules()
+            if isinstance(m, KimiLoRALinear)
+        }
+        # the modules that did not exist when the target list was written
+        for name in ("q_a_proj", "q_b_proj", "attn_gate_proj", "down", "up"):
+            self.assertIn(name, leaves, f"{name} not adapted")
+        # dotted entries must match a qualified suffix, not a bare leaf name
+        self.assertIn("latent.down", DEFAULT_LORA_TARGETS)
+        latent_wrapped = [
+            fqn
+            for fqn, m in model.named_modules()
+            if isinstance(m, KimiLoRALinear) and fqn.endswith(".latent.down")
+        ]
+        self.assertTrue(latent_wrapped)

@@ -310,6 +310,23 @@ class KimiLoRALinear(nn.Module):
     def out_features(self) -> int:
         return self.base.out_features
 
+    @property
+    def bias(self):
+        """Transparent passthrough, so callers that inspect the wrapped
+        Linear keep working. init_weights' graft-gate branch reads
+        ``gate_proj.bias`` to decide whether the gate is the near-identity
+        variant, and attn_gate_proj is a LoRA target."""
+        return self.base.bias
+
+    @property
+    def weight(self):
+        """Transparent passthrough to the base weight.
+
+        Returns None when the base is packed (quantize_base_mxfp4 deletes
+        ``base.weight`` in favour of split qdata/scale storage), which is the
+        signal callers already use to skip init for packed bases."""
+        return self.base._parameters.get("weight")
+
     def _forward_packed_tp(self, x: torch.Tensor) -> torch.Tensor:
         """TP forward for the packed-MXFP4 base: local dequant + local
         matmul, DTensor only at the boundary.
