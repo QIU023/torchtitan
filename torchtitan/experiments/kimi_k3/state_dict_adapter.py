@@ -230,6 +230,20 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             tail = sub[len("ffn._moe.shared_experts.") :]
             w_tag, _, suff = tail.partition(".")
             return f"{prefix}.block_sparse_moe.shared_experts.{_W_TO_HF[w_tag]}.{suff}"
+        # K3's layout (latent MoE projections, the released AttnRes and gate
+        # names) is owned by hf_key_map, which is tested for full coverage
+        # against the released checkpoint index. This adapter predates it and
+        # targets the Kimi-Linear-48B naming, so K3-only keys arrive here;
+        # delegate rather than keep the same table in two places that can drift.
+        from torchtitan.experiments.kimi_k3.hf_key_map import (
+            titan_to_official,
+            UnmappedKey,
+        )
+
+        try:
+            return titan_to_official(key, kda_layers=set())
+        except UnmappedKey:
+            pass
         raise ValueError(f"Unmapped tt key: {key!r}")
 
     # ----- HF -> tt -------------------------------------------------- #
