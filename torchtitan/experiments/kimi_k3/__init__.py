@@ -148,9 +148,48 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
     )
 
 
+def _model_registry_accepts(flavor: str) -> bool:
+    """True when :func:`model_registry` can build this flavor's ModelSpec."""
+    try:
+        model_registry(flavor)
+    except Exception:
+        return False
+    return True
+
+
+def _discovered_flavor_names() -> list[str]:
+    """Every flavor actually registered, discovered rather than enumerated.
+
+    ``flavor_names()`` builds a product over the scaling-law table, so it lists
+    only ``kimi_linear_{size}_{baseline,block_attn_res,full_attn_res}`` and
+    silently omits everything hand-registered in ``config_registry`` -- the K3
+    flavors, the QAT/QLoRA/KCP/quantile-balancing variants. A consumer that
+    discovers flavors from this dict then cannot see them, which is how veRL's
+    engine failed to resolve k3mini.
+
+    Discovering from the registry module means adding a flavor function is
+    enough; there is no second list to keep in sync. Same failure class as the
+    stale init map, and the same fix.
+    """
+    from torchtitan.experiments.kimi_k3 import config_registry
+
+    out = []
+    for name, obj in vars(config_registry).items():
+        if not (name.startswith("kimi_linear_") and callable(obj)):
+            continue
+        # config_registry holds Trainer.Config factories, which are a SUPERSET
+        # of model flavors: some (e.g. the _n4 AttnRes-block variants) exist only
+        # as trainer configs and model_registry cannot parse them. veRL calls
+        # model_registry on every name it discovers here, so listing one it
+        # cannot build turns flavor resolution into a hard error for everyone.
+        if _model_registry_accepts(name):
+            out.append(name)
+    return sorted(out)
+
+
 # Flavor-name dict for registry-discovery consumers (veRL's torchtitan
 # engine looks for a module-level ``*_configs`` dict and uses its KEYS
 # with ``model_registry``). Values are unused.
 kimi_linear_configs: dict[str, None] = {
-    name: None for name in flavor_names()
+    name: None for name in _discovered_flavor_names()
 }

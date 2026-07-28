@@ -1790,6 +1790,23 @@ class KimiLinearSpec:
     # Scope comes from quant_scope.py, not a name list.
     mxfp4_qat: bool = False
 
+    # Registry-discovery passthroughs. veRL's torchtitan engine identifies a
+    # flavor by reading cfg.dim / cfg.n_layers / cfg.vocab_size off
+    # model_registry(flavor).model -- torchtitan's llama-convention names, which
+    # our KimiLinearConfig spells hidden_size / num_hidden_layers. Without these
+    # the shape match silently finds nothing and flavor resolution fails.
+    @property
+    def dim(self) -> int:
+        return self.kimi_config.hidden_size
+
+    @property
+    def n_layers(self) -> int:
+        return self.kimi_config.num_hidden_layers
+
+    @property
+    def vocab_size(self) -> int:
+        return self.kimi_config.vocab_size
+
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
         from torchtitan.experiments.kimi_k3.attn_res_model import (
