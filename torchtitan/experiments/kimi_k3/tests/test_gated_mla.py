@@ -32,7 +32,13 @@ def _cfg():
         moe_intermediate_size=256, num_experts=8, kv_lora_rank=128,
         qk_nope_head_dim=64, qk_rope_head_dim=32, v_head_dim=64,
         kda_head_dim=64, kda_num_heads=4,
-        kda_layers=[1], full_attn_layers=[2],
+        # MLA-ONLY. This file tests the MLA output gate (attn_gate_proj); a KDA
+        # layer contributes nothing to that and drags in fla's triton kernels,
+        # which under triton 3.8 request ~106 KB of dynamic shared memory -- more
+        # than consumer Blackwell (RTX 50-series) provides, so the test failed on
+        # a hardware limit unrelated to what it checks. KDA's own kernels are
+        # covered by test_layers.py and the KCP probes.
+        kda_layers=[], full_attn_layers=[1, 2],
     )
 
 

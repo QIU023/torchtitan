@@ -14,6 +14,10 @@ via fla -- triton on GPU boxes, CPU fallback otherwise -- MLA SDPA,
 
 import unittest
 
+from torchtitan.experiments.kimi_k3.tests.kda_shmem import (
+    skip_reason_if_insufficient,
+)
+
 import torch
 
 from torchtitan.experiments.kimi_k3 import config_registry
@@ -29,6 +33,11 @@ class TestKimiDebugModel(unittest.TestCase):
         self.assertEqual(kimi.num_experts, 8)
 
     def test_forward_backward(self):
+        # fla's KDA kernel at kda_head_dim=64 outgrows consumer Blackwell's
+        # shared memory under triton 3.8; see kda_shmem for the numbers.
+        reason = skip_reason_if_insufficient()
+        if reason:
+            self.skipTest(reason)
         # fla dispatches to triton whenever CUDA is available (even for
         # CPU tensors), so run on GPU when present and only exercise the
         # CPU fallback on CUDA-less boxes.

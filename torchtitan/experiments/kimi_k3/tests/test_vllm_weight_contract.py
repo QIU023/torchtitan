@@ -20,12 +20,23 @@ already produces. This pins the two conventions its loader keys on, both read of
   ``(".gate_up_proj", ".gate_proj", 0), (".gate_up_proj", ".up_proj", 1)``.
   Exporting a pre-fused name would simply never match.
 
-Scope, stated plainly: ``KimiK3ForConditionalGeneration`` is registered in
-NEITHER vLLM 0.26.0 nor main as of 2026-07-28 -- day-0 K3 support lives on an
-unmerged release branch, so its exact class cannot be read yet. What is checkable
-now is that our export satisfies the conventions vLLM's existing Kimi-family
-loader uses, and those come from the checkpoint format rather than from any one
-model class. When the K3 class lands, re-run this against it.
+Confirmed against vLLM's REAL K3 implementation, not just the predecessor. K3
+support is vllm-project/vllm PR #50000 (branch ``kimi-k3``, open and conflicting
+with main as of 2026-07-28), which ships the model under a separate top-level
+package ``vllm.models.kimi_k3`` with ``nvidia/`` and ``amd/`` variants. Both use
+the same conventions this test pins::
+
+    vllm/models/kimi_k3/nvidia/model.py:1203  ckpt_gate_proj_name="w1"
+    vllm/models/kimi_k3/amd/mtp.py:246        ckpt_gate_proj_name="w1"
+                                              ckpt_down_proj_name="w2"
+
+and its modules carry the same checkpoint-facing names our map emits, e.g.
+``routed_expert_down_proj`` (amd/linear.py:230). The branch also registers
+``KimiK3MTPModel``, so speculative decoding has its own weight surface to check
+when we get there.
+
+Note the registry entry points at ``vllm.models.kimi_k3`` rather than
+``vllm.model_executor.models.*``, so a future check must look there.
 """
 
 from __future__ import annotations
