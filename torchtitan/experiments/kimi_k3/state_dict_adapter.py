@@ -96,6 +96,33 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         # class only reads the safetensors index from hf_assets_path.
         super().__init__(model_config, hf_assets_path)
         self.kimi_config = model_config.kimi_config
+        # LoRA renames every wrapped projection's weight (q_proj.weight ->
+        # q_proj.base.weight). to_hf already strips that on export; loading
+        # needs the inverse, or a plain base checkpoint cannot be loaded into a
+        # LoRA model at all -- which is the 48B graft path: take official
+        # weights, attach adapters, train. Without it the load dies on
+        # "Missing key: ...base.weight".
+        self._lora_rank = getattr(model_config, "lora_rank", None)
+        self._lora_targets: tuple[str, ...] = ()
+        if self._lora_rank is not None:
+            from torchtitan.experiments.kimi_k3.lora import DEFAULT_LORA_TARGETS
+
+            self._lora_targets = DEFAULT_LORA_TARGETS
+
+    def _add_lora_base(self, tt_key: str) -> str:
+        """Insert ``.base`` for LoRA-wrapped projections, if LoRA is enabled.
+
+        Matches the same leaf/qualified-suffix rule apply_lora uses, so the two
+        cannot disagree about which modules are wrapped.
+        """
+        if not self._lora_targets or not tt_key.endswith((".weight", ".bias")):
+            return tt_key
+        stem, _, suffix = tt_key.rpartition(".")
+        leaf = stem.rpartition(".")[2]
+        matched = leaf in self._lora_targets or any(
+            "." in t and stem.endswith(f".{t}") for t in self._lora_targets
+        )
+        return f"{stem}.base.{suffix}" if matched else tt_key
 
     # ----- quantization guard -------------------------------------- #
 
@@ -304,6 +331,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 continue
 
             tt_key, value = self._hf_key_to_tt(key, value)
+            tt_key = self._add_lora_base(tt_key) if tt_key else tt_key
             if tt_key is not None:
                 state_dict[tt_key] = value
 
