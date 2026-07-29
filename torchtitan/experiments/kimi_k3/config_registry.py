@@ -459,6 +459,26 @@ def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_diag_1l_mla_nogate() -> Trainer.Config:
+    """One dense MLA layer with the Gated-MLA output gate DISABLED.
+
+    attn_gate_proj is ColwiseParallel(use_local_output=True) and its INPUT is the
+    replicated residual x, so the gradient it contributes back into x is Partial
+    and has to be all-reduced across the tp axis. That is the same shape as the
+    block_attn_res bug fixed earlier, where a bare to_local() defaulted the
+    backward placement to Replicate and silently skipped the all-reduce.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_diag_1l_mla()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_1l_mla_nogate"
+    kc = cfg.model_spec.model.kimi_config
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model, kimi_config=_dc.replace(kc, mla_gated=False)
+    )
+    return cfg
+
+
 def kimi_linear_k3mini_diag_1l_mla_noattnres() -> Trainer.Config:
     """One dense MLA layer with AttnRes DISABLED.
 
