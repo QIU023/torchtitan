@@ -177,11 +177,27 @@ def _alternating_kda_mla_layers(
     return kda, sorted(mla)
 
 
+# Sizes that run against the repo's bundled test tokenizer rather than K3's own.
+# Keeping this in ONE place matters: model_registry (which veRL and
+# convert_to_hf.py resolve through) and the Trainer.Config flavors are separate
+# code paths, and when they disagreed about k3mini's vocab the seed checkpoint
+# came out with a 2016-row embedding that could not load into the 163840-row model
+# the registry built -- which is what blocked the veRL actor.
+BUNDLED_TOKENIZER_SIZES: frozenset[str] = frozenset({"k3mini", "debugmodel", "debugmodel8h"})
+BUNDLED_TOKENIZER_VOCAB = 2016
+K3_VOCAB = 163840
+
+
+def default_vocab_size(size: str) -> int:
+    """Vocab a size uses when the caller does not say otherwise."""
+    return BUNDLED_TOKENIZER_VOCAB if size in BUNDLED_TOKENIZER_SIZES else K3_VOCAB
+
+
 def build_kimi_linear_config(
     size: str,
     *,
     num_experts: int | None = None,
-    vocab_size: int = 163840,
+    vocab_size: int | None = None,
     tie_word_embeddings: bool | None = None,
     kda_mla_ratio: int = 3,
     rope_theta: float = 10000.0,
@@ -210,6 +226,8 @@ def build_kimi_linear_config(
         use_grouped_topk: MoE router grouped-topk gate. Default False
             (simplified); 48B-A3B uses True (matches HF config.json).
     """
+    if vocab_size is None:
+        vocab_size = default_vocab_size(size)
     if size not in _BY_NAME:
         raise ValueError(
             f"Unknown size '{size}'. Valid: {sorted(_BY_NAME.keys())}"
