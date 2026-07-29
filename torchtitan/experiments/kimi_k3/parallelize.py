@@ -688,11 +688,7 @@ def apply_tp_kimi_linear(
                 plan["self_attn.attn_gate_proj"] = ColwiseParallel(
                     use_local_output=True,
                 )
-                # The gate reads the replicated residual with a column-sharded
-                # weight, so its dL/dx is Partial over the tp axis and nothing
-                # downstream reduces it -- see _attn_gate. Hand the module its
-                # group so the reduction happens there.
-                layer.self_attn._tp_group = tp_mesh.get_group()
+
 
         # FFN path.
         if not is_moe:

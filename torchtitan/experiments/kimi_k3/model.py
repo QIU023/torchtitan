@@ -410,37 +410,6 @@ def _cp_all_to_all_headseq(
     )
 
 
-class _SumGradOverTP(torch.autograd.Function):
-    """Identity forward; all-reduces the gradient over the TP group.
-
-    The DTensor way to express this is a Partial-placement gradient that gets
-    redistributed on the way out. This module keeps its residual stream as plain
-    tensors by convention (the TP plan converts at module boundaries with
-    use_local_output=True), so the reduction is done explicitly at the one place
-    that needs it rather than by moving the whole stream into DTensor space.
-    """
-
-    @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        if ctx.group is not None and dist.get_world_size(ctx.group) > 1:
-            grad = grad.contiguous()
-            dist.all_reduce(grad, group=ctx.group)
-        return grad, None
-
-
-def _sum_grad_over_tp(x: torch.Tensor, group):
-    """No-op without TP, and a no-op for DTensor inputs (which carry their own
-    placement and are reduced by redistribute)."""
-    if group is None or isinstance(x, DTensor):
-        return x
-    return _SumGradOverTP.apply(x, group)
-
-
 class KimiMLAAttention(nn.Module):
     """Multi-head Latent Attention, Kimi NoPE variant.
 
@@ -550,19 +519,12 @@ class KimiMLAAttention(nn.Module):
         already has the right width. per_head_graft: one value per head,
         expanded across that head's v_head_dim.
 
-        Under TP the gate reads the REPLICATED residual ``x`` while its weight is
-        column-sharded, so each rank computes only one term of ``dL/dx`` -- the
-        full gradient is the sum over the tp axis. Nothing else reduces it: the
-        residual continues backward independently on every rank, and FSDP only
-        reduces over the data axis. Left alone the residual keeps 1/tp of the
-        gate's contribution, which measured as a 4.7% per-layer gradient deficit
-        compounding to 3.1x end to end (TP_GRAD_FINDING_2026-07-29).
+Under TP ``x`` arrives here as a DTensor (measured), so DTensor's own
+        autograd redistributes the gradient this branch contributes to the
+        residual; there is nothing to reduce by hand. An earlier attempt to
+        all-reduce it explicitly was a no-op for exactly that reason -- see
+        TP_GRAD_FINDING_2026-07-29.
         """
-        # NOT YET EFFECTIVE -- see TP_GRAD_FINDING_2026-07-29. apply_tp_kimi_linear
-        # sets _tp_group on this module, but with the reduction in place the
-        # single-layer ratio is bit-identical to without it (1.0649), which means
-        # this call is not firing at runtime. Do not treat the gate as fixed.
-        x = _sum_grad_over_tp(x, getattr(self, "_tp_group", None))
         g = torch.sigmoid(self.attn_gate_proj(x))
         if self.attn_gate_param == "full_rank":
             return g
