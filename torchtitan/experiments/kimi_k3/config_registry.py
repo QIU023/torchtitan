@@ -409,6 +409,52 @@ def kimi_linear_k3mini_block_attn_res() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_diag_dense_mla() -> Trainer.Config:
+    """DIAGNOSTIC: k3mini with no KDA and no MoE -- dense MLA only.
+
+    The control that separates a TP BACKWARD bug from forward divergence. MoE
+    top-k is discrete, so TP's different reduction order can flip an expert
+    assignment and make the two runs genuinely different models from step one;
+    that alone produces mismatched gradients with no bug anywhere. Removing both
+    MoE and KDA leaves a path where TP is pure tensor sharding of dense matmuls,
+    which MUST be numerically equivalent. A ratio above 1 here is a real backward
+    defect. Not a training configuration.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_diag_no_kda()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_dense_mla"
+    kc = cfg.model_spec.model.kimi_config
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(kc, first_k_dense_replace=kc.num_hidden_layers),
+    )
+    return cfg
+
+
+def kimi_linear_k3mini_diag_no_kda() -> Trainer.Config:
+    """DIAGNOSTIC: k3mini with every layer full-attention (no KDA).
+
+    Exists to isolate which module carries the TP gradient attenuation measured
+    on 2026-07-29 (see TP_GRAD_FINDING). Everything else -- MoE, latent, AttnRes,
+    FSDP, bf16 -- is held identical, so a ratio that returns to 1.0 here points
+    at the KDA layers under TP. Not a training configuration.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_no_kda"
+    kc = cfg.model_spec.model.kimi_config
+    n = kc.num_hidden_layers
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            kc, kda_layers=[], full_attn_layers=list(range(1, n + 1))
+        ),
+    )
+    return cfg
+
+
 def kimi_linear_k3mini_qat_mxfp4() -> Trainer.Config:
     """K3-faithful QAT: MXFP4 routed-expert weights, MXFP8 expert activations.
 
