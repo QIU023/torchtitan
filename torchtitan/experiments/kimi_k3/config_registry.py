@@ -432,6 +432,66 @@ def kimi_linear_k3mini_diag_dense_mla() -> Trainer.Config:
     return cfg
 
 
+def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
+    """DIAGNOSTIC builder: one layer, so amplification cannot run.
+
+    Whole-model numerical comparisons across parallelism are uninformative in
+    this model: it amplifies perturbations ~1.6x per layer, so over 21 layers a
+    bf16-level difference saturates and a correct path becomes indistinguishable
+    from a broken one. One layer removes that entirely -- whatever difference
+    remains is the difference TP itself introduces in a single forward/backward.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = name
+    kc = cfg.model_spec.model.kimi_config
+    kc = _dc.replace(
+        kc,
+        num_hidden_layers=1,
+        kda_layers=[1] if kda else [],
+        full_attn_layers=[] if kda else [1],
+        first_k_dense_replace=0 if moe else 1,
+    )
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model, kimi_config=kc, num_blocks=1
+    )
+    return cfg
+
+
+def kimi_linear_k3mini_diag_1l_mla_noattnres() -> Trainer.Config:
+    """One dense MLA layer with AttnRes DISABLED.
+
+    block_attn_res reads proj.weight directly and hand-rolls the backward grad
+    placements (Partial on the tp axis, to force an all-reduce the default
+    Replicate would skip). That code runs in every layer and is ours, which makes
+    it the first thing to rule in or out for the ~6.5% per-layer TP gap.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_diag_1l_mla()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_1l_mla_noattnres"
+    cfg.model_spec.model = _dc.replace(cfg.model_spec.model, num_blocks=None)
+    return cfg
+
+
+def kimi_linear_k3mini_diag_1l_mla() -> Trainer.Config:
+    """One dense MLA layer: pure tensor sharding, must be TP-exact."""
+    return _diag_single_layer("kimi_linear_k3mini_diag_1l_mla", kda=False, moe=False)
+
+
+def kimi_linear_k3mini_diag_1l_mla_moe() -> Trainer.Config:
+    """One MLA layer with MoE: adds discrete routing."""
+    return _diag_single_layer(
+        "kimi_linear_k3mini_diag_1l_mla_moe", kda=False, moe=True
+    )
+
+
+def kimi_linear_k3mini_diag_1l_kda() -> Trainer.Config:
+    """One KDA layer: adds the recurrence."""
+    return _diag_single_layer("kimi_linear_k3mini_diag_1l_kda", kda=True, moe=False)
+
+
 def kimi_linear_k3mini_diag_no_kda() -> Trainer.Config:
     """DIAGNOSTIC: k3mini with every layer full-attention (no KDA).
 
