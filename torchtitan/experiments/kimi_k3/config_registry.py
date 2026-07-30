@@ -535,6 +535,31 @@ def kimi_linear_k3mini_diag_no_kda() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_muon() -> Trainer.Config:
+    """K3-faithful structure trained with Per-Head Muon (report sec 2.5).
+
+    Kimi K3 uses Muon for its matrix parameters, refined per attention head:
+    instead of orthogonalizing the full Q/K/V projection, each head's block of the
+    momentum matrix is orthogonalized separately, which equalizes the update scale
+    across heads. Non-matrix parameters stay on AdamW.
+
+    This is the last of the two training-recipe items that were implemented but
+    unused -- the Muon optimizer and its tagger existed with nothing selecting
+    them, which is the inert-feature pattern this phase spent days removing.
+    """
+    import dataclasses as _dc
+
+    from torchtitan.experiments.kimi_k3.muon import default_muon
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_muon"
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model, per_head_muon=True
+    )
+    cfg.optimizer = default_muon()
+    return cfg
+
+
 def kimi_linear_k3mini_qat_mxfp4() -> Trainer.Config:
     """K3-faithful QAT: MXFP4 routed-expert weights, MXFP8 expert activations.
 

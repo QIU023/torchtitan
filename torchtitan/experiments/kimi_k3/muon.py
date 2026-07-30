@@ -21,10 +21,13 @@ correct, testable base + a per-head reshape hook. Non-2-D params
 reference Muon recipe.
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torch.optim.optimizer import Optimizer
 
+from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.tools.logging import logger
 
 
@@ -216,3 +219,97 @@ def tag_per_head_muon(model: nn.Module) -> int:
             weight._muon_heads = heads
             tagged += 1
     return tagged
+
+
+# ----- Wiring Muon into torchtitan's optimizer container ------------------ #
+
+
+class KimiOptimizersContainer(OptimizersContainer):
+    """``OptimizersContainer`` that also knows about Muon.
+
+    Core's ``_resolve_optimizer_cls`` hardcodes ``{Adam, AdamW}`` and raises
+    ``NotImplementedError`` for anything else, and CLAUDE.md rules out editing
+    core to accommodate an experiment. Subclassing keeps the addition local: the
+    Config's ``_owner`` machinery builds this class, so a flavor pointing at
+    ``KimiOptimizersContainer.Config`` gets Muon resolution and nothing else
+    changes.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(OptimizersContainer.Config):
+        """Needed even though it adds no fields.
+
+        Configurable sets ``_owner`` per Config CLASS. Inheriting the parent's
+        Config verbatim means ``_owner`` still points at OptimizersContainer, so
+        ``build()`` returns core's container and Muon resolution never happens --
+        the smoke failed with "Optimizer Muon not added" for exactly that reason.
+        """
+
+    @staticmethod
+    def _resolve_optimizer_cls(name: str) -> type:
+        if name == "Muon":
+            return Muon
+        return OptimizersContainer._resolve_optimizer_cls(name)
+
+
+# Report sec 2.5: Muon for the matrix parameters, with the per-head refinement on
+# the attention projections. Everything that is not a 2-D weight matrix -- norms,
+# biases, the 1-D KDA parameters, embeddings and the LM head -- stays on AdamW,
+# which is the standard Muon recipe rather than something specific to K3.
+_MUON_EXCLUDE_PATTERNS = (
+    r".*norm.*",
+    r".*\.bias$",
+    r".*embed_tokens.*",
+    r".*lm_head.*",
+    r".*A_log$",
+    r".*dt_bias$",
+    r".*_res_proj\.weight$",  # AttnRes pseudo-queries are [1, D], not matrices
+    r".*conv1d.*",
+)
+
+
+def default_muon(
+    lr: float = 2e-2,
+    *,
+    adamw_lr: float = 3e-4,
+    momentum: float = 0.95,
+    ns_steps: int = 5,
+) -> "OptimizersContainer.Config":
+    """Muon on the matrix parameters, AdamW on everything else.
+
+    The two learning rates are deliberately different: Muon's update is
+    orthogonalized, so its scale is decoupled from the gradient magnitude and it
+    wants a much larger lr than AdamW on the same model. Passing one lr for both
+    is the usual way to make Muon look bad.
+    """
+    from torchtitan.components.optimizer import ParamGroupConfig
+
+    exclude = "|".join(_MUON_EXCLUDE_PATTERNS)
+    return KimiOptimizersContainer.Config(
+        param_groups=[
+            # AdamW first: the container assigns each parameter to the FIRST
+            # matching pattern, so the narrower exclusion set has to precede the
+            # catch-all Muon group.
+            ParamGroupConfig(
+                pattern=exclude,
+                optimizer_name="AdamW",
+                optimizer_kwargs={
+                    "lr": adamw_lr,
+                    "betas": (0.9, 0.95),
+                    "eps": 1e-8,
+                    "weight_decay": 0.1,
+                },
+            ),
+            ParamGroupConfig(
+                pattern=r".*",
+                optimizer_name="Muon",
+                optimizer_kwargs={
+                    "lr": lr,
+                    "momentum": momentum,
+                    "ns_steps": ns_steps,
+                    "per_head": True,
+                },
+            ),
+        ],
+        implementation="for-loop",
+    )

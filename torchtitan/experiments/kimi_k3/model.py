@@ -1795,6 +1795,11 @@ class KimiLinearSpec:
     # weights + MXFP8 expert activations, fake-quant with a bf16 master.
     # Scope comes from quant_scope.py, not a name list.
     mxfp4_qat: bool = False
+    # Per-Head Muon (report sec 2.5). Tagging has to happen at BUILD time, not in
+    # post_optimizer_build_fn: the optimizer is constructed from the parameters,
+    # and Muon reads _muon_heads off each one, so a tag applied afterwards is
+    # invisible to it.
+    per_head_muon: bool = False
 
     # Registry-discovery passthroughs. veRL's torchtitan engine identifies a
     # flavor by reading cfg.dim / cfg.n_layers / cfg.vocab_size off
@@ -1834,6 +1839,13 @@ class KimiLinearSpec:
                 quantize_base=self.lora_quantize_base,
                 quantize_act=self.lora_quantize_act,
             )
+        if self.per_head_muon:
+            from torchtitan.experiments.kimi_k3.muon import tag_per_head_muon
+
+            from torchtitan.tools.logging import logger
+
+            tagged = tag_per_head_muon(model)
+            logger.info("Per-Head Muon: tagged %d Q/K/V projections.", tagged)
         if self.mxfp4_qat:
             from torchtitan.experiments.kimi_k3.mxfp4_qat import apply_mxfp4_qat
 
