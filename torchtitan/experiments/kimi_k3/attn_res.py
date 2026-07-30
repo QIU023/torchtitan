@@ -21,7 +21,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Partial
 from torch.nn import functional as F
 
 from torchtitan.models.common.linear import Linear as _TTLinear
@@ -88,38 +87,24 @@ def block_attn_res(
     # TP rank has the full local copy under Replicate placement, so to_local
     # is a no-op data-wise but unwraps the DTensor for the einsum dispatcher).
     #
-    # CRITICAL — backward gradient placement on the tp dim. ``K``/``V`` are
-    # produced replicated on the tp mesh in the forward, but they carry
-    # gradients back through rowwise-sharded ``o_proj`` / ``down_proj`` whose
-    # backward emits Partial gradients. So the einsum's gradient w.r.t.
-    # ``query`` is a *per-tp-rank partial contribution* that must be
-    # all-reduced across the tp dim. A bare ``to_local()`` defaults the
-    # backward grad placement to the DTensor's own placement (Replicate on
-    # the tp dim), which tells DTensor the gradient is already consistent and
-    # SKIPS the all-reduce — leaving ``proj.weight.grad`` with only one rank's
-    # share. ``clip_grad_norm_`` then stacks this mis-reduced grad across the
-    # (fsdp, tp) mesh and the norm blows up (observed grad_norm 40k-80k under
-    # 4D mesh). Mirror ``models/common/moe.py``: request Partial on the tp
-    # dim so the backward all-reduces. Non-tp dims (e.g. the fsdp Shard dim
-    # under pure 1D FSDP, or the fsdp dim of the 4D mesh) keep their natural
-    # placement so the pure-FSDP path is byte-for-byte unchanged.
+    # Backward gradient placement on the tp axis. The gradient w.r.t.
+    # ``query`` is ``sum_{n,b,t} grad_logits * K``. Both factors are
+    # replicated across the tp axis here: ``K``/``V`` are replicated in the
+    # forward, and the rowwise ``o_proj`` / ``down_proj`` that feed them are
+    # applied with ``local_output_grad_placements=(Replicate(),)`` (see
+    # parallelize.py), so the gradient arriving at ``h`` is replicated too.
+    # Every tp rank therefore computes the FULL gradient, not a partial
+    # contribution -- the default ``to_local()`` placement (Replicate on tp)
+    # is the correct spec, and requesting Partial makes the backward sum tp
+    # identical copies, inflating ``proj.weight.grad`` by exactly tp.
+    #
+    # Measured on one dense MLA layer from a shared seed checkpoint, varying
+    # only tp: with Partial, dp2/dp2xtp2 = 0.4999 and dp2/dp2xtp4 = 0.2501 on
+    # both AttnRes projections (exactly 1/tp) while all 18 other parameters
+    # sat at 1.0000; with the default placement all parameters sit at 1.0000.
     weight = proj.weight
     if isinstance(weight, DTensor):
-        mesh = weight.device_mesh
-        dim_names = mesh.mesh_dim_names
-        if dim_names is not None and "tp" in dim_names:
-            # Per-mesh-dim grad placements: Partial on tp (force all-reduce
-            # of the replicated-compute gradient), unchanged elsewhere.
-            grad_placements = [
-                Partial() if name == "tp" else weight.placements[i]
-                for i, name in enumerate(dim_names)
-            ]
-            weight = weight.to_local(grad_placements=grad_placements)
-        else:
-            # No tp dim (pure FSDP / pure DP): default to_local backward
-            # placement already matches the param's Shard/Replicate — leave
-            # this path exactly as before.
-            weight = weight.to_local()
+        weight = weight.to_local()
     query = weight.squeeze(0)
     if query.dtype != K.dtype:
         # Frozen-base LoRA keeps the backbone bf16 while trainable
