@@ -535,6 +535,36 @@ def kimi_linear_k3mini_diag_no_kda() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_k3recipe() -> Trainer.Config:
+    """K3-faithful structure AND K3's training recipe: Muon + Quantile Balancing.
+
+    Structure alignment was verified module by module against the released
+    reference; these two were the remaining recipe gaps. Kimi K3 trains with Muon
+    on its matrix parameters (report sec 2.5) and with Quantile Balancing on the
+    router (sec 2.3.3), while this repo defaulted to AdamW and core's sign rule.
+
+    Deliberately a SEPARATE flavor rather than a change to
+    kimi_linear_k3mini_block_attn_res. That flavor carries the cross-parallelism
+    numerical baselines (PARALLEL_NUMERIC_BASELINE / PP_VP_REEXAMINATION), and
+    changing its optimizer or router rule would invalidate every one of those
+    recorded numbers. The baseline flavor stays a fixed reference; faithfulness
+    lives here and in the 2p8t flavor.
+    """
+    import dataclasses as _dc
+
+    from torchtitan.experiments.kimi_k3.muon import default_muon
+    from torchtitan.experiments.kimi_k3.quantile_balance import (
+        register_quantile_balancing,
+    )
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_k3recipe"
+    cfg.model_spec.model = _dc.replace(cfg.model_spec.model, per_head_muon=True)
+    cfg.optimizer = default_muon()
+    cfg.model_spec.post_optimizer_build_fn = register_quantile_balancing
+    return cfg
+
+
 def kimi_linear_k3mini_muon() -> Trainer.Config:
     """K3-faithful structure trained with Per-Head Muon (report sec 2.5).
 
