@@ -547,6 +547,37 @@ def kimi_linear_k3mini_diag_8l_moe_depth() -> Trainer.Config:
     )
 
 
+def kimi_linear_k3mini_diag_4l_moe_8h() -> Trainer.Config:
+    """Four MLA+MoE layers widened to 8 attention heads, so tp8 is possible.
+
+    k3mini has 4 heads, which caps tp at 4 -- tp8 fails structurally with
+    "Cannot unflatten unevenly sharded tensor", not because of a defect. The real
+    2.8T config has far more heads, so the tp8 code path is reachable there and
+    ought to be exercised somewhere.
+
+    hidden_size is also widened to 1024: at 512 the per-rank shard under tp8 is
+    small enough to trip "strides should be multiple of 16 bytes" inside the
+    kernels, which is an alignment constraint of the shard width rather than a
+    parallelism defect.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_diag_4l_moe_depth()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_4l_moe_8h"
+    kc = cfg.model_spec.model.kimi_config
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            kc,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            hidden_size=1024,
+            intermediate_size=2048,
+        ),
+    )
+    return cfg
+
+
 def kimi_linear_k3mini_diag_21l_mla() -> Trainer.Config:
     """21 dense MLA layers, 8 AttnRes blocks -- full depth, AttnRes on."""
     return _diag_multi_layer(
