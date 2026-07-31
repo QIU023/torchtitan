@@ -460,7 +460,7 @@ def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
 
 
 def _diag_multi_layer(
-    name: str, *, num_layers: int, num_blocks: int | None
+    name: str, *, num_layers: int, num_blocks: int | None, moe: bool = False
 ) -> Trainer.Config:
     """DIAGNOSTIC builder: N dense MLA layers with a real AttnRes block count.
 
@@ -483,7 +483,7 @@ def _diag_multi_layer(
         num_hidden_layers=num_layers,
         kda_layers=[],
         full_attn_layers=list(range(1, num_layers + 1)),
-        first_k_dense_replace=num_layers,
+        first_k_dense_replace=0 if moe else num_layers,
     )
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model, kimi_config=kc, num_blocks=num_blocks
@@ -509,6 +509,32 @@ def kimi_linear_k3mini_diag_8l_mla() -> Trainer.Config:
     """Eight dense MLA layers, 4 AttnRes blocks -- does the effect scale?"""
     return _diag_multi_layer(
         "kimi_linear_k3mini_diag_8l_mla", num_layers=8, num_blocks=4
+    )
+
+
+def kimi_linear_k3mini_diag_1l_moe_depth() -> Trainer.Config:
+    """Depth curve leg: 1 MLA+MoE layer. See _diag_multi_layer."""
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_1l_moe_depth", num_layers=1, num_blocks=1, moe=True
+    )
+
+
+def kimi_linear_k3mini_diag_4l_moe_depth() -> Trainer.Config:
+    """Depth curve leg: 4 MLA+MoE layers, 2 AttnRes blocks."""
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_4l_moe_depth", num_layers=4, num_blocks=2, moe=True
+    )
+
+
+def kimi_linear_k3mini_diag_8l_moe_depth() -> Trainer.Config:
+    """Depth curve leg: 8 MLA+MoE layers, 4 AttnRes blocks.
+
+    With 1, 4 and 8 the deviation-vs-depth curve separates a per-layer defect
+    (roughly linear in depth) from this model's ~1.6x per-layer amplification of
+    any perturbation, bf16 included (geometric).
+    """
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_8l_moe_depth", num_layers=8, num_blocks=4, moe=True
     )
 
 
