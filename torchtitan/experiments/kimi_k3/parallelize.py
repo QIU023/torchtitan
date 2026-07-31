@@ -53,7 +53,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 from torch.distributed.tensor import distribute_tensor, DTensor
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torchtitan.distributed.tensor_parallel import NoParallel
 
 from torchtitan.config import (
@@ -418,36 +418,6 @@ def _patch_fla_for_dtensor() -> None:
     _make_patch(FusedRMSNormGated)
 
 
-class _NoParallelPartialGrad(NoParallel):
-    """NoParallel whose plain output declares a Partial backward on the tp axis.
-
-    ``NoParallel._prepare_output_fn`` ends in a bare ``to_local()``, which
-    defaults the backward placement to the output layout (Replicate) -- i.e.
-    "every tp rank's incoming gradient is the same and already complete". For a
-    module whose output is consumed by the MoE that is false: the MoE's backward
-    hands each rank a different share, and declaring Replicate keeps one share
-    and discards the rest. Requesting Partial makes the backward all-reduce them.
-
-    Only correct where the consumer really does produce partial gradients.
-    Applying it to a module that already receives a replicated gradient
-    over-reduces by exactly tp -- the failure mode block_attn_res had.
-    """
-
-    @staticmethod
-    def _prepare_output_fn(
-        output_layout,
-        use_local_output: bool,
-        mod: nn.Module,
-        outputs,
-        device_mesh: DeviceMesh,
-    ):
-        if outputs.placements != (output_layout,):
-            outputs = outputs.redistribute(placements=(output_layout,), async_op=True)
-        if not use_local_output:
-            return outputs
-        return outputs.to_local(grad_placements=(Partial(),))
-
-
 def _model_has_moe(model: nn.Module) -> bool:
     """True if any layer carries a KimiMoE ffn (module-internal MoE
     parallelization applies)."""
@@ -544,21 +514,6 @@ def apply_tp_kimi_linear(
     # the incoming local gradient is taken to be the same on every tp rank
     # and already complete.
     no_par_local = NoParallel(use_local_output=True)
-
-    # Same, but declaring the backward on the tp axis as Partial. This is
-    # required wherever the plain tensor leaving the module is consumed by
-    # the MoE, whose backward hands each tp rank a DIFFERENT share of the
-    # gradient rather than the full replicated value. Measured on one
-    # MLA+MoE layer, gradient norm at the MoE's latent input:
-    #
-    #   tp1                         0.04075606
-    #   tp2  rank0 0.02921830, rank1 0.02839850   ranks DISAGREE
-    #   tp2  after all-reduce       0.04075651    matches tp1
-    #   tp4  after all-reduce       0.04075698    matches tp1
-    #
-    # The shares sum to the tp1 value, so the gradient is genuinely Partial
-    # and declaring it Replicate discards every rank's share but one.
-    no_par_local_partial_grad = _NoParallelPartialGrad(use_local_output=True)
 
     # fla-core triton kernels (causal_conv1d in ShortConvolution,
     # fused_norm_gated in FusedRMSNormGated) do not dispatch through
@@ -821,16 +776,7 @@ def apply_tp_kimi_linear(
             if latent is not None:
                 for n in ("down", "up", "norm"):
                     if getattr(latent, n, None) is not None:
-                        # ``down`` feeds the experts, so its output gradient
-                        # comes back Partial across tp (see
-                        # _NoParallelPartialGrad). ``up`` and ``norm`` sit on
-                        # the far side of the experts and receive a genuinely
-                        # replicated gradient from the residual stream --
-                        # declaring Partial there would over-reduce.
-                        plan[f"ffn.latent.{n}"] = (
-                            no_par_local_partial_grad if n == "down"
-                            else no_par_local
-                        )
+                        plan[f"ffn.latent.{n}"] = no_par_local
             # Under the latent path the shared experts hang off KimiMoE
             # itself (Eq. 11 adds them at full width), not off ffn._moe.
             if getattr(layer.ffn, "shared_experts", None) is not None:
