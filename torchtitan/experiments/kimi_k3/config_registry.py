@@ -435,11 +435,20 @@ def kimi_linear_k3mini_diag_dense_mla() -> Trainer.Config:
 def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
     """DIAGNOSTIC builder: one layer, so amplification cannot run.
 
-    Whole-model numerical comparisons across parallelism are uninformative in
-    this model: it amplifies perturbations ~1.6x per layer, so over 21 layers a
-    bf16-level difference saturates and a correct path becomes indistinguishable
-    from a broken one. One layer removes that entirely -- whatever difference
-    remains is the difference TP itself introduces in a single forward/backward.
+    One layer removes cross-layer amplification, so whatever difference remains
+    is what TP introduces in a single forward/backward.
+
+    The amplification is NOT a general property of this model, contrary to what
+    this docstring used to claim: 21 dense layers with 8 AttnRes blocks sit at
+    4e-4 under pure TP with no growth over depth. It appears only with MoE, which
+    injects a ~1e-4 difference into the gradient stream when the reduction order
+    changes, which AttnRes's uniform-at-init softmax then amplifies about 15x per
+    layer. See TP_GRAD_FINDING_2026-07-29.
+
+    Note the flip side, since it cost time to learn: one layer also pins
+    num_blocks=1, which makes block_attn_res nearly degenerate. Anything about
+    AttnRes verified here says nothing about the multi-block case -- use the
+    _diag_multi_layer flavors for that.
     """
     import dataclasses as _dc
 

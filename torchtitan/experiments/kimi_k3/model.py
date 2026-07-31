@@ -1446,12 +1446,15 @@ class KimiMoE(nn.Module):
             # Router reads x; experts consume W_down x.
             out = self._moe(self.latent.to_latent(x), router_input_BLD=x)
         if isinstance(out, DTensor):
-            # Module-internal MoE parallelization (EP/TP) emits DTensor
-            # (Partial on the TP axis before reduction). This model's
-            # boundary convention is plain tensors (PP P2P, AttnRes
-            # stacking, fla kernels) -- reduce to Replicate (the required
-            # TP all-reduce) and unwrap. to_local's default grad
-            # placement is the tensor's own Replicate.
+            # Module-internal MoE parallelization (EP/TP) emits DTensor.
+            # This model's boundary convention is plain tensors (PP P2P,
+            # AttnRes stacking, fla kernels), so redistribute to Replicate
+            # if needed and unwrap. Measured under TP with EP off the
+            # placements are ALREADY Replicate here, so the redistribute
+            # does not fire and this is a plain unwrap; the gradient
+            # arriving from downstream is replicated and agrees across tp
+            # ranks to 5e-4, so to_local's default Replicate grad
+            # placement is correct.
             if any(not p.is_replicate() for p in out.placements):
                 out = out.redistribute(
                     placements=[Replicate()] * len(out.placements)
