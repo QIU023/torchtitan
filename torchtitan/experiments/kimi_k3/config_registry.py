@@ -459,6 +459,77 @@ def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
     return cfg
 
 
+def _diag_multi_layer(
+    name: str, *, num_layers: int, num_blocks: int | None
+) -> Trainer.Config:
+    """DIAGNOSTIC builder: N dense MLA layers with a real AttnRes block count.
+
+    The single-layer builders pin ``num_blocks=1``, which makes block_attn_res
+    nearly degenerate: the softmax runs over one block, so the pseudo-query
+    gradient path that a real model exercises is barely touched. Anything
+    verified only at one layer says nothing about the multi-block case. These
+    keep every other knob identical and vary only the layer/block count, so an
+    AttnRes defect that needs several blocks has room to appear.
+
+    ``num_blocks=None`` disables AttnRes entirely -- the control leg.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = name
+    kc = cfg.model_spec.model.kimi_config
+    kc = _dc.replace(
+        kc,
+        num_hidden_layers=num_layers,
+        kda_layers=[],
+        full_attn_layers=list(range(1, num_layers + 1)),
+        first_k_dense_replace=num_layers,
+    )
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model, kimi_config=kc, num_blocks=num_blocks
+    )
+    return cfg
+
+
+def kimi_linear_k3mini_diag_4l_mla() -> Trainer.Config:
+    """Four dense MLA layers, 2 AttnRes blocks -- the smallest multi-block case."""
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_4l_mla", num_layers=4, num_blocks=2
+    )
+
+
+def kimi_linear_k3mini_diag_4l_mla_noattnres() -> Trainer.Config:
+    """Four dense MLA layers with AttnRes disabled -- control for the above."""
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_4l_mla_noattnres", num_layers=4, num_blocks=None
+    )
+
+
+def kimi_linear_k3mini_diag_8l_mla() -> Trainer.Config:
+    """Eight dense MLA layers, 4 AttnRes blocks -- does the effect scale?"""
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_8l_mla", num_layers=8, num_blocks=4
+    )
+
+
+def kimi_linear_k3mini_diag_21l_mla() -> Trainer.Config:
+    """21 dense MLA layers, 8 AttnRes blocks -- full depth, AttnRes on."""
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_21l_mla", num_layers=21, num_blocks=8
+    )
+
+
+def kimi_linear_k3mini_diag_21l_mla_noattnres() -> Trainer.Config:
+    """21 dense MLA layers, AttnRes disabled -- the depth control.
+
+    Separates "AttnRes is broken at depth" from "this model amplifies any
+    perturbation ~1.6x per layer, so bf16 saturates by layer 21".
+    """
+    return _diag_multi_layer(
+        "kimi_linear_k3mini_diag_21l_mla_noattnres", num_layers=21, num_blocks=None
+    )
+
+
 def kimi_linear_k3mini_diag_1l_mla_nogate() -> Trainer.Config:
     """One dense MLA layer with the Gated-MLA output gate DISABLED.
 
