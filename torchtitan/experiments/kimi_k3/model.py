@@ -48,7 +48,23 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
 from torchtitan.models.common.linear import Linear as _TTLinear
+import spmd_types as spmd
+from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.protocols.sharding import ShardingConfig
+
+
+def _tp_shard(dim: int) -> ShardingConfig:
+    """Weight sharded on ``dim`` of the tp axis; colwise is 0, rowwise is 1."""
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(dim))}
+    )
+
+
+def _tp_replicate() -> ShardingConfig:
+    """Weight replicated on the tp axis (the NoParallel case)."""
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.R)}
+    )
 
 
 class Linear(_TTLinear):
@@ -313,9 +329,18 @@ class KimiMLP(nn.Module):
         situ_linear_beta: float | None = 25.0,
     ) -> None:
         super().__init__()
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = Linear(
+            hidden_size, intermediate_size, bias=False,
+            sharding_config=_tp_shard(0),
+        )
+        self.up_proj = Linear(
+            hidden_size, intermediate_size, bias=False,
+            sharding_config=_tp_shard(0),
+        )
+        self.down_proj = Linear(
+            intermediate_size, hidden_size, bias=False,
+            sharding_config=_tp_shard(1),
+        )
         self.hidden_act = hidden_act
         self._situ_beta = situ_beta
         self._situ_linear_beta = situ_linear_beta
@@ -476,27 +501,32 @@ class KimiMLAAttention(nn.Module):
             # already uses for KV (kv_a_proj_with_mqa -> kv_a_layernorm ->
             # kv_b_proj), so the TP plan reuses that registration pattern.
             self.q_a_proj = Linear(
-                self.hidden_size, self.q_lora_rank, bias=False
+                self.hidden_size, self.q_lora_rank, bias=False,
+                sharding_config=_tp_replicate(),
             )
             self.q_a_layernorm = nn.RMSNorm(
                 self.q_lora_rank, eps=config.rms_norm_eps
             )
             self.q_b_proj = Linear(
-                self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+                self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False,
+                sharding_config=_tp_shard(0),
             )
         self.kv_a_proj_with_mqa = Linear(
             self.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
+            sharding_config=_tp_replicate(),
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
+            sharding_config=_tp_shard(0),
         )
         self.o_proj = Linear(
-            self.num_heads * self.v_head_dim, self.hidden_size, bias=False
+            self.num_heads * self.v_head_dim, self.hidden_size, bias=False,
+            sharding_config=_tp_shard(1),
         )
 
         # Gated MLA. K3 (tech report Eq. 7):
@@ -513,10 +543,12 @@ class KimiMLAAttention(nn.Module):
                     self.hidden_size,
                     self.num_heads * self.v_head_dim,
                     bias=False,
+                    sharding_config=_tp_shard(0),
                 )
             else:
                 self.attn_gate_proj = Linear(
-                    self.hidden_size, self.num_heads, bias=True
+                    self.hidden_size, self.num_heads, bias=True,
+                    sharding_config=_tp_shard(0),
                 )
 
         # SDPA-only sub-module so the TP plan can wrap it with
@@ -1573,7 +1605,8 @@ class KimiLinearModel(nn.Module):
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(
-            config.hidden_size, config.vocab_size, bias=False
+            config.hidden_size, config.vocab_size, bias=False,
+            sharding_config=_tp_shard(0),
         )
 
         if config.tie_word_embeddings:

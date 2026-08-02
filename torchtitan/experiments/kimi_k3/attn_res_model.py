@@ -134,7 +134,12 @@ class KimiAttnResDecoderLayer(nn.Module):
         # ``AttnResProjection`` is the shared Linear(d, 1, bias=False)
         # wrapper from attn_res/; its weight [1, d] is the pseudo-query
         # vector ``w_l``. Zero-init happens in ``init_weights`` below.
-        proj_cfg = AttnResProjection.Config(dim=d)
+        # NoParallel in the imperative plan -- the output dim is 1, so there
+        # is nothing to shard; declared here so the module carries its own
+        # placement like every other linear after the migration.
+        proj_cfg = AttnResProjection.Config(
+            dim=d, sharding_config=_tp_replicate()
+        )
         self.attn_res_proj = AttnResProjection(proj_cfg)
         self.mlp_res_proj = AttnResProjection(proj_cfg)
         self.attn_res_norm = nn.RMSNorm(d, eps=config.rms_norm_eps)
@@ -267,14 +272,17 @@ class KimiLinearAttnResModel(KimiLinearModel):
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(
-            config.hidden_size, config.vocab_size, bias=False
+            config.hidden_size, config.vocab_size, bias=False,
+            sharding_config=_tp_shard(0),
         )
 
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm
         # before lm_head). Same ``AttnResProjection`` shared with the
         # attn_res/ experiment.
         self.final_attn_res_proj = AttnResProjection(
-            AttnResProjection.Config(dim=config.hidden_size)
+            AttnResProjection.Config(
+                dim=config.hidden_size, sharding_config=_tp_replicate()
+            )
         )
         self.final_attn_res_norm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
