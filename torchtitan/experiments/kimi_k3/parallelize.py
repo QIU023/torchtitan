@@ -254,10 +254,25 @@ def parallelize_kimi_linear(
         # "batch" (= dp_replicate x dp_shard, EXCLUDES cp): grads only
         # reduce over cp through FSDP's mesh. Mirrors upstream llama3's
         # ["dp_replicate", "fsdp"] selection.
+        # veRL builds its own mesh and does not name one "fsdp" -- its axes
+        # are ['pp','batch','loss','dp_replicate','cp','tp','ep','efsdp',
+        # 'dp','dp_shard']. Fall back to composing the same product from the
+        # axes it does have, so the semantics ("fsdp" = dp_shard x cp) are
+        # preserved rather than silently narrowed to dp_shard.
+        def _fsdp_axis(extra: list[str] | None = None):
+            names = list(extra or [])
+            try:
+                return parallel_dims.get_mesh(names + ["fsdp"])
+            except ValueError:
+                axes = names + ["dp_shard"]
+                if parallel_dims.cp_enabled:
+                    axes.append("cp")
+                return parallel_dims.get_mesh(axes)
+
         if parallel_dims.dp_replicate_enabled:
-            dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
+            dp_mesh = _fsdp_axis(["dp_replicate"])
         else:
-            dp_mesh = parallel_dims.get_mesh("fsdp")
+            dp_mesh = _fsdp_axis()
         # Under EP, MoE expert parameters must shard via the *edp* mesh
         # (= dp_shard with the EP rank dim factored out) so FSDP's
         # mesh does not overlap EP's mesh on the same physical ranks.
