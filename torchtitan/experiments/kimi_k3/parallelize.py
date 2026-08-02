@@ -121,18 +121,6 @@ def parallelize_kimi_linear(
         # boundary types plain so PP send/recv, AttnRes block stacking,
         # and triton kernels never see a mixed-mesh tensor.
         tp_mesh = parallel_dims.get_mesh("tp")
-        # Declarative pass first: Module.parallelize() walks the tree and
-        # applies every sharding_config the modules now carry (model.py and
-        # attn_res_model.py), which is upstream's convention and what
-        # LoRAConverter derives adapter placements from. It is a no-op for any
-        # module that has not declared one.
-        #
-        # The imperative plan below still runs for what has NOT migrated -- the
-        # MoE internals, the KDA NoParallel descent, inner_attention, the
-        # layernorms and the LoRA adapters. apply_tp_kimi_linear skips a module
-        # whose parameters are already DTensors, so the two do not double-apply.
-        if _K3_DECLARATIVE_TP:
-            _apply_declarative_sharding(model, parallel_dims)
         apply_tp_kimi_linear(
             model, tp_mesh,
             skip_expert_params=(
@@ -430,54 +418,6 @@ def _patch_fla_for_dtensor() -> None:
     _make_patch(FusedRMSNormGated)
 
 
-# Switch for the declarative sharding pass. Kept as a module-level flag during
-# the migration so a regression can be bisected against the imperative path
-# without editing call sites; it goes away once every module has migrated.
-_K3_DECLARATIVE_TP = True
-
-
-def _apply_declarative_sharding(model: nn.Module, parallel_dims) -> None:
-    """Apply every declared ``sharding_config`` in the tree.
-
-    Upstream calls ``model.parallelize(parallel_dims)``, which recurses. K3's
-    top-level ``KimiLinearModel`` is a plain ``nn.Module`` rather than the
-    protocol ``Module``, so it has no such method -- making it one would pull in
-    Config/Configurable and reach past "standardize the notation". Walking the
-    tree and parallelizing each declaring leaf does the same work.
-
-    Leaves only. ``Module.parallelize`` recurses into children and guards on
-    ``_parallelized``, so parallelizing a container would consume its
-    descendants and then fail when they are reached directly.
-    """
-    from torchtitan.protocols.module import Module as _ProtoModule
-
-    # The _moe subtree is owned by moe.parallelize(), which walks its own
-    # children -- the imperative plan excludes it for the same reason. Its
-    # shared experts are KimiMLP, so they carry the dense-FFN declaration and
-    # would otherwise be parallelized twice.
-    owned_by_moe = set()
-    for mod in model.modules():
-        sub = getattr(getattr(mod, "ffn", None), "_moe", None)
-        if sub is not None:
-            owned_by_moe.update(id(c) for c in sub.modules())
-
-    n = 0
-    for m in model.modules():
-        if id(m) in owned_by_moe:
-            continue
-        if not isinstance(m, _ProtoModule):
-            continue
-        if getattr(m, "_sharding_config", None) is None:
-            continue
-        if getattr(m, "_parallelized", False):
-            continue
-        if any(isinstance(c, _ProtoModule) for c in m.children()):
-            continue
-        m.parallelize(parallel_dims)
-        n += 1
-    logger.info("Applied declarative sharding_config to %d modules.", n)
-
-
 def _model_has_moe(model: nn.Module) -> bool:
     """True if any layer carries a KimiMoE ffn (module-internal MoE
     parallelization applies)."""
@@ -701,12 +641,19 @@ def apply_tp_kimi_linear(
             # compression stays replicated (its output is q_lora_rank, not a
             # head-sharded axis) and only the expansion is Colwise.
             if getattr(layer.self_attn, "q_lora_rank", None) is None:
-                q_plan = {}  # q_proj: declarative sharding_config
+                q_plan = {
+                    "self_attn.q_proj": ColwiseParallel(
+                        use_local_output=False,
+                    ),
+                }
             else:
-                # q_a_proj / q_b_proj: declarative sharding_config.
-                # q_a_layernorm stays imperative -- nn.RMSNorm is not a
-                # protocol Module and cannot carry one.
-                q_plan = {"self_attn.q_a_layernorm": NoParallel()}
+                q_plan = {
+                    "self_attn.q_a_proj": NoParallel(),
+                    "self_attn.q_a_layernorm": NoParallel(),
+                    "self_attn.q_b_proj": ColwiseParallel(
+                        use_local_output=False,
+                    ),
+                }
             plan.update(
                 {
                     **q_plan,
@@ -716,9 +663,16 @@ def apply_tp_kimi_linear(
                     # subsequent kv_a_layernorm + cat with k_pass_expanded
                     # all run consistently in DTensor space (mirrors DSv3's
                     # ``wkv_a`` registration).
-                    # kv_a_proj_with_mqa / kv_b_proj: declarative.
+                    "self_attn.kv_a_proj_with_mqa": NoParallel(),
                     "self_attn.kv_a_layernorm": NoParallel(),
+                    "self_attn.kv_b_proj": ColwiseParallel(
+                        use_local_output=False,
+                    ),
                     "self_attn.inner_attention": inner_attn_plan,
+                    "self_attn.o_proj": RowwiseParallel(
+                        output_layouts=Replicate(),
+                        use_local_output=True,
+                    ),
                 }
             )
             # Gated MLA (k3faithful flavors): per-head gate projection,
@@ -731,7 +685,9 @@ def apply_tp_kimi_linear(
             # [num_heads * v_head_dim], so Colwise keeps the local gate width
             # matched to the local attention output in both cases.
             if getattr(layer.self_attn, "attn_gate_proj", None) is not None:
-                pass  # attn_gate_proj: declarative sharding_config
+                plan["self_attn.attn_gate_proj"] = ColwiseParallel(
+                    use_local_output=True,
+                )
 
 
         # FFN path.

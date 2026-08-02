@@ -144,3 +144,48 @@ same modules (before removing the plan entries) tp2 gave
 7.70006 / 7.04439 / 6.16003 -- i.e. double application changes the numerics, as
 expected, which is why the plan entries have to come out in the same step that
 the declarations go in.
+
+## Step 3: the declarative driver is reverted, and why that is the right answer
+
+The declarative vocabulary has no `use_local_output`. `Module.parallelize()`
+works entirely in DTensor space, and `ShardingConfig` carries
+`state_shardings` / `in_*` / `out_*` / `local_map` -- none of which can say "hand
+the next module a plain tensor". K3's boundary convention is exactly that, and it
+exists for three reasons that cannot be given up: PP P2P sends raw tensors,
+`block_attn_res` stacks plain and DTensor operands, and fla's triton kernels
+dispatch on data pointers. The `aten.mul.Tensor got mixed torch.Tensor and
+DTensor` failure in step 2 is that convention, not a loose end.
+
+So the plan's premise -- replace the imperative plan wholesale -- does not hold
+against this model. Three ways out were available: change the boundary convention
+(gives up the three things it exists for), add `use_local_output` to
+ShardingConfig (modifying core, out of scope), or keep the imperative plan as the
+parallelization mechanism while the declarations stand alongside it.
+
+The third is taken, and it turns out to cost nothing that mattered. What
+`LoRAConverter` needs is `sharding_config` PRESENT on the base linear -- it reads
+`config.sharding_config` to derive adapter placements. It does not need the
+declarations to be the thing that parallelizes the model. Step 1b already
+satisfies that, and the declarations are inert without a driver, so nothing about
+the current numerics changes.
+
+Driver reverted. tp2 back to 7.70006 / 7.04439 / 6.16003, bit-identical to the
+imperative baseline.
+
+## Revised plan
+
+The blocker recorded in LORA_CONVERTER_BLOCKER is cleared by step 1b alone. What
+remains is the LoRA work itself, not a whole-model migration:
+
+1. Adopt `LoRAConverter` for the K3 LoRA path, deriving adapter placements from
+   the declarations step 1b added.
+2. Require it to clear the recorded LoRA numbers: TP's o_proj.lora_b defect
+   (1.33869), PP at 0.105 and CP at 0.150 weighted, with FSDP and EP+FSDP staying
+   exact at 0.00000.
+3. Keep the packed-MXFP4 base and MXFP8 activation path, which upstream has no
+   equivalent for -- the conversion is adapters-to-upstream, quantized-base
+   stays.
+
+The full-model imperative-to-declarative migration is NOT part of this. It needs
+`use_local_output` in the declarative vocabulary, which is a core change and
+belongs upstream as its own proposal if it is wanted at all.
