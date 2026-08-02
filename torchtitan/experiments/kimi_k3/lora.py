@@ -412,7 +412,7 @@ class KimiLoRALinear(nn.Module):
         return out.redistribute(tp_mesh, [Replicate()]).to_local()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from torch.distributed.tensor import DTensor, Replicate
+        from torch.distributed.tensor import DTensor, Replicate, Shard
 
         x_is_dt = isinstance(x, DTensor)
         if self._quantize_base == "nf4":
@@ -465,6 +465,31 @@ class KimiLoRALinear(nn.Module):
                 la = DTensor.from_local(la, mesh, repl, run_check=False)
             if not isinstance(lb, DTensor):
                 lb = DTensor.from_local(lb, mesh, repl, run_check=False)
+        elif isinstance(la, DTensor) and any(
+            p.is_shard() for p in la.placements
+        ):
+            # x is plain but lora_a is sharded on the contracted axis -- the
+            # rowwise case, and o_proj is the only site where it happens (the
+            # MLA attention output is built in plain-tensor land). Unwrapping
+            # both adapters here would make the product each rank's PARTIAL
+            # contribution with no DTensor left to sum it: RowwiseParallel
+            # all-reduces the base only, so the adapter rides outside it and
+            # lora_b's gradient comes back short by ~sqrt(tp).
+            #
+            # Lift x into the adapters' mesh instead of dropping them out of
+            # it. Then DTensor owns the whole product and gets BOTH gradients
+            # right, which one reduction on their shared output cannot: lora_a
+            # is the local shard of a Shard(1) parameter and its gradient is
+            # already complete per rank, while lora_b is Replicate and its
+            # gradient is a sum across ranks.
+            mesh = la.device_mesh
+            shard_axis = next(
+                p.dim for p in la.placements if p.is_shard()
+            )
+            x = DTensor.from_local(
+                x, mesh, (Shard(x.dim() - 1),), run_check=False
+            )
+            del shard_axis
         else:
             if isinstance(la, DTensor):
                 la = la.to_local()
