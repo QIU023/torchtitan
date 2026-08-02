@@ -57,6 +57,8 @@ from torchtitan.experiments.kimi_k3.attn_res import (
     unstack_blocks,
 )
 from torchtitan.experiments.kimi_k3.model import (
+    _tp_replicate,
+    _tp_shard,
     KimiDecoderLayer,
     KimiLinearConfig,
     KimiLinearModel,

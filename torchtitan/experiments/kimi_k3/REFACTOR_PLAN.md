@@ -104,3 +104,43 @@ That first half is pure notation with no placement content, so it can be gated
 on a stricter condition than the rest of the refactor: the parallelism numbers
 must be BIT-IDENTICAL, not merely within tolerance. If converting a constructor
 moves any digit, the conversion is wrong.
+
+## Step 2 status: driver wired, boundary convention not yet expressed
+
+Done and working:
+
+- `_apply_declarative_sharding` walks the tree and parallelizes every leaf that
+  declares a `sharding_config`. Upstream calls `model.parallelize(parallel_dims)`
+  directly, but K3's top-level `KimiLinearModel` is a plain `nn.Module` rather
+  than the protocol `Module`; making it one pulls in Config/Configurable and
+  reaches past "standardize the notation", so the walk does the same work.
+- Leaves only, and the `_moe` subtree is excluded because `moe.parallelize()`
+  owns it -- its shared experts are `KimiMLP` and carry the dense-FFN
+  declaration, so they would be parallelized twice. Same exclusion the
+  imperative plan already makes.
+- 37 modules parallelized declaratively; the run completes.
+
+Blocking the rest:
+
+With the migrated entries removed from the imperative plan, tp2 fails with
+`aten.mul.Tensor got mixed torch.Tensor and DTensor`. That is the boundary
+convention, and it is the substance the mapping table warned about rather than a
+loose end: K3 keeps module boundaries as PLAIN tensors so PP P2P, AttnRes's
+`torch.stack` and fla's triton kernels never meet a DTensor. The imperative plan
+encodes that per module via `use_local_output=True` / `output_layouts=Replicate()`.
+A `sharding_config` with only `state_shardings` says how the WEIGHT is placed and
+says nothing about the output type, so the wrapped forward now returns DTensors
+into plain-tensor code.
+
+Expressing it declaratively means `out_src_shardings` / `out_dst_shardings` on
+each config, matching what each module's imperative entry specified -- and those
+differ within the attention block (q/kv expansions keep DTensor outputs, o_proj
+and attn_gate_proj go plain), so it is per-module transcription, not one global
+setting.
+
+Numbers at this checkpoint, for the record. With both mechanisms active on the
+same modules (before removing the plan entries) tp2 gave
+7.69966 / 6.98268 / 6.10026 against the imperative baseline
+7.70006 / 7.04439 / 6.16003 -- i.e. double application changes the numerics, as
+expected, which is why the plan entries have to come out in the same step that
+the declarations go in.
