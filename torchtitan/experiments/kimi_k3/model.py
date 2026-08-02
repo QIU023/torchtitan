@@ -48,6 +48,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
 from torchtitan.models.common.linear import Linear as _TTLinear
+from torchtitan.protocols.sharding import ShardingConfig
 
 
 class Linear(_TTLinear):
@@ -68,8 +69,18 @@ class Linear(_TTLinear):
         in_features: int,
         out_features: int,
         bias: bool = False,
+        *,
+        sharding_config: "ShardingConfig | None" = None,
     ) -> None:
         nn.Linear.__init__(self, in_features, out_features, bias=bias)
+        # Declarative sharding, the upstream convention. Module.Config.build()
+        # normally sets this attribute; this constructor bypasses Config, so it
+        # sets it directly. None leaves the module exactly as before, which is
+        # what lets the TP plan in parallelize.py keep driving the modules that
+        # have not been migrated yet -- the two forms coexist during the
+        # migration and the plan is removed per module as each one moves.
+        if sharding_config is not None:
+            self._sharding_config = sharding_config
 
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
