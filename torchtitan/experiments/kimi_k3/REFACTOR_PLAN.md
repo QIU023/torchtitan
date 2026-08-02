@@ -60,3 +60,47 @@ mistake that cost the most time in the TP investigation.
 Attention linears (q/kv/o) -> FFN linears -> AttnRes projections -> embedding and
 lm_head -> LoRA path last, since it consumes the sharding_config the earlier
 steps introduce.
+
+## Step 1 mapping: attention linears
+
+Derived from the imperative plan in parallelize.py (lines ~640-690). The
+declarative form must reproduce these exactly -- this table is the contract, and
+any step that changes a placement is a bug in the migration, not an improvement.
+
+| module | imperative today | declarative sharding_config (weight) |
+|---|---|---|
+| `q_proj` (no q_lora) | `ColwiseParallel(use_local_output=False)` | `tp=spmd.S(0)` |
+| `q_a_proj` | `NoParallel()` | `tp=spmd.R` |
+| `q_a_layernorm` | `NoParallel()` | `tp=spmd.R` |
+| `q_b_proj` | `ColwiseParallel(use_local_output=False)` | `tp=spmd.S(0)` |
+| `kv_a_proj_with_mqa` | `NoParallel()` | `tp=spmd.R` |
+| `kv_a_layernorm` | `NoParallel()` | `tp=spmd.R` |
+| `kv_b_proj` | `ColwiseParallel(use_local_output=False)` | `tp=spmd.S(0)` |
+| `o_proj` | `RowwiseParallel(output_layouts=Replicate(), use_local_output=True)` | `tp=spmd.S(1)` |
+| `attn_gate_proj` | `ColwiseParallel(use_local_output=True)` | `tp=spmd.S(0)` |
+
+Two details the table alone does not carry, both load-bearing:
+
+- `use_local_output` differs across these. q/kv expansions keep `False` so the
+  downstream split into `[kv_lora, qk_rope]`, the `kv_a_layernorm` and the `cat`
+  with `k_pass_expanded` all stay in DTensor space. `o_proj` and
+  `attn_gate_proj` use `True` because the model's boundary convention is plain
+  tensors (PP P2P, AttnRes stacking, fla kernels). The declarative form has to
+  preserve which is which, not just the placements.
+- `attn_gate_proj` shards on the head axis under BOTH parameterizations -- the
+  per-head variant is `[num_heads]` and K3's full-rank variant is
+  `[num_heads * v_head_dim]`. Colwise keeps the local gate matched to the local
+  attention output either way.
+
+## Step 1 prerequisite discovered
+
+K3's attention linears are built with POSITIONAL arguments
+(`self.q_a_proj = Linear(in, out, bias=False)` at model.py:467-507) against a
+local `Linear(_TTLinear)` subclass, not with `Linear.Config(...).build()`.
+`sharding_config` lives on the Config, so step 1 is really two changes: convert
+the construction to the Config form first, then attach the sharding.
+
+That first half is pure notation with no placement content, so it can be gated
+on a stricter condition than the rest of the refactor: the parallelism numbers
+must be BIT-IDENTICAL, not merely within tolerance. If converting a constructor
+moves any digit, the conversion is wrong.
