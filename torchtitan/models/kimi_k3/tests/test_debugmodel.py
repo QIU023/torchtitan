@@ -4,29 +4,27 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CI smoke for the kimi_linear_debugmodel flavor.
+"""CI smoke for the kimi_k3_debugmodel flavor.
 
 Config build + a forward/backward through the real module tree (KDA
 via fla -- triton on GPU boxes, CPU fallback otherwise -- MLA SDPA,
 8-expert MoE, Block AttnRes) in a few seconds. The GPU train smoke lives in the launcher docs:
-``--module kimi_k3 --config kimi_linear_debugmodel`` (10 steps).
+``--module kimi_k3 --config kimi_k3_debugmodel`` (10 steps).
 """
 
 import unittest
-
-from torchtitan.models.kimi_k3.tests.kda_shmem import (
-    skip_reason_if_insufficient,
-)
 
 import torch
 
 from torchtitan.models.kimi_k3 import config_registry
 
+from torchtitan.models.kimi_k3.tests.kda_shmem import skip_reason_if_insufficient
+
 
 class TestKimiDebugModel(unittest.TestCase):
     def test_trainer_config_builds(self):
-        cfg = config_registry.kimi_linear_debugmodel()
-        self.assertEqual(cfg.model_spec.flavor, "kimi_linear_debugmodel")
+        cfg = config_registry.kimi_k3_debugmodel()
+        self.assertEqual(cfg.model_spec.flavor, "kimi_k3_debugmodel")
         kimi = cfg.model_spec.model.kimi_config
         self.assertEqual(kimi.num_hidden_layers, 4)
         self.assertEqual(kimi.vocab_size, 2016)
@@ -42,7 +40,7 @@ class TestKimiDebugModel(unittest.TestCase):
         # CPU tensors), so run on GPU when present and only exercise the
         # CPU fallback on CUDA-less boxes.
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        cfg = config_registry.kimi_linear_debugmodel()
+        cfg = config_registry.kimi_k3_debugmodel()
         with torch.device(device):
             model = cfg.model_spec.model.build()
             model.init_weights()

@@ -16,11 +16,11 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import KimiLinearConfig, KimiMLAAttention
+from torchtitan.models.kimi_k3.model import KimiK3Config, KimiMLAAttention
 
 
 def _cfg(q_lora_rank):
-    return KimiLinearConfig(
+    return KimiK3Config(
         vocab_size=128,
         hidden_size=64,
         num_hidden_layers=2,

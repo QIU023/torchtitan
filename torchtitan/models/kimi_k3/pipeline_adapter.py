@@ -1262,7 +1262,7 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     return inner
 
 
-def _inject_kimi_linear_fqns(model: nn.Module, kwargs: dict) -> None:
+def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     """Populate ``parallelism.module_fqns_per_model_part`` so the PP
     split uses Kimi module names and the last stage includes the
     AttnRes final-aggregation modules.
@@ -1306,7 +1306,7 @@ def _inject_kimi_linear_fqns(model: nn.Module, kwargs: dict) -> None:
     parallelism.module_fqns_per_model_part = fqns
 
 
-def pipeline_kimi_linear_with_cache_adapter(model: nn.Module, **kwargs):
+def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
     """``pipelining_fn`` for Kimi Linear (baseline + AttnRes variants).
 
     Behavior:
@@ -1325,7 +1325,7 @@ def pipeline_kimi_linear_with_cache_adapter(model: nn.Module, **kwargs):
     from torchtitan.distributed.pipeline_parallel import pipeline_llm
 
     model = _unwrap_multimodal_for_pp(model, kwargs)
-    _inject_kimi_linear_fqns(model, kwargs)
+    _inject_kimi_k3_fqns(model, kwargs)
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
     )

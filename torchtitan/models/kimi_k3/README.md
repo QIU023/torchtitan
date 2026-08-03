@@ -19,11 +19,11 @@ placeholder interfaces).
 
 | File | Role |
 | --- | --- |
-| [`model.py`](./model.py) | K3 backbone: `KimiDeltaAttention` (KDA via `fla-core`), `KimiMLAAttention`, `KimiMoE`, `KimiDecoderLayer`, `KimiLinearModel` |
-| [`attn_res_model.py`](./attn_res_model.py) | `KimiLinearAttnResModel`: AttnRes weave over the backbone (per-block-start RMSNorm + zero-init pseudo-queries) |
+| [`model.py`](./model.py) | K3 backbone: `KimiDeltaAttention` (KDA via `fla-core`), `KimiMLAAttention`, `KimiMoE`, `KimiDecoderLayer`, `KimiK3Model` |
+| [`attn_res_model.py`](./attn_res_model.py) | `KimiK3AttnResModel`: AttnRes weave over the backbone (per-block-start RMSNorm + zero-init pseudo-queries) |
 | [`attn_res.py`](./attn_res.py) | `block_attn_res()` primitive, `AttnResConfig`, `AttnResProjection`, `stack_blocks` / `unstack_blocks` |
-| [`multimodal_model.py`](./multimodal_model.py) | `KimiLinearMultimodalModel` + `KimiVisionProjector` (SigLIP-splice scaffold for the vision-native path) |
-| [`parallelize.py`](./parallelize.py) | `parallelize_kimi_linear`: FSDP2/HSDP + TP + EP (CP blocked on fla-core `chunk_kda`) |
+| [`multimodal_model.py`](./multimodal_model.py) | `KimiK3LlavaMultimodalModel` + `KimiVisionProjector` (SigLIP-splice scaffold for the vision-native path) |
+| [`parallelize.py`](./parallelize.py) | `parallelize_kimi_k3`: FSDP2/HSDP + TP + EP (CP blocked on fla-core `chunk_kda`) |
 | [`pipeline_adapter.py`](./pipeline_adapter.py) | Cross-stage caching adapter + `pipelining_fn` (Interleaved1F1B), private to this experiment. Opt-in via `TORCHTITAN_ATTNRES_CACHE=1`. |
 | [`layout.py`](./layout.py) | Static block-delta layout tables consumed by the PP adapter |
 | [`model_configs.py`](./model_configs.py) | Architecture-side builders: AttnRes tech-report Table 2 scaling-law table (194m..528m), the SGLang-aligned 447m carrier, the 48B-A3B layout, `build_kimi_linear_config` |

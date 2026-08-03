@@ -27,14 +27,14 @@ from torchtitan.tools.logging import logger
 try:
     from torchtitan.models.kimi_k3.attn_res_model import (
         KimiAttnResDecoderLayer,
-        KimiLinearAttnResModel,
+        KimiK3AttnResModel,
     )
     from torchtitan.models.kimi_k3.model import (
         KimiDecoderLayer,
         KimiDeltaAttention,
-        KimiLinearConfig,
-        KimiLinearModel,
-        KimiLinearSpec,
+        KimiK3Config,
+        KimiK3Model,
+        KimiK3Spec,
         KimiMLAAttention,
         KimiMLP,
         KimiMoE,
@@ -46,13 +46,13 @@ try:
         SCALING_LAW_TABLE,
     )
     from torchtitan.models.kimi_k3.multimodal_model import (
-        KimiLinearMultimodalModel,
+        KimiK3LlavaMultimodalModel,
         KimiMultimodalConfig,
         KimiVisionProjector,
     )
-    from torchtitan.models.kimi_k3.parallelize import parallelize_kimi_linear
+    from torchtitan.models.kimi_k3.parallelize import parallelize_kimi_k3
     from torchtitan.models.kimi_k3.pipeline_adapter import (
-        pipeline_kimi_linear_with_cache_adapter,
+        pipeline_kimi_k3_with_cache_adapter,
     )
 
     _KIMI_IMPORT_ERROR: ImportError | None = None
@@ -63,11 +63,11 @@ __all__ = [
     "KimiAttnResDecoderLayer",
     "KimiDecoderLayer",
     "KimiDeltaAttention",
-    "KimiLinearAttnResModel",
-    "KimiLinearConfig",
-    "KimiLinearModel",
-    "KimiLinearMultimodalModel",
-    "KimiLinearSpec",
+    "KimiK3AttnResModel",
+    "KimiK3Config",
+    "KimiK3Model",
+    "KimiK3LlavaMultimodalModel",
+    "KimiK3Spec",
     "KimiMLAAttention",
     "KimiMLP",
     "KimiMoE",
@@ -81,13 +81,22 @@ __all__ = [
 
 
 def _parse_flavor(flavor: str) -> tuple[str, str]:
-    """Parse ``kimi_linear_<size>_<variant>`` -> (size, variant)."""
-    if not flavor.startswith("kimi_linear_"):
+    """Parse ``kimi_k3_<size>_<variant>`` -> (size, variant).
+
+    Both prefixes are accepted. ``kimi_k3_`` is this model's own naming;
+    ``kimi_linear_`` is kept for the sizes that ARE Kimi Linear -- the paper's
+    Table 2 scaling-law rows (194m..528m) and the released 48B -- where
+    renaming would misattribute a real published model.
+    """
+    for prefix in ("kimi_k3_", "kimi_linear_"):
+        if flavor.startswith(prefix):
+            rest = flavor[len(prefix) :]
+            break
+    else:
         raise ValueError(
             f"Unknown flavor '{flavor}'. Kimi K3 flavors follow "
-            "'kimi_linear_<size>_<variant>'; see flavor_names()."
+            "'kimi_k3_<size>_<variant>'; see flavor_names()."
         )
-    rest = flavor[len("kimi_linear_"):]
     for variant in ("baseline", "block_attn_res", "full_attn_res"):
         suffix = f"_{variant}"
         if rest.endswith(suffix):
@@ -128,21 +137,20 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
     size, variant = _parse_flavor(base_flavor)
     kimi_config = build_kimi_linear_config(size)
     num_blocks = resolve_num_blocks(size, variant)
-    spec_config = KimiLinearSpec(
+    spec_config = KimiK3Spec(
         kimi_config=kimi_config,
         num_blocks=num_blocks,
         attn_res_gated=gated,
         lora_rank=lora_rank,
     )
-    from torchtitan.models.kimi_k3.state_dict_adapter import (
-        KimiLinearStateDictAdapter,
-    )
+    from torchtitan.models.kimi_k3.state_dict_adapter import KimiLinearStateDictAdapter
+
     return ModelSpec(
         name="kimi_linear",
         flavor=flavor,
         model=spec_config,
-        parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )

@@ -31,17 +31,17 @@ import torch
 
 from torchtitan.models.kimi_k3.model import (
     KimiDeltaAttention,
-    KimiLinearConfig,
+    KimiK3Config,
     KimiMLAAttention,
     KimiMLP,
 )
 
 
-def _tiny_config(num_hidden_layers: int = 2) -> KimiLinearConfig:
+def _tiny_config(num_hidden_layers: int = 2) -> KimiK3Config:
     """Small config that fits on CPU. KDA + MLA alternation: layer 0
     KDA (1-indexed: 1), layer 1 MLA (1-indexed: 2).
     """
-    return KimiLinearConfig(
+    return KimiK3Config(
         vocab_size=256,
         hidden_size=128,
         num_hidden_layers=num_hidden_layers,
@@ -105,8 +105,7 @@ class TestKimiMLAAttention(unittest.TestCase):
         self.assertIsNotNone(x.grad)
         # Any param should have grad populated
         any_param_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0
-            for p in mla.parameters()
+            p.grad is not None and p.grad.abs().sum() > 0 for p in mla.parameters()
         )
         self.assertTrue(any_param_grad)
 

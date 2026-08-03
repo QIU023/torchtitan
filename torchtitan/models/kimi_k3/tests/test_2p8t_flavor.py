@@ -21,17 +21,15 @@ from torchtitan.models.kimi_k3 import config_registry, model_registry
 class TestKimi2p8tFlavor(unittest.TestCase):
     def test_generator_emits_k3_scale_moe(self):
         kc = config_registry.build_kimi_linear_config("2p8t")
-        self.assertEqual(kc.num_experts, 896)          # K3 blog
+        self.assertEqual(kc.num_experts, 896)  # K3 blog
         self.assertEqual(kc.num_experts_per_token, 16)  # K3 blog
 
     def test_meta_build(self):
-        spec = model_registry("kimi_linear_2p8t_block_attn_res")
+        spec = model_registry("kimi_k3_2p8t_block_attn_res_provisional")
         with torch.device("meta"):
             model = spec.model.build()
         moe_layers = [
-            layer
-            for layer in model.layers.values()
-            if getattr(layer, "is_moe", False)
+            layer for layer in model.layers.values() if getattr(layer, "is_moe", False)
         ]
         self.assertGreater(len(moe_layers), 0)
         # rough total > 1T (provisional; exact reconciles at 7.27)

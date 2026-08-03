@@ -6,7 +6,7 @@
 
 """AttnRes-woven Kimi Linear model.
 
-``KimiLinearAttnResModel`` subclasses :class:`KimiLinearModel` and threads
+``KimiK3AttnResModel`` subclasses :class:`KimiK3Model` and threads
 Block Attention Residuals through the decoder layer stack, reusing the
 paper's Figure 2 aggregation primitive
 :func:`torchtitan.models.kimi_k3.attn_res.block_attn_res`
@@ -60,8 +60,8 @@ from torchtitan.models.kimi_k3.model import (
     _tp_replicate,
     _tp_shard,
     KimiDecoderLayer,
-    KimiLinearConfig,
-    KimiLinearModel,
+    KimiK3Config,
+    KimiK3Model,
     Linear,
 )
 
@@ -80,8 +80,6 @@ def _scalar_local(a: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     return a.to(like.dtype) if a.dtype != like.dtype else a
 
 
-
-
 def _plain_stream(
     blocks: list[torch.Tensor], partial_block: torch.Tensor
 ) -> torch.Tensor:
@@ -95,6 +93,7 @@ def _plain_stream(
 
 
 # ----- Per-layer AttnRes wrapper ------------------------------------------ #
+
 
 class KimiAttnResDecoderLayer(nn.Module):
     """Kimi decoder layer with AttnRes woven around attn and FFN.
@@ -117,7 +116,10 @@ class KimiAttnResDecoderLayer(nn.Module):
     """
 
     def __init__(
-        self, config: KimiLinearConfig, layer_idx: int, gated: bool = False,
+        self,
+        config: KimiK3Config,
+        layer_idx: int,
+        gated: bool = False,
     ) -> None:
         super().__init__()
         # Reuse the base KimiDecoderLayer entirely — we just delegate
@@ -139,9 +141,7 @@ class KimiAttnResDecoderLayer(nn.Module):
         # NoParallel in the imperative plan -- the output dim is 1, so there
         # is nothing to shard; declared here so the module carries its own
         # placement like every other linear after the migration.
-        proj_cfg = AttnResProjection.Config(
-            dim=d, sharding_config=_tp_replicate()
-        )
+        proj_cfg = AttnResProjection.Config(dim=d, sharding_config=_tp_replicate())
         self.attn_res_proj = AttnResProjection(proj_cfg)
         self.mlp_res_proj = AttnResProjection(proj_cfg)
         self.attn_res_norm = nn.RMSNorm(d, eps=config.rms_norm_eps)
@@ -174,7 +174,9 @@ class KimiAttnResDecoderLayer(nn.Module):
             # the plain backbone) so alpha=0 is bit-identical to it;
             # reconstructing sum(blocks)+partial would reorder additions.
             assert plain_stream is not None
-            h = plain_stream + _scalar_local(self.attn_res_alpha, plain_stream) * (h - plain_stream)
+            h = plain_stream + _scalar_local(self.attn_res_alpha, plain_stream) * (
+                h - plain_stream
+            )
 
         # Block boundary: commit partial into blocks, start fresh accumulator.
         if is_block_start:
@@ -188,11 +190,11 @@ class KimiAttnResDecoderLayer(nn.Module):
             plain_stream = plain_stream + attn_out
 
         # Pre-FFN aggregation (paper Figure 2, pre-FFN step).
-        h = block_attn_res(
-            blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm
-        )
+        h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm)
         if self.attn_res_gated:
-            h = plain_stream + _scalar_local(self.mlp_res_alpha, plain_stream) * (h - plain_stream)
+            h = plain_stream + _scalar_local(self.mlp_res_alpha, plain_stream) * (
+                h - plain_stream
+            )
 
         # FFN sub-layer (MoE or dense SwiGLU).
         ffn_out = self.ffn(self.post_attention_layernorm(h))
@@ -204,10 +206,11 @@ class KimiAttnResDecoderLayer(nn.Module):
 
 # ----- Top-level AttnRes-woven model -------------------------------------- #
 
-class KimiLinearAttnResModel(KimiLinearModel):
+
+class KimiK3AttnResModel(KimiK3Model):
     """Kimi Linear with Block Attention Residuals threaded through layers.
 
-    Backbone identical to :class:`KimiLinearModel` (KDA/MLA alternation,
+    Backbone identical to :class:`KimiK3Model` (KDA/MLA alternation,
     MoE/MLP FFN per layer). AttnRes weaving adds:
 
       * per-layer :class:`KimiAttnResDecoderLayer` in place of
@@ -236,10 +239,13 @@ class KimiLinearAttnResModel(KimiLinearModel):
     """
 
     def __init__(
-        self, config: KimiLinearConfig, *, num_blocks: int,
+        self,
+        config: KimiK3Config,
+        *,
+        num_blocks: int,
         gated: bool = False,
     ) -> None:
-        # Skip KimiLinearModel.__init__'s layer build (it builds
+        # Skip KimiK3Model.__init__'s layer build (it builds
         # KimiDecoderLayer); we need KimiAttnResDecoderLayer instead.
         # Call nn.Module's init, then build what we need ourselves.
         nn.Module.__init__(self)
@@ -247,9 +253,9 @@ class KimiLinearAttnResModel(KimiLinearModel):
 
         n_layers = config.num_hidden_layers
         assert n_layers > 0
-        assert 1 <= num_blocks <= n_layers, (
-            f"num_blocks={num_blocks} out of range [1, {n_layers}]"
-        )
+        assert (
+            1 <= num_blocks <= n_layers
+        ), f"num_blocks={num_blocks} out of range [1, {n_layers}]"
         # K3 partitions by BLOCK SIZE, not by an equal split: the official
         # config ships attn_res_block_size=12 over 93 layers, i.e. 7 full
         # blocks plus a 9-layer partial tail (report sec 2.2: "we partition
@@ -264,7 +270,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         # ModuleDict for pipeline_module_split compatibility — see
-        # KimiLinearModel.__init__ for the same pattern.
+        # KimiK3Model.__init__ for the same pattern.
         self.attn_res_gated = gated
         self.layers = nn.ModuleDict(
             {
@@ -274,7 +280,9 @@ class KimiLinearAttnResModel(KimiLinearModel):
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(
-            config.hidden_size, config.vocab_size, bias=False,
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
             sharding_config=_tp_shard(0),
         )
 
@@ -372,7 +380,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
                         if image_token_id is not None
                         else self._DEFAULT_IMAGE_TOKEN_ID
                     )
-                    image_mask = (tokens == sentinel)
+                    image_mask = tokens == sentinel
                 # Variable image count per row support (B1): the original
                 # ``vision_embeds.reshape(-1, D)`` assumes every row has
                 # exactly ``vision_embeds.size(1)`` image tokens — which
@@ -422,14 +430,10 @@ class KimiLinearAttnResModel(KimiLinearModel):
                     pos_rank = (
                         image_mask.long().cumsum(dim=1) - 1
                     )  # 0-based rank of each True within its row
-                    scatter_mask = image_mask & (
-                        pos_rank < n_keep_per_row.unsqueeze(1)
-                    )
+                    scatter_mask = image_mask & (pos_rank < n_keep_per_row.unsqueeze(1))
                 else:
                     scatter_mask = image_mask
-                h = h.masked_scatter(
-                    scatter_mask.unsqueeze(-1).expand_as(h), source
-                )
+                h = h.masked_scatter(scatter_mask.unsqueeze(-1).expand_as(h), source)
         else:
             h = tokens
 
@@ -448,13 +452,11 @@ class KimiLinearAttnResModel(KimiLinearModel):
         # the embedding; PP mid-stage: reconstruct once at entry (the
         # only reorder point -- single-stage runs stay bit-exact).
         plain_stream = (
-            _plain_stream(block_list, partial_block)
-            if self.attn_res_gated
-            else None
+            _plain_stream(block_list, partial_block) if self.attn_res_gated else None
         )
         for layer_key, layer in self.layers.items():
             layer_idx = int(layer_key)
-            is_block_start = (layer_idx % self.layers_per_block == 0)
+            is_block_start = layer_idx % self.layers_per_block == 0
             block_list, partial_block, plain_stream = layer(
                 block_list, partial_block, is_block_start, plain_stream
             )
@@ -482,9 +484,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
                 # and a zero-first-dim new_zeros is not guaranteed to satisfy
                 # that. VP4 is what surfaced it -- VP1 never sends an empty
                 # stack because every rank's single stage spans a boundary.
-                empty = partial_block.new_zeros(
-                    (0, *partial_block.shape)
-                ).contiguous()
+                empty = partial_block.new_zeros((0, *partial_block.shape)).contiguous()
                 return partial_block, empty
             return partial_block, stack_blocks(block_list)
 
@@ -504,7 +504,9 @@ class KimiLinearAttnResModel(KimiLinearModel):
         return self.lm_head(h_final)
 
     def init_weights(
-        self, init_range: float | None = None, **kwargs,
+        self,
+        init_range: float | None = None,
+        **kwargs,
     ) -> None:
         """Normal init + mandatory zero-init of every pseudo-query.
 
@@ -513,7 +515,7 @@ class KimiLinearAttnResModel(KimiLinearModel):
         training volatility).
 
         ``**kwargs`` forwards trainer-supplied args (e.g. ``buffer_device``)
-        to :meth:`KimiLinearModel.init_weights`.
+        to :meth:`KimiK3Model.init_weights`.
         """
         super().init_weights(init_range, **kwargs)
         # Zero-init every AttnRes pseudo-query (paper requirement).

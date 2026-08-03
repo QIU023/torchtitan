@@ -44,12 +44,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 
-from torchtitan.models.kimi_k3.attn_res_model import KimiLinearAttnResModel
-from torchtitan.models.kimi_k3.model import (
-    KimiLinearConfig,
-    KimiLinearModel,
-    KimiLinearSpec,
-)
+from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
+from torchtitan.models.kimi_k3.model import KimiK3Config, KimiK3Model, KimiK3Spec
 from torchtitan.models.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
 
 
@@ -60,7 +56,7 @@ class KimiMultimodalConfig:
     Attributes:
         kimi_config: The underlying Kimi Linear model's config.
         num_blocks: Optional AttnRes block count (None = plain
-            KimiLinearModel backbone; int N = KimiLinearAttnResModel).
+            KimiK3Model backbone; int N = KimiK3AttnResModel).
         vision_hidden_size: Output dim of the vision tower
             (e.g. CLIP-ViT-L/14 = 1024, SigLIP-400M = 1152).
         projector_hidden_size: Intermediate dim of the 2-layer
@@ -72,7 +68,7 @@ class KimiMultimodalConfig:
             vision-insertion positions.
     """
 
-    kimi_config: KimiLinearConfig
+    kimi_config: KimiK3Config
     num_blocks: int | None = None
     vision_hidden_size: int = 1024
     projector_hidden_size: int = 4096
@@ -105,7 +101,7 @@ class KimiVisionProjector(nn.Module):
         return self.fc2(F.gelu(self.fc1(vision_features)))
 
 
-class KimiLinearMultimodalModel(nn.Module):
+class KimiK3LlavaMultimodalModel(nn.Module):
     """Multimodal wrapper around Kimi Linear (LLaVA-style).
 
     Layout (top-level parameters):
@@ -115,7 +111,7 @@ class KimiLinearMultimodalModel(nn.Module):
         None-able; when None this class degenerates to a text-only
         path (useful for tests / ablations).
       - ``projector``: :class:`KimiVisionProjector` — trained.
-      - ``llm``: :class:`KimiLinearModel` OR :class:`KimiLinearAttnResModel`.
+      - ``llm``: :class:`KimiK3Model` OR :class:`KimiK3AttnResModel`.
 
     Forward accepts:
       - ``input_ids``: ``[B, T]`` token sequence where positions
@@ -150,9 +146,9 @@ class KimiLinearMultimodalModel(nn.Module):
         )
 
         if config.num_blocks is None:
-            self.llm = KimiLinearModel(config.kimi_config)
+            self.llm = KimiK3Model(config.kimi_config)
         else:
-            self.llm = KimiLinearAttnResModel(
+            self.llm = KimiK3AttnResModel(
                 config.kimi_config, num_blocks=config.num_blocks
             )
 
@@ -345,7 +341,7 @@ class KimiK3MultimodalConfig:
       they arrive as a list rather than a padded ``[B, num_images, N, D]``.
     """
 
-    kimi_config: KimiLinearConfig
+    kimi_config: KimiK3Config
     vision_config: "MoonViTConfig"
     num_blocks: int | None = None
     vision_token_id: int = -200
@@ -391,9 +387,9 @@ class KimiK3MultimodalModel(nn.Module):
         self.config = config
         self.vision_tower = MoonViT(config.vision_config)
         if config.num_blocks is None:
-            self.language_model = KimiLinearModel(config.kimi_config)
+            self.language_model = KimiK3Model(config.kimi_config)
         else:
-            self.language_model = KimiLinearAttnResModel(
+            self.language_model = KimiK3AttnResModel(
                 config.kimi_config, num_blocks=config.num_blocks
             )
         if config.vision_config.text_hidden_size != config.kimi_config.hidden_size:
@@ -576,7 +572,7 @@ class KimiK3MultimodalModel(nn.Module):
     ) -> torch.Tensor:
         """``[B, T]`` ids (+ packed patches) -> logits.
 
-        ``**kwargs`` is ignored, mirroring KimiLinearModel: torchtitan's Trainer
+        ``**kwargs`` is ignored, mirroring KimiK3Model: torchtitan's Trainer
         and Validator inject ``attention_masks=None`` and ``positions=...`` for
         the FlexAttention / CP paths, and K3 uses plain SDPA plus KDA Triton
         kernels which take neither.
@@ -637,7 +633,7 @@ class KimiK3MultimodalModel(nn.Module):
             )
         # The backbone's forward embeds int ids; we already embedded, so detach
         # embed_tokens to take its pre-embedded branch. Same mechanism as
-        # KimiLinearMultimodalModel._llm_forward_from_embeds.
+        # KimiK3LlavaMultimodalModel._llm_forward_from_embeds.
         saved = self.language_model.embed_tokens
         try:
             self.language_model.embed_tokens = None
@@ -673,7 +669,7 @@ KimiK3MultimodalModel.layers = property(_mm_layers)
 def _mm_verify_module_protocol(self) -> None:
     """No-op, delegating to the text model's reasoning.
 
-    KimiLinearModel overrides this as a no-op because its internals are plain
+    KimiK3Model overrides this as a no-op because its internals are plain
     nn.Modules rather than Config-built ``Module`` instances -- it ports the HF
     reference layer by layer. The multimodal wrapper adds a MoonViT tower built
     the same way, so the same holds. The trainer calls this post-build; without
@@ -684,15 +680,15 @@ def _mm_verify_module_protocol(self) -> None:
 
 KimiK3MultimodalModel.verify_module_protocol = _mm_verify_module_protocol
 for _name in ("get_attention_masks", "init_weights"):
-    if not hasattr(KimiK3MultimodalModel, _name) and hasattr(KimiLinearModel, _name):
-        setattr(KimiK3MultimodalModel, _name, getattr(KimiLinearModel, _name))
+    if not hasattr(KimiK3MultimodalModel, _name) and hasattr(KimiK3Model, _name):
+        setattr(KimiK3MultimodalModel, _name, getattr(KimiK3Model, _name))
 
 
 @dataclass(kw_only=True, slots=True)
-class KimiK3MultimodalSpec(KimiLinearSpec):
+class KimiK3MultimodalSpec(KimiK3Spec):
     """``BaseModel.Config``-compatible spec for the multimodal model.
 
-    KimiLinearSpec exists because torchtitan's trainer calls
+    KimiK3Spec exists because torchtitan's trainer calls
     ``update_from_config`` and the property accessors on whatever sits at
     ``model_spec.model``; a bare dataclass config fails there. This subclasses it
     so the multimodal flavor gets the same integration surface, and overrides

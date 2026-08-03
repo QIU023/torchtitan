@@ -56,11 +56,11 @@ class TestMXFP4QAT(unittest.TestCase):
 
     def test_apply_wraps_model_targets(self):
         from torchtitan.models.kimi_k3 import config_registry
-        from torchtitan.models.kimi_k3.model import KimiLinearSpec
+        from torchtitan.models.kimi_k3.model import KimiK3Spec
         from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
 
-        kc = config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
-        spec = KimiLinearSpec(kimi_config=kc, num_blocks=None)
+        kc = config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config
+        spec = KimiK3Spec(kimi_config=kc, num_blocks=None)
         with torch.device("cuda"):
             m = spec.build()
             m.init_weights()

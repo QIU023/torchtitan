@@ -20,8 +20,8 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.model import (
+    KimiK3Config,
     KimiLatentMoEProjection,
-    KimiLinearConfig,
     KimiMoE,
 )
 
@@ -71,7 +71,7 @@ class TestLatentProjection(unittest.TestCase):
 
 class TestLatentMoEWiring(unittest.TestCase):
     def _cfg(self, latent):
-        return KimiLinearConfig(
+        return KimiK3Config(
             vocab_size=128,
             hidden_size=64,
             num_hidden_layers=2,

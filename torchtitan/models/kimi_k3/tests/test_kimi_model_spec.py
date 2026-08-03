@@ -7,7 +7,7 @@
 """Smoke tests for ModelSpec integration.
 
 Covers:
-* ``KimiLinearSpec.build()`` dispatches to baseline vs AttnRes variant.
+* ``KimiK3Spec.build()`` dispatches to baseline vs AttnRes variant.
 * ``model_registry(flavor)`` returns a valid :class:`ModelSpec` for each
   of the 15 scaling-law flavors.
 * ``Trainer.Config`` factory resolves for at least one flavor.
@@ -21,38 +21,38 @@ import torch
 
 from torchtitan.models.kimi_k3 import (
     flavor_names,
-    KimiLinearAttnResModel,
-    KimiLinearConfig,
-    KimiLinearModel,
-    KimiLinearSpec,
+    KimiK3AttnResModel,
+    KimiK3Config,
+    KimiK3Model,
+    KimiK3Spec,
     model_registry,
 )
 from torchtitan.models.kimi_k3.config_registry import (
+    build_kimi_linear_config,
     kimi_linear_194m_baseline,
     kimi_linear_528m_block_attn_res,
-    build_kimi_linear_config,
     SCALING_LAW_TABLE,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 
 
-class TestKimiLinearSpec(unittest.TestCase):
+class TestKimiK3Spec(unittest.TestCase):
     def test_baseline_build(self):
         kcfg = build_kimi_linear_config("194m")
-        spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=None)
+        spec = KimiK3Spec(kimi_config=kcfg, num_blocks=None)
         model = spec.build()
-        self.assertIsInstance(model, KimiLinearModel)
+        self.assertIsInstance(model, KimiK3Model)
 
     def test_attn_res_build(self):
         kcfg = build_kimi_linear_config("194m")
-        spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=12)
+        spec = KimiK3Spec(kimi_config=kcfg, num_blocks=12)
         model = spec.build()
-        self.assertIsInstance(model, KimiLinearAttnResModel)
+        self.assertIsInstance(model, KimiK3AttnResModel)
         self.assertEqual(model.num_blocks, 12)
 
     def test_nparams_and_flops(self):
         kcfg = build_kimi_linear_config("194m")
-        spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=None)
+        spec = KimiK3Spec(kimi_config=kcfg, num_blocks=None)
         model = spec.build()
         n_params, flops = spec.get_nparams_and_flops(model, seq_len=8192)
         self.assertGreater(n_params, 100_000_000)  # ~580M total MoE params

@@ -117,13 +117,13 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
             last_save_model_only=False,
         ),
         # AC off by default: the debug/scaling flavors fit without it.
-        # (AC itself is supported -- see parallelize_kimi_linear.)
+        # (AC itself is supported -- see parallelize_kimi_k3.)
         activation_checkpoint=None,
         validator=Validator.Config(freq=500, steps=50),
         # Kimi CP reassembles contiguous rank-ordered seq shards inside
         # KDA/MLA (see model.py); the headtail load balancer permutes the
         # sequence and silently breaks causal order, so it must stay off.
-        # parallelize_kimi_linear raises if this is set back to a balancer.
+        # parallelize_kimi_k3 raises if this is set back to a balancer.
         parallelism=ParallelismConfig(context_parallel_load_balancer=None),
     )
 
@@ -212,21 +212,21 @@ def kimi_linear_436m_block_attn_res_n4() -> Trainer.Config:
     paper's canonical N=8.
     """
     from torchtitan.models.kimi_k3 import (
-        KimiLinearSpec,
-        parallelize_kimi_linear,
-        pipeline_kimi_linear_with_cache_adapter,
+        KimiK3Spec,
+        parallelize_kimi_k3,
+        pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.protocols.model_spec import ModelSpec
 
     cfg = _base_trainer_config("436m")
     kimi_config = build_kimi_linear_config("436m")
-    spec_config = KimiLinearSpec(kimi_config=kimi_config, num_blocks=4)
+    spec_config = KimiK3Spec(kimi_config=kimi_config, num_blocks=4)
     cfg.model_spec = ModelSpec(
         name="kimi_linear",
         flavor="kimi_linear_436m_block_attn_res_n4",
         model=spec_config,
-        parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )
@@ -261,21 +261,21 @@ def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
     the same parallelize_fn / pipelining_fn / loss_fn as 436M.
     """
     from torchtitan.models.kimi_k3 import (
-        KimiLinearSpec,
-        parallelize_kimi_linear,
-        pipeline_kimi_linear_with_cache_adapter,
+        KimiK3Spec,
+        parallelize_kimi_k3,
+        pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.protocols.model_spec import ModelSpec
 
     cfg = _base_trainer_config("447m_aligned")
     kimi_config = build_kimi_linear_config("447m_aligned")
-    spec_config = KimiLinearSpec(kimi_config=kimi_config, num_blocks=4)
+    spec_config = KimiK3Spec(kimi_config=kimi_config, num_blocks=4)
     cfg.model_spec = ModelSpec(
         name="kimi_linear",
         flavor="kimi_linear_447m_aligned_block_attn_res_n4",
         model=spec_config,
-        parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )
@@ -288,7 +288,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     Wraps :func:`kimi_linear_447m_aligned_block_attn_res_n4` and adds a
     Float8LinearConverter with the ``rowwise`` recipe. Excluded from the
     swap: every Linear inside a KDA layer (structurally, via
-    KimiLinearFloat8Spec -- KDA and MLA share the ``self_attn`` name so
+    KimiK3Float8Spec -- KDA and MLA share the ``self_attn`` name so
     no FQN substring can single out KDA), the MLA low-rank down-proj
     (``kv_a_proj_with_mqa``), the AttnRes projections, and the
     vocab/router heads -- those layers have either non-16-aligned
@@ -297,19 +297,19 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     MoE experts (grouped_mm) stay bf16 — Float8GroupedMMConverter is a
     perf-prototype upstream and not in the dispatch path here.
 
-    The Kimi Linear model is built as plain modules (KimiLinearSpec),
+    The Kimi Linear model is built as plain modules (KimiK3Spec),
     not from a ``Linear.Config`` tree, so ``Float8LinearConverter``'s
     config-traversal ``convert`` cannot apply. The converter is still
     built here for its torchao/SM89 validation and recipe resolution;
     the actual swap is module-level inside
-    :class:`KimiLinearFloat8Spec.build` with the same filter semantics.
+    :class:`KimiK3Float8Spec.build` with the same filter semantics.
 
     Expected speedup on RTX 5090 (SM 12.0): 1.3-1.5× over bf16 for the
     dense MLA / projector / output paths; smaller win at the model level
     because KDA Triton + MoE grouped_mm dominate the per-step compute.
     """
     from torchtitan.components.quantization import Float8LinearConverter
-    from torchtitan.models.kimi_k3.model import KimiLinearFloat8Spec
+    from torchtitan.models.kimi_k3.model import KimiK3Float8Spec
 
     cfg = kimi_linear_447m_aligned_block_attn_res_n4()
     converter = Float8LinearConverter.Config(
@@ -327,7 +327,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
         # torchao too old for recipe lookup; converter already warned.
         return cfg
     inner = cfg.model_spec.model
-    cfg.model_spec.model = KimiLinearFloat8Spec(
+    cfg.model_spec.model = KimiK3Float8Spec(
         kimi_config=inner.kimi_config,
         num_blocks=inner.num_blocks,
         param_init=inner.param_init,
@@ -337,7 +337,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_debugmodel_k3faithful() -> Trainer.Config:
+def kimi_k3_debugmodel_k3faithful() -> Trainer.Config:
     """Debug flavor with the K3-faithful architecture deltas ON:
     Gated MLA + alpha-graft Block AttnRes. CI-scale proof that the K3
     architecture (beyond the plain kimi_linear backbone) trains through
@@ -346,8 +346,8 @@ def kimi_linear_debugmodel_k3faithful() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_debugmodel()
-    cfg.model_spec.flavor = "kimi_linear_debugmodel_k3faithful"
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_k3faithful"
     m = cfg.model_spec.model
     # Gated MLA in K3's own parameterization (tech report Eq. 7: full-rank
     # channel-wise sigmoid gate, no bias). The graft flavors below keep
@@ -359,19 +359,19 @@ def kimi_linear_debugmodel_k3faithful() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
+def kimi_k3_debugmodel_gated_lora() -> Trainer.Config:
     """Debug flavor with the full post-train graft stack: alpha-gated
     Block AttnRes + LoRA rank-8 (frozen base, alpha-fullparam
     exception). CI-scale rehearsal of the 48B LoRA leg.
     """
-    cfg = kimi_linear_debugmodel()
-    cfg.model_spec.flavor = "kimi_linear_debugmodel_gated_lora"
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_gated_lora"
     cfg.model_spec.model.attn_res_gated = True
     cfg.model_spec.model.lora_rank = 8
     return cfg
 
 
-def kimi_linear_k3mini_vl() -> Trainer.Config:
+def kimi_k3_mini_vl() -> Trainer.Config:
     """K3-faithful multimodal downscale: text k3mini plus a shrunk MoonViT-V2.
 
     K3 is natively multimodal, so a debug flavor that drops the vision tower
@@ -397,8 +397,8 @@ def kimi_linear_k3mini_vl() -> Trainer.Config:
     from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
 
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_vl"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_vl"
     kc = cfg.model_spec.model.kimi_config
     vision = MoonViTConfig(
         num_hidden_layers=4,
@@ -460,7 +460,7 @@ def kimi_linear_k3mini_vl() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_k3mini_block_attn_res() -> Trainer.Config:
+def kimi_k3_mini_block_attn_res() -> Trainer.Config:
     """K3-FAITHFUL downscale: every structural choice is K3's, extents shrink.
 
     SiTU-GLU, Gated MLA with q-compression and a full-rank output gate, KDA with
@@ -484,7 +484,7 @@ def kimi_linear_k3mini_block_attn_res() -> Trainer.Config:
     from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 
     cfg = _flavor_trainer_config("k3mini", "block_attn_res")
-    cfg.model_spec.flavor = "kimi_linear_k3mini_block_attn_res"
+    cfg.model_spec.flavor = "kimi_k3_mini_block_attn_res"
     m = cfg.model_spec.model
     m.kimi_config = _dc.replace(
         build_kimi_linear_config("k3mini", vocab_size=2016),
@@ -494,7 +494,7 @@ def kimi_linear_k3mini_block_attn_res() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_k3mini_diag_dense_mla() -> Trainer.Config:
+def kimi_k3_mini_diag_dense_mla() -> Trainer.Config:
     """DIAGNOSTIC: k3mini with no KDA and no MoE -- dense MLA only.
 
     The control that separates a TP BACKWARD bug from forward divergence. MoE
@@ -507,8 +507,8 @@ def kimi_linear_k3mini_diag_dense_mla() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_diag_no_kda()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_dense_mla"
+    cfg = kimi_k3_mini_diag_no_kda()
+    cfg.model_spec.flavor = "kimi_k3_mini_diag_dense_mla"
     kc = cfg.model_spec.model.kimi_config
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model,
@@ -537,7 +537,7 @@ def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg = kimi_k3_mini_block_attn_res()
     cfg.model_spec.flavor = name
     kc = cfg.model_spec.model.kimi_config
     kc = _dc.replace(
@@ -569,7 +569,7 @@ def _diag_multi_layer(
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg = kimi_k3_mini_block_attn_res()
     cfg.model_spec.flavor = name
     kc = cfg.model_spec.model.kimi_config
     kc = _dc.replace(
@@ -585,42 +585,38 @@ def _diag_multi_layer(
     return cfg
 
 
-def kimi_linear_k3mini_diag_4l_mla() -> Trainer.Config:
+def kimi_k3_mini_diag_4l_mla() -> Trainer.Config:
     """Four dense MLA layers, 2 AttnRes blocks -- the smallest multi-block case."""
-    return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_4l_mla", num_layers=4, num_blocks=2
-    )
+    return _diag_multi_layer("kimi_k3_mini_diag_4l_mla", num_layers=4, num_blocks=2)
 
 
-def kimi_linear_k3mini_diag_4l_mla_noattnres() -> Trainer.Config:
+def kimi_k3_mini_diag_4l_mla_noattnres() -> Trainer.Config:
     """Four dense MLA layers with AttnRes disabled -- control for the above."""
     return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_4l_mla_noattnres", num_layers=4, num_blocks=None
+        "kimi_k3_mini_diag_4l_mla_noattnres", num_layers=4, num_blocks=None
     )
 
 
-def kimi_linear_k3mini_diag_8l_mla() -> Trainer.Config:
+def kimi_k3_mini_diag_8l_mla() -> Trainer.Config:
     """Eight dense MLA layers, 4 AttnRes blocks -- does the effect scale?"""
-    return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_8l_mla", num_layers=8, num_blocks=4
-    )
+    return _diag_multi_layer("kimi_k3_mini_diag_8l_mla", num_layers=8, num_blocks=4)
 
 
-def kimi_linear_k3mini_diag_1l_moe_depth() -> Trainer.Config:
+def kimi_k3_mini_diag_1l_moe_depth() -> Trainer.Config:
     """Depth curve leg: 1 MLA+MoE layer. See _diag_multi_layer."""
     return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_1l_moe_depth", num_layers=1, num_blocks=1, moe=True
+        "kimi_k3_mini_diag_1l_moe_depth", num_layers=1, num_blocks=1, moe=True
     )
 
 
-def kimi_linear_k3mini_diag_4l_moe_depth() -> Trainer.Config:
+def kimi_k3_mini_diag_4l_moe_depth() -> Trainer.Config:
     """Depth curve leg: 4 MLA+MoE layers, 2 AttnRes blocks."""
     return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_4l_moe_depth", num_layers=4, num_blocks=2, moe=True
+        "kimi_k3_mini_diag_4l_moe_depth", num_layers=4, num_blocks=2, moe=True
     )
 
 
-def kimi_linear_k3mini_diag_8l_moe_depth() -> Trainer.Config:
+def kimi_k3_mini_diag_8l_moe_depth() -> Trainer.Config:
     """Depth curve leg: 8 MLA+MoE layers, 4 AttnRes blocks.
 
     With 1, 4 and 8 the deviation-vs-depth curve separates a per-layer defect
@@ -628,11 +624,11 @@ def kimi_linear_k3mini_diag_8l_moe_depth() -> Trainer.Config:
     any perturbation, bf16 included (geometric).
     """
     return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_8l_moe_depth", num_layers=8, num_blocks=4, moe=True
+        "kimi_k3_mini_diag_8l_moe_depth", num_layers=8, num_blocks=4, moe=True
     )
 
 
-def kimi_linear_k3mini_diag_4l_moe_8h() -> Trainer.Config:
+def kimi_k3_mini_diag_4l_moe_8h() -> Trainer.Config:
     """Four MLA+MoE layers widened to 8 attention heads, so tp8 is possible.
 
     k3mini has 4 heads, which caps tp at 4 -- tp8 fails structurally with
@@ -647,8 +643,8 @@ def kimi_linear_k3mini_diag_4l_moe_8h() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_diag_4l_moe_depth()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_4l_moe_8h"
+    cfg = kimi_k3_mini_diag_4l_moe_depth()
+    cfg.model_spec.flavor = "kimi_k3_mini_diag_4l_moe_8h"
     kc = cfg.model_spec.model.kimi_config
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model,
@@ -663,7 +659,7 @@ def kimi_linear_k3mini_diag_4l_moe_8h() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_k3mini_pp8vp4() -> Trainer.Config:
+def kimi_k3_mini_pp8vp4() -> Trainer.Config:
     """32 layers, sized so PP8 admits VP=4.
 
     With first/last_stage_less_layers=0 the virtual-stage count equals
@@ -672,12 +668,12 @@ def kimi_linear_k3mini_pp8vp4() -> Trainer.Config:
     lps=1 gives 32 stages -- exactly 4 per rank. 21 layers admits no VP>=2
     split at all (21 is not divisible by 8 at any lps).
 
-    Everything else matches kimi_linear_k3mini_block_attn_res.
+    Everything else matches kimi_k3_mini_block_attn_res.
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_pp8vp4"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_pp8vp4"
     kc = cfg.model_spec.model.kimi_config
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model,
@@ -695,25 +691,23 @@ def kimi_linear_k3mini_pp8vp4() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_k3mini_diag_21l_mla() -> Trainer.Config:
+def kimi_k3_mini_diag_21l_mla() -> Trainer.Config:
     """21 dense MLA layers, 8 AttnRes blocks -- full depth, AttnRes on."""
-    return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_21l_mla", num_layers=21, num_blocks=8
-    )
+    return _diag_multi_layer("kimi_k3_mini_diag_21l_mla", num_layers=21, num_blocks=8)
 
 
-def kimi_linear_k3mini_diag_21l_mla_noattnres() -> Trainer.Config:
+def kimi_k3_mini_diag_21l_mla_noattnres() -> Trainer.Config:
     """21 dense MLA layers, AttnRes disabled -- the depth control.
 
     Separates "AttnRes is broken at depth" from "this model amplifies any
     perturbation ~1.6x per layer, so bf16 saturates by layer 21".
     """
     return _diag_multi_layer(
-        "kimi_linear_k3mini_diag_21l_mla_noattnres", num_layers=21, num_blocks=None
+        "kimi_k3_mini_diag_21l_mla_noattnres", num_layers=21, num_blocks=None
     )
 
 
-def kimi_linear_k3mini_diag_1l_mla_nogate() -> Trainer.Config:
+def kimi_k3_mini_diag_1l_mla_nogate() -> Trainer.Config:
     """One dense MLA layer with the Gated-MLA output gate DISABLED.
 
     attn_gate_proj is ColwiseParallel(use_local_output=True) and its INPUT is the
@@ -724,8 +718,8 @@ def kimi_linear_k3mini_diag_1l_mla_nogate() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_diag_1l_mla()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_1l_mla_nogate"
+    cfg = kimi_k3_mini_diag_1l_mla()
+    cfg.model_spec.flavor = "kimi_k3_mini_diag_1l_mla_nogate"
     kc = cfg.model_spec.model.kimi_config
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model, kimi_config=_dc.replace(kc, mla_gated=False)
@@ -733,7 +727,7 @@ def kimi_linear_k3mini_diag_1l_mla_nogate() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_k3mini_diag_1l_mla_noattnres() -> Trainer.Config:
+def kimi_k3_mini_diag_1l_mla_noattnres() -> Trainer.Config:
     """One dense MLA layer with AttnRes DISABLED.
 
     block_attn_res reads proj.weight directly and hand-rolls the backward grad
@@ -743,28 +737,28 @@ def kimi_linear_k3mini_diag_1l_mla_noattnres() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_diag_1l_mla()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_1l_mla_noattnres"
+    cfg = kimi_k3_mini_diag_1l_mla()
+    cfg.model_spec.flavor = "kimi_k3_mini_diag_1l_mla_noattnres"
     cfg.model_spec.model = _dc.replace(cfg.model_spec.model, num_blocks=None)
     return cfg
 
 
-def kimi_linear_k3mini_diag_1l_mla() -> Trainer.Config:
+def kimi_k3_mini_diag_1l_mla() -> Trainer.Config:
     """One dense MLA layer: pure tensor sharding, must be TP-exact."""
-    return _diag_single_layer("kimi_linear_k3mini_diag_1l_mla", kda=False, moe=False)
+    return _diag_single_layer("kimi_k3_mini_diag_1l_mla", kda=False, moe=False)
 
 
-def kimi_linear_k3mini_diag_1l_mla_moe() -> Trainer.Config:
+def kimi_k3_mini_diag_1l_mla_moe() -> Trainer.Config:
     """One MLA layer with MoE: adds discrete routing."""
-    return _diag_single_layer("kimi_linear_k3mini_diag_1l_mla_moe", kda=False, moe=True)
+    return _diag_single_layer("kimi_k3_mini_diag_1l_mla_moe", kda=False, moe=True)
 
 
-def kimi_linear_k3mini_diag_1l_kda() -> Trainer.Config:
+def kimi_k3_mini_diag_1l_kda() -> Trainer.Config:
     """One KDA layer: adds the recurrence."""
-    return _diag_single_layer("kimi_linear_k3mini_diag_1l_kda", kda=True, moe=False)
+    return _diag_single_layer("kimi_k3_mini_diag_1l_kda", kda=True, moe=False)
 
 
-def kimi_linear_k3mini_diag_no_kda() -> Trainer.Config:
+def kimi_k3_mini_diag_no_kda() -> Trainer.Config:
     """DIAGNOSTIC: k3mini with every layer full-attention (no KDA).
 
     Exists to isolate which module carries the TP gradient attenuation measured
@@ -774,8 +768,8 @@ def kimi_linear_k3mini_diag_no_kda() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_diag_no_kda"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_diag_no_kda"
     kc = cfg.model_spec.model.kimi_config
     n = kc.num_hidden_layers
     cfg.model_spec.model = _dc.replace(
@@ -787,7 +781,7 @@ def kimi_linear_k3mini_diag_no_kda() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_k3mini_k3recipe() -> Trainer.Config:
+def kimi_k3_mini_k3recipe() -> Trainer.Config:
     """K3-faithful structure AND K3's training recipe: Muon + Quantile Balancing.
 
     Structure alignment was verified module by module against the released
@@ -796,7 +790,7 @@ def kimi_linear_k3mini_k3recipe() -> Trainer.Config:
     router (sec 2.3.3), while this repo defaulted to AdamW and core's sign rule.
 
     Deliberately a SEPARATE flavor rather than a change to
-    kimi_linear_k3mini_block_attn_res. That flavor carries the cross-parallelism
+    kimi_k3_mini_block_attn_res. That flavor carries the cross-parallelism
     numerical baselines (PARALLEL_NUMERIC_BASELINE / PP_VP_REEXAMINATION), and
     changing its optimizer or router rule would invalidate every one of those
     recorded numbers. The baseline flavor stays a fixed reference; faithfulness
@@ -807,15 +801,15 @@ def kimi_linear_k3mini_k3recipe() -> Trainer.Config:
     from torchtitan.models.kimi_k3.muon import default_muon
     from torchtitan.models.kimi_k3.quantile_balance import register_quantile_balancing
 
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_k3recipe"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_k3recipe"
     cfg.model_spec.model = _dc.replace(cfg.model_spec.model, per_head_muon=True)
     cfg.optimizer = default_muon()
     cfg.model_spec.post_optimizer_build_fn = register_quantile_balancing
     return cfg
 
 
-def kimi_linear_k3mini_muon() -> Trainer.Config:
+def kimi_k3_mini_muon() -> Trainer.Config:
     """K3-faithful structure trained with Per-Head Muon (report sec 2.5).
 
     Kimi K3 uses Muon for its matrix parameters, refined per attention head:
@@ -831,14 +825,14 @@ def kimi_linear_k3mini_muon() -> Trainer.Config:
 
     from torchtitan.models.kimi_k3.muon import default_muon
 
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_muon"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_muon"
     cfg.model_spec.model = _dc.replace(cfg.model_spec.model, per_head_muon=True)
     cfg.optimizer = default_muon()
     return cfg
 
 
-def kimi_linear_k3mini_qat_mxfp4() -> Trainer.Config:
+def kimi_k3_mini_qat_mxfp4() -> Trainer.Config:
     """K3-faithful QAT: MXFP4 routed-expert weights, MXFP8 expert activations.
 
     Report sec 4.1.4 runs QAT through the whole post-training stage (SFT and
@@ -850,26 +844,26 @@ def kimi_linear_k3mini_qat_mxfp4() -> Trainer.Config:
     Fake-quant (dequant(quant(w)) with an STE) so this runs on any GPU; FP4
     hardware speeds deployment, not QAT.
     """
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_qat_mxfp4"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_qat_mxfp4"
     cfg.model_spec.model.mxfp4_qat = True
     return cfg
 
 
-def kimi_linear_k3mini_qlora() -> Trainer.Config:
+def kimi_k3_mini_qlora() -> Trainer.Config:
     """K3-faithful structure + LoRA rank 8 on the K3 module set.
 
     Exercises the updated target set: the compressed-Q pair (q_a_proj /
     q_b_proj), the Gated MLA output gate, and the latent MoE projections --
     none of which existed when DEFAULT_LORA_TARGETS was written.
     """
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_qlora"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_qlora"
     cfg.model_spec.model.lora_rank = 8
     return cfg
 
 
-def kimi_linear_k3mini_quantile_balance() -> Trainer.Config:
+def kimi_k3_mini_quantile_balance() -> Trainer.Config:
     """K3-faithful structure with Quantile Balancing driving the router bias.
 
     Replaces the auxiliary-loss-free sign rule with the solved-bias rule of
@@ -880,13 +874,13 @@ def kimi_linear_k3mini_quantile_balance() -> Trainer.Config:
     """
     from torchtitan.models.kimi_k3.quantile_balance import register_quantile_balancing
 
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_quantile_balance"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_quantile_balance"
     cfg.model_spec.post_optimizer_build_fn = register_quantile_balancing
     return cfg
 
 
-def kimi_linear_k3mini_kcp() -> Trainer.Config:
+def kimi_k3_mini_kcp() -> Trainer.Config:
     """K3-faithful structure with KDA Context Parallelism (report sec 5.1.2).
 
     The sequence stays sharded across CP ranks end to end: a fixed-size halo for
@@ -899,8 +893,8 @@ def kimi_linear_k3mini_kcp() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_k3mini_block_attn_res()
-    cfg.model_spec.flavor = "kimi_linear_k3mini_kcp"
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_kcp"
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model,
         kimi_config=_dc.replace(cfg.model_spec.model.kimi_config, kda_cp_mode="kcp"),
@@ -908,7 +902,7 @@ def kimi_linear_k3mini_kcp() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_k3_2p8t_block_attn_res() -> Trainer.Config:
+def kimi_k3_2p8t_block_attn_res() -> Trainer.Config:
     """Kimi K3 at full scale, from the official config.json (2026-07-27).
 
     93 layers / hidden 7168 / 96 heads (head_dim 128) / 896 experts, top-16, 2
@@ -923,7 +917,7 @@ def kimi_linear_k3_2p8t_block_attn_res() -> Trainer.Config:
     return _flavor_trainer_config("2p8t", "block_attn_res")
 
 
-def kimi_linear_debugmodel_latentmoe() -> Trainer.Config:
+def kimi_k3_debugmodel_latentmoe() -> Trainer.Config:
     """Debug flavor with K3's Stable LatentMoE (report Eq. 11).
 
     Routed experts run in a latent of width ``routed_expert_hidden_size``
@@ -934,8 +928,8 @@ def kimi_linear_debugmodel_latentmoe() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_debugmodel()
-    cfg.model_spec.flavor = "kimi_linear_debugmodel_latentmoe"
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_latentmoe"
     m = cfg.model_spec.model
     m.kimi_config = _dc.replace(
         m.kimi_config,
@@ -946,7 +940,7 @@ def kimi_linear_debugmodel_latentmoe() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_debugmodel8h() -> Trainer.Config:
+def kimi_k3_debugmodel8h() -> Trainer.Config:
     """8-head debug flavor (d=512, H=8) for deep tp x cp meshes.
 
     The 4-head debugmodel binds at tp*cp=4 (MLA heads must divide
@@ -954,8 +948,8 @@ def kimi_linear_debugmodel8h() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    cfg = kimi_linear_debugmodel()
-    cfg.model_spec.flavor = "kimi_linear_debugmodel8h"
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel8h"
     kimi_config = build_kimi_linear_config(
         "debugmodel8h",
         num_experts=8,
@@ -969,7 +963,7 @@ def kimi_linear_debugmodel8h() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_debugmodel_gated_qlora_mxfp4() -> Trainer.Config:
+def kimi_k3_debugmodel_gated_qlora_mxfp4() -> Trainer.Config:
     """Debug QLoRA: gated_lora with the frozen base packed to MXFP4.
 
     Meta-first trainer flow: the model builds with the PACKED layout
@@ -979,8 +973,8 @@ def kimi_linear_debugmodel_gated_qlora_mxfp4() -> Trainer.Config:
     rehearsal of 48B QLoRA on small-VRAM fleets (no rank ever holds the
     full bf16 model).
     """
-    cfg = kimi_linear_debugmodel_gated_lora()
-    cfg.model_spec.flavor = "kimi_linear_debugmodel_gated_qlora_mxfp4"
+    cfg = kimi_k3_debugmodel_gated_lora()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_gated_qlora_mxfp4"
     cfg.model_spec.model.lora_quantize_base = "mxfp4"
     return cfg
 
@@ -1011,7 +1005,7 @@ def kimi_linear_48b_block_attn_res_gated() -> Trainer.Config:
     return cfg
 
 
-def kimi_linear_debugmodel() -> Trainer.Config:
+def kimi_k3_debugmodel() -> Trainer.Config:
     """Tiny CI flavor: 4 layers (3 KDA + 1 MLA), d=256, 8 experts,
     Block AttnRes, 2016-token bundled test tokenizer, c4_test dataset.
 
@@ -1020,9 +1014,9 @@ def kimi_linear_debugmodel() -> Trainer.Config:
     not a training target.
     """
     from torchtitan.models.kimi_k3 import (
-        KimiLinearSpec,
-        parallelize_kimi_linear,
-        pipeline_kimi_linear_with_cache_adapter,
+        KimiK3Spec,
+        parallelize_kimi_k3,
+        pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.models.kimi_k3.state_dict_adapter import KimiLinearStateDictAdapter
     from torchtitan.protocols.model_spec import ModelSpec
@@ -1032,7 +1026,7 @@ def kimi_linear_debugmodel() -> Trainer.Config:
         num_experts=8,
         vocab_size=2016,
     )
-    spec_config = KimiLinearSpec(
+    spec_config = KimiK3Spec(
         kimi_config=kimi_config,
         num_blocks=resolve_num_blocks("debugmodel", "block_attn_res"),
     )
@@ -1042,10 +1036,10 @@ def kimi_linear_debugmodel() -> Trainer.Config:
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=ModelSpec(
             name="kimi_linear",
-            flavor="kimi_linear_debugmodel",
+            flavor="kimi_k3_debugmodel",
             model=spec_config,
-            parallelize_fn=parallelize_kimi_linear,
-            pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+            parallelize_fn=parallelize_kimi_k3,
+            pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
             post_optimizer_build_fn=None,
             state_dict_adapter=KimiLinearStateDictAdapter,
         ),
@@ -1069,7 +1063,7 @@ def kimi_linear_debugmodel() -> Trainer.Config:
     )
 
 
-def kimi_linear_2p8t_block_attn_res() -> Trainer.Config:
+def kimi_k3_2p8t_block_attn_res_provisional() -> Trainer.Config:
     """PROVISIONAL K3 2.8T-A50B flavor (896 experts / 16 active, Block
     AttnRes). Config-level construction target only -- multi-node + EP
     to materialize; dims are placeholders pending the 7.27 config. Used
@@ -1133,9 +1127,9 @@ def _kimi_linear_48b_attnres_downscale(
     deviate (e.g. n_layers=24, num_blocks=8 keeps the paper 3:1 ratio
     while making the depth divisible by PP=8 × VP=3 = 24 chunks).
     """
-    from torchtitan.models.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
+    from torchtitan.models.kimi_k3 import KimiK3Spec, parallelize_kimi_k3
     from torchtitan.models.kimi_k3.pipeline_adapter import (
-        pipeline_kimi_linear_with_cache_adapter,
+        pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.protocols.model_spec import ModelSpec
 
@@ -1167,7 +1161,7 @@ def _kimi_linear_48b_attnres_downscale(
         raise ValueError(
             f"num_blocks={final_num_blocks} must divide n_layers={n_layers}"
         )
-    spec_config = KimiLinearSpec(kimi_config=kcfg, num_blocks=final_num_blocks)
+    spec_config = KimiK3Spec(kimi_config=kcfg, num_blocks=final_num_blocks)
     cfg = _base_trainer_config("48b")
     cfg.training.seq_len = 4096
     cfg.training.local_batch_size = 1  # single-node aggressive
@@ -1182,8 +1176,8 @@ def _kimi_linear_48b_attnres_downscale(
         name="kimi_linear",
         flavor=flavor_name,
         model=spec_config,
-        parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )
@@ -1298,21 +1292,21 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
     retained; only depth reduced by 1 to satisfy the Interleaved1F1B
     divisibility requirement.
     """
-    from torchtitan.models.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
+    from torchtitan.models.kimi_k3 import KimiK3Spec, parallelize_kimi_k3
     from torchtitan.models.kimi_k3.pipeline_adapter import (
-        pipeline_kimi_linear_with_cache_adapter,
+        pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.protocols.model_spec import ModelSpec
 
     kcfg = _build_528m_l16_config()
-    spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=8)
+    spec = KimiK3Spec(kimi_config=kcfg, num_blocks=8)
     cfg = _base_trainer_config("528m")  # paper 528M lr / batch template
     cfg.model_spec = ModelSpec(
         name="kimi_linear",
         flavor="kimi_linear_528m_l16_block_attn_res",
         model=spec,
-        parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )
@@ -1321,21 +1315,21 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
 
 def kimi_linear_528m_l16_full_attn_res() -> Trainer.Config:
     """528M-scale Kimi Linear Full AttnRes (num_blocks = n_layers = 16)."""
-    from torchtitan.models.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
+    from torchtitan.models.kimi_k3 import KimiK3Spec, parallelize_kimi_k3
     from torchtitan.models.kimi_k3.pipeline_adapter import (
-        pipeline_kimi_linear_with_cache_adapter,
+        pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.protocols.model_spec import ModelSpec
 
     kcfg = _build_528m_l16_config()
-    spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=16)
+    spec = KimiK3Spec(kimi_config=kcfg, num_blocks=16)
     cfg = _base_trainer_config("528m")
     cfg.model_spec = ModelSpec(
         name="kimi_linear",
         flavor="kimi_linear_528m_l16_full_attn_res",
         model=spec,
-        parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )
@@ -1346,21 +1340,21 @@ def kimi_linear_528m_l16_baseline() -> Trainer.Config:
     """528M-scale Kimi Linear baseline (no AttnRes) with n_layers=16.
     Paired control for the two AttnRes variants above.
     """
-    from torchtitan.models.kimi_k3 import KimiLinearSpec, parallelize_kimi_linear
+    from torchtitan.models.kimi_k3 import KimiK3Spec, parallelize_kimi_k3
     from torchtitan.models.kimi_k3.pipeline_adapter import (
-        pipeline_kimi_linear_with_cache_adapter,
+        pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.protocols.model_spec import ModelSpec
 
     kcfg = _build_528m_l16_config()
-    spec = KimiLinearSpec(kimi_config=kcfg, num_blocks=None)
+    spec = KimiK3Spec(kimi_config=kcfg, num_blocks=None)
     cfg = _base_trainer_config("528m")
     cfg.model_spec = ModelSpec(
         name="kimi_linear",
         flavor="kimi_linear_528m_l16_baseline",
         model=spec,
-        parallelize_fn=parallelize_kimi_linear,
-        pipelining_fn=pipeline_kimi_linear_with_cache_adapter,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
         post_optimizer_build_fn=None,
         state_dict_adapter=KimiLinearStateDictAdapter,
     )

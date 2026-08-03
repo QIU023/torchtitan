@@ -27,16 +27,17 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import KimiLinearModel
-from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 from torchtitan.models.common.moe import GroupedExperts
+
+from torchtitan.models.kimi_k3.model import KimiK3Model
+from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 
 _SENTINEL = 1234.5
 
 
-def _model() -> KimiLinearModel:
+def _model() -> KimiK3Model:
     cfg = build_kimi_linear_config("k3mini", vocab_size=256)
-    return KimiLinearModel(cfg)
+    return KimiK3Model(cfg)
 
 
 def _expert_params(model):
@@ -91,9 +92,7 @@ class TestExpertInit(unittest.TestCase):
         )
 
     def test_packed_uint8_expert_bytes_are_left_for_the_checkpoint(self):
-        from torchtitan.models.kimi_k3.lora import (
-            quantize_grouped_experts_mxfp4,
-        )
+        from torchtitan.models.kimi_k3.lora import quantize_grouped_experts_mxfp4
 
         model = _model()
         model.init_weights()

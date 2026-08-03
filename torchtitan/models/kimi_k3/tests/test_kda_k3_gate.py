@@ -19,7 +19,7 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import KimiLinearConfig, KimiDeltaAttention
+from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiK3Config
 
 D, H, HD = 64, 4, 16
 
@@ -39,7 +39,7 @@ def _cfg(**kw):
         kda_head_dim=HD,
     )
     base.update(kw)
-    return KimiLinearConfig(**base)
+    return KimiK3Config(**base)
 
 
 class TestKDAFullRankGate(unittest.TestCase):

@@ -42,10 +42,10 @@ class TestLoRAMerge(unittest.TestCase):
         # exception) train. This is what the real 48B LoRA run exercised.
         from torchtitan.models.kimi_k3 import config_registry
         from torchtitan.models.kimi_k3.lora import apply_lora
-        from torchtitan.models.kimi_k3.model import KimiLinearSpec
+        from torchtitan.models.kimi_k3.model import KimiK3Spec
 
-        kc = config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
-        spec = KimiLinearSpec(kimi_config=kc, num_blocks=2, attn_res_gated=True)
+        kc = config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config
+        spec = KimiK3Spec(kimi_config=kc, num_blocks=2, attn_res_gated=True)
         with torch.device("cuda"):
             m = spec.build()
             m.init_weights()
@@ -60,9 +60,9 @@ class TestLoRAMerge(unittest.TestCase):
         import dataclasses
 
         from torchtitan.models.kimi_k3 import config_registry
-        from torchtitan.models.kimi_k3.model import KimiLinearSpec
+        from torchtitan.models.kimi_k3.model import KimiK3Spec
 
-        kc = config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
+        kc = config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config
         if mla_only:
             # All-MLA: KDA kernels are nondeterministic at debug scale and
             # can NaN under accumulated cross-test GPU state; forward-
@@ -71,13 +71,10 @@ class TestLoRAMerge(unittest.TestCase):
             kc = dataclasses.replace(
                 kc, kda_layers=[], full_attn_layers=list(range(1, n + 1))
             )
-        return KimiLinearSpec(kimi_config=kc, num_blocks=None)
+        return KimiK3Spec(kimi_config=kc, num_blocks=None)
 
     def test_merge_tensor_math_and_key_space(self):
-        from torchtitan.models.kimi_k3.lora import (
-            KimiLoRALinear,
-            merge_lora_state_dict,
-        )
+        from torchtitan.models.kimi_k3.lora import KimiLoRALinear, merge_lora_state_dict
 
         m = self._lora_model()
         merged = merge_lora_state_dict(m)
@@ -93,9 +90,7 @@ class TestLoRAMerge(unittest.TestCase):
                 ).to(module.base.weight.dtype)
                 got = merged[f"{mod_name}.weight"]
                 self.assertEqual(got.shape, module.base.weight.shape)
-                self.assertLess(
-                    (got.float() - expect.float()).abs().max().item(), 1e-2
-                )
+                self.assertLess((got.float() - expect.float()).abs().max().item(), 1e-2)
                 checked += 1
         self.assertGreater(checked, 0)
 
@@ -120,19 +115,14 @@ class TestLoRAMerge(unittest.TestCase):
 
         m = self._lora_model(quantize="nf4")
         merged = merge_lora_state_dict(m)
-        self.assertFalse(
-            any(isinstance(v, NF4Tensor) for v in merged.values())
-        )
+        self.assertFalse(any(isinstance(v, NF4Tensor) for v in merged.values()))
 
     def test_post_load_quantize_hook(self):
         # The trainer order: build+load bf16, THEN quantize (not at
         # build over init noise / meta storage).
         from torchao.dtypes.nf4tensor import NF4Tensor
 
-        from torchtitan.models.kimi_k3.lora import (
-            KimiLoRALinear,
-            quantize_lora_bases,
-        )
+        from torchtitan.models.kimi_k3.lora import KimiLoRALinear, quantize_lora_bases
 
         # all-MLA: this test runs a forward (deterministic MLA path)
         m = self._lora_model(mla_only=True)  # bf16 bases, loaded-like
@@ -153,9 +143,7 @@ class TestLoRAMerge(unittest.TestCase):
         self.assertIsInstance(module.base.weight, NF4Tensor)
         # dequant tracks the loaded weight within NF4 error (not init noise)
         deq = module.base.weight.get_original_weight().float()
-        self.assertLess(
-            (deq - ref_w).norm().item() / ref_w.norm().item(), 0.15
-        )
+        self.assertLess((deq - ref_w).norm().item() / ref_w.norm().item(), 0.15)
         # idempotent: second call packs nothing new, no error
         self.assertEqual(quantize_lora_bases(m, experts=False), packed)
         # forward still runs through the NF4 base path
@@ -175,9 +163,7 @@ class TestLoRAMerge(unittest.TestCase):
         m = self._lora_model(quantize="mxfp4")
         merged = merge_lora_state_dict(m)
         self.assertFalse(
-            any(
-                "qdata" in k or "scale" in k or ".base." in k for k in merged
-            )
+            any("qdata" in k or "scale" in k or ".base." in k for k in merged)
         )
         spec = self._spec_plain()
         hf = KimiLinearStateDictAdapter(spec, hf_assets_path=None).to_hf(merged)
@@ -186,10 +172,7 @@ class TestLoRAMerge(unittest.TestCase):
 
     def test_post_load_quantize_mxfp4(self):
         # Trainer order: build+load bf16, THEN MXFP4-pack (not at build).
-        from torchtitan.models.kimi_k3.lora import (
-            KimiLoRALinear,
-            quantize_lora_bases,
-        )
+        from torchtitan.models.kimi_k3.lora import KimiLoRALinear, quantize_lora_bases
 
         m = self._lora_model(mla_only=True)  # forward-running -> MLA path
         ref = None
@@ -211,9 +194,7 @@ class TestLoRAMerge(unittest.TestCase):
         self.assertNotIn("weight", mod.base._parameters)
         # dequant tracks the loaded weight within MXFP4 error (~10-13%)
         deq = mod._dequant_base_mxfp4().float()
-        self.assertLess(
-            (deq - ref_w).norm().item() / ref_w.norm().item(), 0.15
-        )
+        self.assertLess((deq - ref_w).norm().item() / ref_w.norm().item(), 0.15)
         # idempotent + forward runs through the MXFP4 base path
         self.assertEqual(quantize_lora_bases(m, mode="mxfp4", experts=False), packed)
         tok = torch.randint(0, 2016, (1, 96), device="cuda")
@@ -225,10 +206,7 @@ class TestLoRAMerge(unittest.TestCase):
         # (1) trainable set = LoRA + graft, base frozen; (2) merge folds
         # LoRA and CARRIES THE GRAFT params through unchanged; (3) to_hf
         # drops both graft and lora keys, leaving a clean base HF export.
-        from torchtitan.models.kimi_k3.lora import (
-            KimiLoRALinear,
-            merge_lora_state_dict,
-        )
+        from torchtitan.models.kimi_k3.lora import KimiLoRALinear, merge_lora_state_dict
         from torchtitan.models.kimi_k3.state_dict_adapter import (
             KimiLinearStateDictAdapter,
         )
@@ -263,9 +241,7 @@ class TestLoRAMerge(unittest.TestCase):
                     * (module.lora_b.float() @ module.lora_a.float())
                 ).to(module.base.weight.dtype)
                 got = merged[f"{mod_name}.weight"]
-                self.assertLess(
-                    (got.float() - expect.float()).abs().max().item(), 1e-2
-                )
+                self.assertLess((got.float() - expect.float()).abs().max().item(), 1e-2)
                 break
 
         # HF export drops graft + lora, keeps the base backbone
@@ -273,10 +249,7 @@ class TestLoRAMerge(unittest.TestCase):
         hf = adapter.to_hf(merged)
         self.assertTrue(hf)
         self.assertFalse(
-            any(
-                "lora" in k or ".base." in k or any(g in k for g in graft)
-                for k in hf
-            )
+            any("lora" in k or ".base." in k or any(g in k for g in graft) for k in hf)
         )
 
 
@@ -292,9 +265,9 @@ class TestLoRAWrapperTransparency(unittest.TestCase):
     quietly."""
 
     def _wrapped(self, bias: bool):
-        from torchtitan.models.kimi_k3.lora import KimiLoRALinear
-
         import torch.nn as nn
+
+        from torchtitan.models.kimi_k3.lora import KimiLoRALinear
 
         base = nn.Linear(32, 16, bias=bias)
         return base, KimiLoRALinear(base, rank=4, alpha=8.0)
@@ -323,15 +296,11 @@ class TestLoRAWrapperTransparency(unittest.TestCase):
             DEFAULT_LORA_TARGETS,
             KimiLoRALinear,
         )
-        from torchtitan.models.kimi_k3.model import KimiLinearModel
-        from torchtitan.models.kimi_k3.model_configs import (
-            build_kimi_linear_config,
-        )
+        from torchtitan.models.kimi_k3.model import KimiK3Model
+        from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 
         with torch.device("meta"):
-            model = KimiLinearModel(
-                build_kimi_linear_config("k3mini", vocab_size=256)
-            )
+            model = KimiK3Model(build_kimi_linear_config("k3mini", vocab_size=256))
         apply_lora(model, rank=8, alpha=16.0)
         leaves = {
             fqn.rsplit(".", 1)[1]

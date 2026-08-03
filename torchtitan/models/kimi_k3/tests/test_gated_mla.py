@@ -7,7 +7,7 @@
 """Gated MLA tests.
 
 Two parameterizations, two different promises (see
-KimiLinearConfig.attn_gate_param):
+KimiK3Config.attn_gate_param):
 
 * ``per_head_graft`` -- this repo's graft-viable variant. A checkpoint
   pretrained WITHOUT the gate is ~preserved at step 0 (near-identity, not
@@ -22,23 +22,33 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import KimiLinearConfig, KimiLinearModel
+from torchtitan.models.kimi_k3.model import KimiK3Config, KimiK3Model
 
 
 def _cfg():
-    return KimiLinearConfig(
-        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
-        num_key_value_heads=4, vocab_size=2016, intermediate_size=512,
-        moe_intermediate_size=256, num_experts=8, kv_lora_rank=128,
-        qk_nope_head_dim=64, qk_rope_head_dim=32, v_head_dim=64,
-        kda_head_dim=64, kda_num_heads=4,
+    return KimiK3Config(
+        hidden_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=2016,
+        intermediate_size=512,
+        moe_intermediate_size=256,
+        num_experts=8,
+        kv_lora_rank=128,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        kda_head_dim=64,
+        kda_num_heads=4,
         # MLA-ONLY. This file tests the MLA output gate (attn_gate_proj); a KDA
         # layer contributes nothing to that and drags in fla's triton kernels,
         # which under triton 3.8 request ~106 KB of dynamic shared memory -- more
         # than consumer Blackwell (RTX 50-series) provides, so the test failed on
         # a hardware limit unrelated to what it checks. KDA's own kernels are
         # covered by test_layers.py and the KCP probes.
-        kda_layers=[], full_attn_layers=[1, 2],
+        kda_layers=[],
+        full_attn_layers=[1, 2],
     )
 
 
@@ -48,10 +58,10 @@ class TestGatedMLA(unittest.TestCase):
         torch.manual_seed(0)
         cfg = _cfg()
         with torch.device("cuda"):
-            plain = KimiLinearModel(cfg)
+            plain = KimiK3Model(cfg)
             plain.init_weights()
             # near-identity is the per_head_graft promise, not K3's
-            gated = KimiLinearModel(
+            gated = KimiK3Model(
                 dataclasses.replace(
                     cfg, mla_gated=True, attn_gate_param="per_head_graft"
                 )

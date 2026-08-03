@@ -61,20 +61,20 @@ class TestKimiFQNRemapping(unittest.TestCase):
 class TestPipeliningFnInModelSpec(unittest.TestCase):
     def test_all_flavors_wire_pipelining_fn(self):
         """Every registered flavor's ModelSpec points at
-        ``pipeline_kimi_linear_with_cache_adapter``. Runtime detection
+        ``pipeline_kimi_k3_with_cache_adapter``. Runtime detection
         (baseline vs AttnRes) happens inside that function via
         ``num_blocks`` attr check, not at registration time.
         """
-        from torchtitan.models.kimi_k3 import (
-            flavor_names, model_registry,
-        )
+        from torchtitan.models.kimi_k3 import flavor_names, model_registry
         from torchtitan.models.kimi_k3.pipeline_adapter import (
-            pipeline_kimi_linear_with_cache_adapter,
+            pipeline_kimi_k3_with_cache_adapter,
         )
+
         for flavor in flavor_names():
             spec = model_registry(flavor)
             self.assertEqual(
-                spec.pipelining_fn, pipeline_kimi_linear_with_cache_adapter,
+                spec.pipelining_fn,
+                pipeline_kimi_k3_with_cache_adapter,
                 f"{flavor}: pipelining_fn not wired",
             )
 

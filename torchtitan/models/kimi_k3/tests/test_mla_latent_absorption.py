@@ -30,10 +30,10 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import KimiLinearConfig, KimiMLAAttention
+from torchtitan.models.kimi_k3.model import KimiK3Config, KimiMLAAttention
 
 
-def _cfg(**kw) -> KimiLinearConfig:
+def _cfg(**kw) -> KimiK3Config:
     base = dict(
         vocab_size=256,
         hidden_size=128,
@@ -55,7 +55,7 @@ def _cfg(**kw) -> KimiLinearConfig:
         hidden_act="silu",
     )
     base.update(kw)
-    return KimiLinearConfig(**base)
+    return KimiK3Config(**base)
 
 
 def _absorbed_forward(attn: KimiMLAAttention, x: torch.Tensor) -> torch.Tensor:
@@ -100,7 +100,7 @@ def _absorbed_forward(attn: KimiMLAAttention, x: torch.Tensor) -> torch.Tensor:
 
 
 class TestMLALatentAbsorption(unittest.TestCase):
-    def _check(self, cfg: KimiLinearConfig) -> float:
+    def _check(self, cfg: KimiK3Config) -> float:
         torch.manual_seed(0)
         attn = KimiMLAAttention(cfg, layer_idx=0).double()
         for p in attn.parameters():
@@ -121,13 +121,10 @@ class TestMLALatentAbsorption(unittest.TestCase):
 
     def test_absorption_is_exact_without_q_compression(self):
         # the 48B-A3B path: q_proj direct, no q_a/q_b pair
-        self._check(_cfg(q_lora_rank=None, mla_gated=True,
-                         attn_gate_param="full_rank"))
+        self._check(_cfg(q_lora_rank=None, mla_gated=True, attn_gate_param="full_rank"))
 
     def test_official_kv_cache_width_is_kv_lora_plus_rot(self):
-        from torchtitan.models.kimi_k3.model_configs import (
-            build_kimi_linear_config,
-        )
+        from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 
         c = build_kimi_linear_config("2p8t")
         per_token_per_layer = c.kv_lora_rank + c.qk_rope_head_dim

@@ -21,20 +21,20 @@ import torch
 class TestDeltasCompose(unittest.TestCase):
     def test_all_deltas_one_step(self):
         from torchtitan.models.kimi_k3 import config_registry
-        from torchtitan.models.kimi_k3.model import KimiLinearSpec
-        from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
+        from torchtitan.models.kimi_k3.model import KimiK3Spec
         from torchtitan.models.kimi_k3.muon import Muon
+        from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
 
         torch.manual_seed(0)
-        kc = config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
-        kc = dataclasses.replace(kc, mla_gated=True)          # Gated MLA
-        spec = KimiLinearSpec(
+        kc = config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config
+        kc = dataclasses.replace(kc, mla_gated=True)  # Gated MLA
+        spec = KimiK3Spec(
             kimi_config=kc, num_blocks=4, attn_res_gated=True  # alpha graft
         )
         with torch.device("cuda"):
             model = spec.build()
             model.init_weights()
-        n_qat = apply_mxfp4_qat(model, quantize_act=True)      # MXFP4 QAT
+        n_qat = apply_mxfp4_qat(model, quantize_act=True)  # MXFP4 QAT
         self.assertGreater(n_qat, 0)
         model = model.to(torch.bfloat16)
         for name, p in model.named_parameters():
@@ -42,7 +42,7 @@ class TestDeltasCompose(unittest.TestCase):
                 p._muon_heads = kc.num_attention_heads
 
         trainable = [p for p in model.parameters() if p.requires_grad]
-        opt = Muon(trainable, lr=1e-3, adamw_lr=2e-4)          # Per-Head Muon
+        opt = Muon(trainable, lr=1e-3, adamw_lr=2e-4)  # Per-Head Muon
         tok = torch.randint(0, 2016, (1, 128), device="cuda")
         first = last = None
         for i in range(8):

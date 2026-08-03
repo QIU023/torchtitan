@@ -20,13 +20,13 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.lora import KimiLoRALinear
-from torchtitan.models.kimi_k3.model import KimiLinearSpec
+from torchtitan.models.kimi_k3.model import KimiK3Spec
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 from torchtitan.models.kimi_k3.quant_scope import quantizable_modules
 
 
-def _spec(**kw) -> KimiLinearSpec:
-    return KimiLinearSpec(
+def _spec(**kw) -> KimiK3Spec:
+    return KimiK3Spec(
         kimi_config=build_kimi_linear_config("k3mini", vocab_size=256),
         num_blocks=2,
         **kw,
@@ -64,9 +64,7 @@ class TestQATAndLoRACompose(unittest.TestCase):
         m = self._build(lora_rank=8, mxfp4_qat=True)
         lora = {fqn for fqn, x in m.named_modules() if isinstance(x, KimiLoRALinear)}
         qat = {
-            fqn
-            for fqn, e in quantizable_modules(m)
-            if getattr(e, "_mxfp4_qat", False)
+            fqn for fqn, e in quantizable_modules(m) if getattr(e, "_mxfp4_qat", False)
         }
         self.assertTrue(lora)
         self.assertTrue(qat)

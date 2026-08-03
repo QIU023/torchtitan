@@ -18,14 +18,11 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import (
-    KimiLinearConfig,
-    KimiMoE,
-    situ_and_mul,
-)
+from torchtitan.models.common.moe import GroupedExperts
+
+from torchtitan.models.kimi_k3.model import KimiK3Config, KimiMoE, situ_and_mul
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 from torchtitan.models.kimi_k3.moe import KimiSiTUGroupedExperts
-from torchtitan.models.common.moe import GroupedExperts
 
 
 class TestSiTUGroupedExperts(unittest.TestCase):
@@ -56,9 +53,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
         cfg = build_kimi_linear_config("k3mini", vocab_size=256)
         with torch.device("meta"):
             moe = KimiMoE(cfg)
-        names = {
-            n for n, _ in moe._moe.routed_experts.inner_experts.named_parameters()
-        }
+        names = {n for n, _ in moe._moe.routed_experts.inner_experts.named_parameters()}
         self.assertEqual(names, {"w1_EFD", "w2_EDF", "w3_EFD"})
 
     @unittest.skipUnless(torch.cuda.is_available(), "grouped_mm needs CUDA")
@@ -86,9 +81,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
             gate = xs @ experts.w1_EFD[e].bfloat16().transpose(0, 1)
             up = xs @ experts.w3_EFD[e].bfloat16().transpose(0, 1)
             h = situ_and_mul(gate, up, 4.0, 25.0)
-            ref[start : start + n] = (
-                h @ experts.w2_EDF[e].bfloat16().transpose(0, 1)
-            )
+            ref[start : start + n] = h @ experts.w2_EDF[e].bfloat16().transpose(0, 1)
             start += n
         rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
         self.assertLess(rel, 2e-2, f"SiTU expert forward mismatch: {rel:.3e}")
@@ -100,9 +93,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
             for n in ("w1_EFD", "w2_EDF", "w3_EFD"):
                 getattr(core, n).copy_(getattr(experts, n))
         swiglu_out = core(x_RD, counts)
-        diff = (
-            (got.float() - swiglu_out.float()).norm() / got.float().norm()
-        ).item()
+        diff = ((got.float() - swiglu_out.float()).norm() / got.float().norm()).item()
         self.assertGreater(
             diff, 0.1, "SiTU and SwiGLU experts agree -- test has no power"
         )

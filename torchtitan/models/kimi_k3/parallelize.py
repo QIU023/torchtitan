@@ -12,7 +12,7 @@ Supported parallelism dimensions:
   ``torchtitan.models.llama3.parallelize.apply_fsdp``. Adapted to Kimi's
   module names (``embed_tokens``, ``norm``, ``lm_head``, ``layers`` as
   ``nn.ModuleList``).
-* **TP** -- DSv3-style plan in ``apply_tp_kimi_linear``, matched to
+* **TP** -- DSv3-style plan in ``apply_tp_kimi_k3``, matched to
   Kimi's MLA + KDA + MoE layout. All boundary tensors use_local_output
   so PP send/recv, AttnRes stacking, and fla-core triton kernels see
   plain tensors.
@@ -21,13 +21,13 @@ Supported parallelism dimensions:
   each KDA/MLA module. The module boundary stays a seq-sharded plain
   tensor, which is what keeps CP composable with FSDP/TP/PP/EP. Requires
   ``context_parallel_load_balancer=None`` (enforced with a ValueError).
-* **EP** -- Expert Parallel for KimiMoE via ``apply_ep_kimi_linear``;
+* **EP** -- Expert Parallel for KimiMoE via ``apply_ep_kimi_k3``;
   all-to-all dispatch/combine on the EP mesh.
 * **PP** -- via the cross-stage cache adapter in ``pipeline_adapter.py``;
   PP rank assignment is in torchtitan core, scheduling in the
-  ``pipeline_kimi_linear_with_cache_adapter`` wrapper.
+  ``pipeline_kimi_k3_with_cache_adapter`` wrapper.
 * **torch.compile** -- per-decoder-layer compile via
-  ``_apply_compile_kimi_linear``; MoE for-loop and fla-core triton ops
+  ``_apply_compile_kimi_k3``; MoE for-loop and fla-core triton ops
   are carved out.
 * **Activation checkpointing** -- applied via the shared
   ``ActivationCheckpointingConfig.build().apply()`` path since the Kimi
@@ -67,7 +67,7 @@ from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.tools.logging import logger
 
 
-def parallelize_kimi_linear(
+def parallelize_kimi_k3(
     model: nn.Module,
     *,
     parallel_dims: ParallelDims,
@@ -117,7 +117,7 @@ def parallelize_kimi_linear(
         # boundary types plain so PP send/recv, AttnRes block stacking,
         # and triton kernels never see a mixed-mesh tensor.
         tp_mesh = parallel_dims.get_mesh("tp")
-        apply_tp_kimi_linear(
+        apply_tp_kimi_k3(
             model,
             tp_mesh,
             skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
@@ -217,7 +217,7 @@ def parallelize_kimi_linear(
         # MoE only at the block boundary (after FFN residual add),
         # so EP routing within the FFN body is transparent to the
         # AttnRes block-commit logic.
-        apply_ep_kimi_linear(model, parallel_dims)
+        apply_ep_kimi_k3(model, parallel_dims)
         logger.info(
             "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
             parallel_dims.ep,
@@ -237,7 +237,7 @@ def parallelize_kimi_linear(
     # FusedRMSNormGated) are wrapped with torch.compiler.disable since
     # they're triton kernels that dynamo can't trace through.
     if compile_config.enable:
-        _apply_compile_kimi_linear(model, compile_config)
+        _apply_compile_kimi_k3(model, compile_config)
         logger.info(
             "Compiled each KimiDecoderLayer with torch.compile (backend=%s).",
             compile_config.backend,
@@ -475,7 +475,7 @@ def _model_has_moe(model: nn.Module) -> bool:
     return any(bool(getattr(layer, "is_moe", False)) for layer in model.layers.values())
 
 
-def apply_tp_kimi_linear(
+def apply_tp_kimi_k3(
     model: nn.Module,
     tp_mesh: DeviceMesh,
     skip_expert_params: bool = False,
@@ -978,7 +978,7 @@ def apply_tp_kimi_linear(
         #
         # When ``skip_expert_params=True`` (caller has EP enabled), do
         # NOT touch experts — leave them as plain Tensors so the EP
-        # path (apply_ep_kimi_linear) can DTensor-shard them on
+        # path (apply_ep_kimi_k3) can DTensor-shard them on
         # ``ep_mesh`` without hitting cross-mesh redistribute errors.
         # This mirrors llama4's design: TP plan touches router.gate +
         # shared_experts only; routed experts are EP/ETP territory.
@@ -1047,7 +1047,7 @@ def apply_tp_kimi_linear(
                 )
 
 
-def apply_ep_kimi_linear(model: nn.Module, parallel_dims) -> None:
+def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
     """Expert Parallel plan for kimi_linear MoE flavors.
 
     Calls ``_moe.parallelize(parallel_dims)`` on every MoE layer: the
@@ -1266,7 +1266,7 @@ def apply_fsdp(
     disable_fsdp_gradient_division(model)
 
 
-def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) -> None:
+def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> None:
     """Wrap each KimiDecoderLayer with torch.compile.
 
     Carve-outs (must NOT be compiled):

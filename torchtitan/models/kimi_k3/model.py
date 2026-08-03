@@ -113,10 +113,10 @@ except ImportError as err:  # pragma: no cover - import-time guard
 
 
 @dataclass(kw_only=True, slots=True)
-class KimiLinearConfig:
+class KimiK3Config:
     """Torchtitan-flavored config for Kimi Linear.
 
-    Mirrors ``reference/configuration_kimi.py:KimiLinearConfig`` but
+    Mirrors ``reference/configuration_kimi.py:KimiK3Config`` but
     as a plain dataclass (no HF ``PretrainedConfig`` machinery). All
     fields kept identical to the HF config.json knobs for the 48B-A3B
     release; scaling-law variants (194M..528M) override the ones that
@@ -127,7 +127,7 @@ class KimiLinearConfig:
     works).
 
     This class carries the Kimi model hyperparameters only. The
-    torchtitan ``BaseModel.Config`` shim — ``KimiLinearSpec`` — lives
+    torchtitan ``BaseModel.Config`` shim — ``KimiK3Spec`` — lives
     in this module below and wraps one of these for ModelSpec
     registration.
     """
@@ -185,7 +185,7 @@ class KimiLinearConfig:
     moe_layer_freq: int = 1
     use_grouped_topk: bool = True
     num_expert_group: int = 1
-    # Wired by KimiLinearSpec.update_from_config from config.parallelism
+    # Wired by KimiK3Spec.update_from_config from config.parallelism
     # BEFORE build; consumed by KimiMoE to populate the upstream
     # module-internal MoE sharding configs (EP/TP). False = the
     # previously validated FSDP/PP plain path, untouched.
@@ -470,7 +470,7 @@ class KimiMLAAttention(nn.Module):
     torchtitan training doesn't invoke incremental decoding.
     """
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiK3Config, layer_idx: int) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -541,7 +541,7 @@ class KimiMLAAttention(nn.Module):
         # with W_g FULL RANK, i.e. one gate value per output channel of the
         # ungated attention output (num_heads * v_head_dim), applied before
         # W_o. The per-head variant is this repo's graft-preserving
-        # alternative -- see KimiLinearConfig.attn_gate_param.
+        # alternative -- see KimiK3Config.attn_gate_param.
         self.mla_gated = config.mla_gated
         self.attn_gate_param = config.attn_gate_param
         if self.mla_gated:
@@ -658,7 +658,7 @@ class KimiMLAAttention(nn.Module):
         # flash-style fused) is selected by default.
         #
         # Routing through ``self.inner_attention`` (a parameterless
-        # submodule) is the DSv3 pattern: it lets ``apply_tp_kimi_linear``
+        # submodule) is the DSv3 pattern: it lets ``apply_tp_kimi_k3``
         # wrap this call with ``PrepareModuleInput(use_local_output=True)``
         # so q/k/v are converted from DTensor (sharded on the head axis)
         # to plain Tensors before SDPA's mem-efficient cutlass kernel
@@ -825,7 +825,7 @@ class KimiDeltaAttention(nn.Module):
     fixed-seqlen doesn't exercise those).
     """
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiK3Config, layer_idx: int) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -1297,7 +1297,7 @@ class KimiMoE(nn.Module):
     mirrors DSv3's auxiliary-loss-free routing protocol.
     """
 
-    def __init__(self, config: KimiLinearConfig) -> None:
+    def __init__(self, config: KimiK3Config) -> None:
         super().__init__()
         from torchtitan.models.common.config_utils import make_token_dispatcher_config
 
@@ -1519,7 +1519,7 @@ class KimiDecoderLayer(nn.Module):
     Faithful to ``reference:KimiDecoderLayer``.
     """
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiK3Config, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -1577,7 +1577,7 @@ class KimiDecoderLayer(nn.Module):
 # ----- Top-level model ----------------------------------------------------- #
 
 
-class KimiLinearModel(nn.Module):
+class KimiK3Model(nn.Module):
     """Kimi Linear stack: embed -> decoder layers -> final RMSNorm -> LM head.
 
     No KV cache, no generation path. Training / loss is expected to be
@@ -1585,12 +1585,12 @@ class KimiLinearModel(nn.Module):
 
     ``_return_only_new_blocks`` and ``layers_per_block`` attributes
     are defined here so the cross-stage cache adapter can toggle
-    forward output shape once ``KimiLinearAttnResModel`` subclass
+    forward output shape once ``KimiK3AttnResModel`` subclass
     adds the AttnRes block machinery. In the base (non-AttnRes) class
     the flag is ignored — forward always returns full hidden_states.
     """
 
-    def __init__(self, config: KimiLinearConfig) -> None:
+    def __init__(self, config: KimiK3Config) -> None:
         super().__init__()
         self.config = config
 
@@ -1680,7 +1680,7 @@ class KimiLinearModel(nn.Module):
 
     def verify_module_protocol(self) -> None:
         """No-op: our internals are plain nn.Module (not the torchtitan
-        ``Module`` protocol), since KimiLinearModel ports the HF
+        ``Module`` protocol), since KimiK3Model ports the HF
         reference layer-by-layer rather than going through the Config
         chain. Trainer calls this post-build; overriding as no-op keeps
         the FSDP + loss + optimizer paths intact without requiring every
@@ -1808,16 +1808,16 @@ class KimiLinearModel(nn.Module):
 
 
 @dataclass(kw_only=True, slots=True)
-class KimiLinearSpec:
+class KimiK3Spec:
     """``BaseModel.Config``-compatible shim that wraps a
-    :class:`KimiLinearConfig` and an optional ``num_blocks`` (None =
-    plain :class:`KimiLinearModel`; integer N = :class:`KimiLinearAttnResModel`
+    :class:`KimiK3Config` and an optional ``num_blocks`` (None =
+    plain :class:`KimiK3Model`; integer N = :class:`KimiK3AttnResModel`
     with ``num_blocks=N``).
 
     Methods implemented for torchtitan integration:
 
     * :meth:`build` — returns the constructed model instance (either
-      :class:`KimiLinearModel` or :class:`KimiLinearAttnResModel`).
+      :class:`KimiK3Model` or :class:`KimiK3AttnResModel`).
     * :meth:`update_from_config` — no-op for Kimi Linear: MLA uses
       NoPE (``mla_use_nope=True``) so no RoPE max_seq_len to propagate,
       and KDA is seq-len-agnostic (short conv + recurrent state).
@@ -1831,7 +1831,7 @@ class KimiLinearSpec:
     ``update_from_config`` / ``get_nparams_and_flops``.
     """
 
-    kimi_config: KimiLinearConfig
+    kimi_config: KimiK3Config
     num_blocks: int | None = None
     param_init: dict | None = None  # torchtitan BaseModel.Config contract
     # Graft gate: alpha-gated AttnRes reads (alpha=0 == exact identity
@@ -1862,7 +1862,7 @@ class KimiLinearSpec:
     # Registry-discovery passthroughs. veRL's torchtitan engine identifies a
     # flavor by reading cfg.dim / cfg.n_layers / cfg.vocab_size off
     # model_registry(flavor).model -- torchtitan's llama-convention names, which
-    # our KimiLinearConfig spells hidden_size / num_hidden_layers. Without these
+    # our KimiK3Config spells hidden_size / num_hidden_layers. Without these
     # the shape match silently finds nothing and flavor resolution fails.
     @property
     def dim(self) -> int:
@@ -1878,12 +1878,12 @@ class KimiLinearSpec:
 
     def build(self, **kwargs):
         # Local import to defer the attn_res_model dep chain.
-        from torchtitan.models.kimi_k3.attn_res_model import KimiLinearAttnResModel
+        from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
 
         if self.num_blocks is None:
-            model = KimiLinearModel(self.kimi_config)
+            model = KimiK3Model(self.kimi_config)
         else:
-            model = KimiLinearAttnResModel(
+            model = KimiK3AttnResModel(
                 self.kimi_config,
                 num_blocks=self.num_blocks,
                 gated=self.attn_res_gated,
@@ -2040,7 +2040,7 @@ class KimiLinearSpec:
 
         Trainer calls this on the model_config to pretty-print the
         configuration before building. We flatten the wrapped
-        :class:`KimiLinearConfig` dataclass into this dict so the log
+        :class:`KimiK3Config` dataclass into this dict so the log
         shows the actual Kimi hyperparameters (not just a reference).
         """
         import dataclasses
@@ -2049,9 +2049,7 @@ class KimiLinearSpec:
         out["__spec__"] = {
             "num_blocks": self.num_blocks,
             "model_class": (
-                "KimiLinearAttnResModel"
-                if self.num_blocks is not None
-                else "KimiLinearModel"
+                "KimiK3AttnResModel" if self.num_blocks is not None else "KimiK3Model"
             ),
         }
         return out
@@ -2073,7 +2071,7 @@ class KimiLinearSpec:
     @property
     def num_hidden_layers(self) -> int:
         """Expose num_hidden_layers at the spec level so adapter code
-        (pipeline_adapter._inject_kimi_linear_fqns) can get layer count
+        (pipeline_adapter._inject_kimi_k3_fqns) can get layer count
         without reaching into kimi_config.
         """
         return self.kimi_config.num_hidden_layers
@@ -2092,7 +2090,7 @@ class KimiLinearSpec:
         """Config-tree leaf: yield nothing.
 
         The Kimi Linear model is built as plain modules from
-        :class:`KimiLinearConfig`, not from a ``Configurable.Config``
+        :class:`KimiK3Config`, not from a ``Configurable.Config``
         tree, so there are no nested component configs to expose.
         Implemented because the Trainer chain requires it on every
         model config (``has_quantization``, the override mechanism via
@@ -2102,8 +2100,8 @@ class KimiLinearSpec:
 
 
 @dataclass(kw_only=True, slots=True)
-class KimiLinearFloat8Spec(KimiLinearSpec):
-    """:class:`KimiLinearSpec` whose ``build()`` swaps eligible
+class KimiK3Float8Spec(KimiK3Spec):
+    """:class:`KimiK3Spec` whose ``build()`` swaps eligible
     ``nn.Linear`` modules to torchao ``Float8Linear``.
 
     The Kimi Linear model is constructed as plain modules, not from a
@@ -2127,7 +2125,7 @@ class KimiLinearFloat8Spec(KimiLinearSpec):
 
         # Explicit base call: zero-arg super() breaks under
         # @dataclass(slots=True), which recreates the class object.
-        model = KimiLinearSpec.build(self, **kwargs)
+        model = KimiK3Spec.build(self, **kwargs)
 
         kda_linear_fqns = {
             f"{name}.{sub_name}"

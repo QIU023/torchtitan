@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU smoke tests for KimiLinearAttnResModel.
+"""CPU smoke tests for KimiK3AttnResModel.
 
 Exercises the AttnRes weave end-to-end on a tiny config with dense
 FFN only (no MoE, to dodge the ``torch.histc(Long)`` CPU limitation
@@ -22,18 +22,18 @@ import torch
 
 from torchtitan.models.kimi_k3.attn_res_model import (
     KimiAttnResDecoderLayer,
-    KimiLinearAttnResModel,
+    KimiK3AttnResModel,
 )
-from torchtitan.models.kimi_k3.model import KimiLinearConfig
+from torchtitan.models.kimi_k3.model import KimiK3Config
 
 
-def _dense_mla_only_config(num_hidden_layers: int = 4) -> KimiLinearConfig:
+def _dense_mla_only_config(num_hidden_layers: int = 4) -> KimiK3Config:
     """Small config: all MLA (no KDA), all dense FFN (no MoE). KDA
     requires CUDA/Triton and MoE CPU forward hits a torch.histc Long
     limitation, so both are skipped here. The AttnRes weave itself is
     independent of which attention / FFN variant sits below it.
     """
-    return KimiLinearConfig(
+    return KimiK3Config(
         vocab_size=256,
         hidden_size=128,
         num_hidden_layers=num_hidden_layers,
@@ -97,16 +97,18 @@ class TestKimiAttnResDecoderLayer(unittest.TestCase):
         self.assertEqual(new_partial.shape, (B, T, D))
 
         # Non-block-start: blocks unchanged, partial accumulates.
-        new_blocks2, new_partial2, _ = layer(new_blocks, new_partial, is_block_start=False)
+        new_blocks2, new_partial2, _ = layer(
+            new_blocks, new_partial, is_block_start=False
+        )
         self.assertEqual(len(new_blocks2), 3)
         self.assertEqual(new_partial2.shape, (B, T, D))
 
 
-class TestKimiLinearAttnResModel(unittest.TestCase):
+class TestKimiK3AttnResModel(unittest.TestCase):
     def test_instantiate_full_attnres(self):
         """Full AttnRes: num_blocks == num_hidden_layers, one block per layer."""
         cfg = _dense_mla_only_config(num_hidden_layers=4)
-        model = KimiLinearAttnResModel(cfg, num_blocks=4)
+        model = KimiK3AttnResModel(cfg, num_blocks=4)
         self.assertEqual(model.num_blocks, 4)
         self.assertEqual(model.layers_per_block, 1)
         # Pseudo-queries init to zero per paper.
@@ -119,7 +121,7 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
     def test_instantiate_block_attnres(self):
         """Block AttnRes N=2: 4 layers, 2 blocks, 2 layers per block."""
         cfg = _dense_mla_only_config(num_hidden_layers=4)
-        model = KimiLinearAttnResModel(cfg, num_blocks=2)
+        model = KimiK3AttnResModel(cfg, num_blocks=2)
         self.assertEqual(model.num_blocks, 2)
         self.assertEqual(model.layers_per_block, 2)
 
@@ -133,7 +135,7 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
         """
         cfg = _dense_mla_only_config(num_hidden_layers=4)
         torch.manual_seed(0)
-        model = KimiLinearAttnResModel(cfg, num_blocks=2)
+        model = KimiK3AttnResModel(cfg, num_blocks=2)
         model.init_weights()
 
         B, T = 2, 8
@@ -160,7 +162,7 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
         # final block"). A non-divisible split must therefore be ACCEPTED, with
         # layers_per_block ceil-derived.
         cfg = _dense_mla_only_config(num_hidden_layers=5)  # prime
-        model = KimiLinearAttnResModel(cfg, num_blocks=2)
+        model = KimiK3AttnResModel(cfg, num_blocks=2)
         self.assertEqual(model.layers_per_block, 3)  # ceil(5/2)
         # commits fire at layer 0 and 3; the 2-layer tail never commits
         self.assertEqual(model.num_committed_blocks, 2)
@@ -171,7 +173,7 @@ class TestKimiLinearAttnResModel(unittest.TestCase):
         num_blocks = -(-n_layers // block_size)
         self.assertEqual(num_blocks, 8)
         cfg = _dense_mla_only_config(num_hidden_layers=n_layers)
-        model = KimiLinearAttnResModel(cfg, num_blocks=num_blocks)
+        model = KimiK3AttnResModel(cfg, num_blocks=num_blocks)
         self.assertEqual(model.layers_per_block, block_size)
         self.assertEqual(model.num_committed_blocks, 8)
         commits = [i for i in range(n_layers) if i % block_size == 0]

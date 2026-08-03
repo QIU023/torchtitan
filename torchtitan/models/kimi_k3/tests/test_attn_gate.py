@@ -17,13 +17,13 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import KimiLinearConfig, KimiMLAAttention
+from torchtitan.models.kimi_k3.model import KimiK3Config, KimiMLAAttention
 
 H, DV, D = 4, 16, 64
 
 
 def _cfg(param):
-    return KimiLinearConfig(
+    return KimiK3Config(
         vocab_size=128,
         hidden_size=D,
         num_hidden_layers=2,
@@ -67,9 +67,7 @@ class TestAttnGate(unittest.TestCase):
         # every DV-wide slice repeats that head's single value
         for h in range(H):
             sl = g[..., h * DV : (h + 1) * DV]
-            torch.testing.assert_close(
-                sl, per_head[..., h : h + 1].expand_as(sl)
-            )
+            torch.testing.assert_close(sl, per_head[..., h : h + 1].expand_as(sl))
 
     def test_forward_runs_both_params(self):
         torch.manual_seed(0)

@@ -79,15 +79,11 @@ class TestPerHeadMuonTagging(unittest.TestCase):
     def _model(self):
         import torch
 
-        from torchtitan.models.kimi_k3.model import KimiLinearModel
-        from torchtitan.models.kimi_k3.model_configs import (
-            build_kimi_linear_config,
-        )
+        from torchtitan.models.kimi_k3.model import KimiK3Model
+        from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 
         with torch.device("meta"):
-            return KimiLinearModel(
-                build_kimi_linear_config("k3mini", vocab_size=256)
-            )
+            return KimiK3Model(build_kimi_linear_config("k3mini", vocab_size=256))
 
     def _tagged(self, model):
         out = {}

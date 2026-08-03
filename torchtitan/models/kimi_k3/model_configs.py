@@ -6,13 +6,13 @@
 
 """Scaling-law config registry for Kimi Linear + AttnRes.
 
-Parametric :class:`KimiLinearConfig` constructors for the 5 sizes in
+Parametric :class:`KimiK3Config` constructors for the 5 sizes in
 the AttnRes tech-report Table 2 (194M → 528M activated params) plus
 the 48B-A3B upscale target (kept for reference only — 48B needs
 multi-node). Each ``_build_config`` call returns a tuple of
 ``(kimi_config, num_blocks)`` so a caller can wire it into either
-:class:`KimiLinearModel` (baseline, ``num_blocks=None``) or
-:class:`KimiLinearAttnResModel` (AttnRes variant, ``num_blocks=N``).
+:class:`KimiK3Model` (baseline, ``num_blocks=None``) or
+:class:`KimiK3AttnResModel` (AttnRes variant, ``num_blocks=N``).
 
 The paper's Table 2 fields ``d_model``, ``d_ff``, ``L_b`` (= number of
 decoder layers), ``lr`` and ``batch_size`` are preserved verbatim. The
@@ -35,7 +35,7 @@ callers pass a ``num_blocks`` kwarg to pick the AttnRes variant.
 
 These builders return ``(kimi_config, num_blocks)`` tuples for direct
 model construction (CPU tests, ad-hoc experiments). The torchtitan
-integration lives elsewhere: ``KimiLinearSpec`` in ``model.py`` is the
+integration lives elsewhere: ``KimiK3Spec`` in ``model.py`` is the
 ``BaseModel.Config`` shim, and ``config_registry.py`` holds the
 ``Trainer.Config`` flavors the ConfigManager resolves by name.
 """
@@ -45,7 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from torchtitan.models.kimi_k3.model import KimiLinearConfig
+from torchtitan.models.kimi_k3.model import KimiK3Config
 
 
 # ----- Paper Table 2 canonical sizes -------------------------------------- #
@@ -53,19 +53,20 @@ from torchtitan.models.kimi_k3.model import KimiLinearConfig
 # d_ff is the MoE per-expert intermediate size (moe_intermediate_size in our
 # config). L_b is the number of Kimi decoder layers (= num_hidden_layers).
 
+
 @dataclass(frozen=True)
 class _SweepSize:
     """One row of the tech report's scaling-law sweep (Table 2)."""
 
     name: str
-    activated_params: int   # M parameters (reported, non-embedding)
-    tokens: float           # B tokens
-    n_layers: int           # L_b in paper (= num_hidden_layers in our config)
-    num_heads: int          # H in paper (= num_attention_heads + kda_num_heads)
-    d_model: int            # d_model in paper
-    d_ff: int               # d_ff in paper (= moe_intermediate_size in our config)
-    lr: float               # peak learning rate
-    batch_size: int         # global batch size (sequences)
+    activated_params: int  # M parameters (reported, non-embedding)
+    tokens: float  # B tokens
+    n_layers: int  # L_b in paper (= num_hidden_layers in our config)
+    num_heads: int  # H in paper (= num_attention_heads + kda_num_heads)
+    d_model: int  # d_model in paper
+    d_ff: int  # d_ff in paper (= moe_intermediate_size in our config)
+    lr: float  # peak learning rate
+    batch_size: int  # global batch size (sequences)
 
 
 SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
@@ -110,15 +111,11 @@ _BY_NAME: dict[str, _SweepSize] = {s.name: s for s in SCALING_LAW_TABLE}
 # table stays verbatim Table 2). 4 layers = 3 KDA + 1 MLA at the default
 # 3:1 ratio; d=256/H=4 -> head_dim 64, kv_lora 128; builds and runs a
 # forward on CPU in seconds with the bundled 2016-token test tokenizer.
-_BY_NAME["debugmodel"] = _SweepSize(
-    "debugmodel", 1, 0.01, 4, 4, 256, 128, 3e-4, 8
-)
+_BY_NAME["debugmodel"] = _SweepSize("debugmodel", 1, 0.01, 4, 4, 256, 128, 3e-4, 8)
 
 # 8-head debug size for deep tp x cp meshes: H=4 binds at tp*cp=4, so
 # tp2cp4 / tp4cp2 (8 ranks) need H=8. d=512 keeps head_dim 64.
-_BY_NAME["debugmodel8h"] = _SweepSize(
-    "debugmodel8h", 4, 0.01, 4, 8, 512, 128, 3e-4, 8
-)
+_BY_NAME["debugmodel8h"] = _SweepSize("debugmodel8h", 4, 0.01, 4, 8, 512, 128, 3e-4, 8)
 
 # K3-FAITHFUL downscale. Every structural choice is K3's, only the extents
 # shrink, so it is the carrier for anything that must behave like K3 rather
@@ -131,9 +128,12 @@ _BY_NAME["debugmodel8h"] = _SweepSize(
 #     size, same tail length) instead of just being small;
 #   * KDA:MLA 3:1 with the final layer forced global (layers 4, 8, 12);
 #   * latent ratio 0.5 (routed_expert_hidden_size = d/2), Ns = 2 shared.
-_BY_NAME["k3mini"] = _SweepSize(
-    "k3mini", 70, 0.01, 21, 4, 512, 224, 3e-4, 8
-)
+_BY_NAME["k3mini"] = _SweepSize("k3mini", 70, 0.01, 21, 4, 512, 224, 3e-4, 8)
+
+# The flavor functions renamed kimi_linear_k3mini_* -> kimi_k3_mini_*, so the
+# parsed size is now "mini". Alias rather than rename the row: "k3mini" is
+# still what older launch scripts and logbook entries name it.
+_BY_NAME["mini"] = _BY_NAME["k3mini"]
 
 
 # ----- 48B-A3B reference (upscale target, kept for docs) ------------------ #
@@ -141,11 +141,33 @@ _BY_NAME["k3mini"] = _SweepSize(
 # Listed here so the full scale sweep is visible in one file; the 48B
 # config needs multi-node to train.
 
-_KIMI_48B_A3B_KDA_LAYERS = (1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26)
+_KIMI_48B_A3B_KDA_LAYERS = (
+    1,
+    2,
+    3,
+    5,
+    6,
+    7,
+    9,
+    10,
+    11,
+    13,
+    14,
+    15,
+    17,
+    18,
+    19,
+    21,
+    22,
+    23,
+    25,
+    26,
+)
 _KIMI_48B_A3B_FULL_ATTN_LAYERS = (4, 8, 12, 16, 20, 24, 27)
 
 
 # ----- Sweep config builders ---------------------------------------------- #
+
 
 def _alternating_kda_mla_layers(
     n_layers: int,
@@ -183,7 +205,9 @@ def _alternating_kda_mla_layers(
 # code paths, and when they disagreed about k3mini's vocab the seed checkpoint
 # came out with a 2016-row embedding that could not load into the 163840-row model
 # the registry built -- which is what blocked the veRL actor.
-BUNDLED_TOKENIZER_SIZES: frozenset[str] = frozenset({"k3mini", "debugmodel", "debugmodel8h"})
+BUNDLED_TOKENIZER_SIZES: frozenset[str] = frozenset(
+    {"k3mini", "debugmodel", "debugmodel8h"}
+)
 BUNDLED_TOKENIZER_VOCAB = 2016
 K3_VOCAB = 163840
 
@@ -204,8 +228,8 @@ def build_kimi_linear_config(
     rms_norm_eps: float = 1e-5,
     dense_intermediate_size: int | None = None,
     use_grouped_topk: bool | None = None,
-) -> KimiLinearConfig:
-    """Construct a :class:`KimiLinearConfig` for one scaling-law size.
+) -> KimiK3Config:
+    """Construct a :class:`KimiK3Config` for one scaling-law size.
 
     Args:
         size: One of ``{"194m","241m","296m","436m","528m","48b"}``.
@@ -229,9 +253,7 @@ def build_kimi_linear_config(
     if vocab_size is None:
         vocab_size = default_vocab_size(size)
     if size not in _BY_NAME:
-        raise ValueError(
-            f"Unknown size '{size}'. Valid: {sorted(_BY_NAME.keys())}"
-        )
+        raise ValueError(f"Unknown size '{size}'. Valid: {sorted(_BY_NAME.keys())}")
     spec = _BY_NAME[size]
     d = spec.d_model
     H = spec.num_heads
@@ -242,7 +264,7 @@ def build_kimi_linear_config(
         # official config.json
         num_experts_default = 896
         tie_default = False
-        dense_d_ff_default = 33792      # intermediate_size (dense layer 0)
+        dense_d_ff_default = 33792  # intermediate_size (dense layer 0)
         use_grouped_topk_default = True
     elif size == "k3mini":
         num_experts_default = 8
@@ -307,7 +329,9 @@ def build_kimi_linear_config(
         # exact split instead of going through _alternating_kda_mla_layers
         # (which would miss layer 27 because 27 % 4 != 0).
         full_attn_layers = [4, 8, 12, 16, 20, 24, 27]
-        kda_layers = [i for i in range(1, spec.n_layers + 1) if i not in full_attn_layers]
+        kda_layers = [
+            i for i in range(1, spec.n_layers + 1) if i not in full_attn_layers
+        ]
     else:
         # K3 places an extra Gated MLA at the very end (report sec 2.1), so its
         # official full_attn_layers is [4, 8, ..., 88, 92, 93] -- 92 AND 93 both
@@ -322,7 +346,7 @@ def build_kimi_linear_config(
     # Every one of these is a real architectural choice, not a hyperparameter,
     # so they key off the size rather than being global defaults.
     is_k3 = is_k3_shaped(size)
-    return KimiLinearConfig(
+    return KimiK3Config(
         # Vocabulary / embedding
         vocab_size=vocab_size,
         hidden_size=d,
@@ -442,12 +466,13 @@ def resolve_num_blocks(size: str, variant: Variant) -> int | None:
 
 
 def build(
-    size: str, variant: Variant,
-) -> tuple[KimiLinearConfig, int | None]:
+    size: str,
+    variant: Variant,
+) -> tuple[KimiK3Config, int | None]:
     """Top-level entrypoint: return ``(kimi_config, num_blocks)``.
 
-    Pass to :class:`KimiLinearModel` (baseline) or
-    :class:`KimiLinearAttnResModel` (AttnRes) depending on
+    Pass to :class:`KimiK3Model` (baseline) or
+    :class:`KimiK3AttnResModel` (AttnRes) depending on
     ``num_blocks is None``.
     """
     return (
@@ -457,6 +482,7 @@ def build(
 
 
 # ----- Convenience: which (size, variant) pairs exist -------------------- #
+
 
 def flavor_names() -> list[str]:
     """All registered flavor names: ``kimi_linear_{size}_{variant}``."""

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU smoke tests for KimiLinearMultimodalModel scaffolding.
+"""CPU smoke tests for KimiK3LlavaMultimodalModel scaffolding.
 
 Scaffolding scope: verify the module layout + forward path compose
 cleanly on CPU without requiring a real vision tower / pretrained
@@ -27,9 +27,9 @@ import unittest
 import torch
 import torch.nn as nn
 
-from torchtitan.models.kimi_k3.model import KimiLinearConfig
+from torchtitan.models.kimi_k3.model import KimiK3Config
 from torchtitan.models.kimi_k3.multimodal_model import (
-    KimiLinearMultimodalModel,
+    KimiK3LlavaMultimodalModel,
     KimiMultimodalConfig,
     KimiVisionProjector,
 )
@@ -50,13 +50,16 @@ class _DummyViT(nn.Module):
         # Deterministic placeholder: zero features of the right shape.
         # Tests validate shape / control flow, not feature fidelity.
         return torch.zeros(
-            B, self.num_patches, self.vision_hidden_size,
-            dtype=pixel_values.dtype, device=pixel_values.device,
+            B,
+            self.num_patches,
+            self.vision_hidden_size,
+            dtype=pixel_values.dtype,
+            device=pixel_values.device,
         )
 
 
 def _mm_cfg(num_hidden_layers: int = 2) -> KimiMultimodalConfig:
-    kimi = KimiLinearConfig(
+    kimi = KimiK3Config(
         vocab_size=256,
         hidden_size=128,
         num_hidden_layers=num_hidden_layers,
@@ -106,20 +109,18 @@ class TestKimiVisionProjector(unittest.TestCase):
         self.assertEqual(out.shape, (2, 7, 128))
 
 
-class TestKimiLinearMultimodalModel(unittest.TestCase):
+class TestKimiK3LlavaMultimodalModel(unittest.TestCase):
     def test_text_only_forward_when_vision_tower_none(self):
         cfg = _mm_cfg()
-        model = KimiLinearMultimodalModel(cfg, vision_tower=None)
+        model = KimiK3LlavaMultimodalModel(cfg, vision_tower=None)
         input_ids = torch.randint(0, cfg.kimi_config.vocab_size, (2, 8))
         logits = model(input_ids=input_ids, pixel_values=None)
-        self.assertEqual(
-            logits.shape, (2, 8, cfg.kimi_config.vocab_size)
-        )
+        self.assertEqual(logits.shape, (2, 8, cfg.kimi_config.vocab_size))
 
     def test_vision_tower_frozen_by_default(self):
         cfg = _mm_cfg()
         vit = _DummyViT(num_patches=16, vision_hidden_size=32)
-        model = KimiLinearMultimodalModel(cfg, vision_tower=vit)
+        model = KimiK3LlavaMultimodalModel(cfg, vision_tower=vit)
         for p in model.vision_tower.parameters():
             self.assertFalse(p.requires_grad)
 
@@ -131,7 +132,7 @@ class TestKimiLinearMultimodalModel(unittest.TestCase):
         vit = _DummyViT(
             num_patches=num_patches, vision_hidden_size=cfg.vision_hidden_size
         )
-        model = KimiLinearMultimodalModel(cfg, vision_tower=vit)
+        model = KimiK3LlavaMultimodalModel(cfg, vision_tower=vit)
 
         B, T = 2, 8
         V = cfg.vision_token_id
@@ -145,15 +146,13 @@ class TestKimiLinearMultimodalModel(unittest.TestCase):
         # Expanded length: original T=8 + num_patches - 1 (sentinel replaced
         # by num_patches feature slots → +num_patches-1 per sample).
         expected_T = T + num_patches - 1
-        self.assertEqual(
-            logits.shape, (B, expected_T, cfg.kimi_config.vocab_size)
-        )
+        self.assertEqual(logits.shape, (B, expected_T, cfg.kimi_config.vocab_size))
         self.assertTrue(torch.isfinite(logits).all())
 
     def test_rejects_more_vision_tokens_than_images(self):
         cfg = _mm_cfg()
         vit = _DummyViT(num_patches=4, vision_hidden_size=cfg.vision_hidden_size)
-        model = KimiLinearMultimodalModel(cfg, vision_tower=vit)
+        model = KimiK3LlavaMultimodalModel(cfg, vision_tower=vit)
         # 2 vision sentinels but only 1 image → error
         input_ids = torch.randint(1, cfg.kimi_config.vocab_size, (1, 6))
         input_ids[0, 1] = cfg.vision_token_id

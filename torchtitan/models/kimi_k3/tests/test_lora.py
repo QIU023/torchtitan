@@ -18,7 +18,7 @@ import torch
 
 from torchtitan.models.kimi_k3 import config_registry
 from torchtitan.models.kimi_k3.lora import trainable_state_dict
-from torchtitan.models.kimi_k3.model import KimiLinearSpec
+from torchtitan.models.kimi_k3.model import KimiK3Spec
 
 
 def _device():
@@ -36,28 +36,24 @@ class TestKimiLoRA(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(11)
         self.kimi_config = (
-            config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
+            config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config
         )
 
     def test_full_graft_stack_step0_identity(self):
         lora = _build(
-            KimiLinearSpec(
+            KimiK3Spec(
                 kimi_config=self.kimi_config,
                 num_blocks=4,
                 attn_res_gated=True,
                 lora_rank=8,
             )
         )
-        base = _build(
-            KimiLinearSpec(kimi_config=self.kimi_config, num_blocks=None)
-        )
+        base = _build(KimiK3Spec(kimi_config=self.kimi_config, num_blocks=None))
         bsd = base.state_dict()
         # base weights live under .base after wrapping; strip for sharing
         shared = {}
         for k, v in lora.state_dict().items():
-            k2 = k.replace(".base.weight", ".weight").replace(
-                ".base.bias", ".bias"
-            )
+            k2 = k.replace(".base.weight", ".weight").replace(".base.bias", ".bias")
             if k2 in bsd:
                 shared[k2] = v
         self.assertEqual(set(shared), set(bsd))
@@ -76,7 +72,7 @@ class TestKimiLoRA(unittest.TestCase):
 
     def test_grad_routing_and_freeze(self):
         model = _build(
-            KimiLinearSpec(
+            KimiK3Spec(
                 kimi_config=self.kimi_config,
                 num_blocks=4,
                 attn_res_gated=True,
@@ -99,18 +95,12 @@ class TestKimiLoRA(unittest.TestCase):
             self.assertTrue(named[k].requires_grad, k)
             self.assertIsNotNone(named[k].grad, k)
         # AttnRes graft params train full-param (alpha exception).
-        graft_keys = [
-            k for k in named if "attn_res" in k or "mlp_res" in k
-        ]
+        graft_keys = [k for k in named if "attn_res" in k or "mlp_res" in k]
         self.assertTrue(graft_keys)
         for k in graft_keys:
             self.assertTrue(named[k].requires_grad, k)
         # Frozen base: no requires_grad, no grads.
-        frozen = [
-            k
-            for k in named
-            if k not in lora_keys and k not in graft_keys
-        ]
+        frozen = [k for k in named if k not in lora_keys and k not in graft_keys]
         self.assertTrue(frozen)
         for k in frozen:
             self.assertFalse(named[k].requires_grad, k)
@@ -118,7 +108,7 @@ class TestKimiLoRA(unittest.TestCase):
 
     def test_trainable_state_dict_is_lora_plus_graft(self):
         model = _build(
-            KimiLinearSpec(
+            KimiK3Spec(
                 kimi_config=self.kimi_config,
                 num_blocks=4,
                 attn_res_gated=True,
@@ -133,10 +123,7 @@ class TestKimiLoRA(unittest.TestCase):
         self.assertLess(trainable / total, 0.2)
         for k in payload:
             self.assertTrue(
-                "lora_a" in k
-                or "lora_b" in k
-                or "attn_res" in k
-                or "mlp_res" in k,
+                "lora_a" in k or "lora_b" in k or "attn_res" in k or "mlp_res" in k,
                 k,
             )
 

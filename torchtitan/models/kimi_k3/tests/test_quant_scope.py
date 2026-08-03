@@ -22,15 +22,15 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import KimiLinearModel
+from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 from torchtitan.models.kimi_k3.moe import KimiSiTUGroupedExperts
 from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
 from torchtitan.models.kimi_k3.quant_scope import (
-    MXFP4_GROUP_SIZE,
-    OFFICIAL_IGNORE_PATTERNS,
     is_ignored,
     is_quantizable,
+    MXFP4_GROUP_SIZE,
+    OFFICIAL_IGNORE_PATTERNS,
     quantizable_modules,
 )
 
@@ -42,9 +42,9 @@ _ARTIFACT = (
 )
 
 
-def _k3mini_model() -> KimiLinearModel:
+def _k3mini_model() -> KimiK3Model:
     with torch.device("meta"):
-        return KimiLinearModel(build_kimi_linear_config("k3mini", vocab_size=256))
+        return KimiK3Model(build_kimi_linear_config("k3mini", vocab_size=256))
 
 
 class TestQuantScope(unittest.TestCase):
@@ -67,9 +67,7 @@ class TestQuantScope(unittest.TestCase):
             self.assertTrue(fqn.endswith("routed_experts.inner_experts"), fqn)
         # every MoE layer contributes exactly one
         moe_layers = sum(
-            1
-            for _, m in model.named_modules()
-            if isinstance(m, KimiSiTUGroupedExperts)
+            1 for _, m in model.named_modules() if isinstance(m, KimiSiTUGroupedExperts)
         )
         self.assertEqual(len(scoped), moe_layers)
 
@@ -120,11 +118,7 @@ class TestQuantScope(unittest.TestCase):
         from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
 
         self.assertEqual(
-            [
-                fqn
-                for fqn, m in model.named_modules()
-                if isinstance(m, MXFP4QATLinear)
-            ],
+            [fqn for fqn, m in model.named_modules() if isinstance(m, MXFP4QATLinear)],
             [],
         )
 
@@ -207,9 +201,7 @@ class TestGroupedExpertMXFP4Packing(unittest.TestCase):
         return e
 
     def test_packing_shrinks_experts_and_restores_logical_shape(self):
-        from torchtitan.models.kimi_k3.lora import (
-            quantize_grouped_experts_mxfp4,
-        )
+        from torchtitan.models.kimi_k3.lora import quantize_grouped_experts_mxfp4
 
         e = self._experts()
         ref = e.w1_EFD.clone()
@@ -232,9 +224,7 @@ class TestGroupedExpertMXFP4Packing(unittest.TestCase):
         self.assertLess(rel, 0.25)
 
     def test_packed_params_are_contiguous_uint8_for_fsdp(self):
-        from torchtitan.models.kimi_k3.lora import (
-            quantize_grouped_experts_mxfp4,
-        )
+        from torchtitan.models.kimi_k3.lora import quantize_grouped_experts_mxfp4
 
         e = self._experts()
         quantize_grouped_experts_mxfp4(_wrap_in_holder(e))
@@ -253,9 +243,7 @@ class TestGroupedExpertMXFP4Packing(unittest.TestCase):
             self.assertFalse(p.requires_grad, n)
 
     def test_non_blockable_last_dim_stays_bf16(self):
-        from torchtitan.models.kimi_k3.lora import (
-            quantize_grouped_experts_mxfp4,
-        )
+        from torchtitan.models.kimi_k3.lora import quantize_grouped_experts_mxfp4
 
         e = self._experts(dim=48, hidden=96)  # 48 % 32 != 0
         holder = _wrap_in_holder(e)
@@ -267,9 +255,7 @@ class TestGroupedExpertMXFP4Packing(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "grouped_mm needs CUDA")
     def test_packed_experts_still_forward(self):
-        from torchtitan.models.kimi_k3.lora import (
-            quantize_grouped_experts_mxfp4,
-        )
+        from torchtitan.models.kimi_k3.lora import quantize_grouped_experts_mxfp4
 
         e = self._experts().cuda()
         x = torch.randn(6, 64, device="cuda", dtype=torch.bfloat16)

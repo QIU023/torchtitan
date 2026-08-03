@@ -46,7 +46,7 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.hf_key_map import titan_to_official
-from torchtitan.models.kimi_k3.model import KimiLinearModel
+from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 
 # vLLM's kimi_linear.py, verbatim.
@@ -60,7 +60,7 @@ _KDA_1BASED_FULL = {4, 8, 12, 16, 20, 21}
 def _exported_names():
     cfg = build_kimi_linear_config("k3mini", vocab_size=256)
     with torch.device("meta"):
-        model = KimiLinearModel(cfg)
+        model = KimiK3Model(cfg)
     kda = {
         i
         for i in range(cfg.num_hidden_layers)
@@ -136,9 +136,17 @@ class TestVLLMWeightContract(unittest.TestCase):
         # "block_sparse_moe" contains "_moe", so a substring check flags a
         # correct export.
         leaks = {
-            "_moe", "routed_experts", "inner_experts", "w1_EFD", "w2_EDF",
-            "w3_EFD", "latent", "attn_gate_proj", "final_attn_res_proj",
-            "final_attn_res_norm", "ffn",
+            "_moe",
+            "routed_experts",
+            "inner_experts",
+            "w1_EFD",
+            "w2_EDF",
+            "w3_EFD",
+            "latent",
+            "attn_gate_proj",
+            "final_attn_res_proj",
+            "final_attn_res_norm",
+            "ffn",
         }
         for k in self.exported:
             parts = set(k.split("."))

@@ -17,7 +17,7 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3 import config_registry
-from torchtitan.models.kimi_k3.model import KimiLinearSpec
+from torchtitan.models.kimi_k3.model import KimiK3Spec
 
 
 def _pair(gated: bool):
@@ -25,7 +25,7 @@ def _pair(gated: bool):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(7)
-    kimi_config = config_registry.kimi_linear_debugmodel().model_spec.model.kimi_config
+    kimi_config = config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config
     # All-MLA config (no KDA): the AttnRes-graft identity is about the
     # residual-read gating, independent of attention type. Avoiding the
     # fla/KDA triton kernels makes this deterministic + finite (KDA is
@@ -37,10 +37,8 @@ def _pair(gated: bool):
         kda_layers=[],
         full_attn_layers=list(range(1, n + 1)),
     )
-    graft_spec = KimiLinearSpec(
-        kimi_config=kimi_config, num_blocks=4, attn_res_gated=gated
-    )
-    base_spec = KimiLinearSpec(kimi_config=kimi_config, num_blocks=None)
+    graft_spec = KimiK3Spec(kimi_config=kimi_config, num_blocks=4, attn_res_gated=gated)
+    base_spec = KimiK3Spec(kimi_config=kimi_config, num_blocks=None)
     with torch.device(device):
         graft = graft_spec.build()
         graft.init_weights()
@@ -72,14 +70,16 @@ class TestGraftGate(unittest.TestCase):
         # non-deterministic, so assert a very tight tolerance.
         rel = ((lg - lb).norm() / (lb.norm() + 1e-9)).item()
         self.assertLess(
-            rel, 1e-4,
+            rel,
+            1e-4,
             f"gated graft must be ~identity at step 0; rel {rel:.3e}",
         )
 
     def test_ungated_zero_init_is_not_identity(self):
         lg, lb = _pair(gated=False)
         self.assertGreater(
-            (lg - lb).abs().max().item(), 1e-4,
+            (lg - lb).abs().max().item(),
+            1e-4,
             "ungated zero-init read is a uniform source-average and is "
             "expected to differ from the plain backbone -- if this ever "
             "matches exactly, the read semantics changed",

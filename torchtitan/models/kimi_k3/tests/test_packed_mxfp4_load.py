@@ -24,7 +24,7 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.hf_key_map import official_to_titan
-from torchtitan.models.kimi_k3.model import KimiLinearModel
+from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 from torchtitan.models.kimi_k3.packed_mxfp4 import (
     dequantize_mxfp4,
@@ -50,9 +50,7 @@ class TestMXFP4ByteLayout(unittest.TestCase):
             mx.qdata, mx.scale.view(torch.uint8), dtype=torch.float32
         )
         theirs = mx.dequantize().float()
-        self.assertEqual(
-            ((ours - theirs).norm() / theirs.norm()).item(), 0.0
-        )
+        self.assertEqual(((ours - theirs).norm() / theirs.norm()).item(), 0.0)
 
     def test_shapes_follow_the_released_layout(self):
         w = torch.randn(16, 128)
@@ -98,7 +96,7 @@ class TestSyntheticOfficialCheckpointLoad(unittest.TestCase):
     def _model(self):
         cfg = build_kimi_linear_config("k3mini", vocab_size=256)
         with torch.device("meta"):
-            m = KimiLinearModel(cfg)
+            m = KimiK3Model(cfg)
         m.to_empty(device="cpu")
         m.init_weights()
         return m, cfg
@@ -120,7 +118,9 @@ class TestSyntheticOfficialCheckpointLoad(unittest.TestCase):
         torch.manual_seed(0)
         truth, tensors = {}, {}
         for w_official, our_name in (
-            ("w1", "w1_EFD"), ("w2", "w2_EDF"), ("w3", "w3_EFD"),
+            ("w1", "w1_EFD"),
+            ("w2", "w2_EDF"),
+            ("w3", "w3_EFD"),
         ):
             shape = experts._parameters[our_name].shape
             for e in range(cfg.num_experts):
