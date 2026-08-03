@@ -94,6 +94,7 @@ def adapter_enabled() -> bool:
 
 # ----- Rank-shared cache across virtual stages ----------------------------- #
 
+
 class RankLocalCache:
     """Per-rank, per-microbatch forward-block cache shared across VP stages.
 
@@ -126,7 +127,10 @@ class RankLocalCache:
         self._capture_counts: dict[tuple[int, int, int], int] = {}
 
     def append(
-        self, mb_index: int, block: torch.Tensor, meta: tuple[int, int, int],
+        self,
+        mb_index: int,
+        block: torch.Tensor,
+        meta: tuple[int, int, int],
     ) -> None:
         self._blocks.setdefault(mb_index, []).append(block)
         self._producer_meta.setdefault(mb_index, []).append(meta)
@@ -138,7 +142,9 @@ class RankLocalCache:
         return self._producer_meta.get(mb_index, [])
 
     def put_forward(
-        self, mb_index: int, blocks: list[torch.Tensor],
+        self,
+        mb_index: int,
+        blocks: list[torch.Tensor],
         producer_meta: list[tuple[int, int, int]] | None = None,
     ) -> None:
         """Back-compat shim used by unit tests: overwrite the per-mb list."""
@@ -163,7 +169,9 @@ class RankLocalCache:
     # ----- captured-grad slot helpers -------------------------------- #
 
     def capture_grad(
-        self, key: tuple[int, int, int], grad: torch.Tensor,
+        self,
+        key: tuple[int, int, int],
+        grad: torch.Tensor,
     ) -> None:
         """Accumulate (sum) ``grad`` into the captured-grad slot at
         ``key`` and bump the capture counter. Multiple consumer-side
@@ -189,7 +197,8 @@ class RankLocalCache:
         self._capture_counts[key] = self._capture_counts.get(key, 0) + 1
 
     def pop_grad(
-        self, key: tuple[int, int, int],
+        self,
+        key: tuple[int, int, int],
     ) -> tuple[torch.Tensor | None, int]:
         """Return-and-clear ``(captured_grad, capture_count)`` for
         ``key``. ``captured_grad`` is ``None`` / ``capture_count`` is
@@ -337,6 +346,7 @@ def _install_augment_hook(
     """
     if not block_tensor.requires_grad:
         return
+
     def _hook(grad: torch.Tensor) -> torch.Tensor:
         captured, count = rank_cache.pop_grad(slot_key)
         _dbg(
@@ -357,6 +367,7 @@ def _install_augment_hook(
         if captured is None:
             return grad
         return grad + captured
+
     block_tensor.register_hook(_hook)
 
 
@@ -436,8 +447,13 @@ def _strip_wrapped_prefix_hook(
 
 
 def _prepend_wrapped_prefix_pre_hook(
-    state_dict: dict, prefix: str, local_metadata: dict, strict: bool,
-    missing_keys: list, unexpected_keys: list, error_msgs: list,
+    state_dict: dict,
+    prefix: str,
+    local_metadata: dict,
+    strict: bool,
+    missing_keys: list,
+    unexpected_keys: list,
+    error_msgs: list,
 ) -> None:
     """Load pre-hook: add the ``wrapped.`` namespace back."""
     target = prefix + _WRAPPED_PREFIX
@@ -450,6 +466,7 @@ def _prepend_wrapped_prefix_pre_hook(
 
 
 # ----- The adapter module -------------------------------------------------- #
+
 
 class CrossStageCacheAdapter(nn.Module):
     """Wraps an ``AttnResModel`` stage with cross-stage caching.
@@ -479,8 +496,11 @@ class CrossStageCacheAdapter(nn.Module):
     """
 
     def __init__(
-        self, wrapped: nn.Module, *,
-        stage_id: int, num_stages: int,
+        self,
+        wrapped: nn.Module,
+        *,
+        stage_id: int,
+        num_stages: int,
         group: "dist.ProcessGroup | None" = None,
         stage_to_rank: dict[int, int] | None = None,
         pp_rank: int | None = None,
@@ -552,18 +572,14 @@ class CrossStageCacheAdapter(nn.Module):
     def _has_blocks_signature(args) -> bool:
         """True if ``args[1]`` is a 4-D block tensor (middle/last stage)."""
         return (
-            len(args) >= 2
-            and isinstance(args[1], torch.Tensor)
-            and args[1].dim() == 4
+            len(args) >= 2 and isinstance(args[1], torch.Tensor) and args[1].dim() == 4
         )
 
     def _call_wrapped_naive(self, args, kwargs):
         """Dispatch to the wrapped model with the appropriate signature."""
         if self._has_blocks_signature(args):
             partial, new_blocks_tensor, *rest = args
-            return self.wrapped(
-                partial, *rest, blocks=new_blocks_tensor, **kwargs
-            )
+            return self.wrapped(partial, *rest, blocks=new_blocks_tensor, **kwargs)
         return self.wrapped(*args, blocks=None, **kwargs)
 
     def forward(self, *args, **kwargs):
@@ -596,7 +612,8 @@ class CrossStageCacheAdapter(nn.Module):
 
         per_block_shape = (
             new_blocks_out.shape[1:]
-            if new_blocks_out.shape[0] > 0 else partial_out.shape
+            if new_blocks_out.shape[0] > 0
+            else partial_out.shape
         )
         # requires_grad must mirror the runtime delta emission: torch >= 2.12
         # derives the downstream recv-buffer and grad-send metadata from the
@@ -629,8 +646,11 @@ class CrossStageCacheAdapter(nn.Module):
         if self.stage_id == 0:
             partial_out, new_blocks_tensor = self.wrapped(*args, blocks=None, **kwargs)
             return self._finish_forward(
-                mb, partial_out, new_blocks_tensor,
-                prev_recv_tensor=None, incoming_block_indices=[],
+                mb,
+                partial_out,
+                new_blocks_tensor,
+                prev_recv_tensor=None,
+                incoming_block_indices=[],
             )
 
         if not self._has_blocks_signature(args):
@@ -665,9 +685,7 @@ class CrossStageCacheAdapter(nn.Module):
         #   failed to provide under real PP + FSDP + AC rerun.
         earlier_blocks_raw = list(self._cache.get_blocks(mb))
         earlier_meta = list(self._cache.get_meta(mb))
-        cached_indices = [
-            layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta
-        ]
+        cached_indices = [layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta]
         earlier_blocks: list[torch.Tensor] = []
         # Eval / no_grad path: skip the Capture wrapping. With no
         # backward to run, there is nothing to capture into a slot, and
@@ -695,8 +713,7 @@ class CrossStageCacheAdapter(nn.Module):
         pairs.sort(key=lambda p: p[0])
         ordered_blocks = [p[1] for p in pairs]
         blocks_tensor = (
-            torch.stack(ordered_blocks, dim=0)
-            if ordered_blocks else recv_delta_tensor
+            torch.stack(ordered_blocks, dim=0) if ordered_blocks else recv_delta_tensor
         )
 
         wrapped_ret = self.wrapped(partial, *rest, blocks=blocks_tensor, **kwargs)
@@ -707,14 +724,19 @@ class CrossStageCacheAdapter(nn.Module):
 
         partial_out, new_blocks_tensor = wrapped_ret
         return self._finish_forward(
-            mb, partial_out, new_blocks_tensor,
+            mb,
+            partial_out,
+            new_blocks_tensor,
             prev_recv_tensor=recv_delta_tensor,
             incoming_block_indices=incoming_block_indices,
         )
 
     def _finish_forward(
-        self, mb: int, partial_out: torch.Tensor,
-        new_blocks_tensor: torch.Tensor, *,
+        self,
+        mb: int,
+        partial_out: torch.Tensor,
+        new_blocks_tensor: torch.Tensor,
+        *,
         prev_recv_tensor: torch.Tensor | None,
         incoming_block_indices: list[int],
     ):
@@ -741,7 +763,8 @@ class CrossStageCacheAdapter(nn.Module):
                 producer_rank = self._stage_to_rank.get(producer_stage, producer_stage)
                 block_idx_in_producer = layout.commits_at(producer_stage).index(bidx)
                 self._cache.append(
-                    mb, blk,
+                    mb,
+                    blk,
                     (producer_rank, producer_stage, block_idx_in_producer),
                 )
 
@@ -767,16 +790,20 @@ class CrossStageCacheAdapter(nn.Module):
         for local_idx, blk in enumerate(new_blocks_list):
             slot_key = (mb, self.stage_id, local_idx)
             expected_captures = layout.expected_same_rank_captures(
-                self.stage_id, local_idx,
+                self.stage_id,
+                local_idx,
             )
             _install_augment_hook(
-                blk, slot_key, self._cache,
+                blk,
+                slot_key,
+                self._cache,
                 expected_captures=expected_captures,
             )
             # Cache entry must be detached so same-rank consumers cannot
             # reach the producer's forward graph via autograd.
             self._cache.append(
-                mb, blk.detach(),
+                mb,
+                blk.detach(),
                 (self.pp_rank, self.stage_id, local_idx),
             )
         # `new_blocks_list` (attached) is used below for the outgoing
@@ -792,9 +819,7 @@ class CrossStageCacheAdapter(nn.Module):
         out_indices = layout.delta_to_send(self.stage_id)
         cache_by_bidx = {
             layout.commits_at(meta[1])[meta[2]]: blk
-            for meta, blk in zip(
-                self._cache.get_meta(mb), self._cache.get_blocks(mb)
-            )
+            for meta, blk in zip(self._cache.get_meta(mb), self._cache.get_blocks(mb))
         }
         new_by_bidx = {
             my_commits[i]: attached_new_blocks[i]
@@ -813,7 +838,8 @@ class CrossStageCacheAdapter(nn.Module):
                 )
 
         out_blocks_tensor = (
-            torch.stack(send_pieces, dim=0) if send_pieces
+            torch.stack(send_pieces, dim=0)
+            if send_pieces
             else partial_out.new_zeros((0, *partial_out.shape))
         )
         partial_out = self._keepalive_touch(partial_out, prev_recv_tensor)
@@ -890,6 +916,7 @@ class CrossStageCacheAdapter(nn.Module):
 
 # ----- Stage iteration + monkey-patching ----------------------------------- #
 
+
 def _iter_schedule_stages(schedule: _PipelineSchedule):
     """Yield the ``PipelineStage`` objects a schedule holds."""
     if isinstance(schedule, PipelineScheduleSingle):
@@ -921,6 +948,7 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
     # in torch nightly (>=2.10). On torch 2.9 stable the kwarg doesn't
     # exist, so passing it raises TypeError. Detect once and dispatch.
     import inspect as _inspect
+
     _orig_fwd_sig = _inspect.signature(orig_fwd)
     _has_save_kw = "save_forward_output" in _orig_fwd_sig.parameters
 
@@ -929,7 +957,9 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         try:
             if _has_save_kw:
                 return orig_fwd(
-                    fwd_chunk_id, args, kwargs,
+                    fwd_chunk_id,
+                    args,
+                    kwargs,
                     save_forward_output=save_forward_output,
                 )
             return orig_fwd(fwd_chunk_id, args, kwargs)
@@ -937,7 +967,9 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
             _set_mb_index(adapter_key, None)
 
     def patched_bwd(
-        bwd_chunk_id, loss=None, full_backward: bool = True,
+        bwd_chunk_id,
+        loss=None,
+        full_backward: bool = True,
         last_backward: bool = False,
     ):
         # Plain backward pass. The double-backward risk on own-rank
@@ -954,7 +986,9 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         _dbg(f"patched_bwd ENTER stage={adapter.stage_id} mb={bwd_chunk_id}")
         try:
             return orig_bwd(
-                bwd_chunk_id, loss=loss, full_backward=full_backward,
+                bwd_chunk_id,
+                loss=loss,
+                full_backward=full_backward,
                 last_backward=last_backward,
             )
         finally:
@@ -1016,7 +1050,9 @@ def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
         return
 
     import math as _math
+
     from torch.distributed.pipelining.schedules import PipelineScheduleSingle
+
     from torchtitan.distributed.pipeline_parallel import (
         _generate_llm_fqn_per_model_part as generate_llm_fqn_per_model_part,
         get_schedule_class,
@@ -1045,6 +1081,7 @@ def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
 
 
 # ----- Custom pipelining_fn ------------------------------------------------ #
+
 
 def _build_stage_to_rank(stages) -> dict[int, int]:
     """Map ``stage_id -> rank`` from live ``PipelineStage`` objects."""
@@ -1116,8 +1153,11 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
 
     try:
         layout_tables = _infer_block_layout_tables_from_stages(
-            stages, pp_size=pp_size, num_blocks=num_blocks,
-            n_layers=n_layers_total, layers_per_block=layers_per_block,
+            stages,
+            pp_size=pp_size,
+            num_blocks=num_blocks,
+            n_layers=n_layers_total,
+            layers_per_block=layers_per_block,
         )
     except Exception as e:  # pragma: no cover - defensive
         warnings.warn(
@@ -1159,8 +1199,10 @@ _KIMI_ATTN_RES_LAST_STAGE_FQNS = ("final_attn_res_proj", "final_attn_res_norm")
 
 
 def _kimi_llm_fqns(
-    num_stages: int, num_layers: int,
-    input_weight: int = 1, output_weight: int = 1,
+    num_stages: int,
+    num_layers: int,
+    input_weight: int = 1,
+    output_weight: int = 1,
 ) -> list[list[str]]:
     """Kimi-named version of ``generate_llm_fqn_per_model_part``.
 
@@ -1172,6 +1214,7 @@ def _kimi_llm_fqns(
     from torchtitan.distributed.pipeline_parallel import (
         _generate_llm_fqn_per_model_part as generate_llm_fqn_per_model_part,
     )
+
     raw = generate_llm_fqn_per_model_part(
         num_stages, num_layers, input_weight, output_weight
     )
@@ -1179,13 +1222,54 @@ def _kimi_llm_fqns(
     return [[rename.get(n, n) for n in stage] for stage in raw]
 
 
+def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
+    """Split the TEXT model, and re-wrap the stage that owns ``embed_tokens``.
+
+    Core's ``_split_module`` iterates only top-level ``named_children()``. On the
+    multimodal wrapper those children are ``vision_tower`` and
+    ``language_model``, so no FQN scheme reaches the text stack: flat names
+    (``embed_tokens``, ``layers.N``) match nothing, and dotted ones
+    (``language_model.layers.N``) are not recursed into either. Every child then
+    takes the "not in modules_to_keep" branch and is set to None, so the stage
+    holds zero parameters and the optimizer reports
+    ``pattern '.*' matched no parameters``.
+
+    Vision features are spliced into the embeddings, so the tower belongs with
+    whichever chunk kept ``embed_tokens`` -- nothing vision-side crosses a stage
+    boundary. Re-wrapping happens inside ``parallelize_fn`` so the tower is
+    present before SPMD is applied, not bolted on afterwards.
+
+    Returns the module to hand to ``pipeline_llm``: the text model when this is
+    the multimodal wrapper, otherwise ``model`` untouched.
+    """
+    tower = getattr(model, "vision_tower", None)
+    inner = getattr(model, "language_model", None)
+    if tower is None or inner is None:
+        return model
+
+    from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
+
+    mm_config = model.config
+    inner_parallelize = kwargs["parallelize_fn"]
+
+    def _parallelize_with_tower(part: nn.Module, **pk):
+        # The embed_tokens-owning chunk is the first stage by construction.
+        if getattr(part, "embed_tokens", None) is not None:
+            part = KimiK3MultimodalModel.from_parts(mm_config, tower, part)
+        return inner_parallelize(part, **pk)
+
+    kwargs["parallelize_fn"] = _parallelize_with_tower
+    return inner
+
+
 def _inject_kimi_linear_fqns(model: nn.Module, kwargs: dict) -> None:
     """Populate ``parallelism.module_fqns_per_model_part`` so the PP
     split uses Kimi module names and the last stage includes the
     AttnRes final-aggregation modules.
     """
-    if not any(hasattr(model, n) for n in _KIMI_ATTN_RES_LAST_STAGE_FQNS) \
-            and not hasattr(model, "embed_tokens"):
+    if not any(
+        hasattr(model, n) for n in _KIMI_ATTN_RES_LAST_STAGE_FQNS
+    ) and not hasattr(model, "embed_tokens"):
         return  # Not a Kimi model; pass through
     parallelism = kwargs.get("parallelism")
     if parallelism is None or parallelism.module_fqns_per_model_part is not None:
@@ -1209,13 +1293,12 @@ def _inject_kimi_linear_fqns(model: nn.Module, kwargs: dict) -> None:
         )
     else:
         from torchtitan.distributed.pipeline_parallel import get_schedule_class
+
         schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
         stages_per_rank = 1 if issubclass(schedule_class, PipelineScheduleSingle) else 2
         num_virtual_stages = pp * stages_per_rank
 
-    fqns = _kimi_llm_fqns(
-        num_virtual_stages, num_layers, input_weight, output_weight
-    )
+    fqns = _kimi_llm_fqns(num_virtual_stages, num_layers, input_weight, output_weight)
     # Append AttnRes tail modules if present (last stage only).
     extras = [n for n in _KIMI_ATTN_RES_LAST_STAGE_FQNS if hasattr(model, n)]
     if extras:
@@ -1241,6 +1324,7 @@ def pipeline_kimi_linear_with_cache_adapter(model: nn.Module, **kwargs):
     """
     from torchtitan.distributed.pipeline_parallel import pipeline_llm
 
+    model = _unwrap_multimodal_for_pp(model, kwargs)
     _inject_kimi_linear_fqns(model, kwargs)
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
@@ -1289,8 +1373,11 @@ def pipeline_kimi_linear_with_cache_adapter(model: nn.Module, **kwargs):
 
     try:
         layout_tables = _infer_block_layout_tables_from_stages(
-            stages, pp_size=pp_size, num_blocks=num_blocks,
-            n_layers=n_layers_total, layers_per_block=layers_per_block,
+            stages,
+            pp_size=pp_size,
+            num_blocks=num_blocks,
+            n_layers=n_layers_total,
+            layers_per_block=layers_per_block,
         )
     except Exception as e:  # pragma: no cover - defensive
         warnings.warn(

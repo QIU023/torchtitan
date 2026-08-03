@@ -43,15 +43,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.models.kimi_k3.attn_res_model import (
-    KimiLinearAttnResModel,
-)
-from torchtitan.models.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
+from torchtitan.models.kimi_k3.attn_res_model import KimiLinearAttnResModel
 from torchtitan.models.kimi_k3.model import (
-    KimiLinearSpec,
     KimiLinearConfig,
     KimiLinearModel,
+    KimiLinearSpec,
 )
+from torchtitan.models.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
 
 
 @dataclass(kw_only=True, slots=True)
@@ -91,7 +89,10 @@ class KimiVisionProjector(nn.Module):
     """
 
     def __init__(
-        self, *, vision_hidden_size: int, projector_hidden_size: int,
+        self,
+        *,
+        vision_hidden_size: int,
+        projector_hidden_size: int,
         llm_hidden_size: int,
     ) -> None:
         super().__init__()
@@ -132,7 +133,9 @@ class KimiLinearMultimodalModel(nn.Module):
     """
 
     def __init__(
-        self, config: KimiMultimodalConfig, *,
+        self,
+        config: KimiMultimodalConfig,
+        *,
         vision_tower: nn.Module | None = None,
     ) -> None:
         super().__init__()
@@ -181,7 +184,9 @@ class KimiLinearMultimodalModel(nn.Module):
         return projected.view(B, num_images, N_vision, D_llm)
 
     def _inject_vision_features(
-        self, input_ids: torch.Tensor, vision_features: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
+        vision_features: torch.Tensor,
     ) -> torch.Tensor:
         """Build the interleaved embedding sequence.
 
@@ -257,7 +262,8 @@ class KimiLinearMultimodalModel(nn.Module):
         return padded
 
     def forward(
-        self, input_ids: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Multimodal forward.
@@ -283,9 +289,7 @@ class KimiLinearMultimodalModel(nn.Module):
                 "construct with a vision module or drop pixel_values."
             )
             vision_features = self._encode_images(pixel_values)
-            inputs_embeds = self._inject_vision_features(
-                input_ids, vision_features
-            )
+            inputs_embeds = self._inject_vision_features(input_ids, vision_features)
             # LLM was designed to take token ids via embed_tokens.
             # Bypass the embedding by passing hidden states directly.
             # This works because forward(tokens) dispatches based on
@@ -352,6 +356,32 @@ class KimiK3MultimodalModel(nn.Module):
     Submodule names mirror the checkpoint (``vision_tower``, ``language_model``)
     so ``hf_key_map`` is a prefix rename.
     """
+
+    @classmethod
+    def from_parts(
+        cls,
+        config: KimiK3MultimodalConfig,
+        vision_tower: nn.Module,
+        language_model: nn.Module,
+    ) -> "KimiK3MultimodalModel":
+        """Assemble from already-built parts, skipping ``__init__``'s construction.
+
+        The PP split cannot see through this wrapper: core's ``_split_module``
+        walks only top-level ``named_children()``, so neither the flat FQNs
+        (``embed_tokens``, ``layers.N``) nor dotted ones
+        (``language_model.layers.N``) match anything here, and every child is
+        replaced by None -- the stage ends up with zero parameters. The adapter
+        therefore splits the TEXT model and rebuilds this wrapper around the
+        chunk that owns ``embed_tokens``, which is the only place vision
+        features are consumed (they are spliced into the embeddings, so nothing
+        vision-side ever crosses a stage boundary).
+        """
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self.config = config
+        self.vision_tower = vision_tower
+        self.language_model = language_model
+        return self
 
     def __init__(self, config: KimiK3MultimodalConfig) -> None:
         super().__init__()
@@ -439,9 +469,7 @@ class KimiK3MultimodalModel(nn.Module):
 
         Text-only when no patches are supplied or no sentinel is present.
         """
-        sentinel_present = bool(
-            (input_ids == self.config.vision_token_id).any().item()
-        )
+        sentinel_present = bool((input_ids == self.config.vision_token_id).any().item())
         if patches is None or not sentinel_present:
             if patches is not None and not sentinel_present:
                 raise ValueError(
@@ -510,9 +538,7 @@ def _mm_verify_module_protocol(self) -> None:
 
 KimiK3MultimodalModel.verify_module_protocol = _mm_verify_module_protocol
 for _name in ("get_attention_masks", "init_weights"):
-    if not hasattr(KimiK3MultimodalModel, _name) and hasattr(
-        KimiLinearModel, _name
-    ):
+    if not hasattr(KimiK3MultimodalModel, _name) and hasattr(KimiLinearModel, _name):
         setattr(KimiK3MultimodalModel, _name, getattr(KimiLinearModel, _name))
 
 
