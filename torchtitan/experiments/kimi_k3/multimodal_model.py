@@ -428,8 +428,14 @@ class KimiK3MultimodalModel(nn.Module):
         input_ids: torch.Tensor,
         patches: torch.Tensor | None = None,
         grid_thws: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         """``[B, T]`` ids (+ packed patches) -> logits.
+
+        ``**kwargs`` is ignored, mirroring KimiLinearModel: torchtitan's Trainer
+        and Validator inject ``attention_masks=None`` and ``positions=...`` for
+        the FlexAttention / CP paths, and K3 uses plain SDPA plus KDA Triton
+        kernels which take neither.
 
         Text-only when no patches are supplied or no sentinel is present.
         """
@@ -468,6 +474,21 @@ class KimiK3MultimodalModel(nn.Module):
     def init_weights(self, init_range: float | None = None, **kwargs) -> None:
         self.vision_tower.init_weights(init_range)
         self.language_model.init_weights(init_range, **kwargs)
+
+
+def _mm_layers(self):
+    """Expose the text stack where parallelize.py and the PP splitter look.
+
+    Both walk ``model.layers`` (a ModuleDict keyed by layer id -- the PP
+    adapter's layer_to_stage discovery depends on those string keys). The
+    multimodal wrapper keeps the text model at ``self.language_model``, so
+    without this the FSDP wrap fails with "no attribute 'layers'" before any
+    step runs.
+    """
+    return self.language_model.layers
+
+
+KimiK3MultimodalModel.layers = property(_mm_layers)
 
 
 def _mm_verify_module_protocol(self) -> None:
