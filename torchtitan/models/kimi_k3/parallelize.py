@@ -550,6 +550,14 @@ def apply_tp_kimi_linear(
     # Both embed and lm_head emit plain Tensors (use_local_output=True)
     # so the AttnRes top-level forward composes cleanly with the
     # block-stacking path.
+    # The multimodal wrapper keeps the text model at .language_model, so the
+    # top-level plan below -- embed_tokens / norm / lm_head, addressed by name --
+    # would find none of them and leave the embedding un-sharded, which surfaces
+    # as "aten.embedding.default got mixed torch.Tensor and DTensor". Descend to
+    # the text model for the top-level names; the vision tower stays replicated,
+    # which is what MoonViT wants (no head axis to shard at this size).
+    model = getattr(model, "language_model", model)
+
     parallelize_module(
         model,
         tp_mesh,

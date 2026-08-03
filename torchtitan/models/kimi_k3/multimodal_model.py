@@ -472,8 +472,13 @@ class KimiK3MultimodalModel(nn.Module):
             self.language_model.embed_tokens = saved
 
     def init_weights(self, init_range: float | None = None, **kwargs) -> None:
-        self.vision_tower.init_weights(init_range)
-        self.language_model.init_weights(init_range, **kwargs)
+        # Under PP the module is split into stages and the pieces a stage does
+        # not own are set to None -- only the first stage keeps the tower, only
+        # the last keeps lm_head. Guard both rather than assume a whole model.
+        if self.vision_tower is not None:
+            self.vision_tower.init_weights(init_range)
+        if self.language_model is not None:
+            self.language_model.init_weights(init_range, **kwargs)
 
 
 def _mm_layers(self):
