@@ -73,12 +73,18 @@ def block_attn_res(
     # is what all-gathers proj.weight. Moving the weight access above this
     # line would read a sharded param. See apply_fsdp's attn_res_tail note.
     K = norm(V)
-    if K.dtype != V.dtype:
-        # Frozen-base LoRA keeps trainable AttnRes norms as fp32 masters
-        # while the stream is bf16; RMSNorm promotes its output to fp32,
-        # which would leak fp32 into the residual stream downstream.
-        # Compute in the stream dtype (matches FSDP mixed-precision).
-        K = K.to(V.dtype)
+    # FP32 for the whole of alpha, matching the release. The official
+    # _apply_attn_res (modeling_kimi_linear.py) does v.float(), normalizes,
+    # scores and mixes in FP32, and casts back only at the end.
+    #
+    # This is not a precision nicety here. proj is zero-initialized, so the
+    # block softmax starts uniform and the pseudo-query gradient is a
+    # difference of nearly equal terms -- measured at 6x to 15x cancellation
+    # on this model. bf16 is exactly where that costs. The previous code cast
+    # DOWN to the stream dtype at this point and again at the query, to match
+    # FSDP mixed precision; the cast back to V.dtype now happens once, at the
+    # end, on the result.
+    K = K.float()
     # proj.weight is [1, D]; squeeze to [D] and contract with K's channel dim.
     # Under TP, proj is wrapped with NoParallel, which makes proj.weight a
     # DTensor(Replicate) on the tp mesh dim. The downstream einsum mixes
@@ -105,19 +111,11 @@ def block_attn_res(
     weight = proj.weight
     if isinstance(weight, DTensor):
         weight = weight.to_local()
-    query = weight.squeeze(0)
-    if query.dtype != K.dtype:
-        # Frozen-base LoRA keeps the backbone bf16 while trainable
-        # AttnRes pseudo-queries stay fp32 masters. Under FSDP the
-        # mixed-precision policy casts the master to bf16 for compute;
-        # without FSDP (dp_shard=1 debug runs) nothing reconciles the
-        # dtypes and einsum (unlike elementwise ops) refuses mixed
-        # inputs. Compute in the stream dtype to match FSDP numerics.
-        query = query.to(K.dtype)
+    query = weight.squeeze(0).float()
     logits = torch.einsum("d,nbtd->nbt", query, K)
     weights = F.softmax(logits, dim=0)
-    h = torch.einsum("nbt,nbtd->btd", weights, V)
-    return h
+    h = torch.einsum("nbt,nbtd->btd", weights, V.float())
+    return h.to(V.dtype)
 
 
 class AttnResProjection(_TTLinear):
