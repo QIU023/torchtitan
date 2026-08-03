@@ -472,6 +472,20 @@ class KimiLinearAttnResModel(KimiLinearModel):
                     empty = partial_block.new_zeros((0, *partial_block.shape))
                     return partial_block, empty
                 return partial_block, stack_blocks(new_blocks)
+            if not block_list:
+                # Non-delta mode has the same hole delta mode guards above: a
+                # stage span that has not yet crossed any block boundary has
+                # nothing to stack. VP is what exposes it -- with 4 virtual
+                # stages per rank the early ones sit entirely inside the first
+                # block, where pp8 with one stage per rank never landed.
+                # .contiguous(): P2P requires non-overlapping dense tensors,
+                # and a zero-first-dim new_zeros is not guaranteed to satisfy
+                # that. VP4 is what surfaced it -- VP1 never sends an empty
+                # stack because every rank's single stage spans a boundary.
+                empty = partial_block.new_zeros(
+                    (0, *partial_block.shape)
+                ).contiguous()
+                return partial_block, empty
             return partial_block, stack_blocks(block_list)
 
         # Last stage / single-GPU: final aggregation + norm + lm_head.

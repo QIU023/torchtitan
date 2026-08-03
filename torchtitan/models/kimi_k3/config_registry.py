@@ -627,6 +627,39 @@ def kimi_linear_k3mini_diag_4l_moe_8h() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_pp8vp4() -> Trainer.Config:
+    """30 layers, sized so PP8 admits VP=4.
+
+    The virtual-stage count must be divisible by pipeline_parallel_degree AND
+    give at least 2 stages per rank, and it counts the two AttnRes tail modules
+    alongside the decoder layers. At 21 layers that is 23 virtual stages, which
+    is not divisible by 8 at any layers_per_stage: lps=3 gives 8 (one per rank,
+    below VP's minimum) and lps=2 gives 12 (not divisible). 30 layers gives
+    30 + 2 = 32 at lps=1 -- exactly 4 per rank.
+
+    Everything else matches kimi_linear_k3mini_block_attn_res.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_pp8vp4"
+    kc = cfg.model_spec.model.kimi_config
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            kc,
+            num_hidden_layers=30,
+            # All-MLA: pp8 needs dp_shard=1, and without FSDP's
+            # mixed-precision cast the KDA params stay fp32 and fla's kernel
+            # asks for 108,160 B of shared memory against this GPU's 101,376 B.
+            # The PP/VP machinery under test is attention-type agnostic.
+            kda_layers=[],
+            full_attn_layers=list(range(1, 31)),
+        ),
+    )
+    return cfg
+
+
 def kimi_linear_k3mini_diag_21l_mla() -> Trainer.Config:
     """21 dense MLA layers, 8 AttnRes blocks -- full depth, AttnRes on."""
     return _diag_multi_layer(
