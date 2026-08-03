@@ -41,20 +41,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import (
-    CPUOffloadPolicy,
-    fully_shard,
-    MixedPrecisionPolicy,
-)
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
+from torch.distributed.tensor import distribute_module, distribute_tensor, DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
     PrepareModuleInput,
     RowwiseParallel,
 )
-from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from torchtitan.distributed.tensor_parallel import NoParallel
 
 from torchtitan.config import (
     CompileConfig,
@@ -68,6 +63,7 @@ from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
     get_fsdp_reshard_after_forward_policy,
 )
+from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.tools.logging import logger
 
 
@@ -122,10 +118,9 @@ def parallelize_kimi_linear(
         # and triton kernels never see a mixed-mesh tensor.
         tp_mesh = parallel_dims.get_mesh("tp")
         apply_tp_kimi_linear(
-            model, tp_mesh,
-            skip_expert_params=(
-                parallel_dims.ep_enabled or _model_has_moe(model)
-            ),
+            model,
+            tp_mesh,
+            skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
             moe_module_parallel=_model_has_moe(model),
         )
         # Stash the TP mesh on the model so AttnRes top-level forward
@@ -135,7 +130,8 @@ def parallelize_kimi_linear(
         # mesh's local view before aggregation).
         model._tp_mesh = tp_mesh
         logger.info(
-            "Applied DSv3-style TP plan tp_degree=%d.", parallel_dims.tp,
+            "Applied DSv3-style TP plan tp_degree=%d.",
+            parallel_dims.tp,
         )
     if parallel_dims.cp_enabled:
         # Fail loudly on configs the CP implementation cannot honor.
@@ -167,10 +163,7 @@ def parallelize_kimi_linear(
         # inner_attention isn't the torchtitan SDPA type
         # apply_cp_to_forward expects -- hence this module-internal CP
         # rather than the upstream dispatcher.
-        from torchtitan.models.kimi_k3.model import (
-            KimiDeltaAttention,
-            KimiMLAAttention,
-        )
+        from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiMLAAttention
 
         cp_group = parallel_dims.get_mesh("cp").get_group()
         cp_degree = parallel_dims.cp
@@ -199,9 +192,20 @@ def parallelize_kimi_linear(
                     )
                 m._cp_group = cp_group
                 n_attn += 1
+        # The multimodal wrapper needs it too. prepare_context_parallel_input
+        # shards inputs/labels/positions but NOT pixel_values, so each CP rank
+        # sees a slice of the vision sentinels while still being handed the
+        # whole batch of images; the splice then finds a sentinel count that
+        # matches neither the image count nor the token count.
+        from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
+
+        for m in model.modules():
+            if isinstance(m, KimiK3MultimodalModel):
+                m._cp_group = cp_group
         logger.info(
             "Applied Ulysses CP cp_degree=%d (all-to-all at %d attn layers).",
-            cp_degree, n_attn,
+            cp_degree,
+            n_attn,
         )
     if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
         # Expert Parallel for Kimi MoE layers. The
@@ -308,9 +312,7 @@ def parallelize_kimi_linear(
             reduce_dtype=reduce_dtype,
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=training.enable_cpu_offload,
-            reshard_after_forward_policy=(
-                parallelism.fsdp_reshard_after_forward
-            ),
+            reshard_after_forward_policy=(parallelism.fsdp_reshard_after_forward),
             ep_degree=parallel_dims.ep,
             edp_mesh=edp_mesh,
         )
@@ -422,7 +424,10 @@ def _patch_fla_for_dtensor() -> dict:
                     and not isinstance(t, DTensor)
                 ):
                     return DTensor.from_local(
-                        t, in_mesh, in_placements, run_check=False,
+                        t,
+                        in_mesh,
+                        in_placements,
+                        run_check=False,
                     )
                 return t
 
@@ -467,10 +472,7 @@ def _bind_fla_dtensor_shims(model: nn.Module) -> int:
 def _model_has_moe(model: nn.Module) -> bool:
     """True if any layer carries a KimiMoE ffn (module-internal MoE
     parallelization applies)."""
-    return any(
-        bool(getattr(layer, "is_moe", False))
-        for layer in model.layers.values()
-    )
+    return any(bool(getattr(layer, "is_moe", False)) for layer in model.layers.values())
 
 
 def apply_tp_kimi_linear(
@@ -587,8 +589,24 @@ def apply_tp_kimi_linear(
     # top-level plan below -- embed_tokens / norm / lm_head, addressed by name --
     # would find none of them and leave the embedding un-sharded, which surfaces
     # as "aten.embedding.default got mixed torch.Tensor and DTensor". Descend to
-    # the text model for the top-level names; the vision tower stays replicated,
-    # which is what MoonViT wants (no head axis to shard at this size).
+    # the text model for the top-level names.
+    #
+    # MoonViT itself wants no TP at this size (no head axis worth sharding), but
+    # "leave it alone" is not the same as "replicate it". Untouched, its params
+    # stay plain tensors, FSDP wraps them on the dp_mesh alone, and the text
+    # params -- TP'd first, then FSDP'd -- land on the 2D (dp, tp) mesh. Nothing
+    # in the forward notices; clip_grad_norm_ does, and dies stacking gradient
+    # norms across two different meshes. NoParallel replicates on the tp axis so
+    # every parameter shares one mesh.
+    # distribute_module with no partition_fn replicates the whole subtree's
+    # parameters and installs NO boundary hooks. NoParallel would be the obvious
+    # choice, but its output hook assumes a single DTensor and MoonViT returns a
+    # LIST of per-sample feature blocks. encode_images does the two boundary
+    # conversions instead, where the list is in hand.
+    vision_tower = getattr(model, "vision_tower", None)
+    if vision_tower is not None:
+        distribute_module(vision_tower, tp_mesh)
+
     model = getattr(model, "language_model", model)
 
     parallelize_module(
@@ -745,14 +763,11 @@ def apply_tp_kimi_linear(
                     use_local_output=True,
                 )
 
-
         # FFN path.
         if not is_moe:
             ffn = getattr(layer, "ffn", None)
             if ffn is None:
-                raise ValueError(
-                    f"layer {layer.layer_idx}: missing dense ffn"
-                )
+                raise ValueError(f"layer {layer.layer_idx}: missing dense ffn")
             for name in ("gate_proj", "up_proj", "down_proj"):
                 if not hasattr(ffn, name):
                     raise ValueError(
@@ -804,9 +819,7 @@ def apply_tp_kimi_linear(
             # promotes MoE params to (fsdp, tp) after FSDP wrap.
             ffn = getattr(layer, "ffn", None)
             if ffn is None or not hasattr(ffn, "_moe"):
-                raise ValueError(
-                    f"MoE layer {layer.layer_idx}: missing ffn._moe"
-                )
+                raise ValueError(f"MoE layer {layer.layer_idx}: missing ffn._moe")
             if moe_module_parallel:
                 # The post-merge module-internal MoE path owns ALL MoE
                 # parallelization (sharding configs declared at config
@@ -852,9 +865,7 @@ def apply_tp_kimi_linear(
             # plain input from MoE.forward (post-to_local at line 410)
             # while keeping its weight as DTensor on tp_mesh.
             shared = (
-                getattr(ffn._moe, "shared_experts", None)
-                if ffn is not None
-                else None
+                getattr(ffn._moe, "shared_experts", None) if ffn is not None else None
             )
             if shared is not None:
                 # Treat shared_experts as a small dense MLP. Its forward
@@ -873,8 +884,10 @@ def apply_tp_kimi_linear(
         # AttnRes per-layer modules: each layer has TWO pseudo-queries
         # + TWO RMSNorms, all NoParallel.
         for name in (
-            "attn_res_proj", "attn_res_norm",
-            "mlp_res_proj",  "mlp_res_norm",
+            "attn_res_proj",
+            "attn_res_norm",
+            "mlp_res_proj",
+            "mlp_res_norm",
         ):
             if hasattr(layer, name) and getattr(layer, name) is not None:
                 plan[name] = no_par_local
@@ -983,7 +996,9 @@ def apply_tp_kimi_linear(
                         name,
                         nn.Parameter(
                             distribute_tensor(
-                                p.data, tp_mesh, [Replicate()],
+                                p.data,
+                                tp_mesh,
+                                [Replicate()],
                             ),
                             requires_grad=p.requires_grad,
                         ),
@@ -1021,8 +1036,11 @@ def apply_tp_kimi_linear(
                 expert_param_ids.add(id(p))
     for module in model.modules():
         for name, p in list(module._parameters.items()):
-            if p is not None and not isinstance(p, DTensor) \
-                    and id(p) not in expert_param_ids:
+            if (
+                p is not None
+                and not isinstance(p, DTensor)
+                and id(p) not in expert_param_ids
+            ):
                 module._parameters[name] = nn.Parameter(
                     distribute_tensor(p.data, tp_mesh, [Replicate()]),
                     requires_grad=p.requires_grad,
@@ -1061,9 +1079,7 @@ def apply_ep_kimi_linear(model: nn.Module, parallel_dims) -> None:
             )
         moe.parallelize(parallel_dims)
         moe_layers_wrapped += 1
-    logger.info(
-        "EP plan wrapped %d MoE layer experts.", moe_layers_wrapped
-    )
+    logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
 
 
 def apply_fsdp(
@@ -1277,6 +1293,7 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
     from fla.ops.kda.gate import fused_kda_gate
+
     # Mark triton ops as opaque to dynamo. recursive=True so dynamo
     # also stays out on re-entry from autograd backward (otherwise
     # fla's backward kernels trip on cuda_utils.get_device_properties
@@ -1300,8 +1317,11 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
     # because each ``from .attn_res import block_attn_res`` creates an
     # independent binding that wouldn't be touched by patching the
     # source module alone.
-    from torchtitan.models.kimi_k3 import attn_res as _src
-    from torchtitan.models.kimi_k3 import attn_res_model as _kimi_attn_res_mod
+    from torchtitan.models.kimi_k3 import (
+        attn_res as _src,
+        attn_res_model as _kimi_attn_res_mod,
+    )
+
     disabled = torch.compiler.disable(_src.block_attn_res, recursive=True)
     _src.block_attn_res = disabled
     _kimi_attn_res_mod.block_attn_res = disabled
@@ -1317,8 +1337,10 @@ def _apply_compile_kimi_linear(model: nn.Module, compile_config: CompileConfig) 
     # negligible compute cost on top of the already-eager triton
     # kernels.
     from torchtitan.models.kimi_k3.model import KimiDeltaAttention
+
     KimiDeltaAttention.forward = torch.compiler.disable(
-        KimiDeltaAttention.forward, recursive=True,
+        KimiDeltaAttention.forward,
+        recursive=True,
     )
 
     # Allow MoE token-choice routing's data-dependent control flow.
@@ -1364,9 +1386,7 @@ def apply_fsdp_vision(
     """
     from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype, reduce_dtype=reduce_dtype
-    )
+    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
         from torch.distributed.fsdp import CPUOffloadPolicy

@@ -42,6 +42,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.models.kimi_k3.attn_res_model import KimiLinearAttnResModel
 from torchtitan.models.kimi_k3.model import (
@@ -425,7 +426,72 @@ class KimiK3MultimodalModel(nn.Module):
         # The collator emits float32; under FSDP's mixed precision the tower's
         # weights are bf16, and Conv2d refuses the mix rather than promoting.
         weight = self.vision_tower.patch_embed.proj.weight
-        return self.vision_tower(packed.to(weight.dtype), grid_thw)
+        packed = packed.to(weight.dtype)
+
+        # Under TP the tower's params are replicated DTensors (parallelize.py
+        # distributes them so grad-norm clipping sees one mesh). Lift the input
+        # in and drop the outputs back out here: every placement is Replicate,
+        # so both conversions are local metadata changes, not collectives.
+        if isinstance(weight, DTensor):
+            packed = DTensor.from_local(
+                packed, weight.device_mesh, (Replicate(),), run_check=False
+            )
+        features = self.vision_tower(packed, grid_thw)
+        if isinstance(features, torch.Tensor):
+            return features.to_local() if isinstance(features, DTensor) else features
+        return [f.to_local() if isinstance(f, DTensor) else f for f in features]
+
+    def _cp_world_size(self) -> int:
+        group = getattr(self, "_cp_group", None)
+        return 1 if group is None else torch.distributed.get_world_size(group)
+
+    def _select_cp_shard(
+        self,
+        input_ids: torch.Tensor,
+        features: list[torch.Tensor] | torch.Tensor,
+        num_rows: int,
+    ) -> list[torch.Tensor] | torch.Tensor:
+        """Keep only the visual features belonging to this CP rank's shard.
+
+        ``prepare_context_parallel_input`` shards inputs, labels and positions
+        along the sequence but leaves ``pixel_values`` whole, so every CP rank
+        encodes every image while holding only a slice of the sentinels. The
+        features are ordered by sequence position, and the shards are
+        contiguous and equal (the flavor pins ``context_parallel_load_balancer``
+        to None precisely because a permuting balancer would break this), so
+        this rank's slice starts after however many sentinels the lower ranks
+        hold. One all_gather of per-rank sentinel counts settles that.
+
+        This is correctness, not the report's sec 5.2.3 optimization: the
+        encoder still runs redundantly on every CP rank. Dynamic CP would shard
+        the encoder itself along the patch dimension and gather KV instead.
+        """
+        group = getattr(self, "_cp_group", None)
+        if group is None or torch.distributed.get_world_size(group) == 1:
+            return features
+
+        local = int((input_ids == self.config.vision_token_id).sum().item())
+        counts = torch.zeros(
+            torch.distributed.get_world_size(group),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        counts[torch.distributed.get_rank(group)] = local
+        torch.distributed.all_reduce(counts, group=group)
+        if int(counts.sum().item()) != num_rows:
+            raise ValueError(
+                f"CP ranks hold {int(counts.sum().item())} vision sentinel(s) "
+                f"in total but {num_rows} visual token(s) were encoded; the "
+                "sequence shard and the image batch disagree"
+            )
+
+        start = int(counts[: torch.distributed.get_rank(group)].sum().item())
+        flat = (
+            features
+            if isinstance(features, torch.Tensor)
+            else torch.cat(list(features), dim=0)
+        )
+        return flat[start : start + local]
 
     def _splice_per_token(
         self,
@@ -524,26 +590,39 @@ class KimiK3MultimodalModel(nn.Module):
         is exactly how a whole multimodal parallelism matrix once passed while
         validating nothing vision-side.
         """
-        sentinel_present = bool((input_ids == self.config.vision_token_id).any().item())
-        if pixel_values is None or not sentinel_present:
-            if pixel_values is not None and not sentinel_present:
-                raise ValueError(
-                    "pixel_values supplied but input_ids contains no "
-                    f"vision_token_id ({self.config.vision_token_id}); the "
-                    "images would be silently dropped"
-                )
+        num_sentinels = int((input_ids == self.config.vision_token_id).sum().item())
+        cp_active = self._cp_world_size() > 1
+        if pixel_values is None:
             return self.language_model(input_ids)
+        if num_sentinels == 0 and not cp_active:
+            raise ValueError(
+                "pixel_values supplied but input_ids contains no "
+                f"vision_token_id ({self.config.vision_token_id}); the "
+                "images would be silently dropped"
+            )
         if grid_thw is None:
             raise ValueError("grid_thw is required alongside pixel_values")
 
+        # Under CP a rank's sequence shard legitimately holds no sentinel at all
+        # -- every image's tokens landed in another rank's half. It still has to
+        # reach _select_cp_shard, whose all_reduce every CP rank participates in;
+        # returning early here would hang the others. So encode and select
+        # first, and only then decide whether there is anything to splice.
         features = self.encode_images(pixel_values, grid_thw)
-        num_sentinels = int((input_ids == self.config.vision_token_id).sum().item())
         num_images = len(features)
         num_rows = (
             features.shape[0]
             if isinstance(features, torch.Tensor)
             else sum(int(f.shape[0]) for f in features)
         )
+        features = self._select_cp_shard(input_ids, features, num_rows)
+        num_rows = (
+            features.shape[0]
+            if isinstance(features, torch.Tensor)
+            else sum(int(f.shape[0]) for f in features)
+        )
+        if num_sentinels == 0:
+            return self.language_model(input_ids)
         if num_sentinels == num_rows:
             # Collator convention: one sentinel per post-merge visual token.
             embeds = self._splice_per_token(input_ids, features)

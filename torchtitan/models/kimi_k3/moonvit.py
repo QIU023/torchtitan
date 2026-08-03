@@ -64,6 +64,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Replicate
 
 
 @dataclass(kw_only=True)
@@ -162,14 +163,31 @@ class MoonViTPatchEmbed(nn.Module):
         weight = self.pos_emb.weight
         if (h, w) == weight.shape[:-1]:
             return weight.flatten(0, 1)
+        # Interpolate on the LOCAL tensor. Under TP this table is a replicated
+        # DTensor, and with --debug.deterministic bilinear interpolate lowers to
+        # aten._unsafe_index, which DTensor cannot dispatch (it fails with "got
+        # mixed torch.Tensor and DTensor"). Every rank holds the same values, so
+        # dropping to local and lifting the result back is exact and involves no
+        # communication. Non-deterministic mode does not take that lowering,
+        # which is why this only shows up under the numerics flags.
+        mesh = weight.device_mesh if isinstance(weight, DTensor) else None
+        local_weight = weight.to_local() if mesh is not None else weight
         # [H, W, D] -> [1, D, H, W] for interpolate, back to [h*w, D]
         resized = F.interpolate(
-            weight.permute(2, 0, 1).unsqueeze(0).float(),
+            local_weight.permute(2, 0, 1).unsqueeze(0).float(),
             size=(h, w),
             mode=self.mode,
             align_corners=False,
         )
-        return resized.squeeze(0).permute(1, 2, 0).reshape(h * w, -1).to(weight.dtype)
+        out = (
+            resized.squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(h * w, -1)
+            .to(local_weight.dtype)
+        )
+        if mesh is None:
+            return out
+        return DTensor.from_local(out, mesh, (Replicate(),), run_check=False)
 
     def add_pos_emb(self, x_LD: torch.Tensor, grid_thws: torch.Tensor):
         embs = []
@@ -183,9 +201,9 @@ class MoonViTPatchEmbed(nn.Module):
             if t == 1:
                 embs.append(pos_2d)
             else:
-                pos_3d = pos_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
-                    :t
-                ].to(pos_2d.dtype).unsqueeze(1)
+                pos_3d = pos_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[:t].to(
+                    pos_2d.dtype
+                ).unsqueeze(1)
                 embs.append(pos_3d.reshape(-1, pos_3d.shape[-1]))
         return x_LD + torch.cat(embs, dim=0)
 
@@ -211,9 +229,7 @@ class MoonViTRope2D(nn.Module):
     def __init__(self, head_dim: int, max_grid: int, theta: float = 10000.0) -> None:
         super().__init__()
         if head_dim % 4:
-            raise ValueError(
-                f"2-D RoPE needs head_dim divisible by 4, got {head_dim}"
-            )
+            raise ValueError(f"2-D RoPE needs head_dim divisible by 4, got {head_dim}")
         self.head_dim = head_dim
         self.max_grid = max_grid
         self.theta = theta
@@ -238,9 +254,7 @@ class MoonViTRope2D(nn.Module):
         out = []
         for t, h, w in grid_thws.tolist():
             if max(h, w) > self.max_grid:
-                raise ValueError(
-                    f"grid {h}x{w} exceeds rope_max_grid={self.max_grid}"
-                )
+                raise ValueError(f"grid {h}x{w} exceeds rope_max_grid={self.max_grid}")
             rows = table[:h].unsqueeze(1).expand(h, w, -1)
             cols = table[:w].unsqueeze(0).expand(h, w, -1)
             frame = torch.cat([rows, cols], dim=-1).reshape(h * w, -1)
@@ -249,8 +263,18 @@ class MoonViTRope2D(nn.Module):
 
     @staticmethod
     def apply(x_LAK: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-        """Rotate ``[L, A, K]`` by ``[L, K // 2]`` complex factors."""
+        """Rotate ``[L, A, K]`` by ``[L, K // 2]`` complex factors.
+
+        Under TP the tower is replicated via NoParallel, which makes its
+        activations DTensors while this table is built inside forward and stays
+        a plain tensor. Multiplying the two raises "got mixed torch.Tensor and
+        DTensor", so promote the table to a replicated DTensor on the same mesh.
+        """
         L, A, K = x_LAK.shape
+        if isinstance(x_LAK, DTensor) and not isinstance(freqs_cis, DTensor):
+            freqs_cis = DTensor.from_local(
+                freqs_cis, x_LAK.device_mesh, (Replicate(),), run_check=False
+            )
         xc = torch.view_as_complex(x_LAK.float().reshape(L, A, K // 2, 2))
         rotated = xc * freqs_cis.unsqueeze(1)
         return torch.view_as_real(rotated).reshape(L, A, K).to(x_LAK.dtype)
@@ -261,12 +285,8 @@ class MoonViTMLP(nn.Module):
 
     def __init__(self, config: MoonViTConfig) -> None:
         super().__init__()
-        self.fc0 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.fc1 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
+        self.fc0 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.fc1 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc1(_gelu_tanh(self.fc0(x)))
@@ -307,12 +327,16 @@ class MoonViTEncoderLayer(nn.Module):
         bounds = cu_seqlens.tolist()
         for start, end in zip(bounds[:-1], bounds[1:]):
             seg = slice(start, end)
-            out[seg] = F.scaled_dot_product_attention(
-                q[seg].transpose(0, 1).unsqueeze(0),
-                k[seg].transpose(0, 1).unsqueeze(0),
-                v[seg].transpose(0, 1).unsqueeze(0),
-                is_causal=False,
-            ).squeeze(0).transpose(0, 1)
+            out[seg] = (
+                F.scaled_dot_product_attention(
+                    q[seg].transpose(0, 1).unsqueeze(0),
+                    k[seg].transpose(0, 1).unsqueeze(0),
+                    v[seg].transpose(0, 1).unsqueeze(0),
+                    is_causal=False,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+            )
         return self.wo(out.reshape(L, self.num_heads * self.head_dim))
 
     def forward(
@@ -377,7 +401,9 @@ class PatchMergerMLPV2(nn.Module):
             nn.GELU(),
             nn.Linear(merged, config.text_hidden_size, bias=False),
         )
-        self.post_norm = nn.RMSNorm(config.text_hidden_size, eps=config.projector_ln_eps)
+        self.post_norm = nn.RMSNorm(
+            config.text_hidden_size, eps=config.projector_ln_eps
+        )
 
     def forward(self, merged: list[torch.Tensor] | torch.Tensor):
         if isinstance(merged, (list, tuple)):
@@ -405,9 +431,7 @@ class MoonViTEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             MoonViTEncoderLayer(config) for _ in range(config.num_hidden_layers)
         )
-        self.final_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.final_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, x_LD: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         freqs_cis = self.rope_2d.freqs_cis(grid_thws, x_LD.device)
@@ -446,9 +470,7 @@ class MoonViT(nn.Module):
             pixels_BFCHW = pixels_BFCHW.unsqueeze(1)
         B, Fr, C, H, W = pixels_BFCHW.shape
         if H % patch_size or W % patch_size:
-            raise ValueError(
-                f"{H}x{W} is not divisible by patch_size {patch_size}"
-            )
+            raise ValueError(f"{H}x{W} is not divisible by patch_size {patch_size}")
         h, w = H // patch_size, W // patch_size
         x = pixels_BFCHW.reshape(B * Fr, C, h, patch_size, w, patch_size)
         x = x.permute(0, 2, 4, 1, 3, 5).reshape(
