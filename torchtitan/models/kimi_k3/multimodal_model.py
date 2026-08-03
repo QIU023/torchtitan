@@ -428,9 +428,13 @@ class KimiK3MultimodalModel(nn.Module):
         # distributes them so grad-norm clipping sees one mesh). Lift the input
         # in and drop the outputs back out here: every placement is Replicate,
         # so both conversions are local metadata changes, not collectives.
-        if isinstance(weight, DTensor):
+        # Keyed on the mesh parallelize recorded, NOT on whether the weight is
+        # a DTensor -- under FSDP it is one either way, and lifting onto the
+        # FSDP mesh meets the plain all-gathered weight inside the conv.
+        tp_mesh = getattr(self, "_vision_tp_mesh", None)
+        if tp_mesh is not None:
             packed = DTensor.from_local(
-                packed, weight.device_mesh, (Replicate(),), run_check=False
+                packed, tp_mesh, (Replicate(),), run_check=False
             )
         features = self.vision_tower(packed, grid_thw)
         if isinstance(features, torch.Tensor):

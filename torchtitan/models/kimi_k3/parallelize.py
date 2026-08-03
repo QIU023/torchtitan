@@ -60,6 +60,7 @@ from torchtitan.config import (
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import (
+    apply_fsdp_to_vision_encoder,
     disable_fsdp_gradient_division,
     get_fsdp_reshard_after_forward_policy,
 )
@@ -305,6 +306,24 @@ def parallelize_kimi_k3(
                             setattr(m, bname, buf.cuda())
 
             model.register_forward_pre_hook(_hoist_cpu_buffers)
+
+        # Shard the tower before the decoder, as the core helper documents. A
+        # local apply_fsdp_vision used to live here and was never called, so
+        # the tower rode along inside the root wrap fully replicated. That is
+        # invisible at the debug tower's 4 layers / hidden 256, but MoonViT-V2
+        # ships at 447.4M against k3mini's 80.9M text side -- 5.5x the model it
+        # serves -- so replicating it is not an option at real size.
+        vision_tower = getattr(model, "vision_tower", None)
+        if vision_tower is not None:
+            apply_fsdp_to_vision_encoder(
+                vision_tower,
+                dp_mesh,
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+                pp_enabled=parallel_dims.pp_enabled,
+            )
+
         apply_fsdp(
             model,
             dp_mesh=dp_mesh,
@@ -606,6 +625,12 @@ def apply_tp_kimi_k3(
     vision_tower = getattr(model, "vision_tower", None)
     if vision_tower is not None:
         distribute_module(vision_tower, tp_mesh)
+        # Record the mesh rather than letting encode_images sniff the weight.
+        # Once FSDP also shards the tower its params are DTensors too, so
+        # "is the weight a DTensor" no longer distinguishes this replication
+        # from that sharding, and lifting the input on an FSDP mesh puts a
+        # DTensor up against the plain all-gathered weight inside the conv.
+        model._vision_tp_mesh = tp_mesh
 
     model = getattr(model, "language_model", model)
 
@@ -1357,53 +1382,3 @@ def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> N
 
     for _, layer in model.layers.named_children():
         layer.compile(backend=compile_config.backend, fullgraph=False)
-
-
-def apply_fsdp_vision(
-    vision_tower: nn.Module,
-    dp_mesh: DeviceMesh,
-    param_dtype: torch.dtype,
-    reduce_dtype: torch.dtype,
-    *,
-    cpu_offload: bool = False,
-) -> int:
-    """FSDP2 for MoonViT-V2. Returns the number of units wrapped.
-
-    Wrapping granularity mirrors the LLM side: one unit per encoder block, so
-    each block's all-gather overlaps the previous block's compute, plus one unit
-    for the patch embed and one for the projector. The final norm rides with the
-    projector because they always run together at the end of the tower.
-
-    Why the tower needs its own call rather than riding the LLM's ``apply_fsdp``:
-    the language model is wrapped by iterating ``model.layers``, which the tower
-    does not have, and a single root-level ``fully_shard`` over the whole
-    multimodal model would produce one enormous flat parameter group with no
-    overlap. The vision tower is ~0.4B, small next to the backbone but far too
-    large for one unit.
-
-    The tower is TRAINED, not frozen (report sec 2.4 trains MoonViT-V2 from
-    scratch), so its gradients go through the same reduce path as the backbone's.
-    """
-    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-    fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    if cpu_offload:
-        from torch.distributed.fsdp import CPUOffloadPolicy
-
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
-
-    units = 0
-    for block in vision_tower.encoder.blocks:
-        fully_shard(block, **fsdp_config)
-        units += 1
-    fully_shard(vision_tower.patch_embed, **fsdp_config)
-    units += 1
-    # final_layernorm + projector: both run once, at the end.
-    tail = [vision_tower.encoder.final_layernorm, vision_tower.mm_projector]
-    fully_shard(tail, **fsdp_config)
-    units += 1
-    fully_shard(vision_tower, **fsdp_config)
-    units += 1
-    logger.info("Applied FSDP to the vision tower (%d units).", units)
-    return units
