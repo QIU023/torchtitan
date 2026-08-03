@@ -373,6 +373,55 @@ def kimi_linear_debugmodel_gated_lora() -> Trainer.Config:
     return cfg
 
 
+def kimi_linear_k3mini_vl() -> Trainer.Config:
+    """K3-faithful multimodal downscale: text k3mini plus a shrunk MoonViT-V2.
+
+    K3 is natively multimodal, so a debug flavor that drops the vision tower
+    misrepresents the architecture. But the tower at its released size is 447.4M
+    parameters against k3mini's 80.9M text side -- 5.5x -- so a debug run would
+    be dominated by the encoder rather than exercising the K3 structure under
+    test.
+
+    The tower is therefore SHRUNK, not simplified: 4 layers and hidden 256
+    instead of 27 and 1024, while every structural feature of MoonViT-V2 is
+    kept -- the single varlen attention pass (not the factorized one the report
+    describes), 2D RoPE with the divided_fixed absolute embedding, sd2_tpool,
+    and PatchMergerMLPV2. So the multimodal path is genuinely exercised: NaViT
+    packing, the projector, the image_mask splice into the LM hidden states.
+
+    Head count drops to 4 to keep head_dim at 64, matching the released tower.
+    """
+    import dataclasses as _dc
+
+    from torchtitan.experiments.kimi_k3.moonvit import MoonViTConfig
+    from torchtitan.experiments.kimi_k3.multimodal_model import (
+        KimiK3MultimodalSpec,
+    )
+
+    cfg = kimi_linear_k3mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_linear_k3mini_vl"
+    kc = cfg.model_spec.model.kimi_config
+    vision = MoonViTConfig(
+        num_hidden_layers=4,
+        hidden_size=256,
+        num_attention_heads=4,
+        qkv_hidden_size=384,
+        intermediate_size=1024,
+        text_hidden_size=kc.hidden_size,
+    )
+    # KimiK3MultimodalConfig, not KimiMultimodalConfig: it is the
+    # release-faithful one. The projector belongs to the tower (mm_projector is
+    # a MoonViT child in the checkpoint) and the tower is NOT frozen -- report
+    # sec 2.4 trains MoonViT-V2 from scratch jointly with the text model, and
+    # freezing it reproduces the opposite recipe.
+    cfg.model_spec.model = KimiK3MultimodalSpec(
+        kimi_config=kc,
+        vision_config=vision,
+        num_blocks=cfg.model_spec.model.num_blocks,
+    )
+    return cfg
+
+
 def kimi_linear_k3mini_block_attn_res() -> Trainer.Config:
     """K3-FAITHFUL downscale: every structural choice is K3's, extents shrink.
 

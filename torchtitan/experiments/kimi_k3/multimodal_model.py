@@ -48,6 +48,7 @@ from torchtitan.experiments.kimi_k3.attn_res_model import (
 )
 from torchtitan.experiments.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
 from torchtitan.experiments.kimi_k3.model import (
+    KimiLinearSpec,
     KimiLinearConfig,
     KimiLinearModel,
 )
@@ -467,3 +468,46 @@ class KimiK3MultimodalModel(nn.Module):
     def init_weights(self, init_range: float | None = None, **kwargs) -> None:
         self.vision_tower.init_weights(init_range)
         self.language_model.init_weights(init_range, **kwargs)
+
+
+def _mm_verify_module_protocol(self) -> None:
+    """No-op, delegating to the text model's reasoning.
+
+    KimiLinearModel overrides this as a no-op because its internals are plain
+    nn.Modules rather than Config-built ``Module`` instances -- it ports the HF
+    reference layer by layer. The multimodal wrapper adds a MoonViT tower built
+    the same way, so the same holds. The trainer calls this post-build; without
+    it the multimodal flavor cannot be constructed at all.
+    """
+    return None
+
+
+KimiK3MultimodalModel.verify_module_protocol = _mm_verify_module_protocol
+for _name in ("get_attention_masks", "init_weights"):
+    if not hasattr(KimiK3MultimodalModel, _name) and hasattr(
+        KimiLinearModel, _name
+    ):
+        setattr(KimiK3MultimodalModel, _name, getattr(KimiLinearModel, _name))
+
+
+@dataclass(kw_only=True, slots=True)
+class KimiK3MultimodalSpec(KimiLinearSpec):
+    """``BaseModel.Config``-compatible spec for the multimodal model.
+
+    KimiLinearSpec exists because torchtitan's trainer calls
+    ``update_from_config`` and the property accessors on whatever sits at
+    ``model_spec.model``; a bare dataclass config fails there. This subclasses it
+    so the multimodal flavor gets the same integration surface, and overrides
+    only ``build`` to construct the vision-bearing model.
+    """
+
+    vision_config: "MoonViTConfig" = None  # type: ignore[assignment]
+
+    def build(self, **kwargs):
+        return KimiK3MultimodalModel(
+            KimiK3MultimodalConfig(
+                kimi_config=self.kimi_config,
+                vision_config=self.vision_config,
+                num_blocks=self.num_blocks,
+            )
+        )
