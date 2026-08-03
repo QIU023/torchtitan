@@ -50,6 +50,7 @@ from torch.distributed.tensor.placement_types import Replicate
 from torchtitan.models.common.linear import Linear as _TTLinear
 import spmd_types as spmd
 from torchtitan.models.common.decoder_sharding import dense_param_placement
+from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
 
@@ -466,6 +467,30 @@ class KimiMLAAttention(nn.Module):
     ``past_key_values`` / ``Cache`` machinery is not ported since
     torchtitan training doesn't invoke incremental decoding.
     """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        """Child configs, declared so a config tree exists to traverse.
+
+        Upstream's LoRAConverter starts from
+        ``model_config.traverse(Module.Config, recurse=True)`` and swaps every
+        ``Linear.Config`` it finds for a ``LoRALinear.Config``. K3 built its
+        linears positionally with no tree to walk, which is why the converter
+        could not be adopted -- see BASELINE_MATRIX.
+
+        Mirrors deepseek_v3, which declares wq_a / wq_b / wkv_a / wkv_b / wo the
+        same way. Every field is Optional because which projections exist
+        depends on ``q_lora_rank`` (the 48B path has q_proj, the K3 path has the
+        q_a/q_b pair) and on ``mla_gated``.
+        """
+
+        q_proj: "Linear.Config | None" = None
+        q_a_proj: "Linear.Config | None" = None
+        q_b_proj: "Linear.Config | None" = None
+        kv_a_proj_with_mqa: "Linear.Config | None" = None
+        kv_b_proj: "Linear.Config | None" = None
+        o_proj: "Linear.Config | None" = None
+        attn_gate_proj: "Linear.Config | None" = None
 
     def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
         super().__init__()
