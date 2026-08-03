@@ -41,7 +41,6 @@ from torch.nn.attention.varlen import AuxRequest as VarlenAuxRequest, varlen_att
 
 from torchtitan.distributed.compile import maybe_regional_inductor
 from torchtitan.distributed.utils import get_spmd_backend, is_in_batch_invariant_mode
-
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -78,6 +77,7 @@ class VarlenMetadata(NamedTuple):
     cu_seq_k: torch.Tensor
     max_q: int
     max_k: int
+    cu_seq_q_host: tuple[int, ...] | None = None
 
 
 AttentionMasksType = dict[str, BlockMask] | BlockMask | VarlenMetadata
@@ -102,12 +102,14 @@ class VarlenAttention(Module):
         super().__init__()
         self.window_size = config.window_size
 
-        from torchtitan.tools.utils import has_cuda_capability
+        from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
-        # Hopper (SM 9.0) uses FA3
-        if has_cuda_capability(9, 0):
-            if current_flash_attention_impl() != "FA3":
-                activate_flash_attention_impl("FA3")
+        flash_attention_impl = get_cuda_flash_attention_impl()
+        if (
+            flash_attention_impl is not None
+            and current_flash_attention_impl() != flash_attention_impl
+        ):
+            activate_flash_attention_impl(flash_attention_impl)
 
     def forward(
         self,
@@ -189,15 +191,22 @@ class VarlenAttention(Module):
         if out_transform is None:
             assert isinstance(result, torch.Tensor)
             if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-                # exclude CP from typecheck as varlen + CP is not yet supported.
-                spmd.assert_type(result, spmd.V, spmd.PartitionSpec("dp", "tp", None))
+                q_local = spmd.get_local_type(q_TNH)
+                # Varlen + CP is unsupported; packing a CP-sharded L into T is
+                # rejected during q_TNH reshape propagation.
+                q_ps = get_partition_spec(q_TNH)
+                spmd.assert_type(result, q_local, q_ps)
             out_BLNH = result.view(B, L, -1, H).to(q_BLNH.dtype)
             return out_BLNH
 
         out_TNH, lse_NT = result
         if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-            spmd.assert_type(out_TNH, spmd.V, spmd.PartitionSpec("dp", "tp", None))
-            spmd.assert_type(lse_NT, spmd.V, spmd.PartitionSpec("tp", "dp"))
+            q_local = spmd.get_local_type(q_TNH)
+            q_ps = get_partition_spec(q_TNH)
+            spmd.assert_type(out_TNH, q_local, q_ps)
+            # The current implementation returns LSE as (N, T).
+            lse_ps = None if q_ps is None else spmd.PartitionSpec(q_ps[1], q_ps[0])
+            spmd.assert_type(lse_NT, q_local, lse_ps)
 
         out_BLNH = out_TNH.view(B, L, -1, H).to(q_BLNH.dtype)
         # FA varlen returns the LSE as (N, T); reorder to (B, L, N) so
@@ -595,6 +604,8 @@ def create_attention_mask(*args, **kwargs):
 
 def create_varlen_metadata_for_document(
     positions: torch.Tensor,
+    *,
+    include_host_offsets: bool = False,
 ) -> VarlenMetadata:
     """Creates cumulative sequence length indices needed for variable length attention.
 
@@ -604,9 +615,12 @@ def create_varlen_metadata_for_document(
     Args:
         positions: Per-token position tensor with shape ``[b, s]``. Positions
             reset to 0 at each document start.
+        include_host_offsets: Also materialize cumulative sequence offsets as
+            host metadata for kernels that need it.
 
     Returns:
-        VarlenMetadata containing cumulative sequence length indices for q, k, and max_seq_len
+        VarlenMetadata containing cumulative sequence length indices for q, k,
+        and max_seq_len.
     """
     batch_size, seq_len = positions.shape
     device = positions.device
@@ -631,18 +645,36 @@ def create_varlen_metadata_for_document(
         cu_seqlens_list + [torch.tensor([offset], dtype=torch.int32, device=device)]
     )
 
-    max_seqlen: int = 0
-    if len(all_seq_lengths) > 0:
+    max_seqlen: int
+    packed_cu_seqlens_host = None
+    if include_host_offsets:
+        packed_cu_seqlens_host = tuple(
+            int(offset) for offset in packed_cu_seqlens.tolist()
+        )
+        max_seqlen = max(
+            (
+                end - start
+                for start, end in zip(
+                    packed_cu_seqlens_host[:-1],
+                    packed_cu_seqlens_host[1:],
+                    strict=False,
+                )
+            ),
+            default=0,
+        )
+    elif len(all_seq_lengths) > 0:
         all_seq_lengths = torch.cat(all_seq_lengths)
         # device to host sync but only done once per model forward
-        # pyrefly: ignore[bad-assignment]
-        max_seqlen = all_seq_lengths.max().item()
+        max_seqlen = int(all_seq_lengths.max().item())
+    else:
+        max_seqlen = 0
 
     return VarlenMetadata(
         cu_seq_q=packed_cu_seqlens,
         cu_seq_k=packed_cu_seqlens,
         max_q=max_seqlen,
         max_k=max_seqlen,
+        cu_seq_q_host=packed_cu_seqlens_host,
     )
 
 
