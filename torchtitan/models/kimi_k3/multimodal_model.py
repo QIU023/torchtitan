@@ -403,10 +403,58 @@ class KimiK3MultimodalModel(nn.Module):
             )
 
     def encode_images(
-        self, patches: torch.Tensor, grid_thws: torch.Tensor
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> list[torch.Tensor]:
-        """Packed patches -> one ``[N_i, D_llm]`` feature block per sample."""
-        return self.vision_tower(patches, grid_thws)
+        """Collator patches -> one ``[N_i, D_llm]`` feature block per sample.
+
+        The two sides disagree on layout and the shapes do not collide loudly:
+        ``MMCollator`` emits ``[num_images, max_patches, C*P*P]``, zero-PADDED
+        to the largest image in the batch, while MoonViT's patch_embed is a
+        ``Conv2d`` over ``[L, C, P, P]`` with the images CONCATENATED and no
+        padding. Feeding the collator's tensor straight through reaches the
+        conv as a 3-D input and fails there.
+
+        ``grid_thw`` carries each image's ``(t, h, w)``, whose product is that
+        image's real patch count, so the padding is dropped exactly rather than
+        by scanning for zero rows -- a black patch is legitimately all zeros.
+        """
+        cfg = self.config.vision_config
+        counts = grid_thw.prod(dim=-1).tolist()
+        packed = torch.cat([pixel_values[i, :n] for i, n in enumerate(counts)], dim=0)
+        packed = packed.reshape(-1, cfg.in_channels, cfg.patch_size, cfg.patch_size)
+        # The collator emits float32; under FSDP's mixed precision the tower's
+        # weights are bf16, and Conv2d refuses the mix rather than promoting.
+        weight = self.vision_tower.patch_embed.proj.weight
+        return self.vision_tower(packed.to(weight.dtype), grid_thw)
+
+    def _splice_per_token(
+        self,
+        input_ids: torch.Tensor,
+        features: list[torch.Tensor] | torch.Tensor,
+    ) -> torch.Tensor:
+        """Scatter visual features into pre-reserved sentinel positions.
+
+        ``MMCollator`` reserves ONE sentinel per post-merge visual token, so the
+        sequence length is already correct and the features drop straight in;
+        this is the convention the release uses. :meth:`_splice` implements the
+        other one -- a single sentinel per image, expanded in place -- which
+        changes the sequence length and cannot be used with this collator.
+        Which one applies is decided by counting, in :meth:`forward`.
+        """
+        sentinel = self.config.vision_token_id
+        embed = self.language_model.embed_tokens
+        safe_ids = torch.where(
+            input_ids == sentinel, torch.zeros_like(input_ids), input_ids
+        )
+        text = embed(safe_ids)
+
+        flat = (
+            features
+            if isinstance(features, torch.Tensor)
+            else torch.cat(list(features), dim=0)
+        )
+        mask = (input_ids == sentinel).unsqueeze(-1).expand_as(text)
+        return text.masked_scatter(mask, flat.to(text.dtype))
 
     def _splice(
         self,
@@ -456,8 +504,8 @@ class KimiK3MultimodalModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        patches: torch.Tensor | None = None,
-        grid_thws: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        grid_thw: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """``[B, T]`` ids (+ packed patches) -> logits.
@@ -467,28 +515,47 @@ class KimiK3MultimodalModel(nn.Module):
         the FlexAttention / CP paths, and K3 uses plain SDPA plus KDA Triton
         kernels which take neither.
 
-        Text-only when no patches are supplied or no sentinel is present.
+        Text-only when no images are supplied or no sentinel is present.
+
+        The image parameters are named for the COLLATOR's output keys, not this
+        model's internal vocabulary. torchtitan's trainer forwards a batch as
+        ``model(inputs, **extra_kwargs)``, so a parameter spelled any other way
+        is absorbed by ``**kwargs`` and the tower silently never runs -- which
+        is exactly how a whole multimodal parallelism matrix once passed while
+        validating nothing vision-side.
         """
         sentinel_present = bool((input_ids == self.config.vision_token_id).any().item())
-        if patches is None or not sentinel_present:
-            if patches is not None and not sentinel_present:
+        if pixel_values is None or not sentinel_present:
+            if pixel_values is not None and not sentinel_present:
                 raise ValueError(
-                    "patches supplied but input_ids contains no "
+                    "pixel_values supplied but input_ids contains no "
                     f"vision_token_id ({self.config.vision_token_id}); the "
                     "images would be silently dropped"
                 )
             return self.language_model(input_ids)
-        if grid_thws is None:
-            raise ValueError("grid_thws is required alongside patches")
+        if grid_thw is None:
+            raise ValueError("grid_thw is required alongside pixel_values")
 
-        features = self.encode_images(patches, grid_thws)
+        features = self.encode_images(pixel_values, grid_thw)
         num_sentinels = int((input_ids == self.config.vision_token_id).sum().item())
-        if len(features) != num_sentinels:
+        num_images = len(features)
+        num_rows = (
+            features.shape[0]
+            if isinstance(features, torch.Tensor)
+            else sum(int(f.shape[0]) for f in features)
+        )
+        if num_sentinels == num_rows:
+            # Collator convention: one sentinel per post-merge visual token.
+            embeds = self._splice_per_token(input_ids, features)
+        elif num_sentinels == num_images:
+            # LLaVA convention: one sentinel per image, expanded in place.
+            embeds = self._splice(input_ids, features)
+        else:
             raise ValueError(
-                f"{len(features)} image(s) encoded but {num_sentinels} vision "
-                "sentinel(s) in input_ids; these must correspond one to one"
+                f"{num_sentinels} vision sentinel(s) in input_ids match neither "
+                f"the image count ({num_images}, one sentinel per image) nor the "
+                f"visual-token count ({num_rows}, one sentinel per token)"
             )
-        embeds = self._splice(input_ids, features)
         # The backbone's forward embeds int ids; we already embedded, so detach
         # embed_tokens to take its pre-embedded branch. Same mechanism as
         # KimiLinearMultimodalModel._llm_forward_from_embeds.
@@ -555,11 +622,21 @@ class KimiK3MultimodalSpec(KimiLinearSpec):
 
     vision_config: "MoonViTConfig" = None  # type: ignore[assignment]
 
+    vision_token_id: int = -200
+    """Sentinel id the splice scans for; must equal the tokenizer's image id.
+
+    Defaulted to the LLaVA convention for the standalone/test path. A flavor
+    driving a real collator has to override it: at a value the tokenizer never
+    emits, the sentinel scan finds nothing and forward takes its text-only
+    branch without complaint.
+    """
+
     def build(self, **kwargs):
         return KimiK3MultimodalModel(
             KimiK3MultimodalConfig(
                 kimi_config=self.kimi_config,
                 vision_config=self.vision_config,
                 num_blocks=self.num_blocks,
+                vision_token_id=self.vision_token_id,
             )
         )

@@ -391,6 +391,9 @@ def kimi_linear_k3mini_vl() -> Trainer.Config:
     """
     import dataclasses as _dc
 
+    from torchtitan.components.tokenizer import MultiModalTokenizer
+    from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
+    from torchtitan.hf_datasets.multimodal.utils.image import resize_to_patch_budget
     from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
 
@@ -410,10 +413,49 @@ def kimi_linear_k3mini_vl() -> Trainer.Config:
     # a MoonViT child in the checkpoint) and the tower is NOT frozen -- report
     # sec 2.4 trains MoonViT-V2 from scratch jointly with the text model, and
     # freezing it reproduces the opposite recipe.
+    # The bundled tokenizer appends the media tokens ABOVE the 2016-token text
+    # vocab (image 2016, vision_start 2017, vision_end 2018, pad 2019), so the
+    # embedding must cover 2020 or every image row indexes out of range and the
+    # run dies in a CUDA device-side assert. vision_token_id must be the
+    # tokenizer's image id, not the LLaVA -200 default -- at -200 the sentinel
+    # scan never matches and forward silently takes its text-only branch.
+    import dataclasses as _dc2
+
+    kc = _dc2.replace(kc, vocab_size=2020)
+    cfg.loss = _dc2.replace(cfg.loss, global_vocab_size=2020)
     cfg.model_spec.model = KimiK3MultimodalSpec(
         kimi_config=kc,
         vision_config=vision,
         num_blocks=cfg.model_spec.model.num_blocks,
+        vision_token_id=2016,
+    )
+    # Without these the flavor inherits the TEXT dataloader, which emits no
+    # patches -- forward then takes its text-only branch and the tower never
+    # runs, so a "multimodal" run silently validates nothing vision-side.
+    # patch_size and spatial_merge_size must match MoonViTConfig's patch_size
+    # and merge_kernel_size. The bundled test tokenizer already carries the
+    # media tokens the collator needs.
+    cfg.tokenizer = MultiModalTokenizer.Config(
+        image_token="<|media_pad|>",
+        video_token="<|media_pad|>",
+        vision_start_token="<|media_begin|>",
+        vision_end_token="<|media_end|>",
+        pad_token="[PAD]",
+    )
+    cfg.dataloader = MMDataLoader.Config(
+        dataset="cc12m-test",
+        max_images_per_batch=8,
+        patch_size=vision.patch_size,
+        temporal_patch_size=1,
+        spatial_merge_size=vision.merge_kernel_size[0],
+        patch_order="raster",
+        resize_fn=resize_to_patch_budget,
+        max_patches=1024,
+        max_patches_per_side=64,
+        min_pixels=65536,
+        max_pixels=1048576,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
     )
     return cfg
 
