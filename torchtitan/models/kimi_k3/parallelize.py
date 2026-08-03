@@ -322,8 +322,11 @@ def parallelize_kimi_linear(
     return model
 
 
-def _patch_fla_for_dtensor() -> None:
-    """Patch ShortConvolution + FusedRMSNormGated forwards to be DTensor-safe.
+def _patch_fla_for_dtensor() -> dict:
+    """Build DTensor-safe forwards for ShortConvolution + FusedRMSNormGated.
+
+    Returns ``{class: forward_fn}`` for :func:`_bind_fla_dtensor_shims` to bind
+    per instance. Nothing here mutates the fla classes.
 
     Both classes wrap fla-core triton kernels (``causal_conv1d``,
     ``fused_norm_gated``) that take raw tensor pointers and don't
@@ -427,10 +430,38 @@ def _patch_fla_for_dtensor() -> None:
                 return tuple(_rewrap(o) for o in out)
             return _rewrap(out)
 
-        cls.forward = _patched
+        return _patched
 
-    _make_patch(ShortConvolution)
-    _make_patch(FusedRMSNormGated)
+    return {
+        ShortConvolution: _make_patch(ShortConvolution),
+        FusedRMSNormGated: _make_patch(FusedRMSNormGated),
+    }
+
+
+def _bind_fla_dtensor_shims(model: nn.Module) -> int:
+    """Bind the DTensor-safe forwards PER INSTANCE, not on the fla classes.
+
+    The previous form assigned ``cls.forward`` on ShortConvolution and
+    FusedRMSNormGated, which is a global, irreversible mutation of a third-party
+    library: it changes behaviour for every model in the process, including ones
+    that never enabled TP, and cannot be undone. torchtitan's own convention
+    (qwen3_5) keeps kernel dispatch stateless and does the DTensor conversion at
+    the call site.
+
+    Binding to instances keeps the same conversion while touching only the
+    modules of the model being parallelized. Idempotent: a module already bound
+    is skipped.
+    """
+    patches = _patch_fla_for_dtensor()
+    n = 0
+    for m in model.modules():
+        fn = patches.get(type(m))
+        if fn is None or getattr(m, "_fla_dtensor_bound", False):
+            continue
+        m.forward = fn.__get__(m, type(m))
+        m._fla_dtensor_bound = True
+        n += 1
+    return n
 
 
 def _model_has_moe(model: nn.Module) -> bool:
@@ -544,7 +575,9 @@ def apply_tp_kimi_linear(
     # The patch is applied in-place on the class; the patch is
     # idempotent (re-patching a previously patched class is safe — the
     # original-forward attr is set once at first patch).
-    _patch_fla_for_dtensor()
+    n_fla = _bind_fla_dtensor_shims(model)
+    if n_fla:
+        logger.info("Bound DTensor-safe fla forwards on %d modules.", n_fla)
 
     # Top-level layout: embed, output norm, lm_head.
     # Both embed and lm_head emit plain Tensors (use_local_output=True)
