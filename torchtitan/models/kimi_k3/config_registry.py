@@ -863,6 +863,21 @@ def kimi_k3_mini_qlora() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_mini_diag_4l_mla_lora() -> Trainer.Config:
+    """Dense (no MoE) + AttnRes + LoRA rank 8 -- the LoRA gradient control.
+
+    Every LoRA parallelism measurement so far used kimi_k3_mini_qlora, which has
+    MoE, and MoE top-k routing flips under any numerical perturbation: a
+    cross-layout gradient comparison there measures route divergence, not
+    correctness. This flavor removes the confound so a LoRA gradient defect can
+    be told apart from routing.
+    """
+    cfg = kimi_k3_mini_diag_4l_mla()
+    cfg.model_spec.flavor = "kimi_k3_mini_diag_4l_mla_lora"
+    cfg.model_spec.model.lora_rank = 8
+    return cfg
+
+
 def kimi_k3_mini_quantile_balance() -> Trainer.Config:
     """K3-faithful structure with Quantile Balancing driving the router bias.
 
