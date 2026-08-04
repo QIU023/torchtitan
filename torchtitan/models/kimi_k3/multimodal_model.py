@@ -689,7 +689,15 @@ class KimiK3MultimodalModel(nn.Module):
             else sum(int(f.shape[0]) for f in features)
         )
         if num_sentinels == 0:
-            return self.language_model(input_ids)
+            # This rank's sequence shard holds no sentinel: every image's
+            # tokens landed on a CP peer. The tower ran, so its forward
+            # all-gathers matched, but returning here would drop its output
+            # out of the loss graph -- and FSDP2 takes its reduce-scatter from
+            # the autograd hooks on that output, so this rank would skip a
+            # gradient reduction its peers issue. Same hazard as the
+            # image-free path above, reached by a different route.
+            out = self.language_model(input_ids)
+            return add_zero_valued_dependency(out, features)
         if num_sentinels == num_rows:
             # Collator convention: one sentinel per post-merge visual token.
             embeds = self._splice_per_token(input_ids, features)
