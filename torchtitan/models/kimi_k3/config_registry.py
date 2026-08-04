@@ -929,6 +929,10 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
         vision_end_token="<|media_end|>",
         pad_token="[PAD]",
     )
+    # Read off #4025's kimi_k3_debugmodel verbatim. Inheriting k3mini_vl's
+    # image budget instead (max_patches 1024 at 64 per side) made the twin
+    # architectural only: one image then fills most of the sequence, which is a
+    # different data distribution and not the config that PR runs.
     cfg.dataloader = MMDataLoader.Config(
         dataset="cc12m-test",
         max_images_per_batch=8,
@@ -937,12 +941,29 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
         spatial_merge_size=2,
         patch_order="raster",
         resize_fn=resize_to_patch_budget,
-        max_patches=1024,
-        max_patches_per_side=64,
+        max_patches=256,
+        max_patches_per_side=16,
         min_pixels=56 * 56,
-        max_pixels=1048576,
+        max_pixels=224 * 224,
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
+    )
+    cfg.optimizer = default_adamw(lr=8e-4)
+    cfg.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=2,
+        decay_ratio=0.8,
+        decay_type="linear",
+        min_lr_factor=0.0,
+    )
+    # dtype is the one that changes what runs, not just what it converges to.
+    # #4025 sets bfloat16; k3mini's chain leaves the float32 default, and
+    # training.dtype is applied to the model itself while mixed_precision_param
+    # only reaches parameters through FSDP. So on a layout with no FSDP
+    # (dp_shard 1 and no CP) the twin ran KDA on fp32 operands, whose kernel
+    # asks for 108160 bytes of dynamic shared memory -- above the 101376 this
+    # GPU allows -- and dp1/pp2/tp2 died where fsdp2 and cp2 passed.
+    cfg.training = _dc.replace(
+        cfg.training, dtype="bfloat16", seq_len=256, local_batch_size=1
     )
     return cfg
 
