@@ -243,6 +243,40 @@ def _dense_grad(x: torch.Tensor | None) -> torch.Tensor | None:
     return _DenseGrad.apply(x)
 
 
+class KimiK3MTPLayer(nn.Module):
+    """One multi-token-prediction layer, mirroring a backbone block.
+
+    Report sec 3.3: "Kimi K3 is pre-trained with a multi-token-prediction (MTP)
+    layer that mirrors the structure of a backbone block", and Table 1 lists
+    one. The released config.json ships ``num_nextn_predict_layers: 0``, so the
+    published artifact was exported without it -- which is why this is built
+    only when the field is set, and why the default is 0.
+
+    Structure follows the MTP formulation this family uses: the depth-k input
+    fuses the backbone's final hidden state with the embedding of the token k
+    positions ahead, each RMSNormed, concatenated and projected back to the
+    model width, then run through a block with the same structure as a
+    backbone layer. Embedding and output head are shared with the backbone, as
+    the released weight contract expects.
+    """
+
+    def __init__(self, config, layer_idx: int, *, gated: bool) -> None:
+        super().__init__()
+        d = config.hidden_size
+        self.enorm = nn.RMSNorm(d, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(d, eps=config.rms_norm_eps)
+        self.eh_proj = Linear(2 * d, d, bias=False, sharding_config=_tp_shard(0))
+        self.gated = gated
+        self.block = KimiAttnResDecoderLayer(config, layer_idx, gated=gated)
+
+    def forward(self, h: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        fused = self.eh_proj(torch.cat([self.hnorm(h), self.enorm(emb)], dim=-1))
+        # An MTP layer has no incoming block stack: it mirrors one block's
+        # structure, not the AttnRes depth-mixing across the backbone.
+        _, out, _ = self.block([], fused, True, fused if self.gated else None)
+        return out
+
+
 class KimiK3AttnResModel(KimiK3Model):
     """Kimi Linear with Block Attention Residuals threaded through layers.
 
@@ -313,6 +347,19 @@ class KimiK3AttnResModel(KimiK3Model):
                 str(i): KimiAttnResDecoderLayer(config, i, gated=gated)
                 for i in range(n_layers)
             }
+        )
+        # Off unless the config asks for it; see KimiK3MTPLayer for why the
+        # released artifact has none.
+        num_mtp = getattr(config, "num_nextn_predict_layers", 0)
+        self.mtp_layers = (
+            nn.ModuleDict(
+                {
+                    str(i): KimiK3MTPLayer(config, n_layers + i, gated=gated)
+                    for i in range(num_mtp)
+                }
+            )
+            if num_mtp
+            else None
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(

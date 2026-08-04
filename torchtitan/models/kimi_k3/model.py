@@ -182,6 +182,11 @@ class KimiK3Config:
     num_shared_experts: int = 1
     routed_scaling_factor: float = 2.446
     first_k_dense_replace: int = 1
+    # Multi-token prediction. Report Table 1 lists one MTP layer; the RELEASED
+    # config.json ships num_nextn_predict_layers: 0, so the artifact trains
+    # without it. Default 0 to match what can actually be loaded; set 1 to
+    # build the architecture the report describes.
+    num_nextn_predict_layers: int = 0
     moe_layer_freq: int = 1
     use_grouped_topk: bool = True
     num_expert_group: int = 1
