@@ -861,14 +861,22 @@ class KimiDeltaAttention(nn.Module):
         # A_log: per-head log-decay parameter, init uniform in log([1, 16])
         # fla-core 0.5.0 expects shape [H]; HF reference had [1, 1, H, 1]
         # but it's fed through fused_kda_gate which reshapes internally.
+        # Drawn and log'd in fp32 for the init math, then stored at the default
+        # dtype like every other parameter. Keeping the parameter itself fp32
+        # (which is what dtype= on the empty() used to do) makes the module's
+        # dtypes non-uniform under training.dtype=bfloat16, and FSDP2 rejects
+        # that outright: "FSDP expects uniform original parameter dtype".
+        # No-op when the default dtype is fp32.
         self.A_log = nn.Parameter(
-            torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16))
+            torch.log(
+                torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)
+            ).to(torch.get_default_dtype())
         )
 
         # dt_bias: per-(head, head_dim) bias, shape [H * K]. Applied
         # inside fused_kda_gate as softplus(g + dt_bias). Kept zero-init
         # to reproduce HF reference's default init behavior.
-        self.dt_bias = nn.Parameter(torch.zeros(projection_size, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.zeros(projection_size))
 
         # Low-rank forget-gate and output-gate projections
         self.f_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
