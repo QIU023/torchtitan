@@ -207,6 +207,42 @@ class KimiAttnResDecoderLayer(nn.Module):
 # ----- Top-level AttnRes-woven model -------------------------------------- #
 
 
+class _DenseGrad(torch.autograd.Function):
+    """Identity forward; makes the gradient dense on the way back.
+
+    torch's pipeline P2P rejects a non-dense tensor
+    ("Tensors for P2P must be non-overlapping and dense"), and what it ships
+    backwards is the raw ``grad_input`` autograd produced for a stage's PP
+    inputs. Our last stage aggregates the block stack together with the
+    partial block, so the gradient w.r.t. the partial block comes back as a
+    slice of that wider buffer -- dense-looking shape, strided layout.
+
+    Making the stage OUTPUTS contiguous does not help: the buffer in question
+    belongs to the inputs. This barrier sits on the inputs instead, so
+    whatever layout autograd picks, what crosses the wire is dense.
+
+    Found by pp8 over 13 layers, where the grad arrived as [1, 256, 256] with
+    stride [256, 768, 1] (768 = 3 x 256: two blocks plus the partial). pp2 and
+    pp4 never produced a strided grad there, which is why this survived to
+    degree 8.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+        return grad.contiguous()
+
+
+def _dense_grad(x: torch.Tensor | None) -> torch.Tensor | None:
+    """Apply :class:`_DenseGrad` where autograd can actually carry a gradient."""
+    if x is None or not x.is_floating_point() or not x.requires_grad:
+        return x
+    return _DenseGrad.apply(x)
+
+
 class KimiK3AttnResModel(KimiK3Model):
     """Kimi Linear with Block Attention Residuals threaded through layers.
 
@@ -437,13 +473,20 @@ class KimiK3AttnResModel(KimiK3Model):
         else:
             h = tokens
 
+        # PP inputs only: keep the gradient that crosses the wire dense.
+        # See _DenseGrad -- the last stage's aggregation makes the grad for the
+        # partial block a slice of a wider buffer, and P2P refuses it.
+        blocks = _dense_grad(blocks)
+        h = _dense_grad(h)
+        partial_block_src = h
+
         # 2) Unstack incoming blocks; empty list on stage 0 / non-PP.
         if blocks is None:
             block_list: list[torch.Tensor] = []
         else:
             block_list = unstack_blocks(blocks)
         initial_num_blocks = len(block_list)
-        partial_block = h
+        partial_block = partial_block_src
 
         # 3) Thread blocks + partial through this stage's layer slice.
         # ModuleDict keys are original layer indices (preserved across
