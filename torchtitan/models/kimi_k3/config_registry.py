@@ -863,6 +863,90 @@ def kimi_k3_mini_qlora() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
+    """Architectural twin of pytorch/torchtitan#4025's kimi_k3_debugmodel.
+
+    Same model on both sides, so the comparison is our parallelism against
+    theirs rather than two different debug models. Every extent is read off
+    that PR's _debugmodel: 13 layers at dim 256, 4 heads, q_lora 128 /
+    kv_lora 64, qk_nope 32 / qk_rope 16 / v 32, full attention on layers
+    {4, 8, 12} and KDA (head_dim 32, conv 4) elsewhere, AttnRes block size 12,
+    LatentMoE with latent 128 / expert hidden 128 / 8 experts top-2 / 2 shared,
+    dense FFN hidden 1024, vocab 163840, and a 4-layer 3-head MoonViT at
+    dim 256 / qkv 384 / hidden 1024 with spatial merge 2.
+
+    #4025 raises NotImplementedError on tensor, context and pipeline parallel
+    ("Kimi K3 eager reference supports FSDP2 data parallelism only"), so on
+    that side this config has exactly one runnable cell. Here it runs the
+    whole matrix.
+    """
+    import dataclasses as _dc
+
+    from torchtitan.components.tokenizer import MultiModalTokenizer
+    from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
+    from torchtitan.hf_datasets.multimodal.utils.image import resize_to_patch_budget
+    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
+    from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
+
+    cfg = kimi_k3_mini_vl()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_pr_4025"
+    kc = _dc.replace(
+        cfg.model_spec.model.kimi_config,
+        num_hidden_layers=13,
+        hidden_size=256,
+        num_attention_heads=4,
+        q_lora_rank=128,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        vocab_size=163840,
+        full_attn_layers=[4, 8, 12],
+        # Must be derived, not inherited: k3mini's list has 15 entries and this
+        # model has 13 layers, so carrying it over leaves the two descriptions
+        # of the same stack contradicting each other.
+        kda_layers=[i for i in range(1, 14) if i not in (4, 8, 12)],
+    )
+    vision = MoonViTConfig(
+        num_hidden_layers=4,
+        hidden_size=256,
+        num_attention_heads=3,
+        qkv_hidden_size=384,
+        intermediate_size=1024,
+        text_hidden_size=256,
+    )
+    cfg.model_spec.model = KimiK3MultimodalSpec(
+        kimi_config=kc,
+        vision_config=vision,
+        num_blocks=cfg.model_spec.model.num_blocks,
+        vision_token_id=cfg.model_spec.model.vision_token_id,
+    )
+    cfg.loss = _dc.replace(cfg.loss, global_vocab_size=163840)
+    cfg.tokenizer = MultiModalTokenizer.Config(
+        image_token="<|media_pad|>",
+        video_token="<|media_pad|>",
+        vision_start_token="<|media_begin|>",
+        vision_end_token="<|media_end|>",
+        pad_token="[PAD]",
+    )
+    cfg.dataloader = MMDataLoader.Config(
+        dataset="cc12m-test",
+        max_images_per_batch=8,
+        patch_size=14,
+        temporal_patch_size=1,
+        spatial_merge_size=2,
+        patch_order="raster",
+        resize_fn=resize_to_patch_budget,
+        max_patches=1024,
+        max_patches_per_side=64,
+        min_pixels=56 * 56,
+        max_pixels=1048576,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+    )
+    return cfg
+
+
 def kimi_k3_mini_diag_4l_mla_lora() -> Trainer.Config:
     """Dense (no MoE) + AttnRes + LoRA rank 8 -- the LoRA gradient control.
 
