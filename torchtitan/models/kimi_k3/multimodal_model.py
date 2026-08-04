@@ -44,6 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 
+from torchtitan.distributed.fsdp import add_zero_valued_dependency
 from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
 from torchtitan.models.kimi_k3.model import KimiK3Config, KimiK3Model, KimiK3Spec
 from torchtitan.models.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
@@ -445,47 +446,94 @@ class KimiK3MultimodalModel(nn.Module):
         group = getattr(self, "_cp_group", None)
         return 1 if group is None else torch.distributed.get_world_size(group)
 
+    def _tower_needs_collectives(self) -> bool:
+        """Is the tower wrapped in something that issues per-forward collectives?
+
+        True once FSDP has sharded it, which is when skipping it desynchronizes
+        the process group.
+        """
+        return any(
+            isinstance(p, DTensor) and any(pl.is_shard() for pl in p.placements)
+            for p in self.vision_tower.parameters()
+        )
+
+    def _tower_placeholder(self) -> torch.Tensor:
+        """Smallest input that still exercises every tower collective."""
+        cfg = self.config.vision_config
+        weight = self.vision_tower.patch_embed.proj.weight
+        dev = weight.device
+        dtype = weight.dtype if not isinstance(weight, DTensor) else weight.dtype
+        merge = cfg.merge_kernel_size[0]
+        side = merge  # one post-merge token
+        patches = torch.zeros(
+            side * side,
+            cfg.in_channels,
+            cfg.patch_size,
+            cfg.patch_size,
+            device=dev,
+            dtype=dtype,
+        )
+        grid = torch.tensor([[1, side, side]], device=dev, dtype=torch.long)
+        tp_mesh = getattr(self, "_vision_tp_mesh", None)
+        if tp_mesh is not None:
+            patches = DTensor.from_local(
+                patches, tp_mesh, (Replicate(),), run_check=False
+            )
+        feats = self.vision_tower(patches, grid)
+        if isinstance(feats, torch.Tensor):
+            return feats.to_local() if isinstance(feats, DTensor) else feats
+        f0 = feats[0]
+        return f0.to_local() if isinstance(f0, DTensor) else f0
+
+    def _exchange_sentinel_counts(self, local: int) -> torch.Tensor:
+        """Per-rank vision-sentinel counts across the CP group.
+
+        Called unconditionally whenever CP is on, including on ranks with no
+        images: the collective's participants are decided by the mesh, never by
+        the batch.
+        """
+        group = self._cp_group
+        counts = torch.zeros(
+            torch.distributed.get_world_size(group),
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
+        )
+        counts[torch.distributed.get_rank(group)] = local
+        torch.distributed.all_reduce(counts, group=group)
+        return counts
+
     def _select_cp_shard(
         self,
-        input_ids: torch.Tensor,
         features: list[torch.Tensor] | torch.Tensor,
         num_rows: int,
+        counts: torch.Tensor | None,
     ) -> list[torch.Tensor] | torch.Tensor:
         """Keep only the visual features belonging to this CP rank's shard.
 
         ``prepare_context_parallel_input`` shards inputs, labels and positions
         along the sequence but leaves ``pixel_values`` whole, so every CP rank
         encodes every image while holding only a slice of the sentinels. The
-        features are ordered by sequence position, and the shards are
-        contiguous and equal (the flavor pins ``context_parallel_load_balancer``
-        to None precisely because a permuting balancer would break this), so
-        this rank's slice starts after however many sentinels the lower ranks
-        hold. One all_gather of per-rank sentinel counts settles that.
+        features are ordered by sequence position and the shards are contiguous
+        and equal -- the flavor pins ``context_parallel_load_balancer`` to None
+        precisely because a permuting balancer would break that -- so this
+        rank's slice starts after however many sentinels the lower ranks hold.
 
         This is correctness, not the report's sec 5.2.3 optimization: the
         encoder still runs redundantly on every CP rank. Dynamic CP would shard
         the encoder itself along the patch dimension and gather KV instead.
         """
-        group = getattr(self, "_cp_group", None)
-        if group is None or torch.distributed.get_world_size(group) == 1:
+        if counts is None:
             return features
 
-        local = int((input_ids == self.config.vision_token_id).sum().item())
-        counts = torch.zeros(
-            torch.distributed.get_world_size(group),
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        counts[torch.distributed.get_rank(group)] = local
-        torch.distributed.all_reduce(counts, group=group)
         if int(counts.sum().item()) != num_rows:
             raise ValueError(
                 f"CP ranks hold {int(counts.sum().item())} vision sentinel(s) "
                 f"in total but {num_rows} visual token(s) were encoded; the "
                 "sequence shard and the image batch disagree"
             )
-
-        start = int(counts[: torch.distributed.get_rank(group)].sum().item())
+        rank = torch.distributed.get_rank(self._cp_group)
+        start = int(counts[:rank].sum().item())
+        local = int(counts[rank].item())
         flat = (
             features
             if isinstance(features, torch.Tensor)
@@ -592,8 +640,27 @@ class KimiK3MultimodalModel(nn.Module):
         """
         num_sentinels = int((input_ids == self.config.vision_token_id).sum().item())
         cp_active = self._cp_world_size() > 1
+
+        # Under CP the per-rank sentinel counts have to be exchanged, and the
+        # decision to exchange them must not depend on data. A batch carrying
+        # no images at all is a normal occurrence, and letting that rank return
+        # early leaves its CP peers waiting in the collective forever -- a
+        # 100-second NCCL watchdog timeout, not an error. Gate on the mesh,
+        # which every rank agrees on before looking at anything.
+        cp_counts = self._exchange_sentinel_counts(num_sentinels) if cp_active else None
+
         if pixel_values is None:
-            return self.language_model(input_ids)
+            out = self.language_model(input_ids)
+            if self._tower_needs_collectives():
+                # FSDP2 issues the tower's all-gather from its pre-forward hook.
+                # A rank that skips the tower on an image-free batch does not
+                # issue it, and its peers wait in that collective until the
+                # NCCL watchdog fires. Run the tower on a placeholder and keep
+                # the graph edge with a zero-valued dependency, so every rank
+                # issues the same collectives and the tower's contribution to
+                # the data-parallel average is a correct zero.
+                out = add_zero_valued_dependency(out, self._tower_placeholder())
+            return out
         if num_sentinels == 0 and not cp_active:
             raise ValueError(
                 "pixel_values supplied but input_ids contains no "
@@ -615,7 +682,7 @@ class KimiK3MultimodalModel(nn.Module):
             if isinstance(features, torch.Tensor)
             else sum(int(f.shape[0]) for f in features)
         )
-        features = self._select_cp_shard(input_ids, features, num_rows)
+        features = self._select_cp_shard(features, num_rows, cp_counts)
         num_rows = (
             features.shape[0]
             if isinstance(features, torch.Tensor)
