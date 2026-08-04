@@ -446,6 +446,23 @@ class KimiK3MultimodalModel(nn.Module):
         group = getattr(self, "_cp_group", None)
         return 1 if group is None else torch.distributed.get_world_size(group)
 
+    @staticmethod
+    def _keep_tower_alive(output, unused_output: torch.Tensor):
+        """add_zero_valued_dependency, but tolerant of a PP stage's tuple.
+
+        A non-last PP stage returns ``(hidden_state, block_residuals)`` -- the
+        AttnRes adapter ships the block payload alongside. The graph edge only
+        has to land on one of them, so put it on the hidden state and rebuild
+        the tuple, exactly as the adapter's own _keepalive_touch does.
+
+        Kept here rather than in add_zero_valued_dependency so that helper
+        stays byte-identical to #4025's and the rebase is a clean delete.
+        """
+        if isinstance(output, tuple):
+            head, *tail = output
+            return (add_zero_valued_dependency(head, unused_output), *tail)
+        return add_zero_valued_dependency(output, unused_output)
+
     def _tower_needs_collectives(self) -> bool:
         """Is the tower wrapped in something that issues per-forward collectives?
 
@@ -659,7 +676,7 @@ class KimiK3MultimodalModel(nn.Module):
                 # the graph edge with a zero-valued dependency, so every rank
                 # issues the same collectives and the tower's contribution to
                 # the data-parallel average is a correct zero.
-                out = add_zero_valued_dependency(out, self._tower_placeholder())
+                out = self._keep_tower_alive(out, self._tower_placeholder())
             return out
         if num_sentinels == 0 and not cp_active:
             raise ValueError(
@@ -697,7 +714,7 @@ class KimiK3MultimodalModel(nn.Module):
             # gradient reduction its peers issue. Same hazard as the
             # image-free path above, reached by a different route.
             out = self.language_model(input_ids)
-            return add_zero_valued_dependency(out, features)
+            return self._keep_tower_alive(out, features)
         if num_sentinels == num_rows:
             # Collator convention: one sentinel per post-merge visual token.
             embeds = self._splice_per_token(input_ids, features)
