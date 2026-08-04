@@ -183,7 +183,11 @@ def _discovered_flavor_names() -> list[str]:
 
     out = []
     for name, obj in vars(config_registry).items():
-        if not (name.startswith("kimi_linear_") and callable(obj)):
+        # BOTH prefixes. The rename kimi_linear -> kimi_k3 left this filter
+        # matching only the old one, so the 37 flavors registered under the new
+        # name became invisible to discovery -- which is the exact failure this
+        # function's docstring was written to fix, reintroduced by the rename.
+        if not (name.startswith(("kimi_linear_", "kimi_k3_")) and callable(obj)):
             continue
         # config_registry holds Trainer.Config factories, which are a SUPERSET
         # of model flavors: some (e.g. the _n4 AttnRes-block variants) exist only
@@ -198,6 +202,7 @@ def _discovered_flavor_names() -> list[str]:
 # Flavor-name dict for registry-discovery consumers (veRL's torchtitan
 # engine looks for a module-level ``*_configs`` dict and uses its KEYS
 # with ``model_registry``). Values are unused.
-kimi_linear_configs: dict[str, None] = {
-    name: None for name in _discovered_flavor_names()
-}
+kimi_k3_configs: dict[str, None] = {name: None for name in _discovered_flavor_names()}
+# The pre-rename name, same object. Discovery takes the first module-level
+# ``*_configs`` dict it finds, so both spellings resolve identically.
+kimi_linear_configs = kimi_k3_configs
