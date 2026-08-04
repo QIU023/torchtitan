@@ -968,6 +968,48 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_report_arch() -> Trainer.Config:
+    """The PR-4025 twin with the layer pattern the tech report specifies.
+
+    Identical to kimi_k3_debugmodel_pr_4025 in every extent, dataset and
+    training setting, differing in exactly one entry: layer 13 is Gated MLA
+    rather than KDA.
+
+    Report sec 2.1: "Each block contains 3 KDA layers followed by 1 Gated MLA
+    layer... An additional Gated MLA layer is placed at the end of the
+    backbone, ensuring that the final layer always performs global attention."
+    The released shape corroborates it -- 93 = 23 * 4 + 1, i.e. 23 blocks plus
+    that extra MLA -- and our own model_configs.py already builds it that way
+    via force_final_full_attn. The twin does not, because it was written to
+    mirror that PR's debug model and mirrored this too.
+
+    Both flavors are kept. The twin answers "does our parallelism work on their
+    model"; this one answers "does it work on the architecture the report
+    describes", and running both is what makes the one-layer difference the
+    only thing separating the two answers.
+
+    The other report deviation on that PR's side -- no final aggregation over
+    block representations (sec 2.2) -- needs no flavor here: our AttnRes model
+    already carries final_attn_res_proj / final_attn_res_norm, so both flavors
+    have it.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_k3_debugmodel_pr_4025()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch"
+    n = 13
+    full_attn = [4, 8, 12, n]
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            cfg.model_spec.model.kimi_config,
+            full_attn_layers=full_attn,
+            kda_layers=[i for i in range(1, n + 1) if i not in full_attn],
+        ),
+    )
+    return cfg
+
+
 def kimi_k3_mini_diag_4l_mla_lora() -> Trainer.Config:
     """Dense (no MoE) + AttnRes + LoRA rank 8 -- the LoRA gradient control.
 
