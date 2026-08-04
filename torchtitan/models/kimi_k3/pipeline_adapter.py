@@ -1256,10 +1256,54 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
         # The embed_tokens-owning chunk is the first stage by construction.
         if getattr(part, "embed_tokens", None) is not None:
             part = KimiK3MultimodalModel.from_parts(mm_config, tower, part)
+        else:
+            _register_mm_prefix_hooks(part)
         return inner_parallelize(part, **pk)
 
     kwargs["parallelize_fn"] = _parallelize_with_tower
     return inner
+
+
+_MM_INNER_PREFIX = "language_model."
+
+
+def _register_mm_prefix_hooks(part: nn.Module) -> None:
+    """Make a bare-text PP stage save and load under the wrapper's namespace.
+
+    Only the stage owning ``embed_tokens`` is re-wrapped as the multimodal
+    model, so its parameters are named ``language_model.*``. Every other stage
+    is the bare text model and names them ``layers.*``,
+    ``final_attn_res_norm.weight`` and so on -- while a non-PP save, and the
+    first stage's own save, use the prefixed form.
+
+    That split namespace makes ANY checkpoint unloadable under PP for this
+    model, not just a seed checkpoint: a resume fails with
+    "Missing key in checkpoint state_dict: final_attn_res_norm.weight". Cold
+    starts never noticed because they load nothing.
+
+    Fixed in the checkpoint path rather than by re-wrapping every stage: the
+    wrapper's forward expects a tower and an image-splice path, and giving the
+    middle stages one to satisfy a key-naming issue would trade a naming bug for
+    a forward bug.
+    """
+
+    def _add_prefix(module, state_dict, prefix, local_metadata):
+        del module, local_metadata
+        for key in [k for k in state_dict if k.startswith(prefix)]:
+            state_dict[prefix + _MM_INNER_PREFIX + key[len(prefix) :]] = state_dict.pop(
+                key
+            )
+
+    def _strip_prefix(
+        state_dict, prefix, local_metadata, strict, missing, unexpected, errors
+    ):
+        del local_metadata, strict, missing, unexpected, errors
+        wrapped = prefix + _MM_INNER_PREFIX
+        for key in [k for k in state_dict if k.startswith(wrapped)]:
+            state_dict[prefix + key[len(wrapped) :]] = state_dict.pop(key)
+
+    part._register_state_dict_hook(_add_prefix)
+    part._register_load_state_dict_pre_hook(_strip_prefix)
 
 
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
