@@ -1079,6 +1079,44 @@ def kimi_k3_2p8t_block_attn_res() -> Trainer.Config:
     return _flavor_trainer_config("2p8t", "block_attn_res")
 
 
+def kimi_k3_2p8t_vl() -> Trainer.Config:
+    """Kimi K3 at full scale WITH the released vision tower.
+
+    ``kimi_k3_2p8t_block_attn_res`` is the text backbone only, which made
+    "scale-up is a config selection" true of two thirds of the released model:
+    report Table 1 also lists a 401M ViT at 27 layers, patch 14, 12 heads, and
+    the released config.json carries a full ``vision_config``. K3 is natively
+    multimodal, so a 2.8T flavor without it is not the released model.
+
+    Every vision extent comes from that artifact, and MoonViTConfig's defaults
+    already are those values -- 27 layers, hidden 1024, 12 heads, qkv 1536,
+    intermediate 4096, patch 14, 2x2 merge, text_hidden 7168 -- so this passes
+    the config through rather than restating it, and a drift in the defaults
+    surfaces here instead of being masked by a duplicate.
+
+    ``vision_token_id`` is the released ``media_placeholder_token_id``
+    (163605), inside the 163840 vocab. Getting this wrong is silent: the
+    sentinel scan matches nothing and forward takes its text-only branch, so a
+    "multimodal" run validates nothing vision-side.
+
+    Needs real hardware; it exists so the multimodal scale-up is also a config
+    selection rather than a code change.
+    """
+    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
+    from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
+
+    cfg = kimi_k3_2p8t_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_2p8t_vl"
+    text = cfg.model_spec.model
+    cfg.model_spec.model = KimiK3MultimodalSpec(
+        kimi_config=text.kimi_config,
+        vision_config=MoonViTConfig(text_hidden_size=text.kimi_config.hidden_size),
+        num_blocks=text.num_blocks,
+        vision_token_id=163605,
+    )
+    return cfg
+
+
 def kimi_k3_debugmodel_latentmoe() -> Trainer.Config:
     """Debug flavor with K3's Stable LatentMoE (report Eq. 11).
 
