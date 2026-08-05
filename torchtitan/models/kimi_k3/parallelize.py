@@ -522,6 +522,31 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
     if not blocks:
         return 0
 
+    # Attention head sharding when the heads divide the ranks. Reported rather
+    # than silently skipped: the debug tower has 3 heads, which nothing divides.
+    tp_size = tp_mesh.size()
+    tp_rank = tp_mesh.get_local_rank()
+    num_heads = getattr(blocks[0], "num_heads", 0)
+    # KIMI_VIT_TP_HEADS=0 forces replicated attention. Kept as a verification
+    # affordance: head sharding changes the summation order of the attention
+    # output, so the only way to attribute a numerical difference to it is an
+    # A/B on one configuration.
+    import os as _os
+
+    shard_heads = (
+        _os.environ.get("KIMI_VIT_TP_HEADS", "1") != "0"
+        and num_heads >= tp_size
+        and num_heads % tp_size == 0
+    )
+    per_rank = num_heads // tp_size if shard_heads else 0
+    if not shard_heads and num_heads:
+        logger.warning(
+            "MoonViT TP: %d attention heads do not divide %d ranks; attention "
+            "stays replicated and only the MLPs are sharded",
+            num_heads,
+            tp_size,
+        )
+
     plan = {}
     for i in range(len(blocks)):
         # Layouts pinned rather than defaulted. encode_images lifts the
@@ -538,10 +563,27 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
             output_layouts=Replicate(),
             use_local_output=False,
         )
+    if shard_heads:
+        for i in range(len(blocks)):
+            # wo receives [L, A_local * K], exactly a Shard(-1) of [L, A * K].
+            plan[f"encoder.blocks.{i}.wo"] = RowwiseParallel(
+                input_layouts=Shard(-1),
+                output_layouts=Replicate(),
+                use_local_output=False,
+            )
+
     parallelize_module(vision_tower, tp_mesh, plan)
+
+    if shard_heads:
+        for block in blocks:
+            block._tp_head_slice = (tp_rank * per_rank, (tp_rank + 1) * per_rank)
+
     logger.info(
-        "MoonViT TP: %d encoder MLPs sharded on the tp axis (attention replicated)",
+        "MoonViT TP: %d encoder MLPs sharded%s",
         len(blocks),
+        f", attention over {per_rank}/{num_heads} heads per rank"
+        if shard_heads
+        else " (attention replicated)",
     )
     return len(blocks)
 

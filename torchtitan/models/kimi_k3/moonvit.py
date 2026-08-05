@@ -299,6 +299,8 @@ class MoonViTEncoderLayer(nn.Module):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
+        # (lo, hi) head range this rank attends over; None = all heads.
+        self._tp_head_slice: tuple[int, int] | None = None
         self.norm0 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.wqkv = nn.Linear(
             config.hidden_size, 3 * config.qkv_hidden_size, bias=False
@@ -319,6 +321,28 @@ class MoonViTEncoderLayer(nn.Module):
         q = MoonViTRope2D.apply(q, freqs_cis)
         k = MoonViTRope2D.apply(k, freqs_cis)
 
+        # Tensor parallel over heads. wqkv stays REPLICATED and every rank
+        # projects all heads: its fused output is [3, A, K] with the 3 outermost,
+        # so an even column split would give rank 0 all of q plus half of k, and
+        # permuting the weight to fix that would change the checkpoint contract.
+        # Slicing after the projection costs a redundant qkv matmul and
+        # parallelizes attention, which is the part that scales with sequence.
+        heads = self._tp_head_slice
+        if heads is not None:
+            lo, hi = heads
+            # Drop to local BEFORE slicing. q/k/v are DTensor(Replicate) and
+            # slicing one yields another Replicate with a SMALLER logical shape,
+            # which loses the fact that this is a shard -- wo would then see a
+            # logical [L, A_local*K] against a weight whose reduction dim is the
+            # full [L, A*K]. A plain tensor lets wo's Shard(-1) input layout say
+            # it. grad_placements is Partial by construction: each rank's
+            # gradient is its own additive contribution to the replicated wqkv.
+            from torch.distributed.tensor import DTensor as _DT, Partial as _P
+
+            if isinstance(q, _DT):
+                q, k, v = (t.to_local(grad_placements=[_P()]) for t in (q, k, v))
+            q, k, v = q[:, lo:hi], k[:, lo:hi], v[:, lo:hi]
+
         # Block-diagonal attention over the packed stream: each sample attends
         # only within itself. Done as a per-sample loop over SDPA rather than a
         # flash varlen kernel so this runs anywhere; the segment boundaries are
@@ -337,7 +361,8 @@ class MoonViTEncoderLayer(nn.Module):
                 .squeeze(0)
                 .transpose(0, 1)
             )
-        return self.wo(out.reshape(L, self.num_heads * self.head_dim))
+        local_heads = out.size(1)
+        return self.wo(out.reshape(L, local_heads * self.head_dim))
 
     def forward(
         self,

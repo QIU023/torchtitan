@@ -1042,6 +1042,32 @@ def kimi_k3_debugmodel_report_arch_dense() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_report_arch_vit4h() -> Trainer.Config:
+    """The report-architecture flavor with an EVEN-head vision tower.
+
+    The debug tower ships 3 attention heads, which no tensor-parallel degree
+    divides, so vision attention cannot be head-sharded on it and an A/B against
+    the replicated path compares nothing. MoonViT-V2 itself has 12 heads, so 3 is
+    a debug-config artifact rather than a property of the architecture.
+
+    4 heads over the same ``qkv_hidden_size`` 384 gives head_dim 96, which still
+    satisfies the 2-D RoPE's divisible-by-4 requirement, and leaves the parameter
+    count identical to the 3-head config -- so the head split is the only thing
+    that differs, which is what makes it usable as a control.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_k3_debugmodel_report_arch()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch_vit4h"
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        vision_config=_dc.replace(
+            cfg.model_spec.model.vision_config, num_attention_heads=4
+        ),
+    )
+    return cfg
+
+
 def kimi_k3_debugmodel_report_arch_qat() -> Trainer.Config:
     """The report-architecture debug flavor with MXFP4/MXFP8 QAT on, nothing else.
 
