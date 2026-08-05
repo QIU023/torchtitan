@@ -47,6 +47,12 @@ import re
 TEXT_PREFIX = "language_model.model."
 LM_HEAD = "language_model.lm_head.weight"
 
+# The same tensors as seen in a TEXT-ONLY checkpoint, with no multimodal
+# wrapper. Read but never written: titan_to_official always emits the released
+# (multimodal) spelling, so a round-trip stays canonical.
+TEXT_ONLY_PREFIX = "model."
+TEXT_ONLY_LM_HEAD = "lm_head.weight"
+
 # Per-layer names that differ only by spelling.
 _LAYER_RENAME = {
     "self_attention_res_proj": "attn_res_proj",
@@ -114,7 +120,7 @@ def official_to_titan(key: str, *, kda_layers: set[int]) -> tuple[str, str]:
     ``"expert_scale"``, ``"vision"``. Raises :class:`UnmappedKey` otherwise --
     a checkpoint tensor we cannot place is a bug, not something to skip.
     """
-    if key == LM_HEAD:
+    if key in (LM_HEAD, TEXT_ONLY_LM_HEAD):
         return "lm_head.weight", "param"
     if key.startswith(VISION_PREFIX) or key.startswith(PROJECTOR_PREFIX):
         # Our MoonViT holds the projector as a child, so mm_projector.* becomes
@@ -122,10 +128,18 @@ def official_to_titan(key: str, *, kda_layers: set[int]) -> tuple[str, str]:
         if key.startswith(PROJECTOR_PREFIX):
             return f"vision_tower.mm_projector.{key[len(PROJECTOR_PREFIX):]}", "vision"
         return f"vision_tower.{key[len(VISION_PREFIX):]}", "vision"
-    if not key.startswith(TEXT_PREFIX):
+    # The RELEASE is the multimodal wrapper, so its text keys carry
+    # ``language_model.model.``. A text-only checkpoint -- what a text flavor
+    # exports, and what vLLM's KimiLinearForCausalLM consumes -- carries a bare
+    # ``model.``. Accept both: refusing the bare form meant our own adapter could
+    # not read a checkpoint our own exporter had just written, which is where
+    # veRL's actor stopped.
+    if key.startswith(TEXT_PREFIX):
+        rest = key[len(TEXT_PREFIX) :]
+    elif key.startswith(TEXT_ONLY_PREFIX):
+        rest = key[len(TEXT_ONLY_PREFIX) :]
+    else:
         raise UnmappedKey(key)
-
-    rest = key[len(TEXT_PREFIX) :]
     if rest == "embed_tokens.weight":
         return "embed_tokens.weight", "param"
     if rest == "norm.weight":
@@ -192,13 +206,34 @@ def official_to_titan(key: str, *, kda_layers: set[int]) -> tuple[str, str]:
 
 
 def titan_to_official(
-    key: str, *, kda_layers: set[int], expert_idx: int | None = None
+    key: str,
+    *,
+    kda_layers: set[int],
+    expert_idx: int | None = None,
+    text_only: bool = False,
 ) -> str:
     """Inverse of :func:`official_to_titan` for a single tensor.
 
     Expert weights need ``expert_idx`` because one stacked ``w1_EFD`` on our
     side corresponds to ``num_experts`` separate official keys.
+
+    ``text_only`` emits the bare ``model.`` prefix instead of the release's
+    ``language_model.model.``. A text flavor has no vision tower, so the
+    multimodal wrapper spelling names a module that does not exist -- and
+    because the checkpoint loader builds its expected-key list from this
+    function, emitting it made our own adapter unable to read a checkpoint our
+    own exporter had written.
     """
+    if text_only:
+        result = titan_to_official(
+            key, kda_layers=kda_layers, expert_idx=expert_idx, text_only=False
+        )
+        if result.startswith(TEXT_PREFIX):
+            return TEXT_ONLY_PREFIX + result[len(TEXT_PREFIX) :]
+        if result == LM_HEAD:
+            return TEXT_ONLY_LM_HEAD
+        return result
+
     inv_layer = {v: k for k, v in _LAYER_RENAME.items()}
     inv_moe = {v: k for k, v in _MOE_BLOCK_RENAME.items()}
     inv_expert = {v: k for k, v in EXPERT_W_TO_SUFFIXED.items()}

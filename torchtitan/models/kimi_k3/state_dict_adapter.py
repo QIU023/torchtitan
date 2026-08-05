@@ -160,6 +160,11 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
 
     # ----- tt -> HF -------------------------------------------------- #
 
+    def _is_text_only(self) -> bool:
+        """No vision tower -> the release's multimodal wrapper prefix names a
+        module this model does not have, so emit the bare ``model.`` spelling."""
+        return getattr(self.model_config, "vision_config", None) is None
+
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert tt state dict to HF naming; split stacked experts."""
         hf_state_dict: dict[str, Any] = {}
@@ -223,12 +228,12 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 # the saved file, so the view must happen on this side too
                 # (from_hf flattens back).
                 value = value.reshape(1, 1, -1, 1)
-            hf_state_dict[self._tt_key_to_hf(key)] = value
+            hf_state_dict[self._tt_key_to_hf(key, self._is_text_only())] = value
 
         return hf_state_dict
 
     @staticmethod
-    def _tt_key_to_hf(key: str) -> str:
+    def _tt_key_to_hf(key: str, text_only: bool = False) -> str:
         """Single-tensor tt -> HF key mapping (experts handled separately)."""
         direct = {v: k for k, v in _DIRECT_MAP_FROM_HF.items()}
         if key in direct:
@@ -260,7 +265,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         from torchtitan.models.kimi_k3.hf_key_map import titan_to_official, UnmappedKey
 
         try:
-            return titan_to_official(key, kda_layers=set())
+            return titan_to_official(key, kda_layers=set(), text_only=text_only)
         except UnmappedKey:
             pass
         raise ValueError(f"Unmapped tt key: {key!r}")
