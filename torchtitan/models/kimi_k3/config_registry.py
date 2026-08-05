@@ -1042,6 +1042,25 @@ def kimi_k3_debugmodel_report_arch_dense() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_report_arch_qat() -> Trainer.Config:
+    """The report-architecture debug flavor with MXFP4/MXFP8 QAT on, nothing else.
+
+    Report sec 4.1.4 runs QAT through the whole post-training stage, so a
+    parallelism matrix that only ever runs bf16 says nothing about the
+    configuration K3 is actually post-trained in. ``mxfp4_qat`` is the only
+    field that differs from ``kimi_k3_debugmodel_report_arch``, which makes any
+    per-cell difference attributable to the fake-quant wrapper rather than to
+    the model.
+
+    The scope is routed experts only (see quant_scope.py), so this flavor needs
+    MoE -- the dense control cannot carry it.
+    """
+    cfg = kimi_k3_debugmodel_report_arch()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch_qat"
+    cfg.model_spec.model.mxfp4_qat = True
+    return cfg
+
+
 def kimi_k3_mini_diag_4l_mla_lora() -> Trainer.Config:
     """Dense (no MoE) + AttnRes + LoRA rank 8 -- the LoRA gradient control.
 

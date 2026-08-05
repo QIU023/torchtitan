@@ -25,7 +25,10 @@ class TestKimi2p8tFlavor(unittest.TestCase):
         self.assertEqual(kc.num_experts_per_token, 16)  # K3 blog
 
     def test_meta_build(self):
-        spec = model_registry("kimi_k3_2p8t_block_attn_res_provisional")
+        # The config-registry function carries a "_provisional" suffix; the
+        # model flavor it builds does not, and model_registry parses
+        # <size>_<variant> with variant in baseline/block_attn_res/full_attn_res.
+        spec = model_registry("kimi_k3_2p8t_block_attn_res")
         with torch.device("meta"):
             model = spec.model.build()
         moe_layers = [

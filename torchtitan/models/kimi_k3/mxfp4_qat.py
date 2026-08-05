@@ -27,14 +27,34 @@ master trains (STE via detach trick).
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from torchtitan.tools.logging import logger
-import torch.nn.functional as F
 
 _WEIGHT_ELEM = torch.float4_e2m1fn_x2  # MXFP4
-_ACT_ELEM = torch.float8_e4m3fn        # MXFP8
-_BLOCK = 32                        # OCP microscaling block
+_ACT_ELEM = torch.float8_e4m3fn  # MXFP8
+_BLOCK = 32  # OCP microscaling block
+
+
+_warned_shapes: set[tuple] = set()
+
+
+def _warn_unquantized(shape: tuple, block_size: int) -> None:
+    if shape in _warned_shapes:
+        return
+    _warned_shapes.add(shape)
+    logger.warning(
+        "MXFP4 QAT: tensor of shape %s left UNQUANTIZED -- last dim %d is not a "
+        "multiple of the MX block size %d. Under TP this is what a shard of "
+        "w2_EDF looks like, so the effective quantization scope is narrower "
+        "than requested and depends on the parallel layout. Choose an "
+        "intermediate size divisible by block_size * tensor_parallel_degree to "
+        "quantize it.",
+        shape,
+        shape[-1],
+        block_size,
+    )
 
 
 def _fake_quant_mx(t: torch.Tensor, elem_dtype, block_size: int) -> torch.Tensor:
@@ -43,7 +63,14 @@ def _fake_quant_mx(t: torch.Tensor, elem_dtype, block_size: int) -> torch.Tensor
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
     if t.shape[-1] % block_size != 0:
-        return t  # non-blockable dim: leave in high precision (report elsewhere)
+        # Not blockable: leave in high precision. Warn rather than skip in
+        # silence -- for w2_EDF the last dim IS the expert-TP-sharded one, so a
+        # tensor that is blockable whole becomes non-blockable per shard and the
+        # run would quietly train a different quantization scope than requested
+        # (measured: moe_intermediate_size 224 is blockable, 224/2 under tp2 is
+        # not). Once per shape, not once per forward.
+        _warn_unquantized(tuple(t.shape), block_size)
+        return t
     q = MXTensor.to_mx(
         t.contiguous().to(torch.bfloat16), elem_dtype=elem_dtype, block_size=block_size
     ).dequantize()
@@ -122,8 +149,18 @@ def _qat_grouped_experts_subclass(parent_cls: type) -> type:
                     # MX quantization sees a plain tensor. Bare to_local
                     # mirrors the parent: the gradient keeps the parameter's
                     # own placement, correct because each rank quantizes
-                    # exactly its own shard and MX blocks run along the last
-                    # dim, which is never the sharded one for w1/w3.
+                    # exactly its own shard.
+                    #
+                    # Per-shard quantization is NOT equivalent to quantizing
+                    # the whole tensor: MX block scales come from the max-abs
+                    # within each block, so a shard boundary that cuts across
+                    # the blocked dim changes the scales. For w1_EFD/w3_EFD the
+                    # blocked last dim is D, which expert TP does not shard, so
+                    # they are unaffected. For w2_EDF the last dim is the
+                    # intermediate size -- exactly what expert TP shards -- so
+                    # w2 under TP is quantized per shard, and is skipped
+                    # entirely (with a warning) when the shard stops being a
+                    # multiple of the block size.
                     w = w.to_local()
                 self.__dict__[name] = _fake_quant_mx(w, _WEIGHT_ELEM, _BLOCK)
             try:

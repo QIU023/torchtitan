@@ -1901,6 +1901,17 @@ class KimiK3Spec:
                 num_blocks=self.num_blocks,
                 gated=self.attn_res_gated,
             )
+        return self.apply_build_time_features(model)
+
+    def apply_build_time_features(self, model):
+        """Attach LoRA, Per-Head Muon tags and MXFP4 QAT to a built model.
+
+        Separate from ``build`` because the multimodal spec overrides ``build``
+        to construct a vision-bearing model; without a shared entry point every
+        one of these config fields is silently dropped on multimodal flavors.
+        None of them can match a MoonViT module: the LoRA target names and the
+        routed-expert QAT scope do not exist in the tower.
+        """
         if self.lora_rank is not None:
             from torchtitan.models.kimi_k3.lora import apply_lora
 

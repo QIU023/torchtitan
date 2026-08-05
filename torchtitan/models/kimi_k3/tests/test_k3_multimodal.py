@@ -37,7 +37,9 @@ def _cfg(num_blocks=2):
         rope_max_grid=32,
     )
     return KimiK3MultimodalConfig(
-        kimi_config=kc, vision_config=vc, num_blocks=num_blocks,
+        kimi_config=kc,
+        vision_config=vc,
+        num_blocks=num_blocks,
         vision_token_id=SENTINEL,
     )
 
@@ -50,9 +52,7 @@ class TestK3MultimodalStructure(unittest.TestCase):
             {n for n, _ in m.named_children()}, {"vision_tower", "language_model"}
         )
         # the projector is a tower child, as in the checkpoint, not a sibling
-        self.assertIn(
-            "mm_projector", {n for n, _ in m.vision_tower.named_children()}
-        )
+        self.assertIn("mm_projector", {n for n, _ in m.vision_tower.named_children()})
 
     def test_vision_tower_is_trainable(self):
         """Report sec 2.4 trains MoonViT-V2 from scratch jointly; the LLaVA
@@ -141,7 +141,7 @@ class TestK3MultimodalForward(unittest.TestCase):
         patches, grid = MoonViT.patchify(
             torch.randn(1, 3, 32, 32, device="cuda", dtype=torch.bfloat16), 4
         )
-        with self.assertRaisesRegex(ValueError, "one to one"):
+        with self.assertRaisesRegex(ValueError, "match neither the image count"):
             m(ids, patches, grid)
 
 

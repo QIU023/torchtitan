@@ -803,11 +803,13 @@ class KimiK3MultimodalSpec(KimiK3Spec):
     """
 
     def build(self, **kwargs):
-        return KimiK3MultimodalModel(
-            KimiK3MultimodalConfig(
-                kimi_config=self.kimi_config,
-                vision_config=self.vision_config,
-                num_blocks=self.num_blocks,
-                vision_token_id=self.vision_token_id,
+        return self.apply_build_time_features(
+            KimiK3MultimodalModel(
+                KimiK3MultimodalConfig(
+                    kimi_config=self.kimi_config,
+                    vision_config=self.vision_config,
+                    num_blocks=self.num_blocks,
+                    vision_token_id=self.vision_token_id,
+                )
             )
         )
