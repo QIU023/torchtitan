@@ -60,12 +60,25 @@ _LAYER_RENAME = {
 # Attention leaves that keep their name. Both attention types are covered; the
 # official g_proj is ambiguous between them, so it is resolved by layer type.
 _ATTN_SAME = (
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "q_a_proj", "q_a_layernorm", "q_b_proj",
-    "kv_a_proj_with_mqa", "kv_a_layernorm", "kv_b_proj",
-    "f_a_proj", "f_b_proj", "b_proj",
-    "q_conv1d", "k_conv1d", "v_conv1d", "o_norm",
-    "A_log", "dt_bias",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "q_a_proj",
+    "q_a_layernorm",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "kv_a_layernorm",
+    "kv_b_proj",
+    "f_a_proj",
+    "f_b_proj",
+    "b_proj",
+    "q_conv1d",
+    "k_conv1d",
+    "v_conv1d",
+    "o_norm",
+    "A_log",
+    "dt_bias",
 )
 
 # Routed experts: w1 gate, w3 up, w2 down (reference annotates these).
@@ -243,3 +256,112 @@ def titan_to_official(
         return f"{prefix}mlp.{leaf}"
 
     raise UnmappedKey(key)
+
+
+# ---------------------------------------------------------------------------
+# The config half of the same contract.
+#
+# Names are only half of what an inference engine keys on: it builds its modules
+# from config.json first, and a config that disagrees with the weights fails at
+# load with a name error that looks like a naming bug. That happened here -- a
+# fixture carried the low-rank KDA gate (g_a_proj / g_b_proj) while its nested
+# linear_attn_config claimed use_full_rank_gate, and the official loader, which
+# reads the NESTED flag, went looking for g_proj.
+#
+# The schema is vLLM's KimiLinearConfig (vllm/transformers_utils/configs/
+# kimi_linear.py): flat text fields, with the KDA settings in a nested
+# linear_attn_config dict. Deriving both from one KimiK3Config is what makes
+# them unable to disagree.
+# ---------------------------------------------------------------------------
+
+# Fields whose name and meaning are identical on both sides.
+_PASSTHROUGH_CONFIG_FIELDS = (
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "hidden_act",
+    "initializer_range",
+    "rms_norm_eps",
+    "tie_word_embeddings",
+    "max_position_embeddings",
+    "q_lora_rank",
+    "kv_lora_rank",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "v_head_dim",
+    "mla_use_nope",
+    "num_experts",
+    "num_experts_per_token",
+    "num_shared_experts",
+    "moe_intermediate_size",
+    "moe_renormalize",
+    "moe_router_activation_func",
+    "routed_scaling_factor",
+    "routed_expert_hidden_size",
+    "first_k_dense_replace",
+    "moe_layer_freq",
+    "use_grouped_topk",
+    "num_expert_group",
+    "topk_group",
+    "num_nextn_predict_layers",
+    "latent_moe_use_norm",
+    "activation_situ_beta",
+    "activation_situ_linear_beta",
+)
+
+
+def titan_config_to_official(kimi_config, *, num_blocks: int | None = None) -> dict:
+    """Serialize a ``KimiK3Config`` to the official HF text config schema.
+
+    ``num_blocks`` is the Block AttnRes block count; the released config states
+    the block SIZE instead, so it is derived here rather than stored twice.
+    Pass None for a backbone without AttnRes.
+
+    Renames, each because the two sides genuinely spell it differently:
+
+    * ``mla_gated`` -> ``mla_use_output_gate`` (Gated MLA, report Eq. 7)
+    * ``kda_num_heads`` / ``kda_head_dim`` / ``kda_short_conv_kernel_size`` /
+      ``kda_gate_lower_bound`` / ``kda_use_full_rank_gate`` -> the unprefixed
+      keys inside ``linear_attn_config``
+    * ``kda_layers`` / ``full_attn_layers`` appear in ``linear_attn_config``;
+      both sides use 1-based indices there.
+
+    Deliberately NOT emitted: ``kda_cp_mode``, ``moe_enable_ep``,
+    ``moe_enable_tp``, ``attn_gate_param`` -- training-side knobs with no
+    inference meaning. Emitting them would invite an engine to key on a field we
+    do not intend as part of the contract.
+    """
+    cfg: dict = {"model_type": "kimi_linear"}
+    for name in _PASSTHROUGH_CONFIG_FIELDS:
+        if hasattr(kimi_config, name):
+            cfg[name] = getattr(kimi_config, name)
+
+    cfg["mla_use_output_gate"] = bool(getattr(kimi_config, "mla_gated", False))
+    cfg["topk_method"] = "noaux_tc"
+    cfg["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": getattr(kimi_config, "rope_theta", 10000.0),
+    }
+    if num_blocks is not None:
+        # Same ceil derivation KimiK3AttnResModel uses, so the value round-trips
+        # to the same block layout. A partial final block is the released
+        # arrangement, not an edge case: block size 12 over 93 layers is 7 full
+        # blocks plus a 9-layer tail (report sec 2.2).
+        cfg["attn_res_block_size"] = -(-kimi_config.num_hidden_layers // num_blocks)
+
+    cfg["linear_attn_config"] = {
+        "num_heads": kimi_config.kda_num_heads,
+        "head_dim": kimi_config.kda_head_dim,
+        "short_conv_kernel_size": kimi_config.kda_short_conv_kernel_size,
+        "kda_layers": list(kimi_config.kda_layers),
+        "full_attn_layers": list(kimi_config.full_attn_layers),
+        "gate_lower_bound": kimi_config.kda_gate_lower_bound,
+        # The official loader reads the gate form from HERE, not from a
+        # top-level key, and it decides whether the checkpoint must carry
+        # g_proj or the low-rank g_a_proj/g_b_proj pair.
+        "use_full_rank_gate": bool(kimi_config.kda_use_full_rank_gate),
+    }
+    return cfg
