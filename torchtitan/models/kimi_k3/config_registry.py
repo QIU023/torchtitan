@@ -1010,6 +1010,38 @@ def kimi_k3_debugmodel_report_arch() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_report_arch_dense() -> Trainer.Config:
+    """The report-architecture debug flavor with MoE removed, nothing else.
+
+    The control for one specific claim. Across the eighteen-cell matrix the
+    step-1 losses agree bit-for-bit wherever TP and CP are absent, but the
+    spread grows to ~12% by step 100 -- and it grows even among the cells that
+    were bit-identical at step 1. The explanation offered is MoE: top-k is a
+    discrete choice, so any floating-point difference eventually flips which
+    expert a token reaches and the trajectories genuinely diverge.
+
+    That is an explanation, not a measurement, until the same matrix runs on a
+    model with no routing to flip. ``first_k_dense_replace`` set to the layer
+    count makes every layer a plain FFN and changes nothing else -- same 13
+    layers, same KDA/MLA composition with the trailing Gated MLA, same Block
+    AttnRes, same vision tower, same data.
+
+    Expert parallelism is not expressible here, which is not a limitation to
+    work around: a dense model has no experts to shard. Those cells are
+    reported as inapplicable rather than as failures.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_k3_debugmodel_report_arch()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch_dense"
+    kc = cfg.model_spec.model.kimi_config
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(kc, first_k_dense_replace=kc.num_hidden_layers),
+    )
+    return cfg
+
+
 def kimi_k3_mini_diag_4l_mla_lora() -> Trainer.Config:
     """Dense (no MoE) + AttnRes + LoRA rank 8 -- the LoRA gradient control.
 
