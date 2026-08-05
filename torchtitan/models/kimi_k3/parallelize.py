@@ -494,6 +494,58 @@ def _model_has_moe(model: nn.Module) -> bool:
     return any(bool(getattr(layer, "is_moe", False)) for layer in model.layers.values())
 
 
+def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
+    """Tensor-parallelize the MoonViT encoder MLPs. Returns blocks covered.
+
+    Report sec 5.2.3 asks for a genuinely parallel vision tower, not a replicated
+    one. This is the half that is unambiguous: fc0 is hidden -> intermediate and
+    fc1 is intermediate -> hidden with an elementwise GELU between them, so
+    Colwise/Rowwise is exact and the activation shard commutes with the
+    nonlinearity.
+
+    Attention is deliberately NOT sharded here. ``wqkv`` is one fused Linear
+    whose flat output is laid out ``[3, A, K]`` with the 3 outermost, so an
+    even column split hands rank 0 all of q plus half of k -- which is not
+    ``[3, A_local, K]``, and the ``view`` in ``_attend`` would silently
+    reinterpret it. Sharding it needs either a permuted weight layout (and a
+    matching permutation in the state-dict adapter, i.e. a change to the
+    checkpoint contract we just finished aligning to the official
+    implementation) or splitting the fused Linear into three. Left for a
+    separate change rather than smuggled in here.
+
+    Must run BEFORE ``distribute_module`` replicates the rest of the tower:
+    the styles need plain-tensor parameters, and a later ``distribute_module``
+    leaves already-distributed ones alone (verified, not assumed).
+    """
+    encoder = getattr(vision_tower, "encoder", None)
+    blocks = getattr(encoder, "blocks", None) if encoder is not None else None
+    if not blocks:
+        return 0
+
+    plan = {}
+    for i in range(len(blocks)):
+        # Layouts pinned rather than defaulted. encode_images lifts the
+        # tower activations into DTensors at the boundary, so the block
+        # residual is a DTensor and fc1 must hand back a DTensor too --
+        # use_local_output=True here fails the add on mixed Tensor/DTensor.
+        plan[f"encoder.blocks.{i}.mlp.fc0"] = ColwiseParallel(
+            input_layouts=Replicate(),
+            output_layouts=Shard(-1),
+            use_local_output=False,
+        )
+        plan[f"encoder.blocks.{i}.mlp.fc1"] = RowwiseParallel(
+            input_layouts=Shard(-1),
+            output_layouts=Replicate(),
+            use_local_output=False,
+        )
+    parallelize_module(vision_tower, tp_mesh, plan)
+    logger.info(
+        "MoonViT TP: %d encoder MLPs sharded on the tp axis (attention replicated)",
+        len(blocks),
+    )
+    return len(blocks)
+
+
 def apply_tp_kimi_k3(
     model: nn.Module,
     tp_mesh: DeviceMesh,
@@ -624,6 +676,7 @@ def apply_tp_kimi_k3(
     # conversions instead, where the list is in hand.
     vision_tower = getattr(model, "vision_tower", None)
     if vision_tower is not None:
+        _apply_tp_moonvit_mlp(vision_tower, tp_mesh)
         distribute_module(vision_tower, tp_mesh)
         # Record the mesh rather than letting encode_images sniff the weight.
         # Once FSDP also shards the tower its params are DTensors too, so
