@@ -418,6 +418,23 @@ class KimiK3MultimodalModel(nn.Module):
         """
         cfg = self.config.vision_config
         counts = grid_thw.prod(dim=-1).tolist()
+
+        # Context parallel over IMAGES. Without this every CP rank encodes the
+        # whole batch's images and discards the part its sequence shard does not
+        # need. The tower is a per-image function, so splitting the images
+        # changes no arithmetic. The group is the static _cp_group -- only the
+        # work assignment is per-batch, so no dynamic mesh is needed.
+        # KIMI_VIT_CP_IMAGE_SHARD=0 forces the replicated path for A/B.
+        import os as _os
+
+        cp_size = self._cp_world_size()
+        if (
+            cp_size > 1
+            and len(counts) >= cp_size
+            and _os.environ.get("KIMI_VIT_CP_IMAGE_SHARD", "1") != "0"
+        ):
+            return self._encode_images_cp(pixel_values, grid_thw, counts, cp_size)
+
         packed = torch.cat([pixel_values[i, :n] for i, n in enumerate(counts)], dim=0)
         packed = packed.reshape(-1, cfg.in_channels, cfg.patch_size, cfg.patch_size)
         # The collator emits float32; under FSDP's mixed precision the tower's
@@ -441,6 +458,87 @@ class KimiK3MultimodalModel(nn.Module):
         if isinstance(features, torch.Tensor):
             return features.to_local() if isinstance(features, DTensor) else features
         return [f.to_local() if isinstance(f, DTensor) else f for f in features]
+
+    def _encode_images_cp(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        counts: list[int],
+        cp_size: int,
+    ) -> list[torch.Tensor]:
+        """Encode a disjoint slice of the batch's images, then share the features.
+
+        Sizing the collective needs no extra communication: ``grid_thw`` is
+        replicated and the projector's merge kernel divides each image's patch
+        count by a fixed factor, so every rank knows every image's output length
+        up front and the exchange is a fixed-shape all-gather.
+
+        ``funcol.all_gather_tensor`` because it is differentiable: its transpose
+        is the reduce-scatter that hands each rank the gradient for exactly the
+        images it encoded, summed over every rank's token shard.
+        """
+        import torch.distributed._functional_collectives as funcol
+
+        from torchtitan.tools.logging import logger
+
+        group = self._cp_group
+        rank = torch.distributed.get_rank(group)
+        cfg = self.config.vision_config
+        kh, kw = cfg.merge_kernel_size
+        merge = kh * kw
+
+        if any(c % merge for c in counts):
+            raise ValueError(
+                f"image patch counts {counts} must divide the projector merge "
+                f"kernel {kh}x{kw}; CP image sharding sizes its all-gather from "
+                "these counts and cannot do so otherwise"
+            )
+        out_lens = [c // merge for c in counts]
+
+        owner = [i % cp_size for i in range(len(counts))]
+        mine = [i for i, o in enumerate(owner) if o == rank]
+        slot = max(
+            sum(out_lens[i] for i, o in enumerate(owner) if o == r)
+            for r in range(cp_size)
+        )
+
+        if not getattr(self, "_cp_image_shard_logged", False):
+            self._cp_image_shard_logged = True
+            logger.info(
+                "MoonViT CP: sharding %d images over %d CP ranks", len(counts), cp_size
+            )
+
+        local_packed = torch.cat([pixel_values[i, : counts[i]] for i in mine], dim=0)
+        local_packed = local_packed.reshape(
+            -1, cfg.in_channels, cfg.patch_size, cfg.patch_size
+        )
+        weight = self.vision_tower.patch_embed.proj.weight
+        local_packed = local_packed.to(weight.dtype)
+        tp_mesh = getattr(self, "_vision_tp_mesh", None)
+        if tp_mesh is not None:
+            local_packed = DTensor.from_local(
+                local_packed, tp_mesh, (Replicate(),), run_check=False
+            )
+        local_features = self.vision_tower(local_packed, grid_thw[mine])
+        if isinstance(local_features, torch.Tensor):
+            local_features = [local_features]
+        local_features = [
+            f.to_local() if isinstance(f, DTensor) else f for f in local_features
+        ]
+
+        flat = torch.cat(local_features, dim=0)
+        pad = slot - flat.size(0)
+        if pad:
+            flat = torch.cat([flat, flat.new_zeros(pad, flat.size(1))], dim=0)
+        gathered = funcol.all_gather_tensor(flat, gather_dim=0, group=group)
+
+        out: list[torch.Tensor | None] = [None] * len(counts)
+        for r in range(cp_size):
+            base = r * slot
+            for i in [j for j, o in enumerate(owner) if o == r]:
+                out[i] = gathered[base : base + out_lens[i]]
+                base += out_lens[i]
+        return [f for f in out if f is not None]
 
     def _cp_world_size(self) -> int:
         group = getattr(self, "_cp_group", None)
