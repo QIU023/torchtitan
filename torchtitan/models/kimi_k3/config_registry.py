@@ -1068,6 +1068,53 @@ def kimi_k3_debugmodel_report_arch_vit4h() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_report_arch_pp8vp4() -> Trainer.Config:
+    """Report architecture at 32 layers, for the multimodal PP8xVP4 stress test.
+
+    30 layers is what makes pp8 x vp4 expressible: torchtitan counts virtual
+    stages over the split children, and the multimodal wrapper contributes two
+    beyond the decoder layers, so 30 + 2 = 32 = 8 x 4. 32 layers gives 34, which
+    is not divisible by 8 and is rejected. The 13-layer debug model cannot host
+    the cell at all, which is why the matrix reports it as inexpressible.
+
+    Derived from the report-architecture flavor rather than from the text
+    ``kimi_k3_mini_pp8vp4``, so the vision tower, tokenizer, dataloader and
+    ``bfloat16`` all come from a configuration already exercised by the matrix.
+    The text flavor had to drop KDA because it leaves ``training.dtype`` at
+    float32 and, with ``dp_shard=1`` giving no FSDP mixed-precision cast, fla's
+    kernel then asks for 108160 bytes of dynamic shared memory against this
+    card's 101376. bfloat16 here removes that constraint, so the KDA:MLA pattern
+    is kept and the stress test runs the real attention mix.
+
+    Layer pattern extended the same way sec 2.1 describes: global attention every
+    4th layer, plus the trailing layer forced global so the stack still ends on
+    Gated MLA -- 30 is not a multiple of 4, so it has to be appended explicitly.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_k3_debugmodel_report_arch()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch_pp8vp4"
+    # Sequence-length ceiling on 15.5 GiB is set by the vocabulary-sized logits
+    # tensor, not by depth or attention: seq 4096 peaks at 7.7%, while seq 8192
+    # OOMs asking for 5.00 GiB and 8192 x 163840 x 4 bytes is 5.37 GiB -- the
+    # fp32 upcast of the logits. ChunkedLossWrapper is the fix, but it requires a
+    # _skip_lm_head forward these models do not implement (see the note at the
+    # top of this file), so it is a model change rather than a config change.
+    n = 30
+    full_attn = sorted(set(range(4, n + 1, 4)) | {n})
+    kc = cfg.model_spec.model.kimi_config
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            kc,
+            num_hidden_layers=n,
+            full_attn_layers=full_attn,
+            kda_layers=[i for i in range(1, n + 1) if i not in full_attn],
+        ),
+    )
+    return cfg
+
+
 def kimi_k3_debugmodel_report_arch_qat() -> Trainer.Config:
     """The report-architecture debug flavor with MXFP4/MXFP8 QAT on, nothing else.
 
