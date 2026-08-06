@@ -1118,6 +1118,45 @@ def kimi_k3_debugmodel_report_arch_pp8vp4() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_mini_mtp() -> Trainer.Config:
+    """One MTP layer and the MTP loss (report sec 3.3), on the text backbone.
+
+    Two fields differ from the base flavor:
+    ``num_nextn_predict_layers`` and the loss. Table 1 lists one MTP layer; the
+    released config.json ships 0, so the published artifact was exported without
+    it and enabling it is a training-time choice.
+
+    MTP needs the embedding table and the head on the same stage, so it is
+    incompatible with a PP split that separates them -- the model raises rather
+    than quietly degrading to single-token prediction.
+    """
+    import dataclasses as _dc
+
+    from torchtitan.models.kimi_k3.mtp_loss import KimiMTPLoss
+
+    # Text flavor, not the multimodal report-architecture one. The multimodal
+    # wrapper splices vision features and calls the language model with
+    # inputs_embeds, so the token ids MTP needs for its depth-k embedding lookup
+    # are not in scope there -- threading them through the wrapper is follow-up
+    # work, recorded rather than faked.
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_mtp"
+    kc = cfg.model_spec.model.kimi_config
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(kc, num_nextn_predict_layers=1),
+    )
+    cfg.loss = KimiMTPLoss.Config(
+        mtp_weight=0.3,
+        loss_fn=CrossEntropyLoss.Config(global_vocab_size=163840),
+    )
+    # bfloat16, because this chain leaves training.dtype at float32 and with
+    # dp_shard=1 there is no FSDP mixed-precision cast, so fla's KDA kernel asks
+    # for 108160 bytes of dynamic shared memory against this card's 101376.
+    cfg.training = _dc.replace(cfg.training, dtype="bfloat16")
+    return cfg
+
+
 def kimi_k3_debugmodel_report_arch_qat() -> Trainer.Config:
     """The report-architecture debug flavor with MXFP4/MXFP8 QAT on, nothing else.
 

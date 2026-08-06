@@ -591,6 +591,17 @@ class KimiK3AttnResModel(KimiK3Model):
             ) * (h_final - plain_stream)
         if self.norm is not None:
             h_final = self.norm(h_final)
+
+        # Multi-token prediction (report sec 3.3). Runs only where both the
+        # embedding table and the head are present -- which is the last stage
+        # only when PP has not split them apart; see _mtp_logits for why that is
+        # checked rather than assumed.
+        if self.mtp_layers is not None and self.lm_head is not None:
+            from torchtitan.models.kimi_k3.mtp_loss import put_mtp_logits
+
+            self._mtp_logits = self._compute_mtp_logits(tokens, h_final)
+            put_mtp_logits(self._mtp_logits)
+
         # _skip_lm_head is an attribute rather than a forward kwarg because PP
         # backward calls .requires_grad on all stage inputs, which fails on bool
         # kwargs -- same reason core's decoder does it this way. Set by the
@@ -599,6 +610,46 @@ class KimiK3AttnResModel(KimiK3Model):
         if self._skip_lm_head:
             return h_final
         return self.lm_head(h_final)
+
+    # Set by forward when MTP is on: one logits tensor per MTP depth, for a loss
+    # component to consume. Not returned from forward because the trainer's
+    # loss_fn takes a single ``pred``, and changing that is a core change.
+    _mtp_logits: list[torch.Tensor] | None = None
+
+    def _compute_mtp_logits(
+        self, tokens: torch.Tensor, h_final: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Logits for each MTP depth. Depth k predicts the token k+1 ahead.
+
+        The depth-k input fuses the backbone's final hidden state with the
+        embedding of the token k+1 positions ahead, so the last k+1 positions
+        have no target and are dropped by the loss rather than padded here --
+        padding would invent supervision.
+
+        MTP needs the embedding table AND the head. Under PP those live on
+        different stages, so this raises rather than silently producing nothing:
+        a multi-token objective that quietly degrades to single-token is worse
+        than a failed run.
+        """
+        if self.embed_tokens is None:
+            raise RuntimeError(
+                "MTP needs embed_tokens and lm_head on the same stage, but PP "
+                "has split them. Either disable MTP under PP or keep the "
+                "embedding on the last stage."
+            )
+        out = []
+        for k in range(len(self.mtp_layers)):
+            shift = k + 1
+            # Token k+1 ahead, aligned to position t: drop the first `shift`
+            # tokens and let the loss ignore the tail that has no target.
+            ahead = tokens[:, shift:]
+            emb = self.embed_tokens(ahead)
+            h = h_final[:, : ahead.size(1)]
+            hidden = self.mtp_layers[str(k)](h, emb)
+            if self.norm is not None:
+                hidden = self.norm(hidden)
+            out.append(self.lm_head(hidden))
+        return out
 
     def init_weights(
         self,
