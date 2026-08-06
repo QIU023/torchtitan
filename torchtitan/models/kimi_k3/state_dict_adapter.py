@@ -76,6 +76,11 @@ _DIRECT_MAP_FROM_HF = {
     "model.final_attn_res_alpha": "final_attn_res_alpha",
 }
 
+# Attention leaves whose released name differs from ours, so they must reach
+# hf_key_map rather than being passed through. Kept as a set so a second
+# divergence has one place to be added.
+_ATTN_LEAVES_RENAMED_BY_HF_KEY_MAP = frozenset({"attn_gate_proj"})
+
 _PASSTHROUGH_LAYER_TAGS = (
     "attn_res_alpha",
     "mlp_res_alpha",
@@ -244,7 +249,16 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         idx_s, _, sub = rest.partition(".")
         prefix = f"model.layers.{idx_s}"
 
-        if sub in _PASSTHROUGH_LAYER_TAGS or sub.startswith("self_attn."):
+        # self_attn.* is passed through because the Kimi-Linear-48B naming this
+        # adapter was written for matches ours leaf for leaf. K3 breaks that for
+        # exactly one leaf: our attn_gate_proj is the release's g_proj. Passing
+        # it through emitted our own name and the checkpoint load then failed on
+        # a key nothing writes, so the renamed leaves have to fall through to
+        # hf_key_map instead of being caught here.
+        if sub in _PASSTHROUGH_LAYER_TAGS or (
+            sub.startswith("self_attn.")
+            and sub.split(".")[1] not in _ATTN_LEAVES_RENAMED_BY_HF_KEY_MAP
+        ):
             return f"{prefix}.{sub}"
         for proj in ("gate_proj", "up_proj", "down_proj"):
             if sub == f"ffn.{proj}.weight":
