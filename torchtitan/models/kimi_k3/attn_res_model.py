@@ -626,16 +626,30 @@ class KimiK3AttnResModel(KimiK3Model):
         have no target and are dropped by the loss rather than padded here --
         padding would invent supervision.
 
-        MTP needs the embedding table AND the head. Under PP those live on
-        different stages, so this raises rather than silently producing nothing:
-        a multi-token objective that quietly degrades to single-token is worse
-        than a failed run.
+        MTP needs the embedding table AND the head, and raises when it cannot
+        have both rather than silently producing nothing: a multi-token objective
+        that quietly degrades to single-token is worse than a failed run.
+
+        Two distinct reasons ``embed_tokens`` can be absent, and the message says
+        which, because they need different answers:
+
+        * PP has put the embedding and the head on different stages.
+        * The multimodal wrapper set it to None on purpose. That is how it selects
+          the backbone's pre-embedded branch after splicing vision features, so
+          MTP under a multimodal model is not a plumbing problem -- the spliced
+          sequence is LONGER than ``input_ids`` (each sentinel expands to many
+          visual tokens), so "the token k+1 ahead" is no longer a shift of
+          ``input_ids`` and the depth-k target has to come from the spliced
+          sequence. Handing the table back would produce a misaligned objective
+          that still trains, which is the worst outcome.
         """
         if self.embed_tokens is None:
             raise RuntimeError(
-                "MTP needs embed_tokens and lm_head on the same stage, but PP "
-                "has split them. Either disable MTP under PP or keep the "
-                "embedding on the last stage."
+                "MTP needs embed_tokens and lm_head together, and embed_tokens "
+                "is None. Either PP split them across stages, or the multimodal "
+                "wrapper cleared it to take the pre-embedded branch -- in which "
+                "case MTP needs targets from the SPLICED sequence, not from "
+                "input_ids, because the splice changes the sequence length."
             )
         out = []
         for k in range(len(self.mtp_layers)):
