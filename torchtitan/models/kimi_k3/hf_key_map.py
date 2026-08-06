@@ -400,3 +400,59 @@ def titan_config_to_official(kimi_config, *, num_blocks: int | None = None) -> d
         "use_full_rank_gate": bool(kimi_config.kda_use_full_rank_gate),
     }
     return cfg
+
+
+# The vision half of the config contract. The release prefixes the tower's own
+# dims with ``vt_`` while ours are unprefixed, which is the only real divergence;
+# everything else is same-named.
+_VISION_RENAME = {
+    "num_hidden_layers": "vt_num_hidden_layers",
+    "hidden_size": "vt_hidden_size",
+    "num_attention_heads": "vt_num_attention_heads",
+    "intermediate_size": "vt_intermediate_size",
+}
+
+_VISION_PASSTHROUGH = (
+    "patch_size",
+    "init_pos_emb_height",
+    "init_pos_emb_width",
+    "qkv_hidden_size",
+    "text_hidden_size",
+    "merge_kernel_size",
+)
+
+
+def titan_vision_config_to_official(vision_config) -> dict:
+    """Serialize a ``MoonViTConfig`` to the official vision-config schema."""
+    cfg: dict = {"model_type": "kimi_k3_vision"}
+    for ours, theirs in _VISION_RENAME.items():
+        if hasattr(vision_config, ours):
+            cfg[theirs] = getattr(vision_config, ours)
+    for name in _VISION_PASSTHROUGH:
+        if hasattr(vision_config, name):
+            value = getattr(vision_config, name)
+            cfg[name] = list(value) if isinstance(value, tuple) else value
+    return cfg
+
+
+def titan_config_to_official_multimodal(
+    kimi_config,
+    vision_config,
+    *,
+    num_blocks: int | None = None,
+    media_placeholder_token_id: int = 163605,
+) -> dict:
+    """The released config shape: text and vision nested, not flattened.
+
+    ``KimiK3Config`` exposes ``hidden_size`` and ``vocab_size`` as read-only
+    properties delegating to ``text_config``, so a flat text field at the top
+    level does not merely go unread -- it raises "property has no setter" when
+    transformers tries to assign it. The nesting is required, not cosmetic.
+    """
+    return {
+        "model_type": "kimi_k3",
+        "architectures": ["KimiK3ForConditionalGeneration"],
+        "text_config": titan_config_to_official(kimi_config, num_blocks=num_blocks),
+        "vision_config": titan_vision_config_to_official(vision_config),
+        "media_placeholder_token_id": media_placeholder_token_id,
+    }
