@@ -187,7 +187,6 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         hf_state_dict: dict[str, Any] = {}
         num_experts = self.kimi_config.num_experts
         text_only = self._is_text_only(state_dict)
-
         for key, value in state_dict.items():
             # LoRA wrapping renames base weights (q_proj.weight ->
             # q_proj.base.weight); the HF destination is the original
@@ -216,8 +215,17 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 # Official Kimi-Linear-48B export style: routed experts are
                 # block_sparse_moe.experts.{e}.w{1,2,3}.weight (w-naming),
                 # while shared experts use gate/up/down_proj naming.
+                # The wrapper prefix has to be honoured here too. _tt_key_to_hf
+                # applies it to every other key, but the expert path builds its
+                # own name, so a multimodal model emitted experts as "model.*"
+                # while everything else was "language_model.model.*" -- and the
+                # load then failed on exactly the expert keys, nothing else.
+                expert_prefix = "" if text_only else "language_model."
                 hf_abstract_key = (
-                    "model.layers.{}.block_sparse_moe.experts.{}." + w_tag + ".weight"
+                    expert_prefix
+                    + "model.layers.{}.block_sparse_moe.experts.{}."
+                    + w_tag
+                    + ".weight"
                 )
                 if isinstance(value, DTensor):
                     # Online (sharded) path: record placement metadata so
