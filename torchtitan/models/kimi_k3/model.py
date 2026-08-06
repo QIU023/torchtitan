@@ -1603,6 +1603,9 @@ class KimiK3Model(nn.Module):
     the flag is ignored — forward always returns full hidden_states.
     """
 
+    # See the note at the _skip_lm_head check in forward.
+    _skip_lm_head: bool = False
+
     def __init__(self, config: KimiK3Config) -> None:
         super().__init__()
         self.config = config
@@ -1687,6 +1690,16 @@ class KimiK3Model(nn.Module):
             h = layer(h)
         if self.norm is not None:
             h = self.norm(h)
+        # _skip_lm_head is an attribute rather than a forward kwarg because PP
+        # backward calls .requires_grad on all stage inputs and a bool kwarg
+        # fails that -- the same reason core's decoder does it this way. Set by
+        # the trainer when ChunkedLossWrapper is in use, which then applies
+        # lm_head per sequence chunk so the [B, L, V] logits are never
+        # materialised whole. That tensor, not depth or attention, is what caps
+        # sequence length: at V=163840 and L=8192 its fp32 upcast alone is
+        # 5.37 GiB.
+        if self._skip_lm_head:
+            return h
         if self.lm_head is not None:
             return self.lm_head(h)
         return h  # middle PP stage: ship hidden state downstream

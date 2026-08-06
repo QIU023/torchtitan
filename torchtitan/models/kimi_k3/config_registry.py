@@ -23,7 +23,7 @@ from functools import partial
 import torch.nn as nn
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, OptimizersContainer
@@ -1094,12 +1094,15 @@ def kimi_k3_debugmodel_report_arch_pp8vp4() -> Trainer.Config:
 
     cfg = kimi_k3_debugmodel_report_arch()
     cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch_pp8vp4"
-    # Sequence-length ceiling on 15.5 GiB is set by the vocabulary-sized logits
-    # tensor, not by depth or attention: seq 4096 peaks at 7.7%, while seq 8192
-    # OOMs asking for 5.00 GiB and 8192 x 163840 x 4 bytes is 5.37 GiB -- the
-    # fp32 upcast of the logits. ChunkedLossWrapper is the fix, but it requires a
-    # _skip_lm_head forward these models do not implement (see the note at the
-    # top of this file), so it is a model change rather than a config change.
+    # Chunked loss, because what caps sequence length here is the
+    # vocabulary-sized logits tensor and not depth or attention: seq 4096 peaks
+    # at 7.7% of 15.5 GiB, while plain CE at seq 8192 OOMs asking for 5.00 GiB,
+    # and 8192 x 163840 x 4 bytes is 5.37 GiB -- the fp32 upcast of the logits.
+    # Splitting the sequence into 8 chunks takes that to O(B*L/8*V).
+    cfg.loss = ChunkedLossWrapper.Config(
+        num_chunks=8,
+        loss_fn=CrossEntropyLoss.Config(global_vocab_size=163840),
+    )
     n = 30
     full_attn = sorted(set(range(4, n + 1, 4)) | {n})
     kc = cfg.model_spec.model.kimi_config

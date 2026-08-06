@@ -591,6 +591,13 @@ class KimiK3AttnResModel(KimiK3Model):
             ) * (h_final - plain_stream)
         if self.norm is not None:
             h_final = self.norm(h_final)
+        # _skip_lm_head is an attribute rather than a forward kwarg because PP
+        # backward calls .requires_grad on all stage inputs, which fails on bool
+        # kwargs -- same reason core's decoder does it this way. Set by the
+        # trainer when ChunkedLossWrapper is in use, which then applies lm_head
+        # per sequence chunk so the [B, L, V] logits are never materialised whole.
+        if self._skip_lm_head:
+            return h_final
         return self.lm_head(h_final)
 
     def init_weights(
