@@ -165,15 +165,28 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
 
     # ----- tt -> HF -------------------------------------------------- #
 
-    def _is_text_only(self) -> bool:
-        """No vision tower -> the release's multimodal wrapper prefix names a
-        module this model does not have, so emit the bare ``model.`` spelling."""
+    def _is_text_only(self, state_dict=None) -> bool:
+        """Decide the prefix from the STATE DICT, falling back to the config.
+
+        No vision tower means the release's multimodal wrapper prefix names a
+        module this model does not have, so the bare ``model.`` spelling is
+        right. Reading that off the config alone is not reliable: depending on
+        how the spec is threaded, ``model_config`` here can be the inner text
+        config even for a multimodal model, and then a multimodal export gets
+        written with text-only keys and cannot be read back.
+
+        The state dict cannot be wrong about it -- a multimodal model has
+        ``vision_tower.*`` parameters and a text one does not.
+        """
+        if state_dict is not None:
+            return not any(k.startswith("vision_tower.") for k in state_dict)
         return getattr(self.model_config, "vision_config", None) is None
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert tt state dict to HF naming; split stacked experts."""
         hf_state_dict: dict[str, Any] = {}
         num_experts = self.kimi_config.num_experts
+        text_only = self._is_text_only(state_dict)
 
         for key, value in state_dict.items():
             # LoRA wrapping renames base weights (q_proj.weight ->
@@ -233,7 +246,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 # the saved file, so the view must happen on this side too
                 # (from_hf flattens back).
                 value = value.reshape(1, 1, -1, 1)
-            hf_state_dict[self._tt_key_to_hf(key, self._is_text_only())] = value
+            hf_state_dict[self._tt_key_to_hf(key, text_only)] = value
 
         return hf_state_dict
 
@@ -243,6 +256,19 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         direct = {v: k for k, v in _DIRECT_MAP_FROM_HF.items()}
         if key in direct:
             return direct[key]
+        if key.startswith(("vision_tower.", "language_model.")):
+            # A multimodal model's keys carry a wrapper child prefix, and the
+            # vision subtree has no "layers." at all, so both were rejected here
+            # before the hf_key_map delegation below could see them. hf_key_map
+            # owns the vision naming (vision_tower.mm_projector.* becomes the
+            # release's mm_projector.*), so hand them straight over.
+            from torchtitan.models.kimi_k3.hf_key_map import titan_to_official
+
+            return titan_to_official(
+                key.removeprefix("language_model."),
+                kda_layers=set(),
+                text_only=text_only,
+            )
         if not key.startswith("layers."):
             raise ValueError(f"Unmapped tt key: {key!r}")
         rest = key[len("layers.") :]
