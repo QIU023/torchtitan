@@ -62,9 +62,42 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
+
+
+@dataclass
+class CPPatchPlan:
+    """Dynamic CP: one large image split along the PATCH dimension (report 5.2.3).
+
+    Report 5.2.3, verbatim in substance: "A single large image is partitioned
+    along the patch dimension across multiple devices, and attention is computed
+    by gathering key-value pairs (gather-KV) across CP ranks."
+
+    This is the half that the earlier image-level round-robin did NOT provide, and
+    it is the load-bearing one -- the report's stated purpose for it is to reduce
+    "the encoder latency of large visual samples and the cross-device load
+    imbalance, allowing the remaining encoder computation to be hidden in pipeline
+    bubbles", so DEP depends on it rather than the other way round.
+
+    Each rank holds ``shard_len`` consecutive patches of the image and computes q
+    for those alone; k and v are all-gathered across ``group`` so every rank
+    attends over the whole image. The gather is differentiable, so its transpose
+    is the reduce-scatter that returns each rank the gradient for the patches it
+    owns.
+
+    ``valid_total`` is the image's true patch count. A partition needs an equal
+    shard on every rank for a fixed-shape collective, so the tail is padded and
+    the padded KEY positions are masked out of attention. Without the mask the
+    padding would contribute to every softmax -- silently, since the shapes are
+    all correct.
+    """
+
+    group: dist.ProcessGroup
+    shard_len: int
+    valid_total: int
 
 
 @dataclass(kw_only=True)
@@ -301,6 +334,8 @@ class MoonViTEncoderLayer(nn.Module):
         self.head_dim = config.head_dim
         # (lo, hi) head range this rank attends over; None = all heads.
         self._tp_head_slice: tuple[int, int] | None = None
+        # Dynamic CP: set when this rank holds a patch shard of one large image.
+        self._cp_patch_plan: CPPatchPlan | None = None
         self.norm0 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.wqkv = nn.Linear(
             config.hidden_size, 3 * config.qkv_hidden_size, bias=False
@@ -308,6 +343,48 @@ class MoonViTEncoderLayer(nn.Module):
         self.wo = nn.Linear(config.qkv_hidden_size, config.hidden_size, bias=False)
         self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = MoonViTMLP(config)
+
+    def _attend_gather_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        plan: CPPatchPlan,
+    ) -> torch.Tensor:
+        """Attention over one image whose patches are split across ``plan.group``.
+
+        q is this rank's patch shard; k and v are gathered so the shard attends
+        over the whole image. There is no cu_seqlens loop here because a plan means
+        the local stream IS one shard of one image -- a mixed stream (whole small
+        images alongside a shard) needs a per-segment plan and is not supported
+        yet, which is why the caller asserts the single-image case rather than
+        letting a mixed stream silently attend across image boundaries.
+        """
+        import torch.distributed.nn.functional as dist_nn
+
+        # Differentiable gather: the backward is the reduce-scatter that returns
+        # each rank the gradient for the patches it owns. dist.all_gather would
+        # detach and the tower would train on gradients missing every other
+        # rank's contribution.
+        k_full = torch.cat(dist_nn.all_gather(k.contiguous(), group=plan.group), dim=0)
+        v_full = torch.cat(dist_nn.all_gather(v.contiguous(), group=plan.group), dim=0)
+
+        total = k_full.size(0)
+        # SDPA wants [B, A, L, K].
+        q_ = q.transpose(0, 1).unsqueeze(0)
+        k_ = k_full.transpose(0, 1).unsqueeze(0)
+        v_ = v_full.transpose(0, 1).unsqueeze(0)
+
+        attn_mask = None
+        if plan.valid_total < total:
+            # Mask the padded tail out of the KEY axis. Broadcasting over queries
+            # and heads is enough: every query attends to the same key set.
+            attn_mask = torch.zeros(1, 1, 1, total, dtype=torch.bool, device=q.device)
+            attn_mask[..., : plan.valid_total] = True
+        out = F.scaled_dot_product_attention(
+            q_, k_, v_, attn_mask=attn_mask, is_causal=False
+        )
+        return out.squeeze(0).transpose(0, 1)
 
     def _attend(
         self,
@@ -342,6 +419,12 @@ class MoonViTEncoderLayer(nn.Module):
             if isinstance(q, _DT):
                 q, k, v = (t.to_local(grad_placements=[_P()]) for t in (q, k, v))
             q, k, v = q[:, lo:hi], k[:, lo:hi], v[:, lo:hi]
+
+        plan = self._cp_patch_plan
+        if plan is not None:
+            out = self._attend_gather_kv(q, k, v, plan)
+            local_heads = out.size(1)
+            return self.wo(out.reshape(L, local_heads * self.head_dim))
 
         # Block-diagonal attention over the packed stream: each sample attends
         # only within itself. Done as a per-sample loop over SDPA rather than a
@@ -457,6 +540,17 @@ class MoonViTEncoder(nn.Module):
             MoonViTEncoderLayer(config) for _ in range(config.num_hidden_layers)
         )
         self.final_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def set_cp_patch_plan(self, plan: CPPatchPlan | None) -> None:
+        """Apply (or clear) a dynamic-CP patch partition on every block.
+
+        Set per forward, not once at build: which images are large enough to
+        partition depends on the batch, so a plan that outlived its batch would
+        make the next batch's attention gather across a group for a partition that
+        no longer exists.
+        """
+        for block in self.blocks:
+            block._cp_patch_plan = plan
 
     def forward(self, x_LD: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         freqs_cis = self.rope_2d.freqs_cis(grid_thws, x_LD.device)
