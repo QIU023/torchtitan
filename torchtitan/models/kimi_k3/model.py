@@ -47,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate
+from torch.distributed.tensor.placement_types import Partial, Replicate
 
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 
@@ -718,7 +718,16 @@ class KimiMLAAttention(nn.Module):
         # below run on plain local tensors on the cp sub-mesh group.
         q_BLE = _to_local_if_dtensor(q_BLE)
         kv_BLF = _to_local_if_dtensor(kv_BLF)
-        k_rot_BLR = _to_local_if_dtensor(k_rot_BLR)
+        # k_rot needs the PARTIAL grad placement, the other two do not. q and kv
+        # come from Colwise projections and are Shard on tp, so the default
+        # (gradient carries the forward placement) is right. k_rot comes from
+        # kv_a_proj_with_mqa, which is NoParallel -> Replicate, and below it is
+        # expanded onto THIS rank's head subset: each rank does different work
+        # with the same replicated value, so the gradient of that value is the
+        # SUM across tp ranks, i.e. Partial. With the default the sum never
+        # happens and kv_a_proj_with_mqa's gradient ends up rank-dependent while
+        # its placement still says Replicate.
+        k_rot_BLR = _to_local_partial_grad(k_rot_BLR)
 
         kv_head_dim = self.qk_nope_head_dim + self.v_head_dim
         h_loc = q_BLE.shape[-1] // self.q_head_dim
@@ -806,6 +815,34 @@ def _to_local_if_dtensor(t):
     if isinstance(t, DTensor):
         return t.to_local()
     return t
+
+
+def _to_local_partial_grad(t):
+    """``to_local`` for a value each rank then consumes DIFFERENTLY.
+
+    ``to_local()`` defaults the incoming gradient's placement to the forward
+    placement. For a Replicate value that is correct only when every rank does the
+    SAME work with it -- which is exactly KDA's redundant kernels, and why
+    ``_to_local_if_dtensor`` keeps the default.
+
+    It is wrong when the ranks diverge. MLA's CP path expands the replicated
+    ``k_rot`` onto this rank's head subset, so each rank's gradient is one partial
+    contribution and the gradient of the replicated value is their sum: Partial,
+    not Replicate. Keeping the default drops that all-reduce silently, because the
+    placement still reads Replicate afterwards.
+
+    Measured on ``kimi_k3_debugmodel_report_arch`` at tp2 x cp2: all four MLA
+    layers' ``kv_a_proj_with_mqa`` gradients differed across the tp pair by 1-6%
+    relative on every step, while tp2 alone was bit-identical -- the non-CP path
+    never leaves DTensor, so DTensor reduces it there.
+    """
+    if not isinstance(t, DTensor):
+        return t
+    return t.to_local(
+        grad_placements=[
+            Partial() if isinstance(p, Replicate) else p for p in t.placements
+        ]
+    )
 
 
 def _local_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
