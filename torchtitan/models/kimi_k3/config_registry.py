@@ -1176,6 +1176,25 @@ def kimi_k3_debugmodel_report_arch_qat() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_report_arch_lora() -> Trainer.Config:
+    """The report-architecture debug flavor with LoRA rank 8, nothing else.
+
+    The published parallelism matrices are all full-parameter, so they say
+    nothing about the configuration the 48B post-training leg actually runs in.
+    ``lora_rank`` is the only field that differs from
+    ``kimi_k3_debugmodel_report_arch``, which makes any per-cell difference
+    attributable to the adapter path rather than to the model.
+
+    Multimodal, like the flavor it derives from: the matrix runs MoonViT plus the
+    backbone, so a LoRA cell exercises the adapters on the vision tower's
+    projections too.
+    """
+    cfg = kimi_k3_debugmodel_report_arch()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch_lora"
+    cfg.model_spec.model.lora_rank = 8
+    return cfg
+
+
 def kimi_k3_mini_diag_4l_mla_lora() -> Trainer.Config:
     """Dense (no MoE) + AttnRes + LoRA rank 8 -- the LoRA gradient control.
 
