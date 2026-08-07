@@ -450,10 +450,47 @@ class KimiLoRALinear(nn.Module):
                 # e.g. MoE shared experts run in plain-tensor land; the MoE
                 # to_locals direct-child weights but not one nested under a
                 # LoRA wrapper's .base). Densify to match the plain compute.
+                #
+                # WHICH AXIS is sharded decides whether the local matmul is the
+                # whole answer, and this branch bypasses ``self.base`` entirely
+                # -- so the style's own collective does not run and cannot cover
+                # for a wrong choice here:
+                #
+                # * Colwise / Replicate weight: the local product IS this rank's
+                #   output shard (or the full output), which is exactly what a
+                #   ``use_local_output=True`` style produces. Nothing to reduce.
+                # * Rowwise weight (Shard(1), the CONTRACTED in_features axis):
+                #   the local product is only this rank's PARTIAL contribution
+                #   and must be summed across the mesh. ``to_local()`` drops the
+                #   DTensor that would have summed it, so the partial value
+                #   escapes as a plain tensor -- and a plain tensor is assumed
+                #   replicated by everything downstream. That put rank-dependent
+                #   values into the residual stream from MLA's o_proj onward
+                #   (measured: layer 0 o_proj output differed by 3.5e-01 against
+                #   a magnitude of 2.3e-01, and every activation after it
+                #   diverged, while the same architecture without LoRA was
+                #   bit-identical).
+                #
+                # o_proj is the only site that reaches here with a Rowwise base:
+                # the MLA attention output is built in plain-tensor land, whereas
+                # the dense FFN's down_proj receives a DTensor from the Colwise
+                # gate/up pair and so takes the ``self.base(x)`` path below.
                 bb = self.base.bias
                 if isinstance(bb, DTensor):
                     bb = bb.to_local()
-                base_out = F.linear(x, bw.to_local(), bb)
+                if any(p.is_shard() and p.dim == 1 for p in bw.placements):
+                    mesh = bw.device_mesh
+                    x_dt = DTensor.from_local(
+                        x, mesh, (Shard(x.dim() - 1),), run_check=False
+                    )
+                    # Partial -> Replicate all-reduce, then plain to match the
+                    # style's use_local_output=True convention. Bias is added
+                    # AFTER the reduction, or it would be counted once per rank.
+                    base_out = F.linear(x_dt, bw).full_tensor()
+                    if bb is not None:
+                        base_out = base_out + bb
+                else:
+                    base_out = F.linear(x, bw.to_local(), bb)
             else:
                 base_out = self.base(x)
 
