@@ -428,6 +428,18 @@ class KimiK3MultimodalModel(nn.Module):
         import os as _os
 
         cp_size = self._cp_world_size()
+
+        # Dynamic CP (report 5.2.3) comes FIRST, because it covers the case
+        # image-level round-robin structurally cannot: fewer images than ranks, or
+        # one image so much larger than the rest that whole-image assignment
+        # leaves ranks idle. Round-robin then handles the many-small-images case.
+        if cp_size > 1 and _os.environ.get("KIMI_VIT_DYNAMIC_CP", "1") != "0":
+            planned = self._encode_images_dynamic_cp(
+                pixel_values, grid_thw, counts, cp_size
+            )
+            if planned is not None:
+                return planned
+
         if (
             cp_size > 1
             and len(counts) >= cp_size
@@ -458,6 +470,216 @@ class KimiK3MultimodalModel(nn.Module):
         if isinstance(features, torch.Tensor):
             return features.to_local() if isinstance(features, DTensor) else features
         return [f.to_local() if isinstance(f, DTensor) else f for f in features]
+
+    def _encode_images_dynamic_cp(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        counts: list[int],
+        cp_size: int,
+    ) -> list[torch.Tensor] | None:
+        """Partition large images along the patch dimension (report 5.2.3).
+
+        Returns ``None`` when the batch has no image worth partitioning, so the
+        caller falls through to image-level round-robin. Returning None rather than
+        silently doing nothing matters: a path that "handled" a batch by leaving it
+        replicated is how the first CP attempt looked perfect while never engaging.
+
+        Every large image is encoded by one sub-CP group, with its patches split
+        across that sub-group's ranks and attention gathering keys and values
+        inside the sub-group. Small images stay whole and are round-robined over
+        the sub-groups' first ranks, so no rank sits idle.
+
+        One large image per sub-group per pass, and the pass runs once per image
+        slot: the gather-KV attention path assumes the local stream IS one shard of
+        one image, and a mixed stream would let attention run across image
+        boundaries. That is enforced here rather than hoped for.
+        """
+        import os as _os
+
+        import torch.distributed._functional_collectives as funcol
+
+        from torchtitan.models.kimi_k3.moonvit import CPPatchPlan
+        from torchtitan.models.kimi_k3.vit_cp_plan import (
+            balance_images,
+            classify,
+            merged_tokens,
+            row_partition,
+            subgroup_layout,
+        )
+        from torchtitan.tools.logging import logger
+
+        subgroups = getattr(self, "_cp_subgroups", None)
+        if not subgroups:
+            return None
+
+        cfg = self.config.vision_config
+        kh, kw = cfg.merge_kernel_size
+        merge = kh * kw
+        min_patches = int(_os.environ.get("KIMI_VIT_DYNAMIC_CP_MIN_PATCHES", "256"))
+        large = classify(counts, cp_size, min_patches=min_patches)
+        if not large:
+            return None
+
+        n_sub, g = subgroup_layout(len(large), cp_size)
+        group = subgroups.get(n_sub)
+        if group is None or g <= 1:
+            # No usable sub-group of size > 1 means there is nothing to partition
+            # across; round-robin is the better tool for that batch.
+            return None
+
+        # Grid heights must divide the merge kernel for a partition to be legal.
+        # An image that fails it is left to round-robin instead of being cut
+        # unsafely.
+        grids = grid_thw.tolist()
+        large = [i for i in large if grids[i][1] % kh == 0]
+        if not large:
+            return None
+
+        cp_rank = torch.distributed.get_rank(self._cp_group)
+        my_sub = cp_rank // g
+        rank_in_sub = cp_rank % g
+        group_of = balance_images([counts[i] for i in large], n_sub)
+        my_large = [img for img, sub in zip(large, group_of) if sub == my_sub]
+
+        if not getattr(self, "_dynamic_cp_logged", False):
+            self._dynamic_cp_logged = True
+            logger.info(
+                "MoonViT dynamic CP: %d large image(s) of %d over %d sub-CP "
+                "group(s) of %d rank(s); min_patches=%d",
+                len(large),
+                len(counts),
+                n_sub,
+                g,
+                min_patches,
+            )
+
+        weight = self.vision_tower.patch_embed.proj.weight
+        tp_mesh = getattr(self, "_vision_tp_mesh", None)
+        out: dict[int, torch.Tensor] = {}
+
+        # Every sub-group must run the same NUMBER of passes or the collectives
+        # inside them desynchronise. The count is the max over sub-groups, and a
+        # sub-group with fewer images pads with an empty pass.
+        per_sub = [sum(1 for s in group_of if s == k) for k in range(n_sub)]
+        n_passes = max(per_sub) if per_sub else 0
+
+        for p in range(n_passes):
+            img = my_large[p] if p < len(my_large) else None
+            if img is None:
+                # An empty pass still joins this sub-group's collectives, or the
+                # sub-groups desynchronise. One merge block keeps every shape valid
+                # and the output is discarded.
+                local = torch.zeros(
+                    kh * kw, cfg.in_channels, cfg.patch_size, cfg.patch_size
+                )
+                local_grid = torch.tensor([[1, kh, kw]], device=grid_thw.device)
+                plan_grid, row_start, band, real_rows = (1, kh * g, kw), 0, kh, kh
+                valid_total = kh * kw * g
+            else:
+                t, h, w = grids[img]
+                shards = row_partition(t, h, w, kh=kh, group_size=g)
+                sh = shards[rank_in_sub]
+                bands = [s.row_end - s.row_start for s in shards]
+                band = max(bands)
+                # The ceiling split keeps any deficit on the TRAILING ranks, so
+                # every rank's padding lands at the end of the gathered stream
+                # rather than inside it. Taking a prefix below depends on that.
+                if bands != sorted(bands, reverse=True):
+                    raise AssertionError(
+                        f"bands {bands} are not non-increasing; padding would land "
+                        "inside the gathered token stream and corrupt the order"
+                    )
+                flat = pixel_values[img, : counts[img]].reshape(
+                    -1, cfg.in_channels, cfg.patch_size, cfg.patch_size
+                )
+                # This rank's rows of EVERY frame: the projector's temporal mean
+                # spans all frames, so splitting by frame would give each rank the
+                # mean of its own frames instead.
+                pad_rows = band - (sh.row_end - sh.row_start)
+                pieces = []
+                for a, b in sh.ranges:
+                    pieces.append(flat[a:b])
+                    if pad_rows:
+                        pieces.append(
+                            flat.new_zeros(
+                                pad_rows * w,
+                                cfg.in_channels,
+                                cfg.patch_size,
+                                cfg.patch_size,
+                            )
+                        )
+                local = torch.cat(pieces, dim=0)
+                local_grid = torch.tensor([[t, band, w]], device=grid_thw.device)
+                plan_grid = (t, h, w)
+                row_start = sh.row_start
+                real_rows = sh.row_end - sh.row_start
+                valid_total = counts[img]
+
+            local = local.to(weight.dtype).to(pixel_values.device)
+            if tp_mesh is not None:
+                local = DTensor.from_local(
+                    local, tp_mesh, (Replicate(),), run_check=False
+                )
+            plan = CPPatchPlan(
+                group=group,
+                valid_total=valid_total,
+                full_grid=plan_grid,
+                row_start=row_start,
+                band=band,
+                real_rows=real_rows,
+            )
+            feats = self.vision_tower(local, local_grid, plan)
+            if isinstance(feats, torch.Tensor):
+                feats = [feats]
+            feats = [f.to_local() if isinstance(f, DTensor) else f for f in feats]
+            local_feat = torch.cat(feats, dim=0)
+
+            gathered = funcol.all_gather_tensor(
+                local_feat.contiguous(), gather_dim=0, group=group
+            )
+            if img is not None:
+                t, h, w = grids[img]
+                # NOT counts // merge: the projector collapses time, so a video's
+                # token count carries no t.
+                out[img] = gathered[: merged_tokens(h, w, kh, kw)]
+
+        # Images below the threshold, or with an illegal grid, still need
+        # encoding. Round-robin them over sub-group leaders and share the result.
+        rest = [i for i in range(len(counts)) if i not in out]
+        if rest:
+            small = self._encode_images_replicated(pixel_values, grid_thw, rest)
+            for i, f in zip(rest, small):
+                out[i] = f
+        return [out[i] for i in range(len(counts))]
+
+    def _encode_images_replicated(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        which: list[int],
+    ) -> list[torch.Tensor]:
+        """Encode a subset of the batch's images redundantly on every rank.
+
+        Used for the images dynamic CP leaves alone. Redundant rather than sharded
+        because these are the small ones by construction, so the encode is cheap
+        and a second collective would cost more than it saves.
+        """
+        cfg = self.config.vision_config
+        counts = grid_thw.prod(dim=-1).tolist()
+        packed = torch.cat([pixel_values[i, : counts[i]] for i in which], dim=0)
+        packed = packed.reshape(-1, cfg.in_channels, cfg.patch_size, cfg.patch_size)
+        weight = self.vision_tower.patch_embed.proj.weight
+        packed = packed.to(weight.dtype)
+        tp_mesh = getattr(self, "_vision_tp_mesh", None)
+        if tp_mesh is not None:
+            packed = DTensor.from_local(
+                packed, tp_mesh, (Replicate(),), run_check=False
+            )
+        feats = self.vision_tower(packed, grid_thw[which])
+        if isinstance(feats, torch.Tensor):
+            feats = [feats]
+        return [f.to_local() if isinstance(f, DTensor) else f for f in feats]
 
     def _encode_images_cp(
         self,

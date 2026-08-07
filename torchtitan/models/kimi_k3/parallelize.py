@@ -39,6 +39,7 @@ Supported parallelism dimensions:
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
@@ -200,9 +201,11 @@ def parallelize_kimi_k3(
         # matches neither the image count nor the token count.
         from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
 
+        subgroups = _build_cp_subgroups(cp_group)
         for m in model.modules():
             if isinstance(m, KimiK3MultimodalModel):
                 m._cp_group = cp_group
+                m._cp_subgroups = subgroups
         logger.info(
             "Applied Ulysses CP cp_degree=%d (all-to-all at %d attn layers).",
             cp_degree,
@@ -341,6 +344,63 @@ def parallelize_kimi_k3(
             parallel_dims.dp_replicate,
         )
     return model
+
+
+def _build_cp_subgroups(cp_group) -> dict[int, object]:
+    """Pre-create every sub-CP group layout this CP group could use.
+
+    Report 5.2.3 divides each CP group into sub-CP groups so gather-KV runs inside
+    a sub-group instead of across the whole group. Which layout a step wants
+    depends on how many large images the BATCH holds, and building a process group
+    per batch is not an option: ``new_group`` must be called by every process in
+    the default group, with the same rank list, in the same order. A per-batch call
+    would have each rank passing its own CP group's ranks, which is exactly the
+    mismatch that hangs.
+
+    So every layout is built once here and looked up per batch. The layouts are the
+    divisors of ``cp_size`` -- for cp=8 that is 1, 2, 4, 8 sub-groups -- so the set
+    is small, and an unused group costs nothing because NCCL creates its
+    communicator lazily on first use.
+
+    Uniformity across ranks is achieved by all-gathering the CP rank lists first,
+    so every rank iterates the same global list of sub-groups in the same order and
+    keeps the one it belongs to. Returns ``{num_subgroups: this rank's group}``.
+    """
+    if cp_group is None:
+        return {}
+    cp_ranks = dist.get_process_group_ranks(cp_group)
+    cp_size = len(cp_ranks)
+    if cp_size <= 1:
+        return {}
+
+    # Every rank needs every CP group's membership, or the new_group calls below
+    # would differ between ranks.
+    world = dist.get_world_size()
+    all_cp: list[list[int] | None] = [None] * world
+    dist.all_gather_object(all_cp, cp_ranks)
+    # Deduplicate while keeping a deterministic order: identical CP groups appear
+    # once per member rank.
+    seen: list[list[int]] = []
+    for entry in all_cp:
+        if entry and list(entry) not in seen:
+            seen.append(list(entry))
+    seen.sort()
+
+    my_rank = dist.get_rank()
+    out: dict[int, object] = {}
+    for n_sub in [d for d in range(1, cp_size + 1) if cp_size % d == 0]:
+        g = cp_size // n_sub
+        mine = None
+        for ranks in seen:
+            for s in range(n_sub):
+                members = ranks[s * g : (s + 1) * g]
+                # Called on every rank, same order, same lists.
+                pg = dist.new_group(ranks=members)
+                if my_rank in members:
+                    mine = pg
+        if mine is not None:
+            out[n_sub] = mine
+    return out
 
 
 def _patch_fla_for_dtensor() -> dict:

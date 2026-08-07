@@ -79,7 +79,7 @@ def _body(rank: int, n_patches: int, queue) -> None:
         lo, hi = rank * shard, (rank + 1) * shard
 
         layer._cp_patch_plan = CPPatchPlan(
-            group=dist.group.WORLD, shard_len=shard, valid_total=n_patches
+            group=dist.group.WORLD, valid_total=n_patches
         )
         got = layer._attend(x_pad[lo:hi], cu, f_pad[lo:hi])
 

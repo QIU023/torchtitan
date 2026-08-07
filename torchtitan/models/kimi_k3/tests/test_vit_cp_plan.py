@@ -17,51 +17,54 @@ from torchtitan.models.kimi_k3.vit_cp_plan import (
 
 
 class TestRowPartition(unittest.TestCase):
-    def test_cuts_land_on_merge_block_boundaries(self):
-        # h=8, kh=2 -> 4 merge blocks over 2 ranks -> 2 blocks (4 rows) each.
+    def test_bands_are_multiples_of_the_merge_height(self):
         shards = row_partition(1, 8, 3, kh=2, group_size=2)
-        self.assertEqual(
-            [(s.patch_start, s.patch_end) for s in shards], [(0, 12), (12, 24)]
-        )
+        self.assertEqual([(s.row_start, s.row_end) for s in shards], [(0, 4), (4, 8)])
         for s in shards:
-            self.assertEqual(s.patch_start % (2 * 3), 0)
-            self.assertEqual((s.patch_end - s.patch_start) % (2 * 3), 0)
+            self.assertEqual(s.row_start % 2, 0)
+            self.assertEqual((s.row_end - s.row_start) % 2, 0)
 
-    def test_patch_offsets_are_contiguous_and_cover_the_image(self):
+    def test_still_image_is_one_contiguous_range_covering_everything(self):
         shards = row_partition(1, 8, 3, kh=2, group_size=2)
-        self.assertEqual(shards[0].patch_start, 0)
-        for a, b in zip(shards[:-1], shards[1:]):
-            self.assertEqual(a.patch_end, b.patch_start)
-        self.assertEqual(shards[-1].patch_end, 8 * 3)
+        self.assertEqual([s.ranges for s in shards], [((0, 12),), ((12, 24),)])
+        self.assertEqual(shards[-1].ranges[-1][1], 8 * 3)
 
-    def test_video_frames_stay_contiguous(self):
-        """t>1: blocks run frame by frame through the flat stream. Cutting 'rows
-        r0..r1 of every frame' would not be contiguous and was the earlier bug."""
+    def test_video_keeps_every_frame_and_strides_the_band(self):
+        """Time is collapsed by the projector's mean over frames, so a rank must
+        hold ALL frames of its rows. Splitting by frames gives each rank the mean
+        of its own frames -- t times too many tokens, measured as a 100% mismatch."""
         t, h, w, kh = 3, 4, 5, 2
-        shards = row_partition(t, h, w, kh=kh, group_size=3)
-        self.assertEqual(shards[0].patch_start, 0)
-        for a, b in zip(shards[:-1], shards[1:]):
-            self.assertEqual(a.patch_end, b.patch_start)
-        self.assertEqual(shards[-1].patch_end, t * h * w)
-        self.assertEqual(sum(s.num_blocks for s in shards), t * (h // kh))
+        shards = row_partition(t, h, w, kh=kh, group_size=2)
+        self.assertEqual([s.grid for s in shards], [(3, 2, 5), (3, 2, 5)])
+        # One range per frame, each covering this rank's rows within that frame.
+        self.assertEqual(len(shards[0].ranges), t)
+        self.assertEqual(shards[0].ranges, ((0, 10), (20, 30), (40, 50)))
+        self.assertEqual(shards[1].ranges, ((10, 20), (30, 40), (50, 60)))
+        # Every patch of every frame is covered exactly once.
+        covered = sorted(i for s in shards for a, b in s.ranges for i in range(a, b))
+        self.assertEqual(covered, list(range(t * h * w)))
 
-    def test_uneven_split_gives_an_empty_tail_not_a_broken_block(self):
+    def test_uneven_split_leaves_the_deficit_on_trailing_ranks(self):
         shards = row_partition(1, 6, 2, kh=2, group_size=2)
-        self.assertEqual(
-            [(s.patch_start, s.patch_end) for s in shards], [(0, 8), (8, 12)]
-        )
-        # 1 block over 4 ranks: rank 0 takes it, the rest are empty rather than
-        # being handed a fraction of a merge block.
+        bands = [s.row_end - s.row_start for s in shards]
+        self.assertEqual(bands, [4, 2])
+        self.assertEqual(bands, sorted(bands, reverse=True))
         shards = row_partition(1, 2, 2, kh=2, group_size=4)
-        self.assertEqual([s.num_blocks for s in shards], [1, 0, 0, 0])
-        self.assertEqual(
-            [(s.patch_start, s.patch_end) for s in shards],
-            [(0, 4), (4, 4), (4, 4), (4, 4)],
-        )
+        self.assertEqual([s.row_end - s.row_start for s in shards], [2, 0, 0, 0])
 
     def test_height_not_divisible_by_the_kernel_is_refused(self):
         with self.assertRaises(ValueError):
             row_partition(1, 7, 2, kh=2, group_size=2)
+
+
+class TestMergedTokens(unittest.TestCase):
+    def test_time_is_collapsed_so_t_does_not_appear(self):
+        from torchtitan.models.kimi_k3.vit_cp_plan import merged_tokens
+
+        self.assertEqual(merged_tokens(8, 4, 2, 2), 8)
+        # patch_count // (kh*kw) would give 16 for t=2, which is the bug this
+        # helper exists to stop.
+        self.assertEqual(merged_tokens(8, 4, 2, 2), (2 * 8 * 4) // 4 // 2)
 
 
 class TestSubgroupLayout(unittest.TestCase):

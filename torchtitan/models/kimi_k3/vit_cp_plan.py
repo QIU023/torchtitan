@@ -41,39 +41,47 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ImageShard:
-    """One rank's slice of one partitioned image, as flat patch offsets."""
+    """One rank's slice of one partitioned image: a row band, all frames."""
 
-    patch_start: int
-    patch_end: int
-    """Half-open offsets into the image's flat patch stream. May be empty when the
-    image has fewer merge-row blocks than the sub-group has ranks."""
+    row_start: int
+    row_end: int
+    """Half-open band of patch-grid ROWS, a multiple of ``kh``. Empty when the
+    image has fewer row blocks than the sub-group has ranks."""
 
-    num_blocks: int
-    """How many merge-row blocks this shard covers; 0 for an empty shard."""
+    grid: tuple[int, int, int]
+    """The shard's own (t, h, w) -- all frames, this rank's rows."""
+
+    ranges: tuple[tuple[int, int], ...]
+    """One flat ``[start, end)`` range per frame. A still gives one range; a video
+    gives ``t`` of them, because the band is strided in the packed stream."""
 
 
 def row_partition(
     t: int, h: int, w: int, *, kh: int, group_size: int
 ) -> list[ImageShard]:
-    """Split one image's patches across ``group_size`` ranks at safe boundaries.
+    """Split one image across ``group_size`` ranks along the SPATIAL rows.
 
-    The unit is a MERGE-ROW BLOCK: ``kh`` consecutive grid rows, ``kh * w``
-    patches. Two properties make it the right unit, and both are needed:
+    Every rank keeps every frame and takes a band of rows. Two constraints force
+    this shape, and both were learned by measuring:
 
-    * **Merge-safe.** The projector merges each ``(kh, kw)`` block into one token,
-      so a cut inside ``kh`` rows would ask two ranks to merge halves of the same
-      block. Cutting only at multiples of ``kh`` rows cannot.
-    * **Contiguous in the packed stream.** Patches are laid out row-major over
-      ``(t, h, w)``, so a merge-row block is contiguous and consecutive blocks are
-      adjacent -- including across the frame boundary of a video, where the last
-      block of frame f abuts the first of frame f+1. An earlier version cut "rows
-      [r0, r1) of every frame", which is contiguous only when ``t == 1`` and gave
-      silently wrong offsets for video.
+    * **The merge kernel.** The projector merges each ``(kh, kw)`` block, so a cut
+      inside ``kh`` rows would ask two ranks to merge halves of one block. Bands are
+      therefore multiples of ``kh``.
+    * **The temporal pool.** ``tpool_patch_merger`` is ``sd2_tpool``: it takes
+      ``mean(dim=0)`` over ALL frames, collapsing time completely. Splitting a video
+      by FRAMES therefore gives each rank the mean of its own frames and the
+      concatenation is ``t`` times too many tokens, not the mean -- measured as a
+      100% mismatch on t=2. Keeping all frames on every rank makes each rank's
+      temporal mean the true one for its rows.
 
-    An image with fewer blocks than ranks leaves the tail ranks empty rather than
-    raising: a batch does not get to choose its image sizes, and the caller pads
-    for the fixed-shape collective anyway. A non-multiple chunk, by contrast, is
-    always a bug, so that is refused.
+    So the output token count of a partitioned image is ``(h/kh) * (w/kw)``,
+    independent of ``t``, and each rank contributes ``(band/kh) * (w/kw)`` of it.
+
+    A band is strided in the packed stream once ``t > 1``, hence ``ranges`` rather
+    than one offset pair. An image with fewer row blocks than ranks leaves the tail
+    ranks empty; the caller pads for the fixed-shape collective. The ceiling split
+    keeps any deficit on the TRAILING ranks, so padding lands at the end of the
+    gathered stream rather than inside it.
     """
     if h % kh:
         raise ValueError(
@@ -81,22 +89,30 @@ def row_partition(
             "the projector merges (kh, kw) blocks and a partition cannot cut "
             "inside one"
         )
-    block_patches = kh * w
-    blocks = t * (h // kh)
-    # Ceiling split so earlier ranks take the extra block; the tail may be empty.
+    blocks = h // kh
     per = -(-blocks // group_size)
+    frame = h * w
     shards: list[ImageShard] = []
     for r in range(group_size):
         b0 = min(r * per, blocks)
         b1 = min((r + 1) * per, blocks)
+        r0, r1 = b0 * kh, b1 * kh
+        ranges = tuple((f * frame + r0 * w, f * frame + r1 * w) for f in range(t))
         shards.append(
             ImageShard(
-                patch_start=b0 * block_patches,
-                patch_end=b1 * block_patches,
-                num_blocks=b1 - b0,
+                row_start=r0,
+                row_end=r1,
+                grid=(t, r1 - r0, w),
+                ranges=ranges,
             )
         )
     return shards
+
+
+def merged_tokens(h: int, w: int, kh: int, kw: int) -> int:
+    """Tokens the projector emits for one image -- time is collapsed, so ``t``
+    does not appear. ``patch_count // (kh*kw)`` is only right when ``t == 1``."""
+    return (h // kh) * (w // kw)
 
 
 def subgroup_layout(num_large: int, cp_size: int) -> tuple[int, int]:

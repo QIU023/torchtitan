@@ -93,11 +93,62 @@ class CPPatchPlan:
     the padded KEY positions are masked out of attention. Without the mask the
     padding would contribute to every softmax -- silently, since the shapes are
     all correct.
+
+    ``full_grid`` and ``patch_start`` exist because MoonViT carries position
+    information TWICE -- the divided_fixed absolute embedding added at the patch
+    embed, and 2-D RoPE applied to q/k in every block -- and both are built from
+    the grid starting at row 0. Describing a shard as a standalone image therefore
+    gives every rank the same positions, so rank 1's patches would be encoded as
+    if they were rank 0's. Measured before this was carried: the partitioned path
+    differed from the replicated one by 2.3e-03 in step-1 loss, which is far too
+    large for a reduction-order effect. The tables are built for the whole image
+    and sliced.
     """
 
     group: dist.ProcessGroup
-    shard_len: int
     valid_total: int
+    """The image's true patch count, for the padded-key mask."""
+
+    full_grid: tuple[int, int, int] = (0, 0, 0)
+    """(t, h, w) of the WHOLE image, not of this shard."""
+
+    row_start: int = 0
+    """First patch-grid ROW this rank owns, in the whole image's coordinates."""
+
+    band: int = 0
+    """Rows in this rank's tensor, including padding: the shard is (t, band, w)."""
+
+    real_rows: int = 0
+    """How many of ``band`` are real; the rest are padding."""
+
+
+def _slice_for_shard(table: torch.Tensor, plan: "CPPatchPlan"):
+    """Take this rank's ROW BAND out of a table built for the WHOLE image.
+
+    The band is strided once the image is a video: the rank owns rows
+    ``[row_start, row_start + real_rows)`` of EVERY frame, because the projector's
+    temporal mean spans all frames and splitting by frame would break it. So the
+    table is gathered frame by frame and padded to ``band`` rows per frame, exactly
+    mirroring how the caller lays out the pixels.
+
+    Padding rows repeat the last real row rather than being zeroed: a zeroed RoPE
+    factor is not a rotation. Neither choice changes the result -- padded queries
+    are discarded and padded keys are masked -- but staying in range keeps a NaN
+    out of the softmax, where it would reach real rows.
+    """
+    t, h, w = plan.full_grid
+    per_frame = []
+    for f in range(t):
+        base = f * h * w
+        lo = base + plan.row_start * w
+        hi = lo + plan.real_rows * w
+        rows = table[lo:hi]
+        pad_rows = plan.band - plan.real_rows
+        if pad_rows > 0:
+            src = rows[-1:] if rows.size(0) else table[base : base + 1]
+            rows = torch.cat([rows, src.expand(pad_rows * w, *table.shape[1:])], dim=0)
+        per_frame.append(rows)
+    return torch.cat(per_frame, dim=0)
 
 
 @dataclass(kw_only=True)
@@ -240,13 +291,28 @@ class MoonViTPatchEmbed(nn.Module):
                 embs.append(pos_3d.reshape(-1, pos_3d.shape[-1]))
         return x_LD + torch.cat(embs, dim=0)
 
-    def forward(self, patches_LCHW: torch.Tensor, grid_thws: torch.Tensor):
+    def forward(
+        self,
+        patches_LCHW: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+    ):
         """``[L, C, p, p]`` patch pixels -> ``[L, D]`` tokens.
 
         ``L`` is the total token count over the batch, i.e.
         ``sum_i t_i * h_i * w_i``.
         """
         x = self.proj(patches_LCHW).view(patches_LCHW.size(0), -1)
+        if cp_plan is not None:
+            # Dynamic CP: this stream is a SHARD of one image. Build the whole
+            # image's table and take our rows, or every rank would be handed the
+            # positions of rank 0's patches.
+            t, h, w = cp_plan.full_grid
+            full = torch.zeros(t * h * w, x.size(-1), dtype=x.dtype, device=x.device)
+            full = self.add_pos_emb(
+                full, torch.tensor([[t, h, w]], device=grid_thws.device)
+            )
+            return x + _slice_for_shard(full, cp_plan)
         return self.add_pos_emb(x, grid_thws)
 
 
@@ -552,14 +618,35 @@ class MoonViTEncoder(nn.Module):
         for block in self.blocks:
             block._cp_patch_plan = plan
 
-    def forward(self, x_LD: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
-        freqs_cis = self.rope_2d.freqs_cis(grid_thws, x_LD.device)
+    def forward(
+        self,
+        x_LD: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+    ) -> torch.Tensor:
+        if cp_plan is not None:
+            # 2-D RoPE is the SECOND place position enters, so it needs the same
+            # whole-image-then-slice treatment as the absolute embedding.
+            t, h, w = cp_plan.full_grid
+            full = self.rope_2d.freqs_cis(
+                torch.tensor([[t, h, w]], device=grid_thws.device), x_LD.device
+            )
+            freqs_cis = _slice_for_shard(full, cp_plan)
+        else:
+            freqs_cis = self.rope_2d.freqs_cis(grid_thws, x_LD.device)
         lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
         cu_seqlens = torch.cat(
             [torch.zeros(1, dtype=lengths.dtype, device=lengths.device), lengths]
         ).cumsum(0, dtype=torch.int32)
-        for block in self.blocks:
-            x_LD = block(x_LD, cu_seqlens, freqs_cis)
+        self.set_cp_patch_plan(cp_plan)
+        try:
+            for block in self.blocks:
+                x_LD = block(x_LD, cu_seqlens, freqs_cis)
+        finally:
+            # The encoder owns the plan's lifetime so a caller cannot leak one
+            # into the next batch, where it would gather for a partition that no
+            # longer exists.
+            self.set_cp_patch_plan(None)
         return self.final_layernorm(x_LD)
 
 
@@ -600,10 +687,21 @@ class MoonViT(nn.Module):
         )
         return x, grid
 
-    def forward(self, patches_LCHW: torch.Tensor, grid_thws: torch.Tensor):
-        """Packed patches -> a list of ``[N_i, text_hidden_size]`` per sample."""
-        x = self.patch_embed(patches_LCHW, grid_thws)
-        x = self.encoder(x, grid_thws)
+    def forward(
+        self,
+        patches_LCHW: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+    ):
+        """Packed patches -> a list of ``[N_i, text_hidden_size]`` per sample.
+
+        ``cp_plan`` marks the input as one rank's patch shard of a single image
+        (dynamic CP, report 5.2.3). ``grid_thws`` then describes the SHARD -- the
+        merger and the segment bounds want that -- while the plan carries the whole
+        image's grid, which is what the two position sources need.
+        """
+        x = self.patch_embed(patches_LCHW, grid_thws, cp_plan)
+        x = self.encoder(x, grid_thws, cp_plan)
         merged = tpool_patch_merger(x, grid_thws, self.config.merge_kernel_size)
         return self.mm_projector(merged)
 
