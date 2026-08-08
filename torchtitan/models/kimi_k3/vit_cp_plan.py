@@ -168,3 +168,81 @@ def classify(counts: list[int], cp_size: int, *, min_patches: int) -> list[int]:
     if cp_size <= 1:
         return []
     return [i for i, c in enumerate(counts) if c >= min_patches]
+
+
+# --- The ViT/text stage boundary (DEP, report 5.2.3) ----------------------- #
+#
+# DEP splits ViT and text into separate PP stages, so the vision features have to
+# cross a pipeline hop. PP's point-to-point buffers are sized ONCE, not per step,
+# which forces a property that is easy to get wrong: the exchange shape must be a
+# CONFIG-level upper bound, never derived from the current batch. A batch-derived
+# shape works until a later batch carries more image tokens than the first one did,
+# and then it fails inside the P2P rather than anywhere near the cause.
+#
+# Sizing needs no communication either way: grid_thw is replicated, so every stage
+# computes the same layout from it. That is the same property dynamic CP relies on.
+
+
+def stage_exchange_lengths(
+    grids: list[tuple[int, int, int]], *, kh: int, kw: int
+) -> list[int]:
+    """Per-image projected token counts for this batch.
+
+    ``merged_tokens`` per image -- no ``t``, because the projector's temporal mean
+    collapses it. These are the lengths the receiving stage uses to unpack, and it
+    can compute them itself from the replicated ``grid_thw``.
+    """
+    return [merged_tokens(h, w, kh, kw) for _, h, w in grids]
+
+
+def stage_exchange_capacity(
+    max_grid_h: int, max_grid_w: int, max_images: int, *, kh: int, kw: int
+) -> int:
+    """The FIXED row count the ViT stage always sends.
+
+    Derived from configured maxima, not from a batch. Returns the padded token
+    capacity; a batch using less pads and the receiver slices by the real lengths.
+    """
+    if max_images < 0 or max_grid_h < 0 or max_grid_w < 0:
+        raise ValueError("capacity inputs must be non-negative")
+    return max_images * merged_tokens(max_grid_h, max_grid_w, kh, kw)
+
+
+def pack_stage_features(feats, capacity: int):
+    """Concatenate per-image features and pad to ``capacity`` rows.
+
+    Raises when the batch does not fit rather than truncating: a truncated vision
+    feature is a silently wrong model, and the receiving stage cannot tell.
+    """
+    import torch
+
+    if not feats:
+        raise ValueError("no features to pack; the ViT stage has nothing to send")
+    flat = torch.cat(list(feats), dim=0)
+    used = flat.size(0)
+    if used > capacity:
+        raise ValueError(
+            f"vision features need {used} rows but the stage exchange capacity is "
+            f"{capacity}; raise the configured maxima rather than truncating -- a "
+            "truncated feature is a silently wrong model"
+        )
+    if used == capacity:
+        return flat
+    pad = flat.new_zeros(capacity - used, flat.size(1))
+    return torch.cat([flat, pad], dim=0)
+
+
+def unpack_stage_features(packed, lengths: list[int]):
+    """Split a padded exchange buffer back into per-image features."""
+    total = sum(lengths)
+    if total > packed.size(0):
+        raise ValueError(
+            f"unpack needs {total} rows but the buffer holds {packed.size(0)}; the "
+            "sender and receiver disagree on the layout, which they compute "
+            "independently from the replicated grid_thw"
+        )
+    out, off = [], 0
+    for n in lengths:
+        out.append(packed[off : off + n])
+        off += n
+    return out

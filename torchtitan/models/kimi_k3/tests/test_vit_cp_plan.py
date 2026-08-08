@@ -8,6 +8,8 @@
 
 import unittest
 
+import torch
+
 from torchtitan.models.kimi_k3.vit_cp_plan import (
     balance_images,
     classify,
@@ -107,3 +109,48 @@ class TestClassify(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStageExchange(unittest.TestCase):
+    """The ViT/text PP boundary (DEP). See vit_cp_plan's section comment."""
+
+    def test_lengths_carry_no_frame_count(self):
+        from torchtitan.models.kimi_k3.vit_cp_plan import stage_exchange_lengths
+
+        # A 4-frame video and a still with the same spatial grid send the same
+        # number of tokens, because the projector's temporal mean collapses t.
+        self.assertEqual(
+            stage_exchange_lengths([(4, 8, 4), (1, 8, 4)], kh=2, kw=2), [8, 8]
+        )
+
+    def test_capacity_comes_from_configured_maxima_not_a_batch(self):
+        from torchtitan.models.kimi_k3.vit_cp_plan import stage_exchange_capacity
+
+        # PP sizes its P2P buffers once, so a batch-derived shape breaks on the
+        # first later batch that carries more image tokens.
+        self.assertEqual(stage_exchange_capacity(16, 16, 3, kh=2, kw=2), 3 * 8 * 8)
+
+    def test_pack_then_unpack_round_trips(self):
+        from torchtitan.models.kimi_k3.vit_cp_plan import (
+            pack_stage_features,
+            unpack_stage_features,
+        )
+
+        a, b = torch.randn(8, 5), torch.randn(4, 5)
+        packed = pack_stage_features([a, b], capacity=20)
+        self.assertEqual(tuple(packed.shape), (20, 5))
+        got = unpack_stage_features(packed, [8, 4])
+        torch.testing.assert_close(got[0], a)
+        torch.testing.assert_close(got[1], b)
+
+    def test_overflow_raises_instead_of_truncating(self):
+        from torchtitan.models.kimi_k3.vit_cp_plan import pack_stage_features
+
+        with self.assertRaises(ValueError):
+            pack_stage_features([torch.randn(21, 5)], capacity=20)
+
+    def test_unpack_refuses_a_layout_the_buffer_cannot_hold(self):
+        from torchtitan.models.kimi_k3.vit_cp_plan import unpack_stage_features
+
+        with self.assertRaises(ValueError):
+            unpack_stage_features(torch.randn(10, 5), [8, 4])
