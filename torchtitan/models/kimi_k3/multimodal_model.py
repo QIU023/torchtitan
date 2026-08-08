@@ -484,10 +484,72 @@ class KimiK3MultimodalModel(nn.Module):
             packed = DTensor.from_local(
                 packed, tp_mesh, (Replicate(),), run_check=False
             )
-        features = self.vision_tower(packed, grid_thw)
+        if _os.environ.get("KIMI_VIT_SIDE_STREAM") == "1":
+            features = self._run_on_vision_stream(
+                lambda: self.vision_tower(packed, grid_thw),
+                packed if isinstance(packed, torch.Tensor) else None,
+            )
+        else:
+            features = self.vision_tower(packed, grid_thw)
         if isinstance(features, torch.Tensor):
             return features.to_local() if isinstance(features, DTensor) else features
         return [f.to_local() if isinstance(f, DTensor) else f for f in features]
+
+    def _vision_stream(self):
+        """A dedicated CUDA stream for the tower, created once per module.
+
+        Groundwork for DEP's concurrent design (report 5.2.3), and it is only
+        groundwork: running on a side stream and immediately waiting for it cannot
+        overlap anything. The overlap needs the encode for micro-batch m+k issued
+        during micro-batch m's text compute, which is a scheduling change. What this
+        establishes is the part that has to be right first -- cross-stream tensor
+        lifetime and the interaction with FSDP2's tower all-gather, neither of which
+        the AttnRes PP adapter has ever had to deal with (it touches no streams at
+        all).
+
+        Same THREAD, separate stream. Not a worker thread: the adapter keys its
+        per-microbatch cache in a ``threading.local``, and its forward reads a
+        missing key as "this call is PP's shape inference" and diverts WITHOUT
+        raising. A worker thread would therefore take the shape-inference path and
+        return wrong shapes with no error.
+        """
+        if not torch.cuda.is_available():
+            return None
+        s = getattr(self, "_vision_side_stream", None)
+        if s is None:
+            s = torch.cuda.Stream()
+            self._vision_side_stream = s
+        return s
+
+    def _run_on_vision_stream(self, fn, *tensors):
+        """Run ``fn`` on the vision stream with the synchronisation it needs.
+
+        Three edges, and all three are required rather than defensive:
+
+        * the side stream waits for the current one, because ``fn``'s inputs were
+          produced there;
+        * every input is marked ``record_stream`` on the side stream, or the caching
+          allocator may hand its memory to another allocation while the side stream
+          is still reading it -- a correctness bug, not a slowdown;
+        * the current stream waits for the side stream and every output is marked
+          against the current stream, for the same reason in the other direction.
+        """
+        side = self._vision_stream()
+        if side is None:
+            return fn()
+        cur = torch.cuda.current_stream()
+        side.wait_stream(cur)
+        for t in tensors:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(side)
+        with torch.cuda.stream(side):
+            out = fn()
+        cur.wait_stream(side)
+        outs = out if isinstance(out, (list, tuple)) else [out]
+        for t in outs:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(cur)
+        return out
 
     def _encode_images_dynamic_cp(
         self,
