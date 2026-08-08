@@ -1253,6 +1253,22 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     inner_parallelize = kwargs["parallelize_fn"]
 
     def _parallelize_with_tower(part: nn.Module, **pk):
+        if dep_enabled():
+            from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+
+            # The vision chunk is the one that kept embed_tokens and NOTHING else:
+            # its FQN entry matched no layer, so layers is empty. Detected by that
+            # shape rather than by call order, because a rank holding several
+            # virtual stages sees them in an order this function is not told.
+            layers = getattr(part, "layers", None)
+            has_embed = getattr(part, "embed_tokens", None) is not None
+            if has_embed and (layers is None or len(layers) == 0):
+                return inner_parallelize(
+                    KimiK3ViTStage.from_parts(mm_config, tower, part), **pk
+                )
+            _register_mm_prefix_hooks(part)
+            return inner_parallelize(part, **pk)
+
         # The embed_tokens-owning chunk is the first stage by construction.
         if getattr(part, "embed_tokens", None) is not None:
             part = KimiK3MultimodalModel.from_parts(mm_config, tower, part)
@@ -1306,6 +1322,36 @@ def _register_mm_prefix_hooks(part: nn.Module) -> None:
     part._register_load_state_dict_pre_hook(_strip_prefix)
 
 
+_DEP_VISION_FQN = "__kimi_dep_vision__"
+"""A name no text module has, so its PP chunk comes back parameterless."""
+
+
+def dep_enabled() -> bool:
+    """DEP is opt-in while it is being brought up.
+
+    Off by default because it changes the stage count, so a run that enables it
+    silently would report a different pipeline shape than the config asked for.
+    """
+    import os
+
+    return os.environ.get("KIMI_VIT_DEP", "0") == "1"
+
+
+def dep_vision_stages() -> int:
+    """How many stages the vision tower occupies.
+
+    Report 5.2.3 requires vision forward and backward to be "balanced across PP
+    stages", so more than one is the target. It starts at 1 because the total stage
+    count must stay divisible by ``pp_degree`` -- the schedule asserts that -- and
+    the vision stages are taken OUT of the text budget rather than added on top.
+    Growing this therefore trades text stages for vision stages, which is the
+    balance the report is describing and which needs measurement to set.
+    """
+    import os
+
+    return max(1, int(os.environ.get("KIMI_VIT_DEP_STAGES", "1")))
+
+
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     """Populate ``parallelism.module_fqns_per_model_part`` so the PP
     split uses Kimi module names and the last stage includes the
@@ -1342,11 +1388,43 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         stages_per_rank = 1 if issubclass(schedule_class, PipelineScheduleSingle) else 2
         num_virtual_stages = pp * stages_per_rank
 
+    n_vit = dep_vision_stages() if dep_enabled() else 0
+    if n_vit:
+        # Taken out of the text budget, not added on top: the schedule asserts
+        # num_stages % pp_degree == 0, so appending would break pp=2 at the first
+        # vision stage.
+        if num_virtual_stages - n_vit < 1:
+            raise ValueError(
+                f"DEP wants {n_vit} vision stage(s) but only {num_virtual_stages} "
+                "stages exist; raise pipeline_parallel_degree or lower "
+                "KIMI_VIT_DEP_STAGES"
+            )
+        num_virtual_stages -= n_vit
+
     fqns = _kimi_llm_fqns(num_virtual_stages, num_layers, input_weight, output_weight)
     # Append AttnRes tail modules if present (last stage only).
     extras = [n for n in _KIMI_ATTN_RES_LAST_STAGE_FQNS if hasattr(model, n)]
     if extras:
         fqns[-1].extend(extras)
+    if dep_enabled():
+        # DEP: one stage ahead of the text ones that owns the vision tower. The
+        # FQN deliberately matches NOTHING in the text model, so core's
+        # _split_module -- which sets every non-matching child to None -- yields a
+        # zero-parameter chunk. pipeline_llm then does `stages[i].submod = m` with
+        # whatever parallelize_fn returns, so the empty chunk is replaced by the
+        # ViT stage module. That is why this needs no core change and no rename of
+        # language_model.*, which the alternative (hoisting the text stack's
+        # children to the wrapper) would have forced.
+        # The vision stage owns embed_tokens too, so the pipe carries the spliced
+        # EMBEDDING stream rather than ids. Ids cannot travel the pipe: PP's
+        # metadata inference pushes dummy values through it, and indexing an
+        # embedding with those asserts out of bounds. The first text stage
+        # therefore must NOT keep embed_tokens -- it receives pre-embedded input,
+        # which the backbone already supports when embed_tokens is None.
+        fqns[0] = [f for f in fqns[0] if f != "embed_tokens"]
+        vision = [[f"{_DEP_VISION_FQN}{i}"] for i in range(n_vit)]
+        vision[0].append("embed_tokens")
+        fqns = vision + fqns
     parallelism.module_fqns_per_model_part = fqns
 
 

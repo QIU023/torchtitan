@@ -347,6 +347,18 @@ class KimiK3MultimodalConfig:
     num_blocks: int | None = None
     vision_token_id: int = -200
 
+    # --- DEP (report 5.2.3): the ViT/text stage boundary ------------------- #
+    # The exchange buffer between the ViT stage and the first text stage must be
+    # a FIXED shape, because PP sizes its point-to-point buffers once rather than
+    # per step. These are therefore configured maxima, not batch-derived: a
+    # batch-derived shape works until a later batch carries more image tokens,
+    # and then it fails inside the P2P far from the cause. A batch that exceeds
+    # them raises at the sender -- a truncated vision feature is a silently wrong
+    # model the receiving stage cannot detect.
+    dep_max_images: int = 8
+    dep_max_grid_h: int = 32
+    dep_max_grid_w: int = 32
+
 
 class KimiK3MultimodalModel(nn.Module):
     """MoonViT-V2 + Kimi Linear backbone, wired as the release has it.
@@ -370,9 +382,15 @@ class KimiK3MultimodalModel(nn.Module):
         (``language_model.layers.N``) match anything here, and every child is
         replaced by None -- the stage ends up with zero parameters. The adapter
         therefore splits the TEXT model and rebuilds this wrapper around the
-        chunk that owns ``embed_tokens``, which is the only place vision
-        features are consumed (they are spliced into the embeddings, so nothing
-        vision-side ever crosses a stage boundary).
+        chunk that owns ``embed_tokens``, which is where vision features are
+        consumed.
+
+        Under DEP (``KIMI_VIT_DEP=1``, report 5.2.3) the tower gets its own stage
+        instead, and what crosses the hop is the SPLICED EMBEDDING stream -- so the
+        older claim that "nothing vision-side ever crosses a stage boundary" holds
+        only for the non-DEP path. It is the embeddings rather than the ids that
+        cross, because PP's metadata inference pushes dummy values through the pipe
+        and indexing an embedding table with those asserts out of bounds.
         """
         self = cls.__new__(cls)
         nn.Module.__init__(self)
@@ -1065,6 +1083,82 @@ class KimiK3MultimodalModel(nn.Module):
             self.vision_tower.init_weights(init_range)
         if self.language_model is not None:
             self.language_model.init_weights(init_range, **kwargs)
+
+
+class KimiK3ViTStage(KimiK3MultimodalModel):
+    """The vision PP stage under DEP (report 5.2.3): tower + embed + splice.
+
+    Report 5.2.3 requires ViT and text to be separate stages. This owns the tower,
+    and it also owns ``embed_tokens`` and the splice -- which needs saying, because
+    the obvious alternative does not work.
+
+    **Why the embedding lives here.** The splice needs both the features and
+    ``input_ids``, and torchtitan passes positional args only to the FIRST stage. The
+    two ways to get ids to a later stage both fail: sending them over the pipe breaks
+    because PP's metadata inference pushes DUMMY values through it during
+    initialisation, and using them as embedding indices then asserts out of bounds in
+    the gather kernel (measured, not predicted); and putting them in the batch dict
+    would mean editing the shared collator, which is core. So the ids never leave
+    this stage. What crosses the hop is the spliced embedding stream -- one float
+    activation, which is exactly the homogeneous contract PP already expects, and
+    dummy values in it are harmless because nothing indexes with them.
+
+    The compute split the report asks for is unaffected: this stage does the vision
+    encode, the text stages do every transformer layer. An embedding lookup is not
+    text training compute.
+    """
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        grid_thw: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        embed = self.language_model.embed_tokens
+        if embed is None:
+            raise ValueError(
+                "the DEP vision stage must own embed_tokens: it produces the "
+                "spliced embedding stream, and the ids cannot be forwarded to a "
+                "later stage"
+            )
+
+        cp_active = self._cp_world_size() > 1
+        num_sentinels = int((input_ids == self.config.vision_token_id).sum().item())
+        # Gate the exchange on the MESH, never on the data: a batch with no images
+        # is normal, and a rank that returns early leaves its CP peers waiting in
+        # the collective until the watchdog fires.
+        if cp_active:
+            self._exchange_sentinel_counts(num_sentinels)
+
+        if pixel_values is None or grid_thw is None:
+            out = embed(input_ids)
+            if self._tower_needs_collectives():
+                # FSDP2 issues the tower's all-gather from its pre-forward hook, so
+                # a rank that skips the tower does not issue it and its peers wait.
+                out = self._keep_tower_alive(out, self._tower_placeholder())
+            return out
+
+        feats = self.encode_images(pixel_values, grid_thw)
+        if isinstance(feats, torch.Tensor):
+            feats = [feats]
+        num_rows = sum(f.size(0) for f in feats)
+        num_images = len(feats)
+
+        if num_sentinels == num_rows:
+            return self._splice_per_token(input_ids, feats)
+        if num_sentinels == num_images:
+            return self._splice(input_ids, feats)
+        if num_sentinels == 0:
+            # Under CP a rank's sequence shard can legitimately hold no sentinel.
+            # The features still have to stay in the graph, or FSDP2 skips a
+            # gradient reduction this rank's peers issue.
+            return self._keep_tower_alive(embed(input_ids), torch.cat(feats, dim=0))
+        raise ValueError(
+            f"{num_sentinels} vision sentinel(s) in input_ids match neither the "
+            f"image count ({num_images}, one sentinel per image) nor the "
+            f"visual-token count ({num_rows}, one sentinel per token)"
+        )
 
 
 def _mm_layers(self):
