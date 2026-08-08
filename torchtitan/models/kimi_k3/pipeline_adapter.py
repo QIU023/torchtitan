@@ -85,6 +85,7 @@ from torchtitan.models.kimi_k3.layout import (
     _infer_block_layout_tables_from_stages,
     BlockLayoutTables,
 )
+from torchtitan.tools.logging import logger
 
 
 def adapter_enabled() -> bool:
@@ -1191,6 +1192,16 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
     # virtual stage on the rank frees memory.
     _install_step_drop_patch(pp_schedule, installed_adapters)
 
+    # Say so on success, not only on the fallback paths. The adapter is numerically
+    # neutral by design, so loss reads the same whether it engaged or not -- without
+    # this line "wrapped" and "silently fell back" are indistinguishable from the
+    # outside.
+    logger.info(
+        "cross-stage cache adapter wrapped %d stage(s): %s",
+        len(installed_adapters),
+        [s.stage_index for s in stages],
+    )
+
     return pp_schedule, model_parts, has_first_stage, has_last_stage
 
 
@@ -1430,7 +1441,6 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     parallelism.module_fqns_per_model_part = fqns
 
 
-
 def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     """Give the DEP vision stage a prefetcher and tell it which micro-batch it serves.
 
@@ -1454,6 +1464,28 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
 
     vision_stage_modules = [m for m in model_parts if isinstance(m, KimiK3ViTStage)]
     if not vision_stage_modules:
+        # Normal on a text-only rank: the vision stage is global stage 0, so only
+        # one rank holds it. Logged rather than silent because "the run-ahead did
+        # not install" and "the run-ahead did nothing" are otherwise the same
+        # observation -- but WARN only where the stage was supposed to be, or
+        # every text rank cries wolf on a correct run.
+        owns_vision_stage = any(
+            getattr(s, "stage_index", None) == 0
+            for s in _iter_schedule_stages(pp_schedule)
+        )
+        message = (
+            "DEP vision prefetch NOT installed: depth=%d, this rank's model parts "
+            "are %s"
+        )
+        parts = [type(m).__name__ for m in model_parts]
+        if owns_vision_stage:
+            warnings.warn(
+                f"KIMI_VIT_PREFETCH={prefetch_depth()} requested and this rank "
+                f"owns pipeline stage 0, but no KimiK3ViTStage is present in its "
+                f"model parts ({parts}); the run-ahead is OFF."
+            )
+        else:
+            logger.info(message, prefetch_depth(), parts)
         return
 
     for module in vision_stage_modules:
@@ -1509,6 +1541,11 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
     )
+    # Every kimi_k3 flavor registers THIS pipelining_fn, so the DEP run-ahead has
+    # to be installed here; having it only in pipeline_llm_with_cache_adapter left
+    # it dead code, and its absence read as "the prefetch changes nothing".
+    if dep_enabled():
+        _install_vision_prefetch(pp_schedule, model_parts)
     passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
 
     if not adapter_enabled():
@@ -1584,5 +1621,15 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
             model_parts[i] = adapter
 
     _install_step_drop_patch(pp_schedule, installed_adapters)
+
+    # Say so on success, not only on the fallback paths. The adapter is numerically
+    # neutral by design, so loss reads the same whether it engaged or not -- without
+    # this line "wrapped" and "silently fell back" are indistinguishable from the
+    # outside.
+    logger.info(
+        "cross-stage cache adapter wrapped %d stage(s): %s",
+        len(installed_adapters),
+        [s.stage_index for s in stages],
+    )
 
     return pp_schedule, model_parts, has_first_stage, has_last_stage

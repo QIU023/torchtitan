@@ -55,6 +55,8 @@ import os
 
 import torch
 
+from torchtitan.tools.logging import logger
+
 
 def prefetch_depth() -> int:
     """How many micro-batches ahead to encode. 0 disables the prefetch."""
@@ -74,6 +76,11 @@ class VisionPrefetcher:
         self._features: dict[int, list[torch.Tensor]] = {}
         self._kwargs: list[dict] | None = None
         self._num_mbs = 0
+        # Hit/miss counters, reported once per step. Installing the hook proves the
+        # patch is in place; only a HIT proves a micro-batch's encode was already
+        # done when its forward asked for it, which is the whole claim.
+        self._hits = 0
+        self._misses = 0
 
     def begin_step(self, kwarg_mbs) -> None:
         """Record the step's per-micro-batch kwargs and reset the cache.
@@ -82,6 +89,13 @@ class VisionPrefetcher:
         identical on every rank -- which is what lets the prefetch order be a mesh
         property rather than a data one.
         """
+        if self._hits or self._misses:
+            logger.info(
+                "DEP vision prefetch: %d hit(s), %d miss(es) in the previous step",
+                self._hits,
+                self._misses,
+            )
+            self._hits = self._misses = 0
         self._features.clear()
         if kwarg_mbs is None:
             self._kwargs, self._num_mbs = None, 0
@@ -122,7 +136,12 @@ class VisionPrefetcher:
 
     def take(self, mb: int):
         """Features for ``mb`` if prefetched, else None. Removes the entry."""
-        return self._features.pop(mb, None)
+        feats = self._features.pop(mb, None)
+        if feats is None:
+            self._misses += 1
+        else:
+            self._hits += 1
+        return feats
 
     def advance(self, mb: int, depth: int) -> None:
         """After serving ``mb``, start the encodes for the next ``depth``.
