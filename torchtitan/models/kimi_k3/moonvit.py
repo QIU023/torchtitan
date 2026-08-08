@@ -724,6 +724,85 @@ class MoonViT(nn.Module):
         )
         return x, grid
 
+    def block_bounds(self, num_shares: int) -> list[tuple[int, int]]:
+        """Split the encoder's blocks into ``num_shares`` contiguous ranges.
+
+        Report 5.2.3 balances vision passes across PP stages, so shares are as even as
+        possible. A remainder goes to the LAST shares, because share 0 also carries
+        ``patch_embed`` and the final share's projector is cheaper than that -- giving
+        share 0 an extra block as well would make the least balanced stage worse.
+        """
+        n = len(self.encoder.blocks)
+        if num_shares < 1 or num_shares > n:
+            raise ValueError(
+                f"cannot split {n} encoder block(s) into {num_shares} share(s)"
+            )
+        base, extra = divmod(n, num_shares)
+        bounds, lo = [], 0
+        for i in range(num_shares):
+            hi = lo + base + (1 if i >= num_shares - extra else 0)
+            bounds.append((lo, hi))
+            lo = hi
+        return bounds
+
+    def forward_head(
+        self,
+        patches_LCHW: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+        *,
+        upto_block: int | None = None,
+    ) -> torch.Tensor:
+        """Patch embed plus blocks ``[0, upto_block)``, WITHOUT the final norm.
+
+        The first share when the tower spans PP stages. Returns patch hidden states,
+        not features -- the projector belongs to the last share.
+        """
+        x = self.patch_embed(patches_LCHW, grid_thws, cp_plan)
+        return self.encoder.run_blocks(
+            x,
+            grid_thws,
+            cp_plan,
+            block_slice=slice(0, upto_block),
+            apply_final_norm=False,
+        )
+
+    def forward_body(
+        self,
+        x_LD: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+        *,
+        lo: int,
+        hi: int,
+    ) -> torch.Tensor:
+        """Blocks ``[lo, hi)`` only -- a middle share, no norm and no projector."""
+        return self.encoder.run_blocks(
+            x_LD, grid_thws, cp_plan, block_slice=slice(lo, hi), apply_final_norm=False
+        )
+
+    def forward_tail(
+        self,
+        x_LD: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+        *,
+        from_block: int = 0,
+    ):
+        """Blocks ``[from_block, end)``, the final norm, the merge and the projector.
+
+        The last share, and the only one that produces features.
+        """
+        x = self.encoder.run_blocks(
+            x_LD,
+            grid_thws,
+            cp_plan,
+            block_slice=slice(from_block, len(self.encoder.blocks)),
+            apply_final_norm=True,
+        )
+        merged = tpool_patch_merger(x, grid_thws, self.config.merge_kernel_size)
+        return self.mm_projector(merged)
+
     def forward(
         self,
         patches_LCHW: torch.Tensor,

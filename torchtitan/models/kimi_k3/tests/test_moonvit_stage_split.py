@@ -158,5 +158,121 @@ class TestMoonViTStageSplit(unittest.TestCase):
             self.assertTrue(weight.grad.abs().sum() > 0, f"block {share} grad is zero")
 
 
+class TestMoonViTTowerSplit(unittest.TestCase):
+    """The whole tower split into shares must equal ``MoonViT.forward``.
+
+    ``TestMoonViTStageSplit`` pins the encoder blocks. This pins what the PP stages
+    will actually call: head (patch_embed + early blocks), bodies, tail (late blocks +
+    final norm + merge + projector). A defect here would otherwise surface at pp4 as a
+    number that is hard to attribute to arithmetic rather than plumbing.
+    """
+
+    def _tower(self, num_layers: int = 4):
+        from torchtitan.models.kimi_k3.moonvit import MoonViT, MoonViTConfig
+
+        cfg = MoonViTConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=2,
+            qkv_hidden_size=32,
+            num_hidden_layers=num_layers,
+            patch_size=2,
+            text_hidden_size=32,
+            rope_max_grid=64,
+            merge_kernel_size=(2, 2),
+        )
+        torch.manual_seed(0)
+        tower = MoonViT(cfg).to(torch.float32)
+        tower.eval()
+        return tower, cfg
+
+    def _patches(self, cfg, grid):
+        n = int(grid.prod(dim=-1).sum())
+        torch.manual_seed(2)
+        return torch.randn(
+            n, cfg.in_channels, cfg.patch_size, cfg.patch_size, dtype=torch.float32
+        )
+
+    def test_head_tail_equals_forward(self):
+        tower, cfg = self._tower()
+        grid = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+        patches = self._patches(cfg, grid)
+
+        with torch.no_grad():
+            whole = tower(patches, grid)
+            x = tower.forward_head(patches, grid, upto_block=2)
+            split = tower.forward_tail(x, grid, from_block=2)
+
+        self.assertEqual(len(whole), len(split))
+        for a, b in zip(whole, split):
+            torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
+
+    def test_head_body_tail_equals_forward(self):
+        tower, cfg = self._tower()
+        grid = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+        patches = self._patches(cfg, grid)
+
+        with torch.no_grad():
+            whole = tower(patches, grid)
+            x = tower.forward_head(patches, grid, upto_block=1)
+            x = tower.forward_body(x, grid, lo=1, hi=3)
+            split = tower.forward_tail(x, grid, from_block=3)
+
+        for a, b in zip(whole, split):
+            torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
+
+    def test_split_matches_for_several_images(self):
+        """Multiple images at once: the segment bounds are per-image, so a share that
+        recomputed them wrongly would show up here and not with a single image."""
+        tower, cfg = self._tower()
+        grid = torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 2]], dtype=torch.int32)
+        patches = self._patches(cfg, grid)
+
+        with torch.no_grad():
+            whole = tower(patches, grid)
+            x = tower.forward_head(patches, grid, upto_block=2)
+            split = tower.forward_tail(x, grid, from_block=2)
+
+        self.assertEqual(len(whole), len(split))
+        for a, b in zip(whole, split):
+            torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
+
+    def test_block_bounds_are_even_and_cover_everything(self):
+        tower, _ = self._tower(num_layers=27)  # the real MoonViT depth
+        for n in (1, 2, 4, 8):
+            bounds = tower.block_bounds(n)
+            self.assertEqual(len(bounds), n)
+            self.assertEqual(bounds[0][0], 0)
+            self.assertEqual(bounds[-1][1], 27)
+            for (_, hi), (lo, _) in zip(bounds, bounds[1:]):
+                self.assertEqual(hi, lo, "shares must be contiguous with no gap")
+            sizes = [hi - lo for lo, hi in bounds]
+            self.assertLessEqual(max(sizes) - min(sizes), 1, f"uneven split: {sizes}")
+            # The remainder goes to the LAST shares, so share 0 is never the largest.
+            self.assertEqual(sizes[0], min(sizes))
+
+    def test_bounds_reject_more_shares_than_blocks(self):
+        tower, _ = self._tower(num_layers=4)
+        with self.assertRaises(ValueError):
+            tower.block_bounds(5)
+
+    def test_split_by_bounds_equals_forward(self):
+        """Drive the split from ``block_bounds`` itself, the way the stages will."""
+        tower, cfg = self._tower(num_layers=4)
+        grid = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+        patches = self._patches(cfg, grid)
+        bounds = tower.block_bounds(3)
+
+        with torch.no_grad():
+            whole = tower(patches, grid)
+            x = tower.forward_head(patches, grid, upto_block=bounds[0][1])
+            for lo, hi in bounds[1:-1]:
+                x = tower.forward_body(x, grid, lo=lo, hi=hi)
+            split = tower.forward_tail(x, grid, from_block=bounds[-1][0])
+
+        for a, b in zip(whole, split):
+            torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()
