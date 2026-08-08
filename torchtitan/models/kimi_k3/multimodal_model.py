@@ -1201,7 +1201,23 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
                 out = self._keep_tower_alive(out, self._tower_placeholder())
             return out
 
-        feats = self.encode_images(pixel_values, grid_thw)
+        # DEP run-ahead: take this micro-batch's features if a previous action
+        # already encoded them on the vision stream, and start the next ones. The
+        # depth is a mesh property (micro-batch count), never a data one, so every
+        # rank issues the same encodes in the same order -- otherwise two
+        # communicators can deadlock on a cyclic wait with neither one's ordering
+        # violated.
+        pf = getattr(self, "_vision_prefetcher", None)
+        mb = getattr(self, "_dep_current_mb", None)
+        feats = None
+        if pf is not None and mb is not None:
+            feats = pf.take(mb)
+        if feats is None:
+            feats = self.encode_images(pixel_values, grid_thw)
+        if pf is not None and mb is not None:
+            from torchtitan.models.kimi_k3.vit_prefetch import prefetch_depth
+
+            pf.advance(mb, prefetch_depth())
         if isinstance(feats, torch.Tensor):
             feats = [feats]
         num_rows = sum(f.size(0) for f in feats)

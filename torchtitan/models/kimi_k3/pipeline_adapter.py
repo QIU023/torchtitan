@@ -1107,6 +1107,8 @@ def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
     )
+    if dep_enabled():
+        _install_vision_prefetch(pp_schedule, model_parts)
     passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
 
     if not adapter_enabled():
@@ -1426,6 +1428,62 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         vision[0].append("embed_tokens")
         fqns = vision + fqns
     parallelism.module_fqns_per_model_part = fqns
+
+
+
+def _install_vision_prefetch(pp_schedule, model_parts) -> None:
+    """Give the DEP vision stage a prefetcher and tell it which micro-batch it serves.
+
+    The vision stage is NOT wrapped by :class:`CrossStageCacheAdapter` -- it holds the
+    tower and embed_tokens, not AttnRes blocks -- so it does not get that wrapper's
+    mb-index patch and needs its own. Same shape, and for the same reason: the index
+    is schedule-owned and there is no other way to learn it from inside a forward.
+
+    A no-op when the prefetch depth is 0, which is the default, so enabling DEP alone
+    changes nothing here.
+    """
+    from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+    from torchtitan.models.kimi_k3.vit_prefetch import (
+        install_step_hook,
+        prefetch_depth,
+        VisionPrefetcher,
+    )
+
+    if prefetch_depth() <= 0:
+        return
+
+    vision_stage_modules = [m for m in model_parts if isinstance(m, KimiK3ViTStage)]
+    if not vision_stage_modules:
+        return
+
+    for module in vision_stage_modules:
+        prefetcher = VisionPrefetcher(module)
+        module._vision_prefetcher = prefetcher
+        install_step_hook(pp_schedule, prefetcher)
+
+    # Stash the schedule-owned chunk id on the module for the duration of each
+    # forward. Not a thread-local this time: the module instance is already
+    # per-stage, and a plain attribute cannot be read from the wrong thread by
+    # accident -- which is the failure the adapter's thread-local version has.
+    for stage in _iter_schedule_stages(pp_schedule):
+        submod = getattr(stage, "submod", None)
+        if not isinstance(submod, KimiK3ViTStage):
+            continue
+        orig_fwd = stage.forward_one_chunk
+
+        def patched(fwd_chunk_id, args, kwargs=None, _f=orig_fwd, _m=submod, **kw):
+            _m._dep_current_mb = fwd_chunk_id
+            try:
+                return _f(fwd_chunk_id, args, kwargs, **kw)
+            finally:
+                _m._dep_current_mb = None
+
+        stage.forward_one_chunk = patched
+        logger.info(
+            "DEP vision prefetch installed: depth=%d on stage %s",
+            prefetch_depth(),
+            getattr(stage, "stage_index", "?"),
+        )
 
 
 def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
