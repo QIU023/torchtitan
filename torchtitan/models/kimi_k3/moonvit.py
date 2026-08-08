@@ -618,12 +618,21 @@ class MoonViTEncoder(nn.Module):
         for block in self.blocks:
             block._cp_patch_plan = plan
 
-    def forward(
+    def block_inputs(
         self,
         x_LD: torch.Tensor,
         grid_thws: torch.Tensor,
         cp_plan: "CPPatchPlan | None" = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The per-forward ``(freqs_cis, cu_seqlens)`` every block needs.
+
+        Split out so a tower spanning several PP stages can recompute it on each
+        stage from that stage's own ``grid_thws`` (report 5.2.3 balances vision
+        passes across PP stages). Recomputing rather than sending it over the pipe is
+        deliberate: PP's metadata inference pushes DUMMY values through pipe tensors,
+        and these are used as RoPE indices and segment bounds, where a dummy asserts
+        out of bounds -- the same reason ``input_ids`` never leave the vision stage.
+        """
         if cp_plan is not None:
             # 2-D RoPE is the SECOND place position enters, so it needs the same
             # whole-image-then-slice treatment as the absolute embedding.
@@ -638,16 +647,44 @@ class MoonViTEncoder(nn.Module):
         cu_seqlens = torch.cat(
             [torch.zeros(1, dtype=lengths.dtype, device=lengths.device), lengths]
         ).cumsum(0, dtype=torch.int32)
+        return freqs_cis, cu_seqlens
+
+    def run_blocks(
+        self,
+        x_LD: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+        *,
+        block_slice: slice | None = None,
+        apply_final_norm: bool = True,
+    ) -> torch.Tensor:
+        """Run a contiguous range of blocks, optionally without the final norm.
+
+        ``block_slice`` selects this stage's share when the tower is split across PP
+        stages; ``apply_final_norm`` belongs to the last share only. Chaining the
+        shares reproduces the whole encoder exactly, which is asserted by a unit test
+        rather than assumed.
+        """
+        freqs_cis, cu_seqlens = self.block_inputs(x_LD, grid_thws, cp_plan)
+        blocks = self.blocks if block_slice is None else self.blocks[block_slice]
         self.set_cp_patch_plan(cp_plan)
         try:
-            for block in self.blocks:
+            for block in blocks:
                 x_LD = block(x_LD, cu_seqlens, freqs_cis)
         finally:
             # The encoder owns the plan's lifetime so a caller cannot leak one
             # into the next batch, where it would gather for a partition that no
             # longer exists.
             self.set_cp_patch_plan(None)
-        return self.final_layernorm(x_LD)
+        return self.final_layernorm(x_LD) if apply_final_norm else x_LD
+
+    def forward(
+        self,
+        x_LD: torch.Tensor,
+        grid_thws: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
+    ) -> torch.Tensor:
+        return self.run_blocks(x_LD, grid_thws, cp_plan)
 
 
 class MoonViT(nn.Module):

@@ -1359,10 +1359,25 @@ def dep_vision_stages() -> int:
     the vision stages are taken OUT of the text budget rather than added on top.
     Growing this therefore trades text stages for vision stages, which is the
     balance the report is describing and which needs measurement to set.
+
+    Values above 1 are rejected here rather than left to fail downstream. Only the
+    vision chunk holding ``embed_tokens`` becomes a ``KimiK3ViTStage``, so the extra
+    chunks would be zero-parameter shells and the run died in the optimizer with
+    "param_groups pattern '.*' matched no parameters" -- a message that says nothing
+    about the actual gap. The block-split arithmetic this needs is already in place
+    and tested (``MoonViTEncoder.run_blocks``); what is missing is the stage wiring.
     """
     import os
 
-    return max(1, int(os.environ.get("KIMI_VIT_DEP_STAGES", "1")))
+    n = max(1, int(os.environ.get("KIMI_VIT_DEP_STAGES", "1")))
+    if n > 1:
+        raise NotImplementedError(
+            f"KIMI_VIT_DEP_STAGES={n}: splitting the tower across PP stages is "
+            "designed but not wired -- only the chunk holding embed_tokens becomes a "
+            "vision stage, so the others would carry no parameters. See "
+            "VIT_DEP_DESIGN_2026-08-07.md, 'Clause (2), step 2'. Use 1 for now."
+        )
+    return n
 
 
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
