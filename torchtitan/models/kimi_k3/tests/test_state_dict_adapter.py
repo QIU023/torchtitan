@@ -14,9 +14,7 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3 import model_registry
-from torchtitan.models.kimi_k3.state_dict_adapter import (
-    KimiLinearStateDictAdapter,
-)
+from torchtitan.models.kimi_k3.state_dict_adapter import KimiLinearStateDictAdapter
 
 
 def _build_state_dict(flavor: str):
@@ -40,9 +38,7 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         # the HF key space (official checkpoints must load into graft
         # flavors without phantom read keys); the round trip covers the
         # backbone exactly.
-        backbone = {
-            k for k in sd if "attn_res" not in k and "mlp_res" not in k
-        }
+        backbone = {k for k in sd if "attn_res" not in k and "mlp_res" not in k}
         self.assertEqual(set(back), backbone)
         for k in backbone:
             self.assertEqual(
@@ -66,9 +62,7 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         self.assertTrue(moe_keys)
         self.assertEqual(
             len(moe_keys),
-            3 * num_experts * sum(
-                1 for k in sd if k.endswith("w1_EFD")
-            ),
+            3 * num_experts * sum(1 for k in sd if k.endswith("w1_EFD")),
         )
 
     def test_a_log_reshape_from_hf(self):
@@ -78,14 +72,11 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         self.assertTrue(a_log_keys)
         h = sd[a_log_keys[0]].shape[0]
         hf_style = {
-            "model." + a_log_keys[0].replace("layers.", "layers.", 1): torch.zeros(
-                1, 1, h, 1
-            )
+            "model."
+            + a_log_keys[0].replace("layers.", "layers.", 1): torch.zeros(1, 1, h, 1)
         }
         # from_hf must flatten [1,1,H,1] -> [H]
-        out = adapter.from_hf(
-            {f"model.{a_log_keys[0]}": torch.zeros(1, 1, h, 1)}
-        )
+        out = adapter.from_hf({f"model.{a_log_keys[0]}": torch.zeros(1, 1, h, 1)})
         self.assertEqual(tuple(out[a_log_keys[0]].shape), (h,))
 
     def test_packed_weights_rejected(self):
@@ -121,3 +112,63 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMultimodalRoundTrip(unittest.TestCase):
+    """to_hf -> from_hf on a MULTIMODAL flavor must return the text keys.
+
+    The round-trip tests above use text-only flavors, whose keys have no wrapper
+    prefix. A multimodal model's text tensors are named ``language_model.*``, and
+    ``to_hf`` strips that prefix before handing the key to ``hf_key_map`` -- so the
+    inverse has to put it back. It did not, and because an unmapped key returns
+    ``(None, value)`` rather than raising, every text tensor of a multimodal
+    checkpoint was dropped in silence: loading an official shard produced a
+    near-empty state dict with no error.
+
+    Written as its own class so the failure names the direction that is broken.
+    """
+
+    def _adapter_and_sd(self):
+        # Multimodal flavors live in config_registry (Trainer.Config factories), not in
+        # model_registry, which only parses 'kimi_k3_<size>_<variant>'.
+        from torchtitan.models.kimi_k3.config_registry import kimi_k3_mini_vl
+
+        model_spec = kimi_k3_mini_vl().model_spec
+        with torch.device("meta"):
+            model = model_spec.model.build()
+        return (
+            KimiLinearStateDictAdapter(model_spec.model, hf_assets_path=None),
+            model.state_dict(),
+        )
+
+    def test_text_keys_survive_the_round_trip(self):
+        adapter, sd = self._adapter_and_sd()
+        back = adapter.from_hf(adapter.to_hf(sd))
+        # Graft extras are deliberately outside the HF key space, as in the
+        # text-only round trips above.
+        expected = {
+            k
+            for k in sd
+            if "attn_res" not in k
+            and "mlp_res" not in k
+            and k.startswith("language_model.")
+        }
+        missing = sorted(expected - set(back))
+        self.assertEqual(
+            missing[:8],
+            [],
+            f"{len(missing)} of {len(expected)} text tensors lost in the round trip",
+        )
+
+    def test_round_trip_preserves_text_shapes(self):
+        adapter, sd = self._adapter_and_sd()
+        back = adapter.from_hf(adapter.to_hf(sd))
+        for k, v in sd.items():
+            if not k.startswith("language_model."):
+                continue
+            if "attn_res" in k or "mlp_res" in k:
+                continue
+            if k in back:
+                self.assertEqual(
+                    tuple(back[k].shape), tuple(v.shape), f"shape drift at {k}"
+                )

@@ -106,6 +106,21 @@ class UnmappedKey(ValueError):
     """A checkpoint key with no destination. Never ignored silently."""
 
 
+def kda_layers_zero_based(kimi_config) -> set[int]:
+    """``kda_layers`` renumbered to match CHECKPOINT key indices.
+
+    The release lists linear-attention layers 1-BASED in ``linear_attn_config`` and this
+    folder's configs follow it, while checkpoint keys are ``layers.<0-based>``. Comparing
+    the two directly misclassifies every layer whose 0-based index happens to appear in
+    the 1-based set -- and the only visible symptom is a gate tensor landing on the wrong
+    name, so it reads as a missing key rather than an off-by-one.
+
+    Exists because :func:`_mla_layer` puts normalisation on the caller and no caller had
+    a helper to do it with.
+    """
+    return {i - 1 for i in (getattr(kimi_config, "kda_layers", None) or ())}
+
+
 def _mla_layer(layer_idx: int, kda_layers: set[int]) -> bool:
     """The release uses 1-BASED layer indices in linear_attn_config, while
     checkpoint keys are 0-based, so the caller's kda_layers must already be
