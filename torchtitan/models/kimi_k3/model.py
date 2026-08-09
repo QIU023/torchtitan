@@ -141,13 +141,13 @@ def splice_vision_embeds(
     arange = torch.arange(n_vis_max, device=image_mask.device)
     valid = arange.unsqueeze(0) < n_per_row.unsqueeze(1)
     source = vision_embeds[valid].to(h.dtype)
-    if bool((n_per_row > n_vis_max).any()):
-        # 0-based rank of each True within its row.
-        pos_rank = image_mask.long().cumsum(dim=1) - 1
-        keep = torch.clamp(n_per_row, max=n_vis_max)
-        scatter_mask = image_mask & (pos_rank < keep.unsqueeze(1))
-    else:
-        scatter_mask = image_mask
+    # Computed unconditionally rather than behind ``if (n_per_row >
+    # n_vis_max).any()``. That test is a device-to-host sync on the embed path,
+    # once per microbatch, and the two branches agree anyway: with no row over
+    # the limit, every True has pos_rank < n_per_row, so the mask is unchanged.
+    pos_rank = image_mask.long().cumsum(dim=1) - 1  # 0-based rank within the row
+    keep = torch.clamp(n_per_row, max=n_vis_max)
+    scatter_mask = image_mask & (pos_rank < keep.unsqueeze(1))
     return h.masked_scatter(scatter_mask.unsqueeze(-1).expand_as(h), source)
 
 
@@ -1624,8 +1624,13 @@ class KimiDecoderLayer(nn.Module):
             self.self_attn = KimiMLAAttention(config, layer_idx)
             self.is_linear_attn = False
         else:
-            raise NotImplementedError(
-                f"Layer {layer_idx}: neither KDA nor MLA configured."
+            # Reachable: a config with none of the MLA dims set and
+            # mla_use_nope False is constructible, it is just not a model this
+            # port implements. That makes it a configuration error rather than a
+            # missing feature, hence ValueError.
+            raise ValueError(
+                f"Layer {layer_idx}: neither KDA nor MLA configured. Set the "
+                "MLA head dims (or mla_use_nope) or list the layer in kda_layers."
             )
 
         # FFN: dense MLP for the first `first_k_dense_replace` layers, MoE otherwise.
