@@ -1195,7 +1195,13 @@ def kimi_k3_mini_mtp() -> Trainer.Config:
     )
     cfg.loss = KimiMTPLoss.Config(
         mtp_weight=0.3,
-        loss_fn=CrossEntropyLoss.Config(global_vocab_size=163840),
+        # Derived from the model, not hardcoded: this flavor is 2016-wide and the
+        # literal 163840 (the released tokenizer's size) was 81x too large. The loss
+        # uses it to size its vocab-parallel reduction, so a wrong value is not
+        # obviously wrong from the outside.
+        loss_fn=CrossEntropyLoss.Config(
+            global_vocab_size=cfg.model_spec.model.kimi_config.vocab_size
+        ),
     )
     # bfloat16, because this chain leaves training.dtype at float32 and with
     # dp_shard=1 there is no FSDP mixed-precision cast, so fla's KDA kernel asks

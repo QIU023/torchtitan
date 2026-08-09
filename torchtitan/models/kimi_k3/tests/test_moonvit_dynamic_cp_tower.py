@@ -201,6 +201,21 @@ class TestMoonViTDynamicCPTower(unittest.TestCase):
         was wrong: merge-safe but not contiguous."""
         self._run((2, 8, 4))
 
+    def test_video_with_deficit_interleaves_padding(self):
+        """t>1 AND a deficit rank -- the combination none of the cases above hit.
+
+        h=6 gives 3 merge blocks over 2 ranks, so rank 1 is short by one block and
+        pads. With t>1 that padding is added PER FRAME by ``_slice_for_shard``
+        (band rows per frame, then the frames concatenated), so the deficit rank's
+        stream is [frame0 real, frame0 pad, frame1 real, frame1 pad], and the padded
+        positions are INTERLEAVED rather than a trailing run.
+
+        A prefix-only key mask therefore admits frame 0's padding into the softmax
+        and masks frame 1's real keys. (1, 6, 4) has the deficit but only one frame;
+        (2, 8, 4) has the frames but no deficit -- neither can see this.
+        """
+        self._run((2, 6, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

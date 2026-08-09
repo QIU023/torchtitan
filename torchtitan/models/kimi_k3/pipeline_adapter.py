@@ -1649,7 +1649,17 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
         # Wiring first, and unconditionally: a split tower's later shares need the
         # micro-batch index to find grid_thw, and without it they pass activations
         # through with no error at all.
-        _install_vision_stage_wiring(pp_schedule, step_inputs)
+        wired = _install_vision_stage_wiring(pp_schedule, step_inputs)
+        if wired == 0 and dep_vision_stages() > 1:
+            # A split tower whose shares were never wired would run the metadata-inference
+            # path for real micro-batches: activations passed through, no tower, no splice,
+            # no error. With n_vit == 1 zero is normal on a text-only rank, so the check is
+            # gated on the split.
+            raise RuntimeError(
+                f"KIMI_VIT_DEP_STAGES={dep_vision_stages()} but no vision stage was "
+                "wired on this rank; a split tower cannot run unwired -- it would pass "
+                "activations through unprocessed and report no error"
+            )
         _install_vision_prefetch(pp_schedule, model_parts)
     passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
 
