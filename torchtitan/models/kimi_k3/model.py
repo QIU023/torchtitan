@@ -49,6 +49,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate
 
+from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 
 from torchtitan.models.common.linear import Linear as _TTLinear
@@ -424,35 +425,6 @@ class KimiMLP(nn.Module):
 # ----- MLA (NoPE variant) -------------------------------------------------- #
 
 
-class KimiMLAInnerAttention(nn.Module):
-    """SDPA-only inner attention module for KimiMLAAttention.
-
-    Mirrors the DSv3 ``inner_attention`` pattern: pulls
-    :func:`F.scaled_dot_product_attention` into a separate (parameter-free)
-    submodule so the TP plan can wrap it with ``PrepareModuleInput(...,
-    use_local_output=True)``. Under TP, the q/k/v projections produce DTensors
-    sharded along the head axis; ``use_local_output=True`` converts them to
-    plain Tensors before SDPA's internal kernel-selection dispatcher runs,
-    avoiding the "aten.bmm got mixed Tensor and DTensor" failure inside the
-    mem-efficient cutlass kernel path.
-    """
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        scale: float,
-    ) -> torch.Tensor:
-        return F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=True,
-            scale=scale,
-        )
-
-
 def _cp_all_to_all_headseq(
     x: torch.Tensor, cp_group, seq_to_head: bool
 ) -> torch.Tensor:
@@ -609,7 +581,20 @@ class KimiMLAAttention(nn.Module):
 
         # SDPA-only sub-module so the TP plan can wrap it with
         # use_local_output=True (DSv3 pattern). Has no parameters.
-        self.inner_attention = KimiMLAInnerAttention()
+        # torchtitan's own SDPA module rather than a local copy. It brings the
+        # backend priority list (cuDNN, then flash, then math) that a bare
+        # F.scaled_dot_product_attention call leaves to the default dispatcher,
+        # and it is the type the upstream CP dispatcher recognises -- see the
+        # note in parallelize.py about why MLA does its own CP today.
+        #
+        # Kept as a submodule for the same reason DSv3 does: apply_tp_kimi_k3
+        # wraps this call with PrepareModuleInput(use_local_output=True), so q/k/v
+        # are plain Tensors before SDPA's kernel dispatcher runs. Without that,
+        # the mem-efficient cutlass path fails with "aten.bmm got mixed Tensor
+        # and DTensor".
+        self.inner_attention = ScaledDotProductAttention(
+            ScaledDotProductAttention.Config()
+        )
 
     def _attn_gate(self, x: torch.Tensor, width: int) -> torch.Tensor:
         """Sigmoid output gate, broadcastable onto ``[..., width]``.
@@ -711,14 +696,16 @@ class KimiMLAAttention(nn.Module):
         # to plain Tensors before SDPA's mem-efficient cutlass kernel
         # path sees them — avoiding "aten.bmm got mixed Tensor and
         # DTensor" inside SDPA's internal dispatcher.
+        # (B, H, T, D) -> (B, T, H, D) because the shared module takes the
+        # head-minor layout and transposes internally; the two cancel, so this
+        # costs nothing, and the output comes back head-minor already.
         attn_out = self.inner_attention(
-            q_full,
-            k_full,
-            v,
+            q_full.transpose(1, 2),
+            k_full.transpose(1, 2),
+            v.transpose(1, 2),
             scale=self.scaling,
-        )  # (B, H, T, v_head_dim)
+        )  # (B, T, H, v_head_dim)
 
-        attn_out = attn_out.transpose(1, 2)  # (B, T, H, Dv)
         attn_out = attn_out.reshape(B, T, -1)  # (B, T, H*Dv)
         if self.mla_gated:
             attn_out = attn_out * self._attn_gate(x, attn_out.shape[-1])
@@ -812,14 +799,14 @@ class KimiMLAAttention(nn.Module):
             dim=-1,
         )
 
-        attn_BGTV = self.inner_attention(
-            q_BTGQ.transpose(1, 2),
-            k_BTGQ.transpose(1, 2),
-            v_BTGV.transpose(1, 2),
+        attn_BTGV = self.inner_attention(
+            q_BTGQ,
+            k_BTGQ,
+            v_BTGV,
             scale=self.scaling,
         )
         attn_BLHV = _cp_all_to_all_headseq(
-            attn_BGTV.transpose(1, 2).contiguous(), cp_group, seq_to_head=False
+            attn_BTGV.contiguous(), cp_group, seq_to_head=False
         )
         attn_BLE = attn_BLHV.reshape(B, t_loc, h_loc * self.v_head_dim)
         if self.mla_gated:
