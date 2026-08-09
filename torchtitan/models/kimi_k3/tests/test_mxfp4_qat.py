@@ -68,5 +68,57 @@ class TestMXFP4QAT(unittest.TestCase):
         self.assertGreater(n, 0)  # MLA + FFN targets wrapped
 
 
+class TestWrapperLooksLikeLinear(unittest.TestCase):
+    def test_weight_and_bias_are_the_base_parameters(self):
+        from torch import nn
+
+        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+
+        lin = nn.Linear(8, 16, bias=True)
+        wrapped = MXFP4QATLinear(lin, quantize_act=True)
+        # Identity, not equality: tagging an attribute on the returned tensor
+        # has to land on the parameter the optimizer will actually see.
+        self.assertIs(wrapped.weight, lin.weight)
+        self.assertIs(wrapped.bias, lin.bias)
+
+    def test_weight_is_the_master_not_the_fake_quantized_value(self):
+        # The passthrough exposes the trainable bf16 master. Forward quantizes a
+        # local copy, so .weight deliberately does not reflect what forward uses.
+        from torch import nn
+
+        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+
+        lin = nn.Linear(64, 64, bias=False)
+        wrapped = MXFP4QATLinear(lin, quantize_act=False)
+        self.assertIs(wrapped.weight, lin.weight)
+        x = torch.randn(4, 64)
+        self.assertFalse(
+            torch.equal(wrapped(x), torch.nn.functional.linear(x, lin.weight))
+        )
+
+    def test_per_head_muon_still_tags_wrapped_projections(self):
+        from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
+        from torchtitan.models.kimi_k3.muon import tag_per_head_muon
+        from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
+        from torchtitan.models.kimi_k3.tests.test_kimi_attn_res_model import (
+            _dense_mla_only_config,
+        )
+
+        def build():
+            with torch.device("meta"):
+                return KimiK3AttnResModel(
+                    _dense_mla_only_config(num_hidden_layers=4), num_blocks=2
+                )
+
+        baseline = tag_per_head_muon(build())
+        self.assertGreater(baseline, 0)
+        quantized = build()
+        # all_linear is the scope that reaches the MLA projections; the default
+        # k3_official scope wraps routed experts, which are not per-head targets.
+        wrapped = apply_mxfp4_qat(quantized, scope="all_linear")
+        self.assertGreater(wrapped, 0)
+        self.assertEqual(tag_per_head_muon(quantized), baseline)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,11 +12,13 @@ optimizes matrices while non-2-D params take the AdamW fallback, and
 the per-head path orthogonalizes head blocks independently.
 """
 
+import re
 import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.muon import _newton_schulz, Muon
+from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
+from torchtitan.models.kimi_k3.muon import _newton_schulz, default_muon, Muon
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "bf16 NS on CUDA")
@@ -65,6 +67,71 @@ class TestMuon(unittest.TestCase):
             loss.backward()
             opt.step()
         self.assertLess(W.pow(2).mean().item(), first)
+
+
+class TestWeightDecayScope(unittest.TestCase):
+    """Weight decay must not reach 1-D parameters.
+
+    The container assigns each parameter to the first pattern that ``search``es
+    its FQN, so this replicates that walk over a real model's names rather than
+    asserting on the pattern strings, which would pass even if a pattern never
+    matched anything.
+    """
+
+    def _assign(self, name: str):
+        """The group a parameter lands in, by the container's own rule."""
+        for group in default_muon().param_groups:
+            if re.compile(group.pattern).search(name):
+                return group
+        self.fail(f"no group matched {name}")
+
+    def _named_parameters(self):
+        from torchtitan.models.kimi_k3.tests.test_kimi_attn_res_model import (
+            _dense_mla_only_config,
+        )
+
+        with torch.device("meta"):
+            model = KimiK3AttnResModel(
+                _dense_mla_only_config(num_hidden_layers=4), num_blocks=2
+            )
+        return list(model.named_parameters())
+
+    def test_no_one_dimensional_parameter_is_decayed(self):
+        seen_1d = 0
+        for name, param in self._named_parameters():
+            if param.ndim != 1:
+                continue
+            seen_1d += 1
+            group = self._assign(name)
+            with self.subTest(name=name):
+                self.assertEqual(
+                    group.optimizer_kwargs.get("weight_decay", 0.0),
+                    0.0,
+                    f"{name} is 1-D and must not be decayed",
+                )
+        # Guards the walk itself: a config that produced no 1-D parameters would
+        # make the assertion above vacuous.
+        self.assertGreater(seen_1d, 0)
+
+    def test_matrix_parameters_still_reach_muon(self):
+        muon_named = [
+            name
+            for name, param in self._named_parameters()
+            if self._assign(name).optimizer_name == "Muon"
+        ]
+        self.assertTrue(muon_named)
+        # Every projection matrix, and nothing that Muon would fall back on.
+        for name in muon_named:
+            self.assertTrue(name.endswith(".weight"), name)
+
+    def test_decaying_group_keeps_the_released_value(self):
+        decayed = [
+            g
+            for g in default_muon().param_groups
+            if g.optimizer_kwargs.get("weight_decay")
+        ]
+        self.assertEqual(len(decayed), 1)
+        self.assertEqual(decayed[0].optimizer_kwargs["weight_decay"], 0.1)
 
 
 if __name__ == "__main__":
@@ -166,8 +233,6 @@ class TestPerHeadMuonTagging(unittest.TestCase):
 
     def test_per_head_update_differs_from_full_matrix(self):
         """If these agreed, the tagging would be cosmetic."""
-        import copy
-
         import torch
 
         from torchtitan.models.kimi_k3.muon import Muon
