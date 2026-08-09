@@ -145,6 +145,12 @@ def prepare_image(
             size=(plan.new_height, plan.new_width),
             mode="bicubic",
             align_corners=False,
+            # antialias=True to match the reference resampler. PIL/torchvision
+            # antialias on DOWNSCALE; interpolate defaults to False, which skips the
+            # prefilter and aliases high-frequency detail. Every downscaled image then
+            # differs systematically from what the released preprocessing produces --
+            # no error, just a parity gap that surfaces as worse finetune numbers.
+            antialias=True,
         ).clamp(0.0, 1.0)
     if plan.pad_height or plan.pad_width:
         # Pad bottom/right with zeros, matching the release. Note this happens

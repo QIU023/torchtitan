@@ -330,8 +330,15 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         """Convert HF state dict to tt naming; stack per-expert weights."""
         self._check_not_packed(hf_state_dict)
 
+        from torchtitan.models.kimi_k3.hf_key_map import (
+            kda_layers_zero_based,
+            official_to_titan,
+            UnmappedKey,
+        )
+
         state_dict: dict[str, Any] = {}
         num_experts = self.kimi_config.num_experts
+        kda_zero_based = kda_layers_zero_based(self.kimi_config)
         # {layer: {titan_abstract_key: {expert_id: tensor}}}
         expert_weights_by_layer: dict[str, dict[str, dict[int, Any]]] = {}
 
@@ -360,8 +367,6 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 mm_prefix = _MM_TEXT_PREFIX
                 key = key[len(mm_prefix) :]
             elif key.startswith(("vision_tower.", "mm_projector.")):
-                from torchtitan.models.kimi_k3.hf_key_map import official_to_titan
-
                 # hf_key_map owns the vision naming in both directions.
                 tt_key, _kind = official_to_titan(key, kda_layers=set())
                 state_dict[tt_key] = value
@@ -410,12 +415,6 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             # latent MoE (ffn.latent.*), the AttnRes tail, gated MLA. The table also
             # declines K3 shared experts on purpose (see _hf_key_to_tt) because its
             # answer there belongs to a different layout.
-            from torchtitan.models.kimi_k3.hf_key_map import (
-                kda_layers_zero_based,
-                official_to_titan,
-                UnmappedKey,
-            )
-
             # Shared experts are LAYOUT-DEPENDENT, so hf_key_map decides them: the table
             # only knows Kimi Linear's ffn._moe.shared_experts.w1 while K3's latent path
             # uses ffn.shared_experts.gate_proj. For every other key the table goes first
@@ -444,7 +443,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 try:
                     tt_key, _kind = official_to_titan(
                         official_key,
-                        kda_layers=kda_layers_zero_based(self.kimi_config),
+                        kda_layers=kda_zero_based,
                     )
                 except UnmappedKey:
                     tt_key = None
@@ -457,7 +456,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                     # mm_prefix re-attaches below.
                     tt_key, _kind = official_to_titan(
                         official_key,
-                        kda_layers=kda_layers_zero_based(self.kimi_config),
+                        kda_layers=kda_zero_based,
                     )
                 except UnmappedKey:
                     tt_key = None
