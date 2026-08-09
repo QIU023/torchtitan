@@ -407,15 +407,27 @@ class KimiLoRALinear(nn.Module):
         out_loc = F.linear(x_loc, w_loc) + self._lora_scaling * F.linear(
             F.linear(x_loc, la), lb
         )
+        bias = self.base.bias
         if colwise:
             from torch.distributed.tensor import Shard
 
+            # Colwise shards the OUTPUT features, so this rank's bias slice matches its
+            # output slice and is added locally.
+            if bias is not None:
+                b = bias.to_local() if isinstance(bias, DTensor) else bias
+                out_loc = out_loc + b.to(out_loc.dtype)
             return DTensor.from_local(
                 out_loc, tp_mesh, [Shard(out_loc.dim() - 1)], run_check=False
             )
         # Rowwise: local outputs are partial sums over the in/tp shards.
         out = DTensor.from_local(out_loc, tp_mesh, [Partial()], run_check=False)
-        return out.redistribute(tp_mesh, [Replicate()]).to_local()
+        out = out.redistribute(tp_mesh, [Replicate()]).to_local()
+        # Rowwise does NOT shard the output, so the bias must be added AFTER the partial
+        # sums are reduced -- adding it to out_loc would apply it once per TP rank.
+        if bias is not None:
+            b = bias.full_tensor() if isinstance(bias, DTensor) else bias
+            out = out + b.to(out.dtype)
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -425,6 +437,11 @@ class KimiLoRALinear(nn.Module):
             from torchao.dtypes.nf4tensor import linear_nf4
 
             base_out = linear_nf4(x, self.base.weight)
+            # linear_nf4 takes weight only, so the bias has to be added here as the
+            # mxfp4 and unquantized branches do. Omitting it shifted every biased
+            # projection (attn_gate_proj) by a constant with no error.
+            if self.base.bias is not None:
+                base_out = base_out + self.base.bias
         elif self._quantize_base == "mxfp4":
             if getattr(self, "_tp_style", None) is not None:
                 return self._forward_packed_tp(x)

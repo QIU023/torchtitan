@@ -462,10 +462,41 @@ class MoonViTEncoderLayer(nn.Module):
 
         attn_mask = None
         if plan.valid_total < total:
-            # Mask the padded tail out of the KEY axis. Broadcasting over queries
-            # and heads is enough: every query attends to the same key set.
-            attn_mask = torch.zeros(1, 1, 1, total, dtype=torch.bool, device=q.device)
-            attn_mask[..., : plan.valid_total] = True
+            # Mask the padded KEY positions. Broadcasting over queries and heads is
+            # enough: every query attends to the same key set.
+            #
+            # NOT a prefix. ``_slice_for_shard`` pads PER FRAME -- it takes each frame's
+            # band rows, tops that frame up to ``band``, and only then concatenates the
+            # frames -- so a deficit rank's stream is
+            # [frame0 real, frame0 pad, frame1 real, frame1 pad, ...] and the padding is
+            # INTERLEAVED. A prefix mask admits frame 0's padding into the softmax and
+            # masks frame 1's real keys instead: silently wrong encoder output whenever
+            # t > 1 and some rank is short. (t == 1 has one frame, so a prefix happens to
+            # be right, which is why every earlier test passed.)
+            #
+            # Each rank's real row count follows from the same ceiling split
+            # ``row_partition`` performs, so it needs no extra field or collective:
+            # rank r holds min(band, max(0, h - r * band)) real rows.
+            t, h, _w = plan.full_grid
+            group_size = dist.get_world_size(plan.group)
+            keep = torch.zeros(total, dtype=torch.bool, device=q.device)
+            if t > 0 and plan.band > 0 and total % (group_size * t * plan.band) == 0:
+                row_len = total // (group_size * t * plan.band)
+                pos = 0
+                for r in range(group_size):
+                    real_rows = min(plan.band, max(0, h - r * plan.band))
+                    for _frame in range(t):
+                        keep[pos : pos + real_rows * row_len] = True
+                        pos += plan.band * row_len
+            else:
+                # A plan carrying no grid (``full_grid``/``band`` left at their defaults)
+                # describes a flat patch split with no frame structure, which is how the
+                # attention-level unit tests build it. There the padding IS a trailing
+                # run, so the prefix is exact. Falling back rather than computing from
+                # zeros matters: the general branch above would mark nothing valid and
+                # mask every key.
+                keep[: plan.valid_total] = True
+            attn_mask = keep.view(1, 1, 1, total)
         out = F.scaled_dot_product_attention(
             q_, k_, v_, attn_mask=attn_mask, is_causal=False
         )

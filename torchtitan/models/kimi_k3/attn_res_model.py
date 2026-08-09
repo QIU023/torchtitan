@@ -589,6 +589,12 @@ class KimiK3AttnResModel(KimiK3Model):
             h_final = plain_stream + _scalar_local(
                 self.final_attn_res_alpha, plain_stream
             ) * (h_final - plain_stream)
+        # Keep the PRE-norm hidden state for MTP. The reference feeds MTP's hnorm the
+        # unnormalised state (hnorm(h_pre_norm)); passing the already-normalised one
+        # applies two RMSNorms in series, which is not an identity and silently breaks
+        # parity against official MTP weights. The backbone's own norm still applies to
+        # the backbone logits below.
+        h_pre_norm = h_final
         if self.norm is not None:
             h_final = self.norm(h_final)
 
@@ -599,7 +605,7 @@ class KimiK3AttnResModel(KimiK3Model):
         if self.mtp_layers is not None and self.lm_head is not None:
             from torchtitan.models.kimi_k3.mtp_loss import put_mtp_logits
 
-            self._mtp_logits = self._compute_mtp_logits(tokens, h_final)
+            self._mtp_logits = self._compute_mtp_logits(tokens, h_pre_norm)
             put_mtp_logits(self._mtp_logits)
 
         # _skip_lm_head is an attribute rather than a forward kwarg because PP
@@ -684,19 +690,32 @@ class KimiK3AttnResModel(KimiK3Model):
         # Guard against PP-split stages that dropped some modules
         # (pipeline_module_split replaces non-owned modules with None
         # or Identity).
-        for layer in self.layers.values():
-            if hasattr(layer, "attn_res_proj") and layer.attn_res_proj is not None:
-                nn.init.zeros_(layer.attn_res_proj.weight)
-            if hasattr(layer, "mlp_res_proj") and layer.mlp_res_proj is not None:
-                nn.init.zeros_(layer.mlp_res_proj.weight)
-        if self.final_attn_res_proj is not None:
-            nn.init.zeros_(self.final_attn_res_proj.weight)
-        # Graft-gate alphas start at exact zero (identity anchor).
-        for layer in self.layers.values():
+        # One helper over every AttnRes-bearing block, so a block reachable by a new
+        # route cannot be missed. That is what happened with MTP: this loop walked
+        # self.layers only, while an MTP layer wraps its own KimiAttnResDecoderLayer,
+        # leaving those pseudo-queries and gate alphas at raw torch.empty values after
+        # meta -> to_empty -> init. Garbage alphas are a step-0 NaN, and garbage
+        # pseudo-queries violate the paper's zero-init requirement silently.
+        def _zero_attn_res(block) -> None:
+            for name in ("attn_res_proj", "mlp_res_proj"):
+                m = getattr(block, name, None)
+                if m is not None:
+                    nn.init.zeros_(m.weight)
+            # Graft-gate alphas start at exact zero (identity anchor).
             for name in ("attn_res_alpha", "mlp_res_alpha"):
-                a = getattr(layer, name, None)
+                a = getattr(block, name, None)
                 if isinstance(a, nn.Parameter):
                     nn.init.zeros_(a)
+
+        for layer in self.layers.values():
+            _zero_attn_res(layer)
+        if self.mtp_layers is not None:
+            for mtp in self.mtp_layers.values():
+                block = getattr(mtp, "block", None)
+                if block is not None:
+                    _zero_attn_res(block)
+        if self.final_attn_res_proj is not None:
+            nn.init.zeros_(self.final_attn_res_proj.weight)
         a = getattr(self, "final_attn_res_alpha", None)
         if isinstance(a, nn.Parameter):
             nn.init.zeros_(a)

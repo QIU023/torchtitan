@@ -1388,6 +1388,17 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
         # cache needed. The step-inputs cache stays as a fallback for a schedule that
         # does not forward them.
         grid = grid_thw if grid_thw is not None else self._dep_grid_for_current_mb()
+        if grid is None and float(sentinel_mask.sum()) > 0:
+            # The placeholder path below exists for a batch with NO images. Reaching it
+            # while sentinels are present means grid_thw did not arrive at all -- a wiring
+            # or launcher problem -- and continuing would slice the REAL patch payload to
+            # placeholder length and splice the result. Silent wrong output; raise instead.
+            raise ValueError(
+                "a later DEP vision share has sentinels to fill but received no "
+                "grid_thw: PP normally forwards the batch kwargs to every stage, and "
+                "the step-inputs cache is the fallback. Neither provided it, so the "
+                "patch stream cannot be unpacked to its real length"
+            )
         if grid is None:
             # A micro-batch IS in flight and it has no images. Do NOT skip the tower:
             # gate on the mesh, never on the data. Skipping means this rank does not
@@ -1503,8 +1514,19 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
         # Gate the exchange on the MESH, never on the data: a batch with no images
         # is normal, and a rank that returns early leaves its CP peers waiting in
         # the collective until the watchdog fires.
+        #
+        # KEEP the counts. Discarding them and never calling _select_cp_shard was a
+        # silent defect: prepare_context_parallel_input shards the sequence but leaves
+        # pixel_values whole, so every CP rank encodes every image while holding only a
+        # slice of the sentinels. Without the selection this rank splices ALL the
+        # features into its own shard's sentinels. It does not raise -- it produced a
+        # step-1 forward that differed from the non-DEP path by 0.042 from a shared seed
+        # checkpoint -- and it stayed hidden because on the debug flavor the visual
+        # tokens fill the whole sequence, which makes the sequence shard and the
+        # dynamic-CP row band the same size by coincidence.
+        cp_counts = None
         if cp_active:
-            self._exchange_sentinel_counts(num_sentinels)
+            cp_counts = self._exchange_sentinel_counts(num_sentinels)
 
         if pixel_values is None or grid_thw is None:
             out = embed(input_ids)
@@ -1531,6 +1553,13 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
             from torchtitan.models.kimi_k3.vit_prefetch import prefetch_depth
 
             pf.advance(mb, prefetch_depth())
+        if isinstance(feats, torch.Tensor):
+            feats = [feats]
+        num_rows = sum(f.size(0) for f in feats)
+        # Same selection the non-DEP path performs, and for the same reason. Every CP
+        # rank reaches it because the counts exchange above is mesh-gated, so its
+        # internal all_reduce cannot be left half-issued.
+        feats = self._select_cp_shard(feats, num_rows, cp_counts)
         if isinstance(feats, torch.Tensor):
             feats = [feats]
         num_rows = sum(f.size(0) for f in feats)
