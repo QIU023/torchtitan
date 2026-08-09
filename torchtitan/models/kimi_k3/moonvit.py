@@ -864,6 +864,12 @@ class MoonViT(nn.Module):
         patches_LCHW: torch.Tensor,
         grid_thws: torch.Tensor,
         cp_plan: "CPPatchPlan | None" = None,
+        *,
+        part: str | None = None,
+        upto_block: int | None = None,
+        lo: int | None = None,
+        hi: int | None = None,
+        from_block: int | None = None,
     ):
         """Packed patches -> a list of ``[N_i, text_hidden_size]`` per sample.
 
@@ -871,7 +877,27 @@ class MoonViT(nn.Module):
         (dynamic CP, report 5.2.3). ``grid_thws`` then describes the SHARD -- the
         merger and the segment bounds want that -- while the plan carries the whole
         image's grid, which is what the two position sources need.
+
+        ``part`` selects one share of a tower that spans PP stages (report 5.2.3
+        clause 2): "head", "body" or "tail". The shares have to be reached THROUGH
+        this forward rather than by calling forward_head / forward_body /
+        forward_tail directly, because FSDP2 registers its all-gather on the
+        module's __call__: a direct method call leaves patch_embed.proj.weight a
+        sharded DTensor and the conv fails with "got mixed torch.Tensor and
+        DTensor". That is why n_vit > 1 ran only at dp_shard=1 before.
         """
+        if part is not None:
+            if part == "head":
+                return self.forward_head(
+                    patches_LCHW, grid_thws, cp_plan, upto_block=upto_block
+                )
+            if part == "body":
+                return self.forward_body(patches_LCHW, grid_thws, cp_plan, lo=lo, hi=hi)
+            if part == "tail":
+                return self.forward_tail(
+                    patches_LCHW, grid_thws, cp_plan, from_block=from_block or 0
+                )
+            raise ValueError(f"unknown tower part {part!r}")
         x = self.patch_embed(patches_LCHW, grid_thws, cp_plan)
         x = self.encoder(x, grid_thws, cp_plan)
         merged = tpool_patch_merger(x, grid_thws, self.config.merge_kernel_size)

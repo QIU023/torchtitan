@@ -1365,16 +1365,21 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
             # No images is a normal batch. The tower still has to run, or FSDP2's
             # all-gather for these parameters is issued by some ranks and not
             # others -- the hazard _keep_tower_alive exists for.
-            x = self.vision_tower.forward_head(
+            # Through the tower's __call__, not forward_head directly: FSDP2
+            # registers its all-gather there, and a direct method call leaves
+            # patch_embed.proj.weight a sharded DTensor.
+            x = self.vision_tower(
                 self._dep_placeholder_patches(),
                 self._dep_placeholder_grid(),
+                part="head",
                 upto_block=hi,
             )
             x = x * 0.0
         else:
-            x = self.vision_tower.forward_head(
+            x = self.vision_tower(
                 self._dep_packed_patches(pixel_values, grid_thw),
                 grid_thw,
+                part="head",
                 upto_block=hi,
             )
         return (
@@ -1440,14 +1445,14 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
         x = unpack_stage_patches(patches_padded, real_rows)
 
         if self._dep_role == "body":
-            x = self.vision_tower.forward_body(x, grid, lo=lo, hi=hi)
+            x = self.vision_tower(x, grid, part="body", lo=lo, hi=hi)
             return (
                 pack_stage_patches(x, self._dep_patch_capacity()),
                 text_embeds,
                 sentinel_mask,
             )
 
-        feats = self.vision_tower.forward_tail(x, grid, from_block=lo)
+        feats = self.vision_tower(x, grid, part="tail", from_block=lo)
         if isinstance(feats, torch.Tensor):
             feats = [feats]
         flat = torch.cat(list(feats), dim=0)
