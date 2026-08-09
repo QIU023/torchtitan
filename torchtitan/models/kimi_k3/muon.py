@@ -253,16 +253,26 @@ class KimiOptimizersContainer(OptimizersContainer):
 # the attention projections. Everything that is not a 2-D weight matrix -- norms,
 # biases, the 1-D KDA parameters, embeddings and the LM head -- stays on AdamW,
 # which is the standard Muon recipe rather than something specific to K3.
-_MUON_EXCLUDE_PATTERNS = (
-    r".*norm.*",
+# Parameters Muon skips. Split by dimensionality because weight decay applies
+# to one subset and not the other: decaying a 1-D parameter shrinks a gain or an
+# offset toward zero, which is a change in the function rather than the
+# capacity control decay is meant to be. The 2-D and 3-D entries keep decay.
+_MUON_EXCLUDE_1D_PATTERNS = (
+    r".*norm.*",  # RMSNorm gains
     r".*\.bias$",
+    r".*A_log$",  # KDA decay rates
+    r".*dt_bias$",
+)
+_MUON_EXCLUDE_DECAY_PATTERNS = (
     r".*embed_tokens.*",
     r".*lm_head.*",
-    r".*A_log$",
-    r".*dt_bias$",
-    r".*_res_proj\.weight$",  # AttnRes pseudo-queries are [1, D], not matrices
-    r".*conv1d.*",
+    # AttnRes pseudo-queries are [1, D]: 2-D by ndim, so they stay here, but the
+    # step function treats them as vectors (see step()'s min(shape) > 1 test).
+    # Whether they should also be decay-exempt is a separate numerics question.
+    r".*_res_proj\.weight$",
+    r".*conv1d.*",  # short conv weights are 3-D
 )
+_MUON_EXCLUDE_PATTERNS = _MUON_EXCLUDE_1D_PATTERNS + _MUON_EXCLUDE_DECAY_PATTERNS
 
 
 def default_muon(
@@ -281,21 +291,22 @@ def default_muon(
     """
     from torchtitan.components.optimizer import ParamGroupConfig
 
-    exclude = "|".join(_MUON_EXCLUDE_PATTERNS)
+    adamw_kwargs = {"lr": adamw_lr, "betas": (0.9, 0.95), "eps": 1e-8}
     return KimiOptimizersContainer.Config(
         param_groups=[
-            # AdamW first: the container assigns each parameter to the FIRST
-            # matching pattern, so the narrower exclusion set has to precede the
-            # catch-all Muon group.
+            # AdamW first, and its no-decay half before its decaying half: the
+            # container assigns each parameter to the FIRST matching pattern, so
+            # narrower sets have to precede wider ones, and both have to precede
+            # the catch-all Muon group.
             ParamGroupConfig(
-                pattern=exclude,
+                pattern="|".join(_MUON_EXCLUDE_1D_PATTERNS),
                 optimizer_name="AdamW",
-                optimizer_kwargs={
-                    "lr": adamw_lr,
-                    "betas": (0.9, 0.95),
-                    "eps": 1e-8,
-                    "weight_decay": 0.1,
-                },
+                optimizer_kwargs={**adamw_kwargs, "weight_decay": 0.0},
+            ),
+            ParamGroupConfig(
+                pattern="|".join(_MUON_EXCLUDE_DECAY_PATTERNS),
+                optimizer_name="AdamW",
+                optimizer_kwargs={**adamw_kwargs, "weight_decay": 0.1},
             ),
             ParamGroupConfig(
                 pattern=r".*",

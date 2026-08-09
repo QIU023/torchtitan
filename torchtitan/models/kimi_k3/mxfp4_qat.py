@@ -104,6 +104,20 @@ class MXFP4QATLinear(nn.Module):
     def out_features(self) -> int:
         return self.base.out_features
 
+    # Passthroughs, not conveniences: callers that reach for .weight on a
+    # projection get None from a bare wrapper and silently skip it. That is how
+    # tag_per_head_muon lost every wrapped Q/K/V projection, degrading Per-Head
+    # Muon to full-matrix Muon with no warning (the warning only fires when
+    # NOTHING is tagged, and unwrapped projections still tag). Returning the
+    # base parameter itself, not a copy, keeps attribute tagging effective.
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        return self.base.bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = _fake_quant_mx(self.base.weight, _WEIGHT_ELEM, _BLOCK)
         if self.quantize_act:
