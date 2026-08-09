@@ -154,16 +154,48 @@ class VisionPrefetcher:
             self.ensure(mb + ahead)
 
 
-def install_step_hook(schedule, prefetcher: VisionPrefetcher) -> None:
-    """Make ``schedule.step`` hand its ``kwarg_mbs`` to the prefetcher first.
+class VisionStepInputs:
+    """Per-step ``grid_thw`` lookup for tower shares that never see the batch.
+
+    When the tower spans PP stages (report 5.2.3's "balances vision forward and
+    backward passes across PP stages"), every share needs ``grid_thw`` to recompute its
+    RoPE frequencies and segment bounds. Only the first stage receives the batch, and
+    the value cannot be sent down the pipe: PP's metadata inference pushes dummy values
+    through pipe tensors, and these are used as indices and bounds where a dummy
+    asserts out of bounds.
+
+    ``kwarg_mbs`` is handed to ``schedule.step`` whole, so capturing it at step entry
+    makes every micro-batch's grid available to every stage on this rank, with no change
+    to core and nothing extra on the wire.
+    """
+
+    def __init__(self) -> None:
+        self._kwargs: list[dict] | None = None
+
+    def begin_step(self, kwarg_mbs) -> None:
+        self._kwargs = None if kwarg_mbs is None else list(kwarg_mbs)
+
+    def grid_for(self, mb: int):
+        """This micro-batch's ``grid_thw``, or None when it carries no images."""
+        if self._kwargs is None or not (0 <= mb < len(self._kwargs)):
+            return None
+        return (self._kwargs[mb] or {}).get("grid_thw")
+
+
+def install_step_hook(schedule, observer) -> None:
+    """Make ``schedule.step`` hand its ``kwarg_mbs`` to ``observer.begin_step`` first.
+
+    Takes any object with ``begin_step`` -- :class:`VisionPrefetcher` for the run-ahead
+    and :class:`VisionStepInputs` for a split tower -- so both can be installed on the
+    same schedule without either knowing about the other.
 
     Bound on the instance rather than the class: two schedules in one process (a
-    validator alongside a trainer) must not share a prefetcher.
+    validator alongside a trainer) must not share one.
     """
     original = schedule.step
 
     def step(*args, **kwargs):
-        prefetcher.begin_step(kwargs.get("kwarg_mbs"))
+        observer.begin_step(kwargs.get("kwarg_mbs"))
         return original(*args, **kwargs)
 
     schedule.step = step

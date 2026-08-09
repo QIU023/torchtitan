@@ -1168,7 +1168,252 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
     The compute split the report asks for is unaffected: this stage does the vision
     encode, the text stages do every transformer layer. An embedding lookup is not
     text training compute.
+
+    **Spanning several stages** (report 5.2.3's other clause, "balances vision forward
+    and backward passes across PP stages") is selected by :meth:`set_dep_role`. With
+    one vision stage the role is ``"both"`` and this class behaves exactly as above --
+    that path is left untouched on purpose, since its numerics are already pinned.
+    With n > 1 the roles are:
+
+    * ``head`` -- ``patch_embed`` + its block share, AND ``embed_tokens``. Emits
+      ``(patches_padded, text_embeds, sentinel_mask)``.
+    * ``body`` -- its block share on the patch stream, the other two passed through.
+    * ``tail`` -- its block share + final norm + merge + projector, then the splice.
+
+    Every pipe payload is a float activation, which is what makes this safe: dummy
+    values from PP's metadata inference are harmless because nothing indexes with them.
+    The patch stream is padded to a capacity derived from ``dep_max_*`` because PP
+    sizes its buffers once rather than per step.
     """
+
+    _dep_role: str = "both"
+    _dep_bounds: tuple[int, int] | None = None
+    _dep_num_shares: int = 1
+    _dep_step_inputs = None
+
+    def set_dep_role(
+        self,
+        role: str,
+        *,
+        bounds: tuple[int, int] | None = None,
+        num_shares: int = 1,
+        step_inputs=None,
+    ) -> None:
+        """Declare which share of a split tower this stage carries.
+
+        ``step_inputs`` supplies ``grid_thw`` per micro-batch to the body and tail
+        stages, which never see the batch: PP hands positional args and kwargs to the
+        first stage only. They recompute their block inputs from it rather than
+        receiving them, because RoPE indices and segment bounds cannot survive PP's
+        dummy metadata values.
+        """
+        if role not in ("both", "head", "body", "tail"):
+            raise ValueError(f"unknown DEP vision stage role {role!r}")
+        if role != "both" and bounds is None:
+            raise ValueError(f"role {role!r} needs its block bounds")
+        if role in ("body", "tail") and step_inputs is None:
+            raise ValueError(
+                f"role {role!r} cannot see the batch, so it needs step_inputs to "
+                "recover grid_thw"
+            )
+        self._dep_role = role
+        self._dep_bounds = bounds
+        self._dep_num_shares = num_shares
+        self._dep_step_inputs = step_inputs
+
+    def _dep_grid_for_current_mb(self) -> torch.Tensor | None:
+        """This micro-batch's ``grid_thw``, for a stage that never sees the batch."""
+        si = self._dep_step_inputs
+        mb = getattr(self, "_dep_current_mb", None)
+        if si is None or mb is None:
+            return None
+        return si.grid_for(mb)
+
+    def _dep_patch_capacity(self) -> int:
+        from torchtitan.models.kimi_k3.vit_cp_plan import stage_patch_capacity
+
+        cfg = self.config
+        return stage_patch_capacity(
+            cfg.dep_max_grid_h, cfg.dep_max_grid_w, cfg.dep_max_images
+        )
+
+    def _dep_packed_patches(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Collator patches -> the tower's ``[L, C, P, P]`` layout, padding dropped.
+
+        Same reshape as :meth:`_encode_images_replicated`: the collator emits
+        ``[num_images, max_patches, C*P*P]`` zero-padded to the batch's largest image,
+        while patch_embed is a conv over concatenated images with no padding. The real
+        count comes from ``grid_thw``, not from scanning for zero rows -- a black patch
+        is legitimately all zeros.
+        """
+        cfg = self.config.vision_config
+        counts = grid_thw.prod(dim=-1).tolist()
+        packed = torch.cat(
+            [pixel_values[i, : counts[i]] for i in range(len(counts))], dim=0
+        )
+        packed = packed.reshape(-1, cfg.in_channels, cfg.patch_size, cfg.patch_size)
+        return packed.to(self.vision_tower.patch_embed.proj.weight.dtype)
+
+    def _dep_reject_cp(self) -> None:
+        if self._cp_world_size() > 1:
+            raise NotImplementedError(
+                "a tower split across PP stages does not yet support CP: the shard "
+                "decision and the dynamic-CP patch plan are made inside "
+                "encode_images, and each share would have to recompute them "
+                "identically. Use KIMI_VIT_DEP_STAGES=1 with CP for now."
+            )
+
+    def _dep_forward_head(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        grid_thw: torch.Tensor | None,
+    ):
+        """First share: patch_embed + early blocks, and the text embedding.
+
+        Emits ``(patches_padded, text_embeds, sentinel_mask)``. All three are float
+        activations, so PP's dummy metadata values are harmless -- nothing downstream
+        indexes with them, which is the property that lets the tower span stages at
+        all.
+        """
+        from torchtitan.models.kimi_k3.vit_cp_plan import pack_stage_patches
+
+        embed = self.language_model.embed_tokens
+        if embed is None:
+            raise ValueError(
+                "the DEP vision head stage must own embed_tokens: it produces the "
+                "text embedding stream, and the ids cannot be forwarded onward"
+            )
+        self._dep_reject_cp()
+
+        sentinel = self.config.vision_token_id
+        is_sentinel = input_ids == sentinel
+        # Embed with the sentinel replaced, exactly as _splice_per_token does: the
+        # sentinel id is negative, so embedding it directly indexes out of bounds.
+        safe_ids = torch.where(is_sentinel, torch.zeros_like(input_ids), input_ids)
+        text_embeds = embed(safe_ids)
+        sentinel_mask = is_sentinel.to(text_embeds.dtype)
+
+        _, hi = self._dep_bounds
+        if pixel_values is None or grid_thw is None:
+            # No images is a normal batch. The tower still has to run, or FSDP2's
+            # all-gather for these parameters is issued by some ranks and not
+            # others -- the hazard _keep_tower_alive exists for.
+            x = self.vision_tower.forward_head(
+                self._dep_placeholder_patches(),
+                self._dep_placeholder_grid(),
+                upto_block=hi,
+            )
+            x = x * 0.0
+        else:
+            x = self.vision_tower.forward_head(
+                self._dep_packed_patches(pixel_values, grid_thw),
+                grid_thw,
+                upto_block=hi,
+            )
+        return (
+            pack_stage_patches(x, self._dep_patch_capacity()),
+            text_embeds,
+            sentinel_mask,
+        )
+
+    def _dep_forward_later(self, patches_padded, text_embeds, sentinel_mask):
+        """A body or tail share.
+
+        PP passes the upstream stage's output tuple POSITIONALLY, so ``forward``'s
+        three parameters carry the patch stream, the text embeddings and the sentinel
+        mask here -- not ids, pixels and grid. Renamed at this boundary rather than
+        threaded onward under misleading names.
+        """
+        from torchtitan.models.kimi_k3.vit_cp_plan import (
+            pack_stage_patches,
+            unpack_stage_patches,
+        )
+
+        self._dep_reject_cp()
+        lo, hi = self._dep_bounds
+
+        if getattr(self, "_dep_current_mb", None) is None:
+            # PP's metadata inference runs forward with no micro-batch in flight.
+            # Shapes are what it measures, and every payload keeps its shape through
+            # this stage (the tail's output matches text_embeds because the per-token
+            # splice preserves length), so passing them through is safe and enough.
+            return (
+                (patches_padded, text_embeds, sentinel_mask)
+                if self._dep_role == "body"
+                else text_embeds
+            )
+
+        grid = self._dep_grid_for_current_mb()
+        if grid is None:
+            # A micro-batch IS in flight and it has no images. Do NOT skip the tower:
+            # gate on the mesh, never on the data. Skipping means this rank does not
+            # issue FSDP2's all-gather for these blocks while its peers do, and they
+            # wait until the NCCL watchdog fires. The head sent a placeholder-sized
+            # payload for exactly this case, so the shapes line up.
+            grid = self._dep_placeholder_grid()
+
+        real_rows = int(grid.prod(dim=-1).sum())
+        x = unpack_stage_patches(patches_padded, real_rows)
+
+        if self._dep_role == "body":
+            x = self.vision_tower.forward_body(x, grid, lo=lo, hi=hi)
+            return (
+                pack_stage_patches(x, self._dep_patch_capacity()),
+                text_embeds,
+                sentinel_mask,
+            )
+
+        feats = self.vision_tower.forward_tail(x, grid, from_block=lo)
+        if isinstance(feats, torch.Tensor):
+            feats = [feats]
+        flat = torch.cat(list(feats), dim=0)
+        num_sentinels = int(sentinel_mask.sum().item())
+        if num_sentinels == 0:
+            # Keep the tower in the loss graph even with nothing to splice, or this
+            # rank skips a gradient reduction its peers issue.
+            return self._keep_tower_alive(text_embeds, flat)
+        if num_sentinels != flat.size(0):
+            raise ValueError(
+                f"{num_sentinels} sentinel(s) but {flat.size(0)} visual token(s): a "
+                "tower split across stages supports only the per-token collator "
+                "convention, where the sequence length is already correct. The "
+                "one-sentinel-per-image convention changes the sequence length per "
+                "sample, which PP cannot size a buffer for"
+            )
+        mask = (sentinel_mask > 0.5).unsqueeze(-1).expand_as(text_embeds)
+        return text_embeds.masked_scatter(mask, flat.to(text_embeds.dtype))
+
+    def _dep_placeholder_grid(self) -> torch.Tensor:
+        """Grid for the smallest image a share can process: one merged token."""
+        merge = self.config.vision_config.merge_kernel_size[0]
+        return torch.tensor(
+            [[1, merge, merge]],
+            dtype=torch.int32,
+            device=self.vision_tower.patch_embed.proj.weight.device,
+        )
+
+    def _dep_placeholder_patches(self) -> torch.Tensor:
+        """Zero PATCHES matching :meth:`_dep_placeholder_grid`.
+
+        Distinct from :meth:`_tower_placeholder`, which returns FEATURES because it
+        runs the whole tower -- correct for the single-stage keep-alive, wrong here:
+        a share must exercise only its own parameters' collectives, and feeding
+        features into ``forward_head`` reaches the patch conv with a 2-D input.
+        """
+        cfg = self.config.vision_config
+        weight = self.vision_tower.patch_embed.proj.weight
+        merge = cfg.merge_kernel_size[0]
+        return torch.zeros(
+            merge * merge,
+            cfg.in_channels,
+            cfg.patch_size,
+            cfg.patch_size,
+            device=weight.device,
+            dtype=weight.dtype,
+        )
 
     def forward(
         self,
@@ -1177,6 +1422,14 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
         grid_thw: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # A split tower routes to the role bodies. "both" falls through to the
+        # single-stage path below, unchanged -- its numerics are already pinned and
+        # nothing here should perturb them.
+        if self._dep_role == "head":
+            return self._dep_forward_head(input_ids, pixel_values, grid_thw)
+        if self._dep_role in ("body", "tail"):
+            return self._dep_forward_later(input_ids, pixel_values, grid_thw)
+
         embed = self.language_model.embed_tokens
         if embed is None:
             raise ValueError(
