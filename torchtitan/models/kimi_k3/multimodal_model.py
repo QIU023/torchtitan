@@ -1211,11 +1211,6 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
             raise ValueError(f"unknown DEP vision stage role {role!r}")
         if role != "both" and bounds is None:
             raise ValueError(f"role {role!r} needs its block bounds")
-        if role in ("body", "tail") and step_inputs is None:
-            raise ValueError(
-                f"role {role!r} cannot see the batch, so it needs step_inputs to "
-                "recover grid_thw"
-            )
         self._dep_role = role
         self._dep_bounds = bounds
         self._dep_num_shares = num_shares
@@ -1319,7 +1314,9 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
             sentinel_mask,
         )
 
-    def _dep_forward_later(self, patches_padded, text_embeds, sentinel_mask):
+    def _dep_forward_later(
+        self, patches_padded, text_embeds, sentinel_mask, grid_thw=None
+    ):
         """A body or tail share.
 
         PP passes the upstream stage's output tuple POSITIONALLY, so ``forward``'s
@@ -1346,7 +1343,11 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
                 else text_embeds
             )
 
-        grid = self._dep_grid_for_current_mb()
+        # PP forwards the batch kwargs to EVERY stage, not just the first, so a later
+        # share usually has grid_thw handed to it directly -- no pipe payload and no
+        # cache needed. The step-inputs cache stays as a fallback for a schedule that
+        # does not forward them.
+        grid = grid_thw if grid_thw is not None else self._dep_grid_for_current_mb()
         if grid is None:
             # A micro-batch IS in flight and it has no images. Do NOT skip the tower:
             # gate on the mesh, never on the data. Skipping means this rank does not
@@ -1415,21 +1416,40 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
             dtype=weight.dtype,
         )
 
-    def forward(
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        """Dispatch on the role. Untyped ``*args`` for one specific reason.
+
+        PP forwards the batch's kwargs to EVERY stage, and a later share also receives
+        its upstream's three-tensor output POSITIONALLY. With a named signature those
+        collide -- "got multiple values for argument 'pixel_values'" -- because the
+        patch stream binds to ``input_ids`` and the batch's own ``pixel_values`` then
+        arrives by keyword as well. Taking both positionally and pulling the batch
+        metadata out by name keeps the two channels apart.
+        """
+        if self._dep_role in ("body", "tail"):
+            patches, text_embeds, sentinel_mask = args[:3]
+            return self._dep_forward_later(
+                patches, text_embeds, sentinel_mask, grid_thw=kwargs.get("grid_thw")
+            )
+
+        input_ids = args[0] if args else kwargs["input_ids"]
+        pixel_values = args[1] if len(args) > 1 else kwargs.get("pixel_values")
+        grid_thw = args[2] if len(args) > 2 else kwargs.get("grid_thw")
+        if self._dep_role == "head":
+            return self._dep_forward_head(input_ids, pixel_values, grid_thw)
+        return self._forward_single_stage(input_ids, pixel_values, grid_thw)
+
+    def _forward_single_stage(
         self,
         input_ids: torch.Tensor,
         pixel_values: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
-        **kwargs,
     ) -> torch.Tensor:
-        # A split tower routes to the role bodies. "both" falls through to the
-        # single-stage path below, unchanged -- its numerics are already pinned and
-        # nothing here should perturb them.
-        if self._dep_role == "head":
-            return self._dep_forward_head(input_ids, pixel_values, grid_thw)
-        if self._dep_role in ("body", "tail"):
-            return self._dep_forward_later(input_ids, pixel_values, grid_thw)
+        """The unsplit vision stage: tower + embed + splice, in one place.
 
+        Left exactly as it was when its numerics were pinned; the role dispatch above
+        is the only thing in front of it.
+        """
         embed = self.language_model.embed_tokens
         if embed is None:
             raise ValueError(

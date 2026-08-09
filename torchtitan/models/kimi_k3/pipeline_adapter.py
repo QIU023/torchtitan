@@ -1265,20 +1265,51 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     mm_config = model.config
     inner_parallelize = kwargs["parallelize_fn"]
 
+    step_inputs = None
+    if dep_enabled():
+        from torchtitan.models.kimi_k3.vit_prefetch import VisionStepInputs
+
+        # Marker submodules so each vision chunk knows WHICH share it is. They must
+        # really exist on the module being split: _split_module keeps children whose
+        # name is in the chunk's FQN list and sets the rest to None, so a marker that
+        # matched nothing (the previous scheme) leaves every share indistinguishable.
+        # They hold no parameters, so they add nothing to any stage.
+        for i in range(dep_vision_stages()):
+            inner.add_module(f"{_DEP_VISION_FQN}{i}", nn.Module())
+        step_inputs = VisionStepInputs()
+        # Read back by the pipelining_fn, which needs to hook the schedule that does
+        # not exist yet at this point.
+        inner._dep_step_inputs_holder = step_inputs
+
     def _parallelize_with_tower(part: nn.Module, **pk):
         if dep_enabled():
             from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
 
-            # The vision chunk is the one that kept embed_tokens and NOTHING else:
-            # its FQN entry matched no layer, so layers is empty. Detected by that
-            # shape rather than by call order, because a rank holding several
-            # virtual stages sees them in an order this function is not told.
-            layers = getattr(part, "layers", None)
-            has_embed = getattr(part, "embed_tokens", None) is not None
-            if has_embed and (layers is None or len(layers) == 0):
-                return inner_parallelize(
-                    KimiK3ViTStage.from_parts(mm_config, tower, part), **pk
-                )
+            # Which vision share is this? The marker submodule that survived
+            # _split_module carries the index, so identity comes from the chunk
+            # itself. Call order cannot be used: a rank holding several virtual
+            # stages sees them in an order this function is not told. And "holds
+            # embed_tokens and no layers" only identifies share 0 -- the later
+            # shares hold neither, so they are indistinguishable from a text chunk
+            # without the marker.
+            share = _dep_vision_share_index(part)
+            if share is not None:
+                n_vit = dep_vision_stages()
+                stage = KimiK3ViTStage.from_parts(mm_config, tower, part)
+                if n_vit > 1:
+                    bounds = stage.vision_tower.block_bounds(n_vit)
+                    role = (
+                        "head"
+                        if share == 0
+                        else ("tail" if share == n_vit - 1 else "body")
+                    )
+                    stage.set_dep_role(
+                        role,
+                        bounds=bounds[share],
+                        num_shares=n_vit,
+                        step_inputs=step_inputs,
+                    )
+                return inner_parallelize(stage, **pk)
             _register_mm_prefix_hooks(part)
             return inner_parallelize(part, **pk)
 
@@ -1291,6 +1322,71 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
 
     kwargs["parallelize_fn"] = _parallelize_with_tower
     return inner
+
+
+def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
+    """Give every vision stage its micro-batch index, and the step its ``kwarg_mbs``.
+
+    Required whenever the tower spans stages, not just for the run-ahead: a body or
+    tail share reads ``grid_thw`` by micro-batch index, and without the index it takes
+    the metadata-inference path -- passing activations through unprocessed, with no
+    error. A silently unsplit tower and a silently un-spliced batch are exactly the
+    failure shape to design out, so this is installed unconditionally under DEP and its
+    count is logged.
+
+    Returns how many stages were wired, so a caller can assert engagement instead of
+    inferring it from numerics.
+    """
+    from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+    from torchtitan.models.kimi_k3.vit_prefetch import install_step_hook
+
+    if step_inputs is not None:
+        install_step_hook(pp_schedule, step_inputs)
+
+    wired = 0
+    for stage in _iter_schedule_stages(pp_schedule):
+        submod = getattr(stage, "submod", None)
+        if not isinstance(submod, KimiK3ViTStage):
+            continue
+        orig_fwd = stage.forward_one_chunk
+
+        def patched(fwd_chunk_id, args, kwargs=None, _f=orig_fwd, _m=submod, **kw):
+            _m._dep_current_mb = fwd_chunk_id
+            try:
+                return _f(fwd_chunk_id, args, kwargs, **kw)
+            finally:
+                _m._dep_current_mb = None
+
+        stage.forward_one_chunk = patched
+        wired += 1
+
+    if wired:
+        logger.info(
+            "DEP vision stage wiring: %d stage(s) on this rank, roles %s",
+            wired,
+            [
+                getattr(s.submod, "_dep_role", "?")
+                for s in _iter_schedule_stages(pp_schedule)
+                if isinstance(getattr(s, "submod", None), KimiK3ViTStage)
+            ],
+        )
+    return wired
+
+
+def _dep_vision_share_index(part: nn.Module) -> int | None:
+    """Which vision share ``part`` is, from the marker submodule that survived the split.
+
+    Returns None for a text chunk. Reading identity off the chunk rather than off call
+    order matters because a rank holding several virtual stages receives them in an
+    order ``parallelize_fn`` is not told.
+    """
+    for name, child in part.named_children():
+        if child is not None and name.startswith(_DEP_VISION_FQN):
+            try:
+                return int(name[len(_DEP_VISION_FQN) :])
+            except ValueError:
+                continue
+    return None
 
 
 _MM_INNER_PREFIX = "language_model."
@@ -1360,24 +1456,14 @@ def dep_vision_stages() -> int:
     Growing this therefore trades text stages for vision stages, which is the
     balance the report is describing and which needs measurement to set.
 
-    Values above 1 are rejected here rather than left to fail downstream. Only the
-    vision chunk holding ``embed_tokens`` becomes a ``KimiK3ViTStage``, so the extra
-    chunks would be zero-parameter shells and the run died in the optimizer with
-    "param_groups pattern '.*' matched no parameters" -- a message that says nothing
-    about the actual gap. The block-split arithmetic this needs is already in place
-    and tested (``MoonViTEncoder.run_blocks``); what is missing is the stage wiring.
+    Above 1 the tower is split: share 0 takes ``patch_embed`` plus its blocks and
+    ``embed_tokens``, the last share takes its blocks plus the projector and the
+    splice, and what crosses each hop is a fixed-capacity patch stream alongside the
+    text embeddings. See ``KimiK3ViTStage.set_dep_role``.
     """
     import os
 
-    n = max(1, int(os.environ.get("KIMI_VIT_DEP_STAGES", "1")))
-    if n > 1:
-        raise NotImplementedError(
-            f"KIMI_VIT_DEP_STAGES={n}: splitting the tower across PP stages is "
-            "designed but not wired -- only the chunk holding embed_tokens becomes a "
-            "vision stage, so the others would carry no parameters. See "
-            "VIT_DEP_DESIGN_2026-08-07.md, 'Clause (2), step 2'. Use 1 for now."
-        )
-    return n
+    return max(1, int(os.environ.get("KIMI_VIT_DEP_STAGES", "1")))
 
 
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
@@ -1477,6 +1563,17 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     if prefetch_depth() <= 0:
         return
 
+    if dep_vision_stages() > 1:
+        # The run-ahead prefetches by calling encode_images, which assumes one stage
+        # performs the whole encode. With the tower split that would run every block
+        # on share 0 and defeat the split. Refuse rather than silently negate it.
+        warnings.warn(
+            f"KIMI_VIT_PREFETCH={prefetch_depth()} ignored: the run-ahead has no "
+            f"cross-stage form yet, and KIMI_VIT_DEP_STAGES="
+            f"{dep_vision_stages()} splits the tower. Running without the run-ahead."
+        )
+        return
+
     vision_stage_modules = [m for m in model_parts if isinstance(m, KimiK3ViTStage)]
     if not vision_stage_modules:
         # Normal on a text-only rank: the vision stage is global stage 0, so only
@@ -1508,24 +1605,12 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         module._vision_prefetcher = prefetcher
         install_step_hook(pp_schedule, prefetcher)
 
-    # Stash the schedule-owned chunk id on the module for the duration of each
-    # forward. Not a thread-local this time: the module instance is already
-    # per-stage, and a plain attribute cannot be read from the wrong thread by
-    # accident -- which is the failure the adapter's thread-local version has.
+    # The micro-batch index patch lives in _install_vision_stage_wiring, which runs
+    # first and unconditionally under DEP -- patching it here too would wrap
+    # forward_one_chunk twice.
     for stage in _iter_schedule_stages(pp_schedule):
-        submod = getattr(stage, "submod", None)
-        if not isinstance(submod, KimiK3ViTStage):
+        if not isinstance(getattr(stage, "submod", None), KimiK3ViTStage):
             continue
-        orig_fwd = stage.forward_one_chunk
-
-        def patched(fwd_chunk_id, args, kwargs=None, _f=orig_fwd, _m=submod, **kw):
-            _m._dep_current_mb = fwd_chunk_id
-            try:
-                return _f(fwd_chunk_id, args, kwargs, **kw)
-            finally:
-                _m._dep_current_mb = None
-
-        stage.forward_one_chunk = patched
         logger.info(
             "DEP vision prefetch installed: depth=%d on stage %s",
             prefetch_depth(),
@@ -1552,14 +1637,19 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
     from torchtitan.distributed.pipeline_parallel import pipeline_llm
 
     model = _unwrap_multimodal_for_pp(model, kwargs)
+    step_inputs = getattr(model, "_dep_step_inputs_holder", None)
     _inject_kimi_k3_fqns(model, kwargs)
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
     )
-    # Every kimi_k3 flavor registers THIS pipelining_fn, so the DEP run-ahead has
-    # to be installed here; having it only in pipeline_llm_with_cache_adapter left
-    # it dead code, and its absence read as "the prefetch changes nothing".
+    # Every kimi_k3 flavor registers THIS pipelining_fn, so the DEP wiring has to be
+    # installed here; having it only in pipeline_llm_with_cache_adapter left it dead
+    # code, and its absence read as "the prefetch changes nothing".
     if dep_enabled():
+        # Wiring first, and unconditionally: a split tower's later shares need the
+        # micro-batch index to find grid_thw, and without it they pass activations
+        # through with no error at all.
+        _install_vision_stage_wiring(pp_schedule, step_inputs)
         _install_vision_prefetch(pp_schedule, model_parts)
     passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
 

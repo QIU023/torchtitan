@@ -250,8 +250,10 @@ class TestViTStageRoles(unittest.TestCase):
             stage.set_dep_role("middle", bounds=(0, 1))
         with self.assertRaises(ValueError):
             stage.set_dep_role("head")  # no bounds
-        with self.assertRaises(ValueError):
-            stage.set_dep_role("tail", bounds=(0, 1))  # no step_inputs
+        # step_inputs is NOT required: PP forwards the batch kwargs to every stage, so
+        # a later share normally reads grid_thw straight from them and the cache is
+        # only a fallback.
+        stage.set_dep_role("tail", bounds=(0, 1))
 
     def test_gradient_reaches_both_the_head_and_tail_blocks(self):
         """The report balances vision BACKWARD passes too, so both shares must train."""
