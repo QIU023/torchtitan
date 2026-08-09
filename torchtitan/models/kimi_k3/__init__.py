@@ -61,6 +61,9 @@ except ImportError as _err:
     _KIMI_IMPORT_ERROR = _err
 
 __all__ = [
+    # Imported in the guarded block above for re-export; listed here so that is
+    # deliberate rather than an unused import.
+    "SCALING_LAW_TABLE",
     "KimiAttnResDecoderLayer",
     "KimiDecoderLayer",
     "KimiDeltaAttention",
@@ -207,7 +210,28 @@ def _discovered_flavor_names() -> list[str]:
 # Flavor-name dict for registry-discovery consumers (veRL's torchtitan
 # engine looks for a module-level ``*_configs`` dict and uses its KEYS
 # with ``model_registry``). Values are unused.
-kimi_k3_configs: dict[str, None] = {name: None for name in _discovered_flavor_names()}
+def _flavor_config_dict() -> dict[str, None]:
+    """Names for registry discovery, or empty when fla-core is absent.
+
+    Discovery reads this as a module-level dict, so it stays one rather than
+    becoming a lazy attribute. But building it walks config_registry ->
+    model_configs -> model, and model imports fla-core at module scope. Without
+    the try, importing this package at all fails on a machine without fla --
+    which turns the pointed "requires fla-core" message from something raised
+    when a model is built into something raised when the package is read.
+    """
+    try:
+        return {name: None for name in _discovered_flavor_names()}
+    except ImportError as err:
+        logger.warning(
+            "kimi_k3 flavor discovery unavailable (%s); the flavor list is empty. "
+            "Building any kimi_k3 model still raises with instructions.",
+            err,
+        )
+        return {}
+
+
+kimi_k3_configs: dict[str, None] = _flavor_config_dict()
 # The pre-rename name, same object. Discovery takes the first module-level
 # ``*_configs`` dict it finds, so both spellings resolve identically.
 kimi_linear_configs = kimi_k3_configs
