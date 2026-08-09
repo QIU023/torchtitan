@@ -289,7 +289,16 @@ class MoonViTPatchEmbed(nn.Module):
                     pos_2d.dtype
                 ).unsqueeze(1)
                 embs.append(pos_3d.reshape(-1, pos_3d.shape[-1]))
-        return x_LD + torch.cat(embs, dim=0)
+        table = torch.cat(embs, dim=0)
+        # Under vision TP ``_spatial`` returns a Replicate DTensor, while dynamic CP's
+        # caller builds its whole-image placeholder as a plain tensor -- adding those
+        # raises "got mixed torch.Tensor and DTensor". Taking ``to_local`` is exact here
+        # rather than a lossy fallback: the table is REPLICATED, so the local shard IS
+        # the full table. TP x dynamic CP had no coverage until the matrix was rerun on
+        # this head, which is where it surfaced.
+        if isinstance(table, DTensor) and not isinstance(x_LD, DTensor):
+            table = table.to_local()
+        return x_LD + table
 
     def forward(
         self,
@@ -312,7 +321,17 @@ class MoonViTPatchEmbed(nn.Module):
             full = self.add_pos_emb(
                 full, torch.tensor([[t, h, w]], device=grid_thws.device)
             )
-            return x + _slice_for_shard(full, cp_plan)
+            pos = _slice_for_shard(full, cp_plan)
+            # Slice on a LOCAL tensor -- _slice_for_shard indexes rows, so it must not run
+            # on a DTensor -- then match x's type. Under vision TP x is a DTensor and the
+            # position table is REPLICATED across the TP axis, so wrapping the slice as
+            # Replicate is exact rather than a coercion. Adding the two without this is
+            # the "mixed torch.Tensor and DTensor" failure that TP x dynamic CP hit.
+            if isinstance(x, DTensor) and not isinstance(pos, DTensor):
+                pos = DTensor.from_local(
+                    pos, x.device_mesh, (Replicate(),), run_check=False
+                )
+            return x + pos
         return self.add_pos_emb(x, grid_thws)
 
 
