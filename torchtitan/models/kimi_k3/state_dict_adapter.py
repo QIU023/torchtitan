@@ -141,12 +141,28 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         self, path: str, from_quantized: bool = False
     ) -> HuggingFaceStorageReader:
         if from_quantized:
-            raise NotImplementedError(
-                "Quantized (packed) Kimi checkpoints are not supported yet: "
-                "the MXFP4 unpack path lands once the K3 report fixes the "
-                "exact packing. Refusing to silently treat packed weights "
-                "as ordinary values."
+            # torch's own reader rather than a local unpack path. Its MXFP4
+            # handling is format-compatible with what packed_mxfp4.py implements
+            # on every axis that can be checked without a released artifact: the
+            # same 16-entry E2M1 value table, the same 32-value group, and it
+            # dispatches on the `_blocks` / `_scales` suffixes that K3's
+            # `.weight_blocks` / `.scales` keys carry.
+            #
+            # What is NOT checked, for want of a packed K3 checkpoint on this
+            # box, is the blocks tensor's dimension order -- upstream expects
+            # [a, b, groups, bytes]. So this path is exercised by an explicit
+            # from_quantized=True and is not the default. It replaces a blanket
+            # refusal whose stated reason (waiting on the report to fix the
+            # packing) is stale: the packing is known and implemented.
+            #
+            # block_size is left at its default because MXFP4 does not use it --
+            # it is the fp8 blockwise scale tile, and the group size for MXFP4
+            # comes from the blocks tensor itself.
+            from torch.distributed.checkpoint.quantized_hf_storage import (
+                QuantizedHuggingFaceStorageReader,
             )
+
+            return QuantizedHuggingFaceStorageReader(path)
         return HuggingFaceStorageReader(path)
 
     @staticmethod

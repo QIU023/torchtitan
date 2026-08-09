@@ -9,6 +9,7 @@
 Uses meta-device builds -- key/shape coverage only, no weight values.
 """
 
+import inspect
 import unittest
 
 import torch
@@ -95,11 +96,56 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
                 }
             )
 
-    def test_quantized_reader_rejected(self):
+    def test_quantized_reader_dequantizes(self):
+        """from_quantized must return a reader that UNPACKS, not a plain one.
+
+        This replaces a test that pinned a blanket NotImplementedError. The hazard
+        that refusal guarded -- packed bytes reaching the model as if they were
+        values -- is what is asserted here instead: the reader has to be the
+        dequantizing subclass. A plain HuggingFaceStorageReader would pass uint8
+        blocks straight through.
+        """
+        from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
+        from torch.distributed.checkpoint.quantized_hf_storage import (
+            QuantizedHuggingFaceStorageReader,
+        )
+
         spec, _ = _build_state_dict("kimi_linear_194m_block_attn_res")
         adapter = KimiLinearStateDictAdapter(spec.model, hf_assets_path=None)
-        with self.assertRaises(NotImplementedError):
-            adapter.get_hf_storage_reader("/nonexistent", from_quantized=True)
+        reader = adapter.get_hf_storage_reader("/nonexistent", from_quantized=True)
+        self.assertIsInstance(reader, QuantizedHuggingFaceStorageReader)
+
+        plain = adapter.get_hf_storage_reader("/nonexistent")
+        self.assertIsInstance(plain, HuggingFaceStorageReader)
+        self.assertNotIsInstance(plain, QuantizedHuggingFaceStorageReader)
+
+    def test_our_e2m1_table_matches_the_readers(self):
+        """The two decoders have to agree on the value table, or a checkpoint read
+        through torch's reader would differ from one read through ours."""
+        import re
+
+        from torch.distributed.checkpoint.quantized_hf_storage import (
+            QuantizedHuggingFaceStorageReader,
+        )
+
+        from torchtitan.models.kimi_k3.packed_mxfp4 import (
+            _E2M1_VALUES,
+            MXFP4_GROUP_SIZE,
+        )
+
+        src = inspect.getsource(
+            QuantizedHuggingFaceStorageReader._dequantize_tensor_mxfp4
+        )
+        # Anchored past the "[" so the 4 in "FP4_VALUES" is not read as an entry.
+        start = src.index("[", src.index("FP4_VALUES"))
+        table = src[start : src.index("]", start)]
+        theirs = tuple(float(v) for v in re.findall(r"[-+]?\d+\.\d+|[-+]?\d+", table))
+        # Length first: this reads upstream source, so a reformat there could
+        # silently extract nothing and make the comparison vacuous. Sixteen is the
+        # only correct answer for E2M1, so assert it and let a change be loud.
+        self.assertEqual(len(theirs), 16)
+        self.assertEqual(theirs, tuple(float(v) for v in _E2M1_VALUES))
+        self.assertEqual(MXFP4_GROUP_SIZE, 32)
 
     def test_tied_embedding_alias_warns(self):
         spec, sd = _build_state_dict("kimi_linear_194m_block_attn_res")
