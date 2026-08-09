@@ -313,6 +313,7 @@ class KimiK3AttnResModel(KimiK3Model):
         config: KimiK3Config,
         *,
         num_blocks: int,
+        layers_per_block: int | None = None,
         gated: bool = False,
     ) -> None:
         # Skip KimiK3Model.__init__'s layer build (it builds
@@ -330,12 +331,27 @@ class KimiK3AttnResModel(KimiK3Model):
         # config ships attn_res_block_size=12 over 93 layers, i.e. 7 full
         # blocks plus a 9-layer partial tail (report sec 2.2: "we partition
         # its layers into 8 blocks with 12-layer size, giving a partial final
-        # block"). So layers_per_block is ceil-derived and the last block is
-        # allowed to be short; the commit rule (layer_idx %% layers_per_block)
-        # is unchanged and simply never fires inside the partial tail, which
-        # matches the reference (its remainder layer does not commit).
+        # block"). The last block is allowed to be short; the commit rule
+        # (layer_idx % layers_per_block) simply never fires inside the partial
+        # tail, matching the reference (its remainder layer does not commit).
+        #
+        # layers_per_block is the operative quantity, so take it directly when
+        # the caller knows the block size. Deriving it from num_blocks instead
+        # loses information and cannot be inverted: block size 12 over 21
+        # layers is 2 blocks, but ceil(21 / 2) is 11, and no num_blocks
+        # whatsoever satisfies ceil(21 / n) == 12. The ceil fallback below is
+        # exact when num_blocks came from the config directly (the official
+        # pair 93/8 gives 12) and is only lossy for a size-derived count.
+        if layers_per_block is not None:
+            if not 1 <= layers_per_block <= n_layers:
+                raise ValueError(
+                    f"layers_per_block={layers_per_block} out of range "
+                    f"[1, {n_layers}]"
+                )
+            self.layers_per_block = layers_per_block
+        else:
+            self.layers_per_block = -(-n_layers // num_blocks)  # ceil
         self.num_blocks = num_blocks
-        self.layers_per_block = -(-n_layers // num_blocks)  # ceil
         self.num_committed_blocks = -(-n_layers // self.layers_per_block)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)

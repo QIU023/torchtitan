@@ -363,7 +363,12 @@ _PASSTHROUGH_CONFIG_FIELDS = (
 )
 
 
-def titan_config_to_official(kimi_config, *, num_blocks: int | None = None) -> dict:
+def titan_config_to_official(
+    kimi_config,
+    *,
+    num_blocks: int | None = None,
+    layers_per_block: int | None = None,
+) -> dict:
     """Serialize a ``KimiK3Config`` to the official HF text config schema.
 
     ``num_blocks`` is the Block AttnRes block count; the released config states
@@ -395,12 +400,18 @@ def titan_config_to_official(kimi_config, *, num_blocks: int | None = None) -> d
         "rope_type": "default",
         "rope_theta": getattr(kimi_config, "rope_theta", 10000.0),
     }
-    if num_blocks is not None:
-        # Same ceil derivation KimiK3AttnResModel uses, so the value round-trips
-        # to the same block layout. A partial final block is the released
-        # arrangement, not an edge case: block size 12 over 93 layers is 7 full
-        # blocks plus a 9-layer tail (report sec 2.2).
-        cfg["attn_res_block_size"] = -(-kimi_config.num_hidden_layers // num_blocks)
+    if layers_per_block is not None or num_blocks is not None:
+        # A partial final block is the released arrangement, not an edge case:
+        # block size 12 over 93 layers is 7 full blocks plus a 9-layer tail
+        # (report sec 2.2). Prefer the model's actual layers_per_block; the ceil
+        # fallback reproduces what KimiK3AttnResModel derives from num_blocks
+        # alone, which is exact for a config-supplied count but cannot recover a
+        # size-derived one (see that constructor for why it is not invertible).
+        cfg["attn_res_block_size"] = (
+            layers_per_block
+            if layers_per_block is not None
+            else -(-kimi_config.num_hidden_layers // num_blocks)
+        )
 
     cfg["linear_attn_config"] = {
         "num_heads": kimi_config.kda_num_heads,
@@ -455,6 +466,7 @@ def titan_config_to_official_multimodal(
     vision_config,
     *,
     num_blocks: int | None = None,
+    layers_per_block: int | None = None,
     media_placeholder_token_id: int = 163605,
 ) -> dict:
     """The released config shape: text and vision nested, not flattened.
@@ -467,7 +479,9 @@ def titan_config_to_official_multimodal(
     return {
         "model_type": "kimi_k3",
         "architectures": ["KimiK3ForConditionalGeneration"],
-        "text_config": titan_config_to_official(kimi_config, num_blocks=num_blocks),
+        "text_config": titan_config_to_official(
+            kimi_config, num_blocks=num_blocks, layers_per_block=layers_per_block
+        ),
         "vision_config": titan_vision_config_to_official(vision_config),
         "media_placeholder_token_id": media_placeholder_token_id,
     }

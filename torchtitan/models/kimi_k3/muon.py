@@ -161,7 +161,7 @@ class Muon(Optimizer):
         st["exp_avg_sq"].mul_(b2).addcmul_(g, g, value=1 - b2)
         bc1 = 1 - b1 ** st["step"]
         bc2 = 1 - b2 ** st["step"]
-        denom = (st["exp_avg_sq"].sqrt() / (bc2 ** 0.5)).add_(group["adamw_eps"])
+        denom = (st["exp_avg_sq"].sqrt() / (bc2**0.5)).add_(group["adamw_eps"])
         if group["weight_decay"]:
             p.mul_(1 - group["adamw_lr"] * group["weight_decay"])
         p.addcdiv_(st["exp_avg"], denom, value=-group["adamw_lr"] / bc1)
@@ -188,10 +188,7 @@ def tag_per_head_muon(model: nn.Module) -> int:
     from shapes, and a projection whose output width is not a multiple of its
     head count is left untagged instead of partitioned wrongly.
     """
-    from torchtitan.models.kimi_k3.model import (
-        KimiDeltaAttention,
-        KimiMLAAttention,
-    )
+    from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiMLAAttention
 
     tagged = 0
     for module in model.modules():

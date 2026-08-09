@@ -85,9 +85,7 @@ class BlockLayoutTables:
                     f"Pass an explicit layer_to_stage map."
                 )
             layers_per_stage = n_layers // self.num_stages
-            layer_to_stage = {
-                ell: ell // layers_per_stage for ell in range(n_layers)
-            }
+            layer_to_stage = {ell: ell // layers_per_stage for ell in range(n_layers)}
         self._layer_to_stage = dict(layer_to_stage)
 
         self._commits_at: dict[int, list[int]] = {}
@@ -120,7 +118,9 @@ class BlockLayoutTables:
         return list(self._cache_consumers_of_block.get(block_idx, ()))
 
     def expected_same_rank_captures(
-        self, producer_stage: int, block_idx_in_producer: int,
+        self,
+        producer_stage: int,
+        block_idx_in_producer: int,
     ) -> int:
         """Count of later same-rank virtual stages that read producer
         ``producer_stage``'s ``block_idx_in_producer``-th commit from
@@ -139,7 +139,8 @@ class BlockLayoutTables:
         b = commits[block_idx_in_producer]
         producer_rank = producer_stage % self.P
         return sum(
-            1 for c in self._cache_consumers_of_block.get(b, [])
+            1
+            for c in self._cache_consumers_of_block.get(b, [])
             if c % self.P == producer_rank and c > producer_stage
         )
 

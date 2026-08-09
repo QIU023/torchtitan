@@ -1896,6 +1896,11 @@ class KimiK3Spec:
 
     kimi_config: KimiK3Config
     num_blocks: int | None = None
+    # Block size for Block AttnRes, when the flavor derives its block count
+    # from one. num_blocks alone cannot express K3's "full blocks plus a short
+    # tail" partition (see KimiK3AttnResModel.__init__), so carry the size and
+    # let the model use it verbatim. None keeps the equal-split reading.
+    attn_res_block_size: int | None = None
     param_init: dict | None = None  # torchtitan BaseModel.Config contract
     # Graft gate: alpha-gated AttnRes reads (alpha=0 == exact identity
     # with the plain backbone at step 0). For grafting onto pretrained
@@ -1949,6 +1954,7 @@ class KimiK3Spec:
             model = KimiK3AttnResModel(
                 self.kimi_config,
                 num_blocks=self.num_blocks,
+                layers_per_block=self.attn_res_block_size,
                 gated=self.attn_res_gated,
             )
         return self.apply_build_time_features(model)
@@ -2149,16 +2155,6 @@ class KimiK3Spec:
         without reaching into kimi_config.
         """
         return self.kimi_config.num_hidden_layers
-
-    @property
-    def dim(self) -> int:
-        """veRL's torchtitan engine matches flavors by (dim, n_layers,
-        vocab_size); expose the Decoder.Config-style names."""
-        return self.kimi_config.hidden_size
-
-    @property
-    def vocab_size(self) -> int:
-        return self.kimi_config.vocab_size
 
     def traverse(self, config_cls, *, recurse: bool = False, _prefix: str = ""):
         """Config-tree leaf: yield nothing.

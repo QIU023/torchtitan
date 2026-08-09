@@ -48,6 +48,7 @@ from torchtitan.models.kimi_k3 import model_registry as attn_res_model_registry
 from torchtitan.models.kimi_k3.model_configs import (  # noqa: F401
     _alternating_kda_mla_layers,
     _BY_NAME,
+    attn_res_block_size,
     build,
     build_kimi_linear_config,
     flavor_names,
@@ -330,6 +331,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     cfg.model_spec.model = KimiK3Float8Spec(
         kimi_config=inner.kimi_config,
         num_blocks=inner.num_blocks,
+        attn_res_block_size=inner.attn_res_block_size,
         param_init=inner.param_init,
         torchao_float8_config=converter.torchao_config,
         filter_fqns=list(converter.config.filter_fqns),
@@ -427,6 +429,7 @@ def kimi_k3_mini_vl() -> Trainer.Config:
         kimi_config=kc,
         vision_config=vision,
         num_blocks=cfg.model_spec.model.num_blocks,
+        attn_res_block_size=cfg.model_spec.model.attn_res_block_size,
         vision_token_id=2016,
     )
     # Without these the flavor inherits the TEXT dataloader, which emits no
@@ -1397,6 +1400,7 @@ def kimi_k3_debugmodel8h() -> Trainer.Config:
         cfg.model_spec.model,
         kimi_config=kimi_config,
         num_blocks=resolve_num_blocks("debugmodel8h", "block_attn_res"),
+        attn_res_block_size=attn_res_block_size("debugmodel8h"),
     )
     return cfg
 
@@ -1467,6 +1471,7 @@ def kimi_k3_debugmodel() -> Trainer.Config:
     spec_config = KimiK3Spec(
         kimi_config=kimi_config,
         num_blocks=resolve_num_blocks("debugmodel", "block_attn_res"),
+        attn_res_block_size=attn_res_block_size("debugmodel"),
     )
     return Trainer.Config(
         loss=CrossEntropyLoss.Config(global_vocab_size=2016),

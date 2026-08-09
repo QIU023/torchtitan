@@ -182,5 +182,62 @@ class TestKimiK3AttnResModel(unittest.TestCase):
         self.assertEqual(n_layers - commits[-1], 9)
 
 
+def _partitioned(n_layers: int, num_blocks: int, **kwargs) -> KimiK3AttnResModel:
+    """Build on meta -- these assertions read the partition, never a weight."""
+    cfg = _dense_mla_only_config(num_hidden_layers=n_layers)
+    with torch.device("meta"):
+        return KimiK3AttnResModel(cfg, num_blocks=num_blocks, **kwargs)
+
+
+class TestBlockSizePartition(unittest.TestCase):
+    """K3 partitions by block SIZE: full blocks plus a short tail.
+
+    num_blocks alone cannot express that -- see
+    KimiK3AttnResModel.__init__ for why ceil(n_layers / num_blocks) is not
+    invertible back to the block size.
+    """
+
+    def test_official_pair_is_unchanged_by_the_explicit_path(self):
+        # 93 layers / 8 blocks: the ceil derivation already lands on the
+        # released block size 12, so passing it explicitly must agree.
+        for kwargs in ({}, {"layers_per_block": 12}):
+            with self.subTest(**kwargs):
+                model = _partitioned(n_layers=93, num_blocks=8, **kwargs)
+                self.assertEqual(model.layers_per_block, 12)
+                self.assertEqual(model.num_committed_blocks, 8)
+
+    def test_size_derived_count_honors_the_block_size(self):
+        # k3mini's shape: block size 12 over 21 layers is 2 blocks of 12+9.
+        # Deriving from num_blocks=2 instead gives an 11+10 equal split, and
+        # no num_blocks satisfies ceil(21 / n) == 12, which is why the size
+        # has to be passed rather than recovered.
+        model = _partitioned(n_layers=21, num_blocks=2, layers_per_block=12)
+        self.assertEqual(model.layers_per_block, 12)
+        self.assertEqual(model.num_committed_blocks, 2)
+        commits = [i for i in range(21) if i % model.layers_per_block == 0]
+        self.assertEqual(commits, [0, 12])
+
+    def test_k3mini_flavor_wires_the_block_size_through(self):
+        from torchtitan.models.kimi_k3 import model_configs as mc
+
+        size = "k3mini"
+        num_blocks = mc.resolve_num_blocks(size, "block_attn_res")
+        block_size = mc.attn_res_block_size(size)
+        config = mc.build_kimi_linear_config(size)
+        with torch.device("meta"):
+            model = KimiK3AttnResModel(
+                config, num_blocks=num_blocks, layers_per_block=block_size
+            )
+        self.assertEqual(model.layers_per_block, block_size)
+        # Round trip closes now: size 12 -> ceil(21/12) = 2 blocks -> size 12.
+        self.assertEqual(
+            -(-config.num_hidden_layers // model.layers_per_block), num_blocks
+        )
+
+    def test_out_of_range_block_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _partitioned(n_layers=8, num_blocks=2, layers_per_block=9)
+
+
 if __name__ == "__main__":
     unittest.main()

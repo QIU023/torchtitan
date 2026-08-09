@@ -42,8 +42,22 @@ _E8M0_BIAS = 127
 # E2M1: 1 sign, 2 exponent, 1 mantissa. The 16 representable magnitudes, in
 # nibble order 0..15 (sign bit is the high bit of the nibble).
 _E2M1_VALUES = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 
@@ -134,9 +148,7 @@ def quantize_mxfp4(
         torch.zeros_like(amax),
         torch.floor(torch.log2(amax)) - 2 + _E8M0_BIAS,
     ).clamp(0, 255)
-    factor = torch.where(
-        exp == 0, torch.ones_like(exp), torch.exp2(exp - _E8M0_BIAS)
-    )
+    factor = torch.where(exp == 0, torch.ones_like(exp), torch.exp2(exp - _E8M0_BIAS))
     normalized = groups / factor
 
     table = _e2m1_table(weight.device, torch.float32)
@@ -179,9 +191,7 @@ def load_packed_experts(
                     f"missing packed data for expert slice {key}; refusing a "
                     "partial load, which would leave that expert at init values"
                 )
-            block = dequantize_mxfp4(
-                tensors[key], tensors[f"{key}:scale"], dtype=dtype
-            )
+            block = dequantize_mxfp4(tensors[key], tensors[f"{key}:scale"], dtype=dtype)
             if block.shape != param.shape[1:]:
                 raise ValueError(
                     f"{key} dequantized to {tuple(block.shape)} but the slice "

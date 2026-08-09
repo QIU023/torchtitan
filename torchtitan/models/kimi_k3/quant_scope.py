@@ -92,6 +92,4 @@ def is_quantizable(fqn: str, module: nn.Module) -> bool:
 
 def quantizable_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
     """Every module in ``model`` that K3's scope puts in MXFP4."""
-    return [
-        (fqn, m) for fqn, m in model.named_modules() if is_quantizable(fqn, m)
-    ]
+    return [(fqn, m) for fqn, m in model.named_modules() if is_quantizable(fqn, m)]
