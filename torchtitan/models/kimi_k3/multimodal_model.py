@@ -71,6 +71,11 @@ class KimiMultimodalConfig:
 
     kimi_config: KimiK3Config
     num_blocks: int | None = None
+    # Block size for Block AttnRes, when the flavor derives its block count
+    # from one. num_blocks alone cannot express K3's "full blocks plus a short
+    # tail" partition (see KimiK3AttnResModel.__init__), so carry the size and
+    # let the model use it verbatim. None keeps the equal-split reading.
+    attn_res_block_size: int | None = None
     vision_hidden_size: int = 1024
     projector_hidden_size: int = 4096
     vision_token_id: int = -200  # LLaVA convention: negative sentinel
@@ -150,7 +155,9 @@ class KimiK3LlavaMultimodalModel(nn.Module):
             self.llm = KimiK3Model(config.kimi_config)
         else:
             self.llm = KimiK3AttnResModel(
-                config.kimi_config, num_blocks=config.num_blocks
+                config.kimi_config,
+                num_blocks=config.num_blocks,
+                layers_per_block=config.attn_res_block_size,
             )
 
         # Freeze vision tower by default (LLaVA-1.5 stage-1 recipe).
@@ -345,6 +352,11 @@ class KimiK3MultimodalConfig:
     kimi_config: KimiK3Config
     vision_config: "MoonViTConfig"
     num_blocks: int | None = None
+    # Block size for Block AttnRes, when the flavor derives its block count
+    # from one. num_blocks alone cannot express K3's "full blocks plus a short
+    # tail" partition (see KimiK3AttnResModel.__init__), so carry the size and
+    # let the model use it verbatim. None keeps the equal-split reading.
+    attn_res_block_size: int | None = None
     vision_token_id: int = -200
 
     # --- DEP (report 5.2.3): the ViT/text stage boundary ------------------- #
@@ -409,7 +421,9 @@ class KimiK3MultimodalModel(nn.Module):
             self.language_model = KimiK3Model(config.kimi_config)
         else:
             self.language_model = KimiK3AttnResModel(
-                config.kimi_config, num_blocks=config.num_blocks
+                config.kimi_config,
+                num_blocks=config.num_blocks,
+                layers_per_block=config.attn_res_block_size,
             )
         if config.vision_config.text_hidden_size != config.kimi_config.hidden_size:
             raise ValueError(
@@ -1643,6 +1657,7 @@ class KimiK3MultimodalSpec(KimiK3Spec):
                     kimi_config=self.kimi_config,
                     vision_config=self.vision_config,
                     num_blocks=self.num_blocks,
+                    attn_res_block_size=self.attn_res_block_size,
                     vision_token_id=self.vision_token_id,
                 )
             )

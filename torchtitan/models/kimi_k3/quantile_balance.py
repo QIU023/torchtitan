@@ -119,9 +119,7 @@ def quantile_balance_bias(
     # Per expert, over tokens. "lower" interpolation keeps the result on an
     # actual margin value, which is what makes the count land on the target
     # exactly rather than between two order statistics.
-    b_hat = -torch.quantile(
-        margins_TE, 1.0 - top_k / n, dim=0, interpolation="lower"
-    )
+    b_hat = -torch.quantile(margins_TE, 1.0 - top_k / n, dim=0, interpolation="lower")
     return b_hat - b_hat.mean()
 
 
@@ -318,9 +316,7 @@ class QuantileBalancer:
             key = id(moe)
             self._moes[key] = moe
             self._top_k[key] = moe.router.top_k
-            self._handles.append(
-                moe.router.register_forward_hook(self._make_hook(key))
-            )
+            self._handles.append(moe.router.register_forward_hook(self._make_hook(key)))
 
     @staticmethod
     def _iter_moes(model_parts):
@@ -343,8 +339,11 @@ class QuantileBalancer:
                     scores_TE, bias.detach(), self._top_k[key]
                 )
                 counts = margin_histogram(
-                    scores_TE, cutoff_T, num_bins=self.num_bins,
-                    lo=self.lo, hi=self.hi,
+                    scores_TE,
+                    cutoff_T,
+                    num_bins=self.num_bins,
+                    lo=self.lo,
+                    hi=self.hi,
                 ).to(torch.int32)
                 prev = self._counts.get(key)
                 self._counts[key] = counts if prev is None else prev + counts
@@ -363,9 +362,7 @@ class QuantileBalancer:
                 # Counts are additive, so one SUM all-reduce reconstructs the
                 # whole-batch margin distribution regardless of how tokens are
                 # sharded across dp/cp.
-                dist.all_reduce(
-                    counts, group=self.loss_group, op=dist.ReduceOp.SUM
-                )
+                dist.all_reduce(counts, group=self.loss_group, op=dist.ReduceOp.SUM)
             bias = quantile_balance_bias_histogram(
                 counts.to(torch.int64), self._top_k[key], lo=self.lo, hi=self.hi
             )

@@ -40,6 +40,7 @@ try:
         KimiMoE,
     )
     from torchtitan.models.kimi_k3.model_configs import (
+        attn_res_block_size,
         build_kimi_linear_config,
         flavor_names,
         resolve_num_blocks,
@@ -76,6 +77,7 @@ __all__ = [
     "build_kimi_linear_config",
     "flavor_names",
     "model_registry",
+    "attn_res_block_size",
     "resolve_num_blocks",
 ]
 
@@ -140,6 +142,9 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
     spec_config = KimiK3Spec(
         kimi_config=kimi_config,
         num_blocks=num_blocks,
+        attn_res_block_size=(
+            attn_res_block_size(size) if variant == "block_attn_res" else None
+        ),
         attn_res_gated=gated,
         lora_rank=lora_rank,
     )

@@ -166,9 +166,7 @@ def prepare_image(
     return patches.to(pixels_CHW.dtype), (1, h, w)
 
 
-def pack_images(
-    images: list[torch.Tensor], **kw
-) -> tuple[torch.Tensor, torch.Tensor]:
+def pack_images(images: list[torch.Tensor], **kw) -> tuple[torch.Tensor, torch.Tensor]:
     """Several images of DIFFERENT sizes -> one packed batch + ``grid_thws``.
 
     This is the shape MoonViT's forward takes, and the reason it takes that

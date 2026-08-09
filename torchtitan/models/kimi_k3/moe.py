@@ -81,9 +81,7 @@ class KimiSiTUGroupedExperts(GroupedExperts):
         up_RF = torch._grouped_mm(
             x_RD.bfloat16(), w3_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
         )
-        h_RF = situ_and_mul(
-            gate_RF, up_RF, self.situ_beta, self.situ_linear_beta
-        )
+        h_RF = situ_and_mul(gate_RF, up_RF, self.situ_beta, self.situ_linear_beta)
         return torch._grouped_mm(
             h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
         ).type_as(x_RD)
