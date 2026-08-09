@@ -54,6 +54,27 @@ class TestRowPartition(unittest.TestCase):
         shards = row_partition(1, 2, 2, kh=2, group_size=4)
         self.assertEqual([s.row_end - s.row_start for s in shards], [2, 0, 0, 0])
 
+    def test_video_with_an_uneven_split_keeps_every_frame_on_every_rank(self):
+        """t > 1 AND blocks % group_size != 0 -- the combination with no coverage.
+
+        The two cases above each hold one variable still: the video test splits
+        evenly, the uneven test uses a single frame. Their intersection is where
+        the padding is interleaved PER FRAME rather than trailing, which is
+        exactly what the gather-KV mask got wrong.
+        """
+        t, h, w, kh = 2, 6, 2, 2
+        shards = row_partition(t, h, w, kh=kh, group_size=2)
+        bands = [s.row_end - s.row_start for s in shards]
+        # 3 merge blocks over 2 ranks: 2 blocks then 1, so 4 rows then 2.
+        self.assertEqual(bands, [4, 2])
+        self.assertEqual(bands, sorted(bands, reverse=True))
+        # Each rank still holds all t frames of its own rows, one range each.
+        for shard in shards:
+            self.assertEqual(len(shard.ranges), t)
+            self.assertEqual(shard.grid, (t, shard.row_end - shard.row_start, w))
+        covered = sorted(i for s in shards for a, b in s.ranges for i in range(a, b))
+        self.assertEqual(covered, list(range(t * h * w)))
+
     def test_height_not_divisible_by_the_kernel_is_refused(self):
         with self.assertRaises(ValueError):
             row_partition(1, 7, 2, kh=2, group_size=2)

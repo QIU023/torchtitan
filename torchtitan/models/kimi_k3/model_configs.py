@@ -417,8 +417,16 @@ def is_k3_shaped(size: str) -> bool:
     One predicate so the K3 deltas (SiTU, both full-rank gates, the lower-bounded
     decay, q-compression, LatentMoE, the extra final global-attention layer,
     block size 12) cannot drift apart across the builder.
+
+    Keyed on the ROW, not the name. A name list silently excluded the "mini"
+    alias, so every flavor built as ``kimi_k3_mini_*`` after the rename got the
+    sweep architecture instead of the K3 one -- silu rather than SiTU, 32 experts
+    rather than 8, and block size 3 rather than 12 -- while the trainer flavor of
+    the same name built the K3 architecture. That is a checkpoint that loads into
+    neither, from two spellings of one row.
     """
-    return size in ("2p8t", "k3mini")
+    row = _BY_NAME.get(size)
+    return row is not None and row in (_BY_NAME["2p8t"], _BY_NAME["k3mini"])
 
 
 def attn_res_block_size(size: str) -> int:
