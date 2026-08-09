@@ -162,5 +162,71 @@ class TestKimiK3LlavaMultimodalModel(unittest.TestCase):
             model(input_ids=input_ids, pixel_values=pixel_values)
 
 
+class TestVisionSpliceSharedByBothModels(unittest.TestCase):
+    """The vision-embed splice, which the base model used to do the naive way.
+
+    The AttnRes subclass grew a careful implementation; the base model kept
+    ``h[image_mask] = vision_embeds.reshape(-1, D)``, which fails on exactly the
+    cases the subclass's version exists to handle. Both now call one helper.
+    """
+
+    def test_an_all_false_mask_is_a_no_op(self):
+        # This is PP shape inference: the scheduler runs forward once on
+        # zero-filled tokens. Advanced-index assignment raises here.
+        from torchtitan.models.kimi_k3.model import splice_vision_embeds
+
+        h = torch.randn(2, 5, 4)
+        vision = torch.randn(2, 3, 4)
+        mask = torch.zeros(2, 5, dtype=torch.bool)
+        out = splice_vision_embeds(h, vision, mask)
+        self.assertTrue(torch.equal(out, h))
+
+    def test_rows_may_hold_different_image_counts(self):
+        from torchtitan.models.kimi_k3.model import splice_vision_embeds
+
+        h = torch.zeros(2, 4, 3)
+        vision = torch.tensor(
+            [
+                [[1.0, 1, 1], [2, 2, 2], [0, 0, 0]],
+                [[3.0, 3, 3], [0, 0, 0], [0, 0, 0]],
+            ]
+        )
+        # Row 0 has two image slots, row 1 has one.
+        mask = torch.tensor([[True, False, True, False], [False, True, False, False]])
+        out = splice_vision_embeds(h, vision, mask)
+        self.assertTrue(torch.equal(out[0, 0], vision[0, 0]))
+        self.assertTrue(torch.equal(out[0, 2], vision[0, 1]))
+        self.assertTrue(torch.equal(out[1, 1], vision[1, 0]))
+        # Non-image positions untouched.
+        self.assertTrue(torch.equal(out[0, 1], torch.zeros(3)))
+
+    def test_more_sentinels_than_embeds_keeps_the_surplus_text_embedding(self):
+        # A text token that tokenizes to the sentinel id. The surplus position
+        # must keep its text embedding rather than trip the CUDA size assert.
+        from torchtitan.models.kimi_k3.model import splice_vision_embeds
+
+        h = torch.full((1, 4, 2), 9.0)
+        vision = torch.tensor([[[1.0, 1.0]]])
+        mask = torch.tensor([[True, True, False, False]])
+        out = splice_vision_embeds(h, vision, mask)
+        self.assertTrue(torch.equal(out[0, 0], vision[0, 0]))
+        self.assertTrue(torch.equal(out[0, 1], torch.full((2,), 9.0)))
+
+    def test_the_base_model_forward_survives_shape_inference(self):
+        from torchtitan.models.kimi_k3.model import KimiK3Model
+        from torchtitan.models.kimi_k3.tests.test_kimi_attn_res_model import (
+            _dense_mla_only_config,
+        )
+
+        model = KimiK3Model(_dense_mla_only_config(num_hidden_layers=2))
+        model.init_weights()
+        tokens = torch.zeros(1, 6, dtype=torch.long)
+        vision = torch.randn(1, 2, model.config.hidden_size)
+        mask = torch.zeros(1, 6, dtype=torch.bool)
+        with torch.no_grad():
+            out = model(tokens, vision_embeds=vision, image_mask=mask)
+        self.assertEqual(out.shape[:2], (1, 6))
+
+
 if __name__ == "__main__":
     unittest.main()

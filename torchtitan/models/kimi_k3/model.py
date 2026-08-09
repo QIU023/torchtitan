@@ -109,6 +109,48 @@ except ImportError as err:  # pragma: no cover - import-time guard
     ) from err
 
 
+def splice_vision_embeds(
+    h: torch.Tensor,
+    vision_embeds: torch.Tensor,
+    image_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Write ``vision_embeds`` into ``h`` at the positions ``image_mask`` marks.
+
+    ``h[image_mask] = vision_embeds.reshape(-1, D)`` is the obvious spelling and
+    is wrong in three ways this handles:
+
+    * Under PP shape inference the scheduler runs forward once on zero-filled
+      tokens, so the mask is all False and advanced-index assignment raises a
+      shape mismatch. ``masked_scatter`` copies as many elements as the mask
+      asks for, which is none.
+    * The reshape assumes every row holds exactly ``vision_embeds.size(1)``
+      image tokens. True for single-image data, false as soon as a batch mixes
+      text-only rows or multi-image rows, so the source is filtered to the
+      leading ``n`` slots of each row first.
+    * Destinations must equal sources or ``masked_scatter`` trips a CUDA
+      device-side assert (``masked_scatter_size_check``) that surfaces
+      asynchronously in whatever kernel runs next -- typically a linear or an
+      FSDP all-gather, which makes an embed-scatter mismatch look like an
+      attention or MoE bug. A row can hold more sentinels than there are embeds
+      when a text token tokenizes to the sentinel id, so destinations are capped
+      per row. Surplus positions keep their text embedding, which is correct:
+      they are text tokens that collided with the sentinel, not image slots.
+    """
+    n_per_row = image_mask.sum(dim=1)
+    n_vis_max = vision_embeds.size(1)
+    arange = torch.arange(n_vis_max, device=image_mask.device)
+    valid = arange.unsqueeze(0) < n_per_row.unsqueeze(1)
+    source = vision_embeds[valid].to(h.dtype)
+    if bool((n_per_row > n_vis_max).any()):
+        # 0-based rank of each True within its row.
+        pos_rank = image_mask.long().cumsum(dim=1) - 1
+        keep = torch.clamp(n_per_row, max=n_vis_max)
+        scatter_mask = image_mask & (pos_rank < keep.unsqueeze(1))
+    else:
+        scatter_mask = image_mask
+    return h.masked_scatter(scatter_mask.unsqueeze(-1).expand_as(h), source)
+
+
 # ----- Config -------------------------------------------------------------- #
 
 
@@ -1717,10 +1759,7 @@ class KimiK3Model(nn.Module):
             # forward so FSDP sees a single root call (calling
             # embed_tokens externally would split the root).
             if vision_embeds is not None and image_mask is not None:
-                h = h.clone()
-                h[image_mask] = vision_embeds.reshape(-1, vision_embeds.size(-1)).to(
-                    h.dtype
-                )
+                h = splice_vision_embeds(h, vision_embeds, image_mask)
         else:
             h = tokens  # middle/last PP stage: tokens IS the hidden state
         for layer in self.layers.values():

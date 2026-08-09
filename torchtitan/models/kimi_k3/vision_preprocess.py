@@ -194,8 +194,13 @@ def pack_video(
     """A video -> packed patches + ``grid_thws``, grouped by the temporal kernel.
 
     Frames are grouped into samples of at most ``temporal_merge_kernel_size``,
-    which is why ``t`` never exceeds ``init_pos_emb_time``. Every frame must have
-    the same resolution, so one resize plan covers the whole group.
+    which is why ``t`` never exceeds ``init_pos_emb_time``. Each group records a
+    single ``(t, h, w)``, which is only valid if every frame in it resizes to the
+    same grid -- and it does, structurally: the parameter is one stacked
+    ``[F, C, H, W]`` tensor, so all frames share H and W, and
+    :func:`prepare_image` derives the grid from ``navit_resize(W, H, ...)``, a
+    pure function of those. Ragged input goes to :func:`pack_images`, which
+    records a grid per image. Nothing to enforce here; the type does it.
     """
     if frames_FCHW.dim() != 4:
         raise ValueError(f"expected [F, C, H, W], got {tuple(frames_FCHW.shape)}")

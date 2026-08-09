@@ -42,9 +42,7 @@ class TestPolicyMatchesOfficial(unittest.TestCase):
         self.assertEqual(vp.PATCH_SIZE, cfg["patch_size"])
         self.assertEqual(vp.MERGE_KERNEL_SIZE, cfg["merge_kernel_size"])
         self.assertEqual(vp.IN_PATCH_LIMIT, cfg["in_patch_limit"])
-        self.assertEqual(
-            vp.PATCH_LIMIT_ON_ONE_SIDE, cfg["patch_limit_on_one_side"]
-        )
+        self.assertEqual(vp.PATCH_LIMIT_ON_ONE_SIDE, cfg["patch_limit_on_one_side"])
         self.assertEqual(
             vp.TEMPORAL_MERGE_KERNEL_SIZE, cfg["temporal_merge_kernel_size"]
         )
@@ -103,17 +101,21 @@ class TestPacking(unittest.TestCase):
 
     def test_packed_output_feeds_the_tower(self):
         cfg = MoonViTConfig(
-            num_hidden_layers=1, hidden_size=32, num_attention_heads=2,
-            qkv_hidden_size=48, intermediate_size=64, patch_size=14,
-            init_pos_emb_height=16, init_pos_emb_width=16,
-            text_hidden_size=64, rope_max_grid=32,
+            num_hidden_layers=1,
+            hidden_size=32,
+            num_attention_heads=2,
+            qkv_hidden_size=48,
+            intermediate_size=64,
+            patch_size=14,
+            init_pos_emb_height=16,
+            init_pos_emb_width=16,
+            text_hidden_size=64,
+            rope_max_grid=32,
         )
         torch.manual_seed(0)
         tower = MoonViT(cfg)
         tower.init_weights()
-        patches, grid = pack_images(
-            [torch.rand(3, 112, 112), torch.rand(3, 56, 84)]
-        )
+        patches, grid = pack_images([torch.rand(3, 112, 112), torch.rand(3, 56, 84)])
         out = tower(patches, grid)
         self.assertEqual(len(out), 2)
         for item, (t, h, w) in zip(out, grid.tolist()):
@@ -175,6 +177,20 @@ class TestCollatorBridge(unittest.TestCase):
         rows = torch.zeros(1, 4, 99)
         with self.assertRaisesRegex(ValueError, "patch_dim"):
             from_titan_collator(rows, torch.tensor([[1, 2, 2]]))
+
+
+class TestPackVideoGrids(unittest.TestCase):
+    """One grid entry per temporal group has to describe every frame in it."""
+
+    def test_uniform_frames_pack_cleanly(self):
+        from torchtitan.models.kimi_k3.vision_preprocess import pack_video
+
+        frames = torch.rand(4, 3, 64, 64)
+        patches, grids = pack_video(frames)
+        t_total = int(grids[:, 0].sum())
+        self.assertEqual(t_total, 4)
+        expected = sum(int(t * h * w) for t, h, w in grids.tolist())
+        self.assertEqual(patches.shape[0], expected)
 
 
 if __name__ == "__main__":

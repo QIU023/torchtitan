@@ -37,7 +37,6 @@ caller. A concrete SigLIP integration is follow-up work.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -269,7 +268,7 @@ class KimiK3LlavaMultimodalModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multimodal forward.
 
@@ -1147,18 +1146,24 @@ class KimiK3MultimodalModel(nn.Module):
         # returning early here would hang the others. So encode and select
         # first, and only then decide whether there is anything to splice.
         features = self.encode_images(pixel_values, grid_thw)
-        num_images = len(features)
-        num_rows = (
-            features.shape[0]
-            if isinstance(features, torch.Tensor)
-            else sum(int(f.shape[0]) for f in features)
-        )
-        features = self._select_cp_shard(features, num_rows, cp_counts)
-        num_rows = (
-            features.shape[0]
-            if isinstance(features, torch.Tensor)
-            else sum(int(f.shape[0]) for f in features)
-        )
+
+        def _rows(f):
+            if isinstance(f, torch.Tensor):
+                return f.shape[0]
+            return sum(int(x.shape[0]) for x in f)
+
+        features = self._select_cp_shard(features, _rows(features), cp_counts)
+        num_rows = _rows(features)
+        # Counted AFTER the shard selection, because the counts below are
+        # compared against THIS rank's sentinels. Under CP the shard is a flat
+        # tensor -- the per-image grouping is gone -- so an image count is not a
+        # meaningful thing to match against, and it degenerates to the row
+        # count, which the per-token branch handles. That branch is also the one
+        # that necessarily fires under CP: the shard is sized by this rank's
+        # sentinel count, so num_rows == num_sentinels by construction, and
+        # _select_cp_shard already rejects the one convention where they could
+        # differ.
+        num_images = num_rows if isinstance(features, torch.Tensor) else len(features)
         if num_sentinels == 0:
             # This rank's sequence shard holds no sentinel: every image's
             # tokens landed on a CP peer. The tower ran, so its forward
@@ -1199,6 +1204,16 @@ class KimiK3MultimodalModel(nn.Module):
             self.vision_tower.init_weights(init_range)
         if self.language_model is not None:
             self.language_model.init_weights(init_range, **kwargs)
+
+    def get_attention_masks(self, *args, **kwargs):
+        """No mask passthrough, same as the text model -- see KimiK3Model.
+
+        Spelled out here rather than copied onto the class at import time. The
+        loop that used to do that also listed init_weights, which this class
+        defines itself, so that half of it could never fire; a reader of the
+        class saw neither method.
+        """
+        return None
 
 
 class KimiK3ViTStage(KimiK3MultimodalModel):
@@ -1623,9 +1638,6 @@ def _mm_verify_module_protocol(self) -> None:
 
 
 KimiK3MultimodalModel.verify_module_protocol = _mm_verify_module_protocol
-for _name in ("get_attention_masks", "init_weights"):
-    if not hasattr(KimiK3MultimodalModel, _name) and hasattr(KimiK3Model, _name):
-        setattr(KimiK3MultimodalModel, _name, getattr(KimiK3Model, _name))
 
 
 @dataclass(kw_only=True, slots=True)
