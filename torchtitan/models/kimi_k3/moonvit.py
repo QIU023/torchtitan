@@ -505,7 +505,7 @@ class MoonViTEncoderLayer(nn.Module):
     def _attend(
         self,
         x_LD: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        seq_bounds: list[int],
         freqs_cis: torch.Tensor,
     ) -> torch.Tensor:
         L = x_LD.size(0)
@@ -547,8 +547,7 @@ class MoonViTEncoderLayer(nn.Module):
         # flash varlen kernel so this runs anywhere; the segment boundaries are
         # the same either way.
         out = torch.empty_like(q)
-        bounds = cu_seqlens.tolist()
-        for start, end in zip(bounds[:-1], bounds[1:]):
+        for start, end in zip(seq_bounds[:-1], seq_bounds[1:]):
             seg = slice(start, end)
             out[seg] = (
                 F.scaled_dot_product_attention(
@@ -566,10 +565,10 @@ class MoonViTEncoderLayer(nn.Module):
     def forward(
         self,
         x_LD: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        seq_bounds: list[int],
         freqs_cis: torch.Tensor,
     ) -> torch.Tensor:
-        x_LD = x_LD + self._attend(self.norm0(x_LD), cu_seqlens, freqs_cis)
+        x_LD = x_LD + self._attend(self.norm0(x_LD), seq_bounds, freqs_cis)
         return x_LD + self.mlp(self.norm1(x_LD))
 
 
@@ -716,11 +715,18 @@ class MoonViTEncoder(nn.Module):
         rather than assumed.
         """
         freqs_cis, cu_seqlens = self.block_inputs(x_LD, grid_thws, cp_plan)
+        # Converted ONCE per forward, not once per block. cu_seqlens lives on the
+        # device and .tolist() is a device-to-host sync, so doing it inside the
+        # block loop paid 27 syncs per tower forward at K3's depth -- and the
+        # boundaries are identical for every block, being a property of the batch.
+        # The tensor stays block_inputs' contract because a later DEP share
+        # recomputes it locally rather than receiving it over the pipe.
+        seq_bounds = cu_seqlens.tolist()
         blocks = self.blocks if block_slice is None else self.blocks[block_slice]
         self.set_cp_patch_plan(cp_plan)
         try:
             for block in blocks:
-                x_LD = block(x_LD, cu_seqlens, freqs_cis)
+                x_LD = block(x_LD, seq_bounds, freqs_cis)
         finally:
             # The encoder owns the plan's lifetime so a caller cannot leak one
             # into the next batch, where it would gather for a partition that no

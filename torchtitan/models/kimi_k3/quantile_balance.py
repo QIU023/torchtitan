@@ -357,12 +357,25 @@ class QuantileBalancer:
             return  # no forward ran since the last step (e.g. step 0 resume)
         import torch.distributed as dist
 
+        if self.loss_group is not None and dist.is_initialized():
+            # Counts are additive, so one SUM all-reduce reconstructs the
+            # whole-batch margin distribution regardless of how tokens are
+            # sharded across dp/cp.
+            #
+            # One collective for every layer, not one per layer. Reducing inside
+            # the loop below issues a blocking all-reduce per MoE layer, and they
+            # serialise: 92 of them per optimizer step at K3's depth, each paying
+            # full latency for num_bins int32 values. Every histogram has the
+            # same shape (num_bins is one attribute, not per layer) and the same
+            # dtype, so they stack. Integer SUM is exact, so this cannot move the
+            # numbers -- only the number of round trips.
+            keys = list(self._counts)
+            stacked = torch.stack([self._counts[k] for k in keys])
+            dist.all_reduce(stacked, group=self.loss_group, op=dist.ReduceOp.SUM)
+            for i, key in enumerate(keys):
+                self._counts[key] = stacked[i]
+
         for key, counts in self._counts.items():
-            if self.loss_group is not None and dist.is_initialized():
-                # Counts are additive, so one SUM all-reduce reconstructs the
-                # whole-batch margin distribution regardless of how tokens are
-                # sharded across dp/cp.
-                dist.all_reduce(counts, group=self.loss_group, op=dist.ReduceOp.SUM)
             bias = quantile_balance_bias_histogram(
                 counts.to(torch.int64), self._top_k[key], lo=self.lo, hi=self.hi
             )
