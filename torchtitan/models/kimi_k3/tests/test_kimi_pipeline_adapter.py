@@ -79,5 +79,51 @@ class TestPipeliningFnInModelSpec(unittest.TestCase):
             )
 
 
+class TestContiguousSplitGuard(unittest.TestCase):
+    """The layer->stage discovery verifies the layout it cannot replace.
+
+    ``stages`` is the local rank's stages, so the discovery can never see every
+    layer and the map it builds is always partial. What it can do is check the
+    contiguous default against the layers this rank actually holds.
+    """
+
+    @staticmethod
+    def _stage(stage_index: int, layer_ids):
+        from torch import nn
+
+        submod = nn.Module()
+        if layer_ids is not None:
+            submod.layers = nn.ModuleDict({str(i): nn.Identity() for i in layer_ids})
+        stage = nn.Module()
+        stage.submod = submod
+        stage.stage_index = stage_index
+        return stage
+
+    def _infer(self, stages):
+        from torchtitan.models.kimi_k3.layout import (
+            _infer_block_layout_tables_from_stages,
+        )
+
+        # 8 layers over 2 stages -> 4 per stage; blocks of 4 -> 2 blocks.
+        return _infer_block_layout_tables_from_stages(
+            stages, pp_size=2, num_blocks=2, n_layers=8, layers_per_block=4
+        )
+
+    def test_a_contiguous_rank_is_accepted(self):
+        tables = self._infer([self._stage(1, [4, 5, 6, 7])])
+        self.assertEqual(tables.num_blocks, 2)
+
+    def test_a_non_contiguous_split_raises_instead_of_mislaying_blocks(self):
+        # Stage 1 holding the first four layers contradicts the default, which
+        # would route block deltas to the wrong stage.
+        with self.assertRaises(ValueError) as ctx:
+            self._infer([self._stage(1, [0, 1, 2, 3])])
+        self.assertIn("non-contiguous", str(ctx.exception))
+
+    def test_stages_without_layers_leave_nothing_to_verify(self):
+        tables = self._infer([self._stage(0, None)])
+        self.assertEqual(tables.num_blocks, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

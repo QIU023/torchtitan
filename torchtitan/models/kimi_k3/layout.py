@@ -241,10 +241,15 @@ def _infer_block_layout_tables_from_stages(
 ) -> BlockLayoutTables:
     """Build :class:`BlockLayoutTables` from live ``PipelineStage`` objects.
 
-    Inspects each ``stage.submod.layers`` (or ``stage.submod.wrapped.layers``
-    when the adapter has already wrapped the stage) to recover the
-    layer-id -> stage-id map. Falls back to the contiguous default when no
-    stage exposes a ``layers`` attribute (CPU unit tests).
+    The layout itself is the contiguous default (layer ``ell`` on stage
+    ``ell // layers_per_stage``). ``stages`` holds only the local rank's stages,
+    so a complete layer-id -> stage-id map is not obtainable here without a
+    collective; what the local stages DO expose is used to verify the default
+    instead. A non-contiguous split raises rather than producing a layout that
+    is wrong in a way only the gradients would show.
+
+    Stages that expose no ``layers`` attribute (CPU unit tests) leave nothing to
+    verify, which is not an error.
     """
     num_local_stages = len(stages)
     if num_local_stages < 1:
@@ -271,9 +276,23 @@ def _infer_block_layout_tables_from_stages(
                 continue
             layer_to_stage[layer_id] = stage_idx
 
-    if len(layer_to_stage) != n_layers:
-        # Incomplete discovery -> trust the contiguous default.
-        layer_to_stage = None  # type: ignore[assignment]
+    # Verify, do not adopt: the map above covers this rank's layers only.
+    # BlockLayoutTables raises on its own if the layer count is not divisible,
+    # and its message is the clearer one, so leave that case to it.
+    if layer_to_stage and n_layers % num_stages == 0:
+        layers_per_stage = n_layers // num_stages
+        for layer_id, stage_idx in sorted(layer_to_stage.items()):
+            expected = layer_id // layers_per_stage
+            if stage_idx != expected:
+                raise ValueError(
+                    f"layer {layer_id} sits on stage {stage_idx}, but the "
+                    f"contiguous layout this adapter assumes puts it on stage "
+                    f"{expected} (n_layers={n_layers}, num_stages={num_stages}). "
+                    "A non-contiguous pipeline split is not supported: the "
+                    "cross-stage cache would route block deltas to the wrong "
+                    "stages."
+                )
+    layer_to_stage = None  # type: ignore[assignment]
 
     return BlockLayoutTables(
         pp_size=pp_size,
