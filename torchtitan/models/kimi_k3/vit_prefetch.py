@@ -63,6 +63,18 @@ def prefetch_depth() -> int:
     return max(0, int(os.environ.get("KIMI_VIT_PREFETCH", "0")))
 
 
+def prefetch_sync_only() -> bool:
+    """Force the prefetch to JOIN at issue time -- the negative control for overlap.
+
+    Exists so the overlap metric can be falsified. With this on, ensure() joins straight
+    away, which is exactly what the code did before the issue/join split, so the measured
+    default-stream time between issue and join must collapse to ~0. A metric that reported
+    overlap in both arms would be measuring nothing, which is how the first version of
+    this instrument ("was the encode complete on arrival") failed.
+    """
+    return os.environ.get("KIMI_VIT_PREFETCH_SYNC") == "1"
+
+
 class VisionPrefetcher:
     """Per-step cache of vision features, encoded ahead on a side stream.
 
@@ -81,6 +93,20 @@ class VisionPrefetcher:
         # done when its forward asked for it, which is the whole claim.
         self._hits = 0
         self._misses = 0
+        # Async bookkeeping. The overlap metric is DEFAULT-STREAM TIME BETWEEN ISSUE AND
+        # JOIN, not "was the encode complete on arrival" -- that first attempt was useless
+        # because the synchronous wrapper also leaves the encode complete by the time
+        # take() runs, so it read the same either way. Time on the current stream between
+        # ensure() and take() is zero when the issue path joins immediately and positive
+        # only when real work was interleaved.
+        self._pending: dict[int, object] = {}
+        self._issued_at: dict[int, object] = {}
+        self._spans: list[tuple[object, object]] = []
+        # The encode's own GPU time, bracketed on the side stream. This is what decides
+        # whether there is anything to hide at all: if it is microseconds, no scheduling
+        # change can show up in a step time, and that is a fact about the config rather
+        # than about the implementation.
+        self._encode_spans: list[tuple[object, object]] = []
 
     def begin_step(self, kwarg_mbs) -> None:
         """Record the step's per-micro-batch kwargs and reset the cache.
@@ -90,13 +116,38 @@ class VisionPrefetcher:
         property rather than a data one.
         """
         if self._hits or self._misses:
+            # Read the spans now: the previous step's events are all complete by the time
+            # the next step begins, so elapsed_time needs no extra synchronisation.
+            total, measured = 0.0, 0
+            for issued, joined in self._spans:
+                try:
+                    total += issued.elapsed_time(joined)
+                    measured += 1
+                except (RuntimeError, ValueError):
+                    pass
+            enc_total, enc_n = 0.0, 0
+            for a, b in self._encode_spans:
+                try:
+                    enc_total += a.elapsed_time(b)
+                    enc_n += 1
+                except (RuntimeError, ValueError):
+                    pass
             logger.info(
-                "DEP vision prefetch: %d hit(s), %d miss(es) in the previous step",
+                "DEP vision prefetch: %d hit(s), %d miss(es); encode GPU time %.2f ms "
+                "over %d encode(s); default-stream span %.2f ms over %d span(s)",
                 self._hits,
                 self._misses,
+                enc_total,
+                enc_n,
+                total,
+                measured,
             )
             self._hits = self._misses = 0
         self._features.clear()
+        self._pending.clear()
+        self._issued_at.clear()
+        self._spans.clear()
+        self._encode_spans.clear()
         if kwarg_mbs is None:
             self._kwargs, self._num_mbs = None, 0
             return
@@ -126,21 +177,56 @@ class VisionPrefetcher:
         if inputs is None:
             return
         pixel_values, grid_thw = inputs
-        feats = self._owner._run_on_vision_stream(
+        # ISSUE without joining. Using the synchronous wrapper here would block the
+        # current stream on the encode straight away, so the encode would merely happen
+        # EARLIER rather than concurrently -- which is what it did before this split, and
+        # is why a 31/32 hit rate coexisted with no measurable overlap. The join happens
+        # in take(), when the consumer actually needs the features.
+        feats, done = self._owner._issue_on_vision_stream(
             lambda: self._owner.encode_images(pixel_values, grid_thw),
             pixel_values if isinstance(pixel_values, torch.Tensor) else None,
         )
+        if prefetch_sync_only():
+            # Negative control: join here, so nothing can overlap. KEEP the event so
+            # take() still records a span -- the control has to produce a READING of
+            # ~0, not an absent reading, or it cannot falsify anything. Waiting on an
+            # already-complete event in take() is a no-op.
+            self._owner._join_vision_stream(feats, done)
         if isinstance(feats, torch.Tensor):
             feats = [feats]
         self._features[mb] = feats
+        self._pending[mb] = done
+        if done is not None:
+            issued = torch.cuda.Event(enable_timing=True)
+            issued.record(torch.cuda.current_stream())
+            self._issued_at[mb] = issued
+            enc = getattr(self._owner, "_last_encode_span", None)
+            if enc is not None:
+                self._encode_spans.append(enc)
 
     def take(self, mb: int):
-        """Features for ``mb`` if prefetched, else None. Removes the entry."""
+        """Features for ``mb`` if prefetched, else None. Removes the entry.
+
+        Joins the side stream here rather than at issue time, which is the whole point:
+        between ``ensure(mb)`` and ``take(mb)`` the default stream runs text compute while
+        the encode is in flight.
+        """
         feats = self._features.pop(mb, None)
+        done = self._pending.pop(mb, None)
+        issued = self._issued_at.pop(mb, None)
         if feats is None:
             self._misses += 1
-        else:
-            self._hits += 1
+            return None
+        self._hits += 1
+        if done is not None:
+            if issued is not None:
+                # Stamp the current stream BEFORE joining: the gap from issue to here is
+                # default-stream work that ran while this encode was in flight. Recording
+                # after the join would fold the wait itself into the number.
+                arrived = torch.cuda.Event(enable_timing=True)
+                arrived.record(torch.cuda.current_stream())
+                self._spans.append((issued, arrived))
+            self._owner._join_vision_stream(feats, done)
         return feats
 
     def advance(self, mb: int, depth: int) -> None:

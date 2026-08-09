@@ -534,22 +534,62 @@ class KimiK3MultimodalModel(nn.Module):
         * the current stream waits for the side stream and every output is marked
           against the current stream, for the same reason in the other direction.
         """
+        out, done = self._issue_on_vision_stream(fn, *tensors)
+        self._join_vision_stream(out, done)
+        return out
+
+    def _issue_on_vision_stream(self, fn, *tensors):
+        """Issue ``fn`` on the vision stream and return ``(out, event)`` WITHOUT waiting.
+
+        This is the half that makes overlap possible. :meth:`_run_on_vision_stream` joins
+        immediately, which is correct for a synchronous encode but means the side stream
+        buys nothing -- the caller blocks on it before running anything else. The
+        run-ahead needs the encode for micro-batch m+k in flight WHILE m's text compute
+        runs, so it issues here and joins later, in :meth:`_join_vision_stream`.
+
+        The input-side edges are the same as the synchronous path and equally required:
+        the side stream waits for the current one because ``fn``'s inputs were produced
+        there, and each input is ``record_stream``'d so the caching allocator cannot hand
+        its memory to another allocation while the side stream still reads it.
+        """
         side = self._vision_stream()
         if side is None:
-            return fn()
+            return fn(), None
         cur = torch.cuda.current_stream()
         side.wait_stream(cur)
         for t in tensors:
             if isinstance(t, torch.Tensor) and t.is_cuda:
                 t.record_stream(side)
+        # Bracket the encode ON THE SIDE STREAM so its own GPU time is measurable.
+        # Without this the only observable is the span between issue and join, which is
+        # dominated by text compute and PP communication and therefore reads the same
+        # whether or not the encode ran concurrently -- a metric that cannot be falsified.
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
         with torch.cuda.stream(side):
+            started.record(side)
             out = fn()
-        cur.wait_stream(side)
+            finished.record(side)
+        done = finished
+        self._last_encode_span = (started, finished)
+        return out, done
+
+    def _join_vision_stream(self, out, done) -> None:
+        """Make the current stream wait for an issued encode, and hand the outputs over.
+
+        Both halves are needed: without the wait the consumer reads memory the side
+        stream is still writing, and without ``record_stream`` on the outputs the
+        allocator may reuse buffers the side stream produced while the current stream
+        still holds them.
+        """
+        if done is None:
+            return
+        cur = torch.cuda.current_stream()
+        cur.wait_event(done)
         outs = out if isinstance(out, (list, tuple)) else [out]
         for t in outs:
             if isinstance(t, torch.Tensor) and t.is_cuda:
                 t.record_stream(cur)
-        return out
 
     def _encode_images_dynamic_cp(
         self,
