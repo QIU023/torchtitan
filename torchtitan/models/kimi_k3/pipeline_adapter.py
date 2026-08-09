@@ -37,7 +37,7 @@ same PP stage chain that forward uses (PP owns all NCCL, so no
 deadlock risk), and each stage's forward graph is traversed exactly
 once per mb so peak memory equals the naive-PP baseline.
 
-:func:`pipeline_llm_with_cache_adapter` is a ``pipelining_fn`` plugged
+:func:`pipeline_kimi_k3_with_cache_adapter` is a ``pipelining_fn`` plugged
 into the experiment's ``ModelSpec``; it delegates to core
 ``pipeline_llm`` and (when ``TORCHTITAN_ATTNRES_CACHE=1``) wraps each
 stage's submod. Schedule must be Interleaved1F1B; otherwise we warn.
@@ -1023,9 +1023,15 @@ def _install_step_drop_patch(
                 try:
                     adapter._drop_all_seen_and_clear()
                 except Exception:
-                    # Swallow per-adapter drop failures so one poisoned
-                    # adapter doesn't prevent the others from clearing.
-                    pass
+                    # Continue so one poisoned adapter cannot keep the others
+                    # from clearing -- but say so. Swallowing this silently
+                    # turns a cache that stopped evicting into a slow memory
+                    # leak with no symptom until OOM.
+                    logger.warning(
+                        "cross-stage cache sweep failed for one adapter; "
+                        "continuing with the rest",
+                        exc_info=True,
+                    )
 
     pp_schedule.step = patched_step  # type: ignore[method-assign]
 
@@ -1035,174 +1041,7 @@ def _install_step_drop_patch(
 _ATTN_RES_EXTRA_LAST_STAGE_FQNS = ("final_attn_res_proj", "final_attn_res_norm")
 
 
-def _inject_attn_res_fqns(model: nn.Module, kwargs: dict) -> None:
-    """Extend the PP module-FQN split so AttnRes top-level modules
-    (``final_attn_res_proj`` / ``final_attn_res_norm``) survive
-    ``pipeline_module_split`` on the last stage.
-    """
-    if not any(hasattr(model, n) for n in _ATTN_RES_EXTRA_LAST_STAGE_FQNS):
-        return
-    parallelism = kwargs.get("parallelism")
-    if parallelism is None or parallelism.module_fqns_per_model_part is not None:
-        return
-    model_config = kwargs.get("model_config")
-    pp = kwargs["parallel_dims"].pp
-    if pp <= 1 or model_config is None or not hasattr(model_config, "layers"):
-        return
-
-    import math as _math
-
-    from torch.distributed.pipelining.schedules import PipelineScheduleSingle
-
-    from torchtitan.distributed.pipeline_parallel import (
-        _generate_llm_fqn_per_model_part as generate_llm_fqn_per_model_part,
-        get_schedule_class,
-    )
-
-    num_layers = len(model_config.layers)
-    input_weight = parallelism.pipeline_parallel_first_stage_less_layers
-    output_weight = parallelism.pipeline_parallel_last_stage_less_layers
-    layers_per_stage = parallelism.pipeline_parallel_layers_per_stage
-
-    if layers_per_stage is not None:
-        num_virtual_stages = _math.ceil(
-            (num_layers + input_weight + output_weight) / layers_per_stage
-        )
-    else:
-        schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
-        stages_per_rank = 1 if issubclass(schedule_class, PipelineScheduleSingle) else 2
-        num_virtual_stages = pp * stages_per_rank
-
-    fqns = generate_llm_fqn_per_model_part(
-        num_virtual_stages, num_layers, input_weight, output_weight
-    )
-    extras = [n for n in _ATTN_RES_EXTRA_LAST_STAGE_FQNS if hasattr(model, n)]
-    fqns[-1].extend(extras)
-    parallelism.module_fqns_per_model_part = fqns
-
-
 # ----- Custom pipelining_fn ------------------------------------------------ #
-
-
-def _build_stage_to_rank(stages) -> dict[int, int]:
-    """Map ``stage_id -> rank`` from live ``PipelineStage`` objects."""
-    mapping: dict[int, int] = {}
-    for stage in stages:
-        mapping[stage.stage_index] = stage.group_rank
-    return mapping
-
-
-def pipeline_llm_with_cache_adapter(model: nn.Module, **kwargs):
-    """Custom ``pipelining_fn`` for AttnRes.
-
-    Delegates to core ``pipeline_llm``; when
-    ``TORCHTITAN_ATTNRES_CACHE=1`` and the schedule is Interleaved1F1B,
-    wraps each stage's submod with :class:`CrossStageCacheAdapter`.
-    Returns the same 4-tuple as core.
-    """
-    # Deferred import so this module stays importable without torchtitan's
-    # distributed wiring (CPU unit tests).
-    from torchtitan.distributed.pipeline_parallel import pipeline_llm
-
-    _inject_attn_res_fqns(model, kwargs)
-    pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
-        model, **kwargs
-    )
-    if dep_enabled():
-        _install_vision_prefetch(pp_schedule, model_parts)
-    passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
-
-    if not adapter_enabled():
-        return passthrough
-
-    # Schedule guard: Interleaved1F1B is the only delta protocol we
-    # characterize; anything else falls back with a warn.
-    if _INTERLEAVED_1F1B_CLASS is None or not isinstance(
-        pp_schedule, _INTERLEAVED_1F1B_CLASS
-    ):
-        warnings.warn(
-            "cross-stage caching currently supports only Interleaved1F1B; "
-            "running without optimization"
-        )
-        return passthrough
-
-    stages = list(_iter_schedule_stages(pp_schedule))
-    # ``stages`` is this rank's LOCAL stages; ``stage.stage_index`` is
-    # GLOBAL. Total virtual stages = parallel_dims.pp * V.
-    parallel_dims = kwargs.get("parallel_dims")
-    pp_size = parallel_dims.pp if parallel_dims is not None else len(stages)
-    num_stages = pp_size * len(stages)
-    stage_to_rank = {s: s % pp_size for s in range(num_stages)}
-
-    # Find the AttnRes config on any stage's inner model.
-    inner0 = getattr(stages[0], "submod", None)
-    inner0_cfg = getattr(inner0, "config", None)
-    attn_res_config = getattr(inner0_cfg, "attn_res", None) if inner0_cfg else None
-    if attn_res_config is None or not getattr(attn_res_config, "enabled", False):
-        warnings.warn(
-            "Could not locate an enabled AttnRes config on stage 0; "
-            "cross-stage caching falls back to naive PP."
-        )
-        return passthrough
-
-    num_blocks = attn_res_config.num_blocks
-    # ``inner0_cfg.layers`` is this stage's slice; total layers live on
-    # the outer ``model_config``.
-    n_layers_total = len(inner0_cfg.layers) * num_stages
-    model_config = kwargs.get("model_config")
-    if model_config is not None and hasattr(model_config, "layers"):
-        n_layers_total = len(model_config.layers)
-    layers_per_block = n_layers_total // num_blocks
-
-    try:
-        layout_tables = _infer_block_layout_tables_from_stages(
-            stages,
-            pp_size=pp_size,
-            num_blocks=num_blocks,
-            n_layers=n_layers_total,
-            layers_per_block=layers_per_block,
-        )
-    except Exception as e:  # pragma: no cover - defensive
-        warnings.warn(
-            f"Failed to build static block-layout tables ({e!r}); "
-            "cross-stage caching falls back to naive PP."
-        )
-        return passthrough
-
-    installed_adapters: list[CrossStageCacheAdapter] = []
-    for i, stage in enumerate(stages):
-        adapter = CrossStageCacheAdapter(
-            stage.submod,
-            stage_id=stage.stage_index,
-            num_stages=num_stages,
-            group=getattr(stage, "group", None),
-            stage_to_rank=stage_to_rank,
-            pp_rank=getattr(stage, "group_rank", None),
-            layout_tables=layout_tables,
-        )
-        stage.submod = adapter
-        _install_mb_index_patch(stage, adapter)
-        installed_adapters.append(adapter)
-        # Keep model_parts in sync for optimizer/compile paths.
-        if i < len(model_parts):
-            model_parts[i] = adapter
-
-    # Install step-end drop sweep AFTER every per-mb patch. The VP
-    # drop-guard in _drop_all_seen_and_clear ensures only the last
-    # virtual stage on the rank frees memory.
-    _install_step_drop_patch(pp_schedule, installed_adapters)
-
-    # Say so on success, not only on the fallback paths. The adapter is numerically
-    # neutral by design, so loss reads the same whether it engaged or not -- without
-    # this line "wrapped" and "silently fell back" are indistinguishable from the
-    # outside.
-    logger.info(
-        "cross-stage cache adapter wrapped %d stage(s): %s",
-        len(installed_adapters),
-        [s.stage_index for s in stages],
-    )
-
-    return pp_schedule, model_parts, has_first_stage, has_last_stage
 
 
 # ----- Kimi Linear / K3 pipelining wiring (merged from kimi_linear/) ----- #

@@ -1446,40 +1446,46 @@ def apply_fsdp(
     disable_fsdp_gradient_division(model)
 
 
-def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> None:
-    """Wrap each KimiDecoderLayer with torch.compile.
+_fla_dynamo_carveout_done = False
 
-    Carve-outs (must NOT be compiled):
-    * fla-core triton kernels (chunk_kda, ShortConvolution,
-      FusedRMSNormGated, fused_kda_gate) — dynamo cannot trace through
-      arbitrary Triton, and these are already optimized.
-    * MoE for-loop expert path (when ``use_grouped_mm=False``) — same
-      unbacked-symint issue torchtitan upstream documents in
-      ``apply_compile_sparse``.
 
-    The fla carve-outs are applied as ``torch.compiler.disable`` shims
-    with ``recursive=True`` so dynamo treats the entire subtree as
-    opaque (otherwise the backward pass re-enters dynamo at e.g.
-    ``cuda_utils.get_device_properties`` and emits warnings).
+def _disable_dynamo_on_fla_ops() -> None:
+    """Make the fla kernels and the AttnRes read opaque to dynamo.
 
-    Recompile-limit handling: KimiDecoderLayer alternates between
-    KDA and MLA attention (3:1 by layer index). Default dynamo
-    recompile_limit=8 is too small — the type check on
-    ``self_attn`` triggers a recompile per attention class, and once
-    the limit is hit dynamo silently falls back to eager for
-    affected frames. We bump recompile_limit + cache_size_limit so
-    each layer-flavor compiles cleanly on first hit and stays cached.
+    Split out of :func:`_apply_compile_kimi_k3` for two reasons. This is global
+    state -- class attributes and module bindings, nothing owned by the model
+    passed in -- so applying it per model part would wrap each function once per
+    part under PP. And separating it is what makes the carve-out observable at
+    all: a caller can compare a rebound name against fla's original. The version
+    of this code that discarded ``torch.compiler.disable``'s return value did
+    nothing, and nothing could see that.
     """
+    global _fla_dynamo_carveout_done
+    if _fla_dynamo_carveout_done:
+        return
+    _fla_dynamo_carveout_done = True
+
     from fla.modules import FusedRMSNormGated, ShortConvolution
-    from fla.ops.kda import chunk_kda, fused_recurrent_kda
-    from fla.ops.kda.gate import fused_kda_gate
 
     # Mark triton ops as opaque to dynamo. recursive=True so dynamo
     # also stays out on re-entry from autograd backward (otherwise
     # fla's backward kernels trip on cuda_utils.get_device_properties
     # and lru_cache decorators inside fused_norm_gate).
-    for op in (chunk_kda, fused_recurrent_kda, fused_kda_gate):
-        torch.compiler.disable(op, recursive=True)
+    #
+    # torch.compiler.disable RETURNS a wrapper; it does not mark the function
+    # in place. Discarding the return left all three ops fully traceable, so
+    # this carve-out did nothing. Rebinding has to happen on the module that
+    # CALLS them -- model.py's own `from fla.ops.kda import ...` bindings --
+    # for the same reason spelled out for block_attn_res below. Patching
+    # fla.ops.kda alone would not be seen by an already-imported name.
+    from torchtitan.models.kimi_k3 import model as _model_mod
+
+    for _name in ("chunk_kda", "fused_recurrent_kda", "fused_kda_gate"):
+        setattr(
+            _model_mod,
+            _name,
+            torch.compiler.disable(getattr(_model_mod, _name), recursive=True),
+        )
     for cls in (ShortConvolution, FusedRMSNormGated):
         cls.forward = torch.compiler.disable(cls.forward, recursive=True)
 
@@ -1522,6 +1528,33 @@ def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> N
         KimiDeltaAttention.forward,
         recursive=True,
     )
+
+
+def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> None:
+    """Wrap each KimiDecoderLayer with torch.compile.
+
+    Carve-outs (must NOT be compiled):
+    * fla-core triton kernels (chunk_kda, ShortConvolution,
+      FusedRMSNormGated, fused_kda_gate) — dynamo cannot trace through
+      arbitrary Triton, and these are already optimized.
+    * MoE for-loop expert path (when ``use_grouped_mm=False``) — same
+      unbacked-symint issue torchtitan upstream documents in
+      ``apply_compile_sparse``.
+
+    The fla carve-outs are applied as ``torch.compiler.disable`` shims
+    with ``recursive=True`` so dynamo treats the entire subtree as
+    opaque (otherwise the backward pass re-enters dynamo at e.g.
+    ``cuda_utils.get_device_properties`` and emits warnings).
+
+    Recompile-limit handling: KimiDecoderLayer alternates between
+    KDA and MLA attention (3:1 by layer index). Default dynamo
+    recompile_limit=8 is too small — the type check on
+    ``self_attn`` triggers a recompile per attention class, and once
+    the limit is hit dynamo silently falls back to eager for
+    affected frames. We bump recompile_limit + cache_size_limit so
+    each layer-flavor compiles cleanly on first hit and stays cached.
+    """
+    _disable_dynamo_on_fla_ops()
 
     # Allow MoE token-choice routing's data-dependent control flow.
     torch._dynamo.config.capture_scalar_outputs = True
