@@ -1492,15 +1492,29 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
         # micro-batch index to find grid_thw, and without it they pass activations
         # through with no error at all.
         wired = _install_vision_stage_wiring(pp_schedule, step_inputs)
-        if wired == 0 and dep_vision_stages() > 1:
-            # A split tower whose shares were never wired would run the metadata-inference
-            # path for real micro-batches: activations passed through, no tower, no splice,
-            # no error. With n_vit == 1 zero is normal on a text-only rank, so the check is
-            # gated on the split.
+        # A split tower whose shares were never wired would run the
+        # metadata-inference path for real micro-batches: activations passed
+        # through, no tower, no splice, no error. So assert engagement -- but
+        # against what THIS rank should own, not against a global count.
+        #
+        # The vision stages are the first dep_vision_stages() global stage
+        # indices, so a rank owning none of them correctly wires zero. The first
+        # version of this check read `wired == 0 and n_vit > 1`, which assumed
+        # every rank owns a vision stage once the tower is split. That holds only
+        # when n_vit == pp_degree; at pp=4 with n_vit=2 the two ranks holding
+        # only text stages raised, and n_vit > 1 could not run at all.
+        n_vit = dep_vision_stages()
+        expected = sum(
+            1
+            for stage in _iter_schedule_stages(pp_schedule)
+            if getattr(stage, "stage_index", None) is not None
+            and stage.stage_index < n_vit
+        )
+        if wired != expected:
             raise RuntimeError(
-                f"KIMI_VIT_DEP_STAGES={dep_vision_stages()} but no vision stage was "
-                "wired on this rank; a split tower cannot run unwired -- it would pass "
-                "activations through unprocessed and report no error"
+                f"KIMI_VIT_DEP_STAGES={n_vit}: this rank owns {expected} vision "
+                f"stage(s) by stage index but {wired} were wired; an unwired share "
+                "passes activations through unprocessed and reports no error"
             )
         _install_vision_prefetch(pp_schedule, model_parts)
     passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
