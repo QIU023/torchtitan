@@ -627,6 +627,15 @@ def clip_grad_norm_(
         total_norm = total_norm.full_tensor()
 
     if pp_mesh is not None:
+        # Normalise dtype and device before the collective. get_total_norm returns a CPU
+        # float32 tensor(0.) for an empty gradient list, so a PP rank whose share of the
+        # model contributes no gradients to one of these groups reaches this all_reduce
+        # with float32 while a peer holding bf16 gradients carries bfloat16. NCCL returns
+        # GARBAGE for a dtype mismatch instead of raising: the observed symptom is one
+        # side of the pipeline reporting a plausible norm -- its own PP shard's sum only --
+        # and the other reporting NaN, while every individual gradient is finite. float32
+        # is also the right width for a sum of squares.
+        total_norm = total_norm.to(device=pp_mesh.device_type, dtype=torch.float32)
         if math.isinf(norm_type):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
         else:
@@ -693,6 +702,15 @@ def _clip_grad_norm_with_ep(
         total_norm **= 1.0 / norm_type
 
     if pp_mesh is not None:
+        # Normalise dtype and device before the collective. get_total_norm returns a CPU
+        # float32 tensor(0.) for an empty gradient list, so a PP rank whose share of the
+        # model contributes no gradients to one of these groups reaches this all_reduce
+        # with float32 while a peer holding bf16 gradients carries bfloat16. NCCL returns
+        # GARBAGE for a dtype mismatch instead of raising: the observed symptom is one
+        # side of the pipeline reporting a plausible norm -- its own PP shard's sum only --
+        # and the other reporting NaN, while every individual gradient is finite. float32
+        # is also the right width for a sum of squares.
+        total_norm = total_norm.to(device=pp_mesh.device_type, dtype=torch.float32)
         if math.isinf(norm_type):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
         else:
