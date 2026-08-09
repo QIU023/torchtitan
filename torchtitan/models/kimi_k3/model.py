@@ -2057,11 +2057,17 @@ class KimiK3Spec:
                 # Treat both as dense for non-attention FLOPs; embedding
                 # lookup is free, lm_head is a real projection.
                 nparams_dense += p.numel()
-            elif ".moe.shared_experts" in name:
+            # These must match the real module names, which are ``_moe`` with a
+            # leading underscore and ``routed_experts`` rather than ``experts``.
+            # Every one of these buckets used to get zero hits, which sent all
+            # MoE parameters into `dense` -- i.e. counted every expert as
+            # activated. Keep the trailing dot: it stops the router pattern from
+            # also claiming a dense FFN's ``gate_proj``.
+            elif "._moe.shared_experts." in name:
                 nparams_shared += p.numel()
-            elif ".moe.router" in name or ".moe.gate" in name:
+            elif "._moe.router." in name:
                 nparams_router += p.numel()
-            elif ".moe.experts" in name:
+            elif "._moe.routed_experts." in name:
                 nparams_routed += p.numel()
             else:
                 nparams_dense += p.numel()
