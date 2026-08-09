@@ -93,6 +93,12 @@ _PASSTHROUGH_LAYER_TAGS = (
 )
 
 
+_MM_TEXT_PREFIX = "language_model."
+"""Wrapper child prefix a multimodal model's TEXT tensors carry, both in tt naming
+and in to_hf's export. Named rather than inlined because from_hf has to strip it on
+the way in and re-attach it on every destination."""
+
+
 class KimiLinearStateDictAdapter(MoEStateDictAdapter):
     """StateDictAdapter for KimiK3Model / KimiK3AttnResModel."""
 
@@ -338,6 +344,29 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         # contract (the caller replaces it with the returned dict).
         for key in list(hf_state_dict.keys()):
             value = hf_state_dict.pop(key)
+
+            # Undo to_hf's multimodal naming before any pattern below sees the key.
+            # to_hf strips the wrapper child prefix and hands the rest to hf_key_map,
+            # so a multimodal export is "language_model.model.layers.N..." for text and
+            # "vision_tower.*"/"mm_projector.*" for vision. Every regex here is anchored
+            # at "model.layers.", so without this NOTHING matched and _hf_key_to_tt
+            # returned (None, value) -- which is a skip, not an error. Measured before
+            # the fix: 526 of 526 text tensors of a kimi_k3_mini_vl round trip were
+            # dropped in silence, i.e. an official multimodal shard loaded as
+            # near-empty.
+            mm_prefix = ""
+            official_key = key  # hf_key_map's inverse expects the ORIGINAL export name
+            if key.startswith(_MM_TEXT_PREFIX):
+                mm_prefix = _MM_TEXT_PREFIX
+                key = key[len(mm_prefix) :]
+            elif key.startswith(("vision_tower.", "mm_projector.")):
+                from torchtitan.models.kimi_k3.hf_key_map import official_to_titan
+
+                # hf_key_map owns the vision naming in both directions.
+                tt_key, _kind = official_to_titan(key, kda_layers=set())
+                state_dict[tt_key] = value
+                continue
+
             expert_m = re.match(
                 r"model\.layers\.(\d+)\.(?:mlp|block_sparse_moe)\.experts\."
                 r"(\d+)\.(\w+)\.weight",
@@ -352,7 +381,8 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                     "layers.{}.ffn._moe.routed_experts.inner_experts."
                     + _EXPERT_W_SUFFIXED[w_tag]
                 )
-                new_key = titan_abstract_key.format(layer_num)
+                new_key = mm_prefix + titan_abstract_key.format(layer_num)
+                titan_abstract_key = mm_prefix + titan_abstract_key
 
                 layer_bucket = expert_weights_by_layer.setdefault(layer_num, {})
                 layer_bucket.setdefault(titan_abstract_key, {})[int(expert_num)] = value
@@ -373,12 +403,77 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                     state_dict[new_key] = stacked
                 continue
 
-            tt_key, value = self._hf_key_to_tt(key, value)
+            # Hand-written table first: it carries VALUE transforms (the 4-D A_log
+            # reshape) that hf_key_map does not, and delegating ahead of it silently
+            # dropped those, producing shape drift instead of a missing key. hf_key_map
+            # is the fallback for everything the table does not know -- the K3 layouts:
+            # latent MoE (ffn.latent.*), the AttnRes tail, gated MLA. The table also
+            # declines K3 shared experts on purpose (see _hf_key_to_tt) because its
+            # answer there belongs to a different layout.
+            from torchtitan.models.kimi_k3.hf_key_map import (
+                kda_layers_zero_based,
+                official_to_titan,
+                UnmappedKey,
+            )
+
+            # Shared experts are LAYOUT-DEPENDENT, so hf_key_map decides them: the table
+            # only knows Kimi Linear's ffn._moe.shared_experts.w1 while K3's latent path
+            # uses ffn.shared_experts.gate_proj. For every other key the table goes first
+            # because it also performs value transforms (the 4-D A_log reshape) that
+            # hf_key_map does not.
+            # Which layout applies is decided the SAME way to_hf decides it: to_hf sends
+            # keys carrying the wrapper prefix to hf_key_map and keeps everything else on
+            # its own table, so a multimodal export is in K3 naming and a text-only
+            # export is in Kimi Linear naming. Mirroring that exactly is what makes the
+            # round trip close; asking hf_key_map for a text-only model's shared experts
+            # returned a K3 path the model does not have -- and it returned it
+            # SUCCESSFULLY, so no UnmappedKey fallback could catch it.
+            #
+            # TODO: this is a proxy for "does this model use the latent MoE layout". It
+            # holds for every flavor here because the K3 layouts arrived with the
+            # multimodal ones, and it breaks the day a text-only latent flavor exists.
+            # g_proj joins shared experts as a key the table cannot decide. The release
+            # uses ONE name for two different gates -- KDA's own g_proj and gated MLA's
+            # output gate, which is attn_gate_proj on our side -- so resolving it needs
+            # the layer type, which only hf_key_map has. The table returned g_proj
+            # unchanged, a non-None answer that suppressed the fallback and left
+            # attn_gate_proj unwritten: an official gated-MLA load would keep its gates
+            # at random init.
+            tt_key = None
+            if "g_proj" in key or (mm_prefix and "shared_experts" in key):
+                try:
+                    tt_key, _kind = official_to_titan(
+                        official_key,
+                        kda_layers=kda_layers_zero_based(self.kimi_config),
+                    )
+                except UnmappedKey:
+                    tt_key = None
+            if tt_key is None:
+                tt_key, value = self._hf_key_to_tt(key, value)
+            if tt_key is None:
+                try:
+                    # official_key, not the prefix-stripped one: hf_key_map keys off the
+                    # full released name and returns an unprefixed tt key, which
+                    # mm_prefix re-attaches below.
+                    tt_key, _kind = official_to_titan(
+                        official_key,
+                        kda_layers=kda_layers_zero_based(self.kimi_config),
+                    )
+                except UnmappedKey:
+                    tt_key = None
             tt_key = self._add_lora_base(tt_key) if tt_key else tt_key
             if tt_key is not None:
-                state_dict[tt_key] = value
+                state_dict[mm_prefix + tt_key] = value
 
-        if "lm_head.weight" not in state_dict and "embed_tokens.weight" in state_dict:
+        mm = (
+            _MM_TEXT_PREFIX
+            if any(k.startswith(_MM_TEXT_PREFIX) for k in state_dict)
+            else ""
+        )
+        if (
+            f"{mm}lm_head.weight" not in state_dict
+            and f"{mm}embed_tokens.weight" in state_dict
+        ):
             # Kimi scaling-law configs tie lm_head to the embedding and the
             # HF export omits the alias. For a genuinely untied model with a
             # missing head this is wrong -- warn loudly either way.
@@ -386,7 +481,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 "HF checkpoint has no lm_head.weight; aliasing "
                 "embed_tokens.weight (Kimi tied-embedding convention)."
             )
-            state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"]
+            state_dict[f"{mm}lm_head.weight"] = state_dict[f"{mm}embed_tokens.weight"]
 
         return state_dict
 
@@ -442,6 +537,11 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             w_tag = _HF_TO_W.get(proj, proj)
             if w_tag not in ("w1", "w2", "w3"):
                 raise ValueError(f"Unknown shared-expert projection in {key!r}")
+            # Kimi Linear's layout. K3's latent MoE names the same tensor
+            # ffn.shared_experts.gate_proj, so from_hf asks hf_key_map FIRST for these
+            # and uses this answer only when hf_key_map declines -- see the
+            # shared-expert branch there. Returning it unconditionally wrote a key that
+            # exists in another layout, which no fallback could detect.
             return f"{tt_prefix}.ffn._moe.shared_experts.{w_tag}.{suff}", value
 
         # Unknown per-layer key: skip with a debug note rather than failing
