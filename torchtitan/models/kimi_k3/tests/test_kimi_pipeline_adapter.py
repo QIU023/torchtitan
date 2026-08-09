@@ -125,5 +125,41 @@ class TestContiguousSplitGuard(unittest.TestCase):
         self.assertEqual(tables.num_blocks, 2)
 
 
+class TestStepEndSweep(unittest.TestCase):
+    """What the step-end sweep evicts.
+
+    Only backward marks a microbatch as seen, so a sweep keyed on the seen-set
+    alone cannot reach anything a forward-only pass cached.
+    """
+
+    @staticmethod
+    def _adapter():
+        from torch import nn
+
+        from torchtitan.models.kimi_k3.pipeline_adapter import CrossStageCacheAdapter
+
+        return CrossStageCacheAdapter(nn.Identity(), stage_id=0, num_stages=1)
+
+    def test_a_forward_only_microbatch_is_evicted(self):
+        import torch
+
+        adapter = self._adapter()
+        adapter._cache.append(0, torch.zeros(2), (0, 0, 0))
+        # Evaluation reaches exactly this state: cached blocks, nothing marked.
+        self.assertEqual(adapter._cache._seen_mbs, set())
+        adapter._drop_all_cached_and_clear()
+        self.assertEqual(adapter._cache.get_blocks(0), [])
+
+    def test_a_backward_marked_microbatch_is_still_evicted(self):
+        import torch
+
+        adapter = self._adapter()
+        adapter._cache.append(1, torch.zeros(2), (0, 0, 0))
+        adapter.on_microbatch_end(1)
+        adapter._drop_all_cached_and_clear()
+        self.assertEqual(adapter._cache.get_blocks(1), [])
+        self.assertEqual(adapter._cache._seen_mbs, set())
+
+
 if __name__ == "__main__":
     unittest.main()

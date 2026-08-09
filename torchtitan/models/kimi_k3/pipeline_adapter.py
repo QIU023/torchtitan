@@ -859,7 +859,7 @@ class CrossStageCacheAdapter(nn.Module):
             return (head + touch, *tail)
         return payload + touch
 
-    def _drop_all_seen_and_clear(self) -> None:
+    def _drop_all_cached_and_clear(self) -> None:
         """Drop every mb the cache saw during the step and clear the
         seen-set. Called by the step-end monkey-patch after every
         adapter on this rank has finished backward. Honors the VP
@@ -871,8 +871,11 @@ class CrossStageCacheAdapter(nn.Module):
             pp_size = self._layout.P if self._layout is not None else self.num_stages
             if self.stage_id + pp_size < self.num_stages:
                 return
-        seen = list(self._cache._seen_mbs)
-        for mb_index in seen:
+        # Union, not just the seen-set: only backward marks an mb as seen, so a
+        # forward-only pass (evaluation) caches blocks that nothing would ever
+        # announce for eviction. Nothing in the cache outlives the step, so the
+        # keys actually present are the right thing to drop.
+        for mb_index in set(self._cache._seen_mbs) | set(self._cache._blocks):
             self._cache.drop(mb_index)
         # Defensive: ensure the seen-set is clear even if drop() didn't
         # remove every entry.
@@ -1010,7 +1013,7 @@ def _install_step_drop_patch(
     """Wrap ``pp_schedule.step`` so every registered adapter on this
     rank evicts its seen mbs from the shared cache EXACTLY ONCE after
     ``orig_step`` returns. The VP drop-guard inside
-    :meth:`_drop_all_seen_and_clear` ensures only the last virtual
+    :meth:`_drop_all_cached_and_clear` ensures only the last virtual
     stage on the rank actually frees memory.
     """
     orig_step = pp_schedule.step
@@ -1021,7 +1024,7 @@ def _install_step_drop_patch(
         finally:
             for adapter in adapters:
                 try:
-                    adapter._drop_all_seen_and_clear()
+                    adapter._drop_all_cached_and_clear()
                 except Exception:
                     # Continue so one poisoned adapter cannot keep the others
                     # from clearing -- but say so. Swallowing this silently
@@ -1550,6 +1553,12 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
             n_layers=n_layers_total,
             layers_per_block=layers_per_block,
         )
+    except ValueError:
+        # An unsupported configuration, not a rank-local mishap. Falling back
+        # here would leave this rank without an adapter while its peers have
+        # one, and a rank with no adapter sends no delta -- the first
+        # cross-stage hop would hang instead of reporting the real problem.
+        raise
     except Exception as e:  # pragma: no cover - defensive
         warnings.warn(
             f"Failed to build Kimi Linear block-layout tables ({e!r}); "
