@@ -863,6 +863,22 @@ def quantize_lora_bases(
 
 
 @torch.no_grad()
+def _materialize(t: torch.Tensor) -> torch.Tensor:
+    """A full, plain tensor -- ``full_tensor()`` on a DTensor, else unchanged.
+
+    Same idiom :meth:`KimiLoRALinear._dequant_base_mxfp4` already uses on the
+    packed base. It matters on both sides of the merge: mixing a materialized
+    base with sharded adapters either raises on the add, or -- worse -- produces
+    a rank-local shard that then gets written under a full-tensor key, so the
+    exported checkpoint silently holds one rank's slice.
+
+    This is a collective, and every rank walks the same modules in the same
+    order, so the calls line up. Export runs outside autograd, hence no
+    grad_placements.
+    """
+    return t.full_tensor() if hasattr(t, "full_tensor") else t
+
+
 def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Fold LoRA adapters into base weights and return a plain state dict
     keyed by ORIGINAL param names (no ``.base``/``lora_a``/``lora_b``).
@@ -891,9 +907,14 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
                 base_w = base_w.get_original_weight()
         else:
             base_w = module.base.weight
+        base_w = _materialize(base_w)
         out_dtype = base_w.dtype if base_w.dtype != torch.uint8 else torch.bfloat16
-        # fp32 delta for deployable precision, cast back to base dtype.
-        delta = module._lora_scaling * (module.lora_b.float() @ module.lora_a.float())
+        # fp32 delta for deployable precision, cast back to base dtype. Both
+        # adapters are materialized first: under TP they are DTensors while the
+        # dequantized base is already plain.
+        lora_b = _materialize(module.lora_b)
+        lora_a = _materialize(module.lora_a)
+        delta = module._lora_scaling * (lora_b.float() @ lora_a.float())
         sd[f"{mod_name}.weight"] = (base_w.float() + delta).to(out_dtype).contiguous()
         for suffix in (
             ".base.weight",

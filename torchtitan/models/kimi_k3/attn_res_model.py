@@ -63,6 +63,7 @@ from torchtitan.models.kimi_k3.model import (
     KimiK3Config,
     KimiK3Model,
     Linear,
+    splice_vision_embeds,
 )
 
 
@@ -480,59 +481,7 @@ class KimiK3AttnResModel(KimiK3Model):
                         else self._DEFAULT_IMAGE_TOKEN_ID
                     )
                     image_mask = tokens == sentinel
-                # Variable image count per row support (B1): the original
-                # ``vision_embeds.reshape(-1, D)`` assumes every row has
-                # exactly ``vision_embeds.size(1)`` image tokens — which
-                # holds for LLaVA-Pretrain (1 img × 196 tokens) but breaks
-                # the moment data has zero-image rows (text-only mixed in)
-                # or multi-image rows. Filter ``vision_embeds`` to the
-                # leading ``n_image_per_row[i]`` slots of each row before
-                # flattening so ``masked_scatter`` consumes the correct
-                # row-major sequence of embeds.
-                #
-                # Under PP shape inference (zero-filled tokens, image_mask
-                # all False), n_image_per_row=0 → valid all False →
-                # source has shape (0, D), masked_scatter is a no-op.
-                # Under uniform-image data (all rows == n_vis_max), valid
-                # is all True → source equals the original reshape, so
-                # this is a strict superset of the previous behavior.
-                n_per_row = image_mask.sum(dim=1)
-                n_vis_max = vision_embeds.size(1)
-                arange = torch.arange(n_vis_max, device=image_mask.device)
-                valid = arange.unsqueeze(0) < n_per_row.unsqueeze(1)
-                source = vision_embeds[valid].to(h.dtype)
-                # Robustness fix (seq-KD SFT crash, 2026-05): the number of
-                # scatter DESTINATIONS (True positions in ``image_mask``) must
-                # exactly equal the number of SOURCE embeds, or
-                # ``Tensor.masked_scatter`` trips the CUDA device-side assert
-                # ``masked_scatter_size_check: totalElements <= srcSize``
-                # (IndexKernel.cu:400). That assert surfaces ASYNC at a much
-                # later kernel (a KDA/MLA/FFN linear → CUBLAS_STATUS_EXECUTION_FAILED
-                # or an FSDP all-gather), making it look like an MoE/attention
-                # bug when it is really an embed-scatter count mismatch.
-                #
-                # The source is clamped to at most ``n_vis_max`` embeds per row
-                # (``valid`` above), but ``image_mask`` can have MORE than
-                # ``n_vis_max`` True positions in a row when the *text* tokens
-                # happen to contain the image-sentinel id (e.g. distilled SFT
-                # answers tokenize to Llama-3.1 id 32000 == ``IMAGE_TOKEN_ID``,
-                # the reserved token reused as ``<image>`` — it decodes to the
-                # ordinary subword 'utility', so ~0.03% of teacher-rewritten
-                # rows contain it). Cap the destinations to the leading
-                # ``n_vis_max`` per row so destinations == source. This is a
-                # no-op for well-formed rows (``n_per_row <= n_vis_max``); for
-                # over-count rows the surplus sentinel positions simply keep
-                # their text-embedding (correct: they are real text tokens that
-                # collided with the sentinel id, not image slots).
-                n_keep_per_row = torch.clamp(n_per_row, max=n_vis_max)
-                if bool((n_per_row > n_vis_max).any()):
-                    pos_rank = (
-                        image_mask.long().cumsum(dim=1) - 1
-                    )  # 0-based rank of each True within its row
-                    scatter_mask = image_mask & (pos_rank < n_keep_per_row.unsqueeze(1))
-                else:
-                    scatter_mask = image_mask
-                h = h.masked_scatter(scatter_mask.unsqueeze(-1).expand_as(h), source)
+                h = splice_vision_embeds(h, vision_embeds, image_mask)
         else:
             h = tokens
 
@@ -706,6 +655,7 @@ class KimiK3AttnResModel(KimiK3Model):
         # Guard against PP-split stages that dropped some modules
         # (pipeline_module_split replaces non-owned modules with None
         # or Identity).
+
         # One helper over every AttnRes-bearing block, so a block reachable by a new
         # route cannot be missed. That is what happened with MTP: this loop walked
         # self.layers only, while an MTP layer wraps its own KimiAttnResDecoderLayer,

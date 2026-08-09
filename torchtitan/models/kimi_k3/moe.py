@@ -75,13 +75,18 @@ class KimiSiTUGroupedExperts(GroupedExperts):
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
-        gate_RF = torch._grouped_mm(
-            x_RD.bfloat16(), w1_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
+        # Through the inherited seam, not torch._grouped_mm directly: the MXFP8
+        # converter installs its quantized GEMM by overriding _grouped_mm, so a
+        # direct call silently opts every routed expert out of it -- which is
+        # where the majority of the model's FLOPs live, and the opposite of what
+        # this class's docstring promises.
+        gate_RF = self._grouped_mm(
+            A=x_RD.bfloat16(), B_t=w1_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
         )
-        up_RF = torch._grouped_mm(
-            x_RD.bfloat16(), w3_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
+        up_RF = self._grouped_mm(
+            A=x_RD.bfloat16(), B_t=w3_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
         )
         h_RF = situ_and_mul(gate_RF, up_RF, self.situ_beta, self.situ_linear_beta)
-        return torch._grouped_mm(
-            h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
+        return self._grouped_mm(
+            A=h_RF, B_t=w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
         ).type_as(x_RD)

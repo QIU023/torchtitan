@@ -253,6 +253,39 @@ class TestLoRAMerge(unittest.TestCase):
         )
 
 
+class TestMergeMaterializesShardedAdapters(unittest.TestCase):
+    """The merge must not mix a full base with sharded adapters.
+
+    Real DTensors need a process group, so this stands in a tensor that reports
+    a ``full_tensor()`` -- which is the only thing the merge path keys on -- and
+    checks the merge used the full value rather than the local one.
+    """
+
+    def test_an_adapter_offering_full_tensor_is_materialized(self):
+        from torchtitan.models.kimi_k3.lora import _materialize
+
+        class _Sharded(torch.Tensor):
+            @staticmethod
+            def __new__(cls, local, full):
+                obj = torch.Tensor._make_subclass(cls, local, False)
+                obj._full = full
+                return obj
+
+            def full_tensor(self):
+                return self._full
+
+        local = torch.zeros(2, 2)
+        full = torch.ones(2, 2)
+        out = _materialize(_Sharded(local, full))
+        self.assertTrue(torch.equal(out, full))
+
+    def test_a_plain_tensor_passes_through_untouched(self):
+        from torchtitan.models.kimi_k3.lora import _materialize
+
+        t = torch.randn(3, 3)
+        self.assertIs(_materialize(t), t)
+
+
 if __name__ == "__main__":
     unittest.main()
 
