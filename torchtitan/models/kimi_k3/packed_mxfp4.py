@@ -95,9 +95,15 @@ def dequantize_mxfp4(
     values = torch.stack([table[lo], table[hi]], dim=-1).flatten(-2)
 
     exp = scale.to(torch.int32)
+    # OCP MX: E8M0 encodes the exponent directly, so 0x00 is 2**-127 and only 0xFF is
+    # special (NaN). Mapping 0x00 to zero and letting 0xFF fall through to
+    # exp2(255-127) = inf is wrong in both directions, and quantize_mxfp4 never emits
+    # either value -- so the round-trip test could not see it. An official shard that
+    # does use them would decode to zeros where it meant a tiny scale, and to inf where
+    # it meant NaN.
     factors = torch.where(
-        exp == 0,
-        torch.zeros_like(exp, dtype=torch.float32),
+        exp == 0xFF,
+        torch.full_like(exp, float("nan"), dtype=torch.float32),
         torch.exp2((exp - _E8M0_BIAS).to(torch.float32)),
     )
     factors = factors.repeat_interleave(group_size, dim=-1)

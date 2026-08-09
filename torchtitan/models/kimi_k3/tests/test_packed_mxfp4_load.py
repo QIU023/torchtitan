@@ -188,3 +188,43 @@ class TestSyntheticOfficialCheckpointLoad(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestE8M0SpecialCodes(unittest.TestCase):
+    """The two E8M0 codes ``quantize_mxfp4`` never emits.
+
+    OCP MX defines 0x00 as 2**-127 and 0xFF as NaN. A round trip through this
+    module's own quantizer cannot reach either -- it picks scales from the data --
+    so the decode was free to be wrong in both directions and was: 0x00 mapped to
+    zero and 0xFF fell through to exp2(255-127), i.e. inf. An official shard using
+    them would silently decode a tiny scale as zero and a NaN as inf.
+    """
+
+    def _decode_one_group(self, scale_code: int):
+        from torchtitan.models.kimi_k3.packed_mxfp4 import (
+            dequantize_mxfp4,
+            MXFP4_GROUP_SIZE,
+        )
+
+        # One group whose every nibble is E2M1 code 1 == value 0.5, so the decoded
+        # magnitude is exactly the scale factor times 0.5.
+        packed = torch.full((1, MXFP4_GROUP_SIZE // 2), 0x11, dtype=torch.uint8)
+        scale = torch.tensor([[scale_code]], dtype=torch.uint8)
+        return dequantize_mxfp4(packed, scale, dtype=torch.float32)
+
+    def test_zero_code_is_two_to_the_minus_127_not_zero(self):
+        out = self._decode_one_group(0x00)
+        self.assertTrue(
+            torch.isfinite(out).all(), "0x00 must decode to a finite tiny scale"
+        )
+        self.assertFalse(
+            bool((out == 0).all()),
+            "0x00 decoded to zero; OCP MX defines it as 2**-127",
+        )
+
+    def test_all_ones_code_is_nan_not_inf(self):
+        out = self._decode_one_group(0xFF)
+        self.assertTrue(bool(torch.isnan(out).all()), "0xFF must decode to NaN")
+        self.assertFalse(
+            bool(torch.isinf(out).any()), "0xFF decoded to inf; OCP MX defines NaN"
+        )
