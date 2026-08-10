@@ -1550,14 +1550,17 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
         # the collective until the watchdog fires.
         #
         # KEEP the counts. Discarding them and never calling _select_cp_shard was a
-        # silent defect: prepare_context_parallel_input shards the sequence but leaves
+        # defect: prepare_context_parallel_input shards the sequence but leaves
         # pixel_values whole, so every CP rank encodes every image while holding only a
         # slice of the sentinels. Without the selection this rank splices ALL the
-        # features into its own shard's sentinels. It does not raise -- it produced a
-        # step-1 forward that differed from the non-DEP path by 0.042 from a shared seed
-        # checkpoint -- and it stayed hidden because on the debug flavor the visual
-        # tokens fill the whole sequence, which makes the sequence shard and the
-        # dynamic-CP row band the same size by coincidence.
+        # features into its own shard's sentinels.
+        #
+        # Whether that is visible depends entirely on how the sentinels fall across the
+        # CP shards. The debug flavor at seq 256 puts all of them on one rank
+        # (counts=[64, 0]), and there the omission is a no-op -- the rank holding none
+        # has nowhere to splice -- which is why removing the call again moves no number.
+        # At seq 96 the split is counts=[47, 1] and the pre-fix path fails outright.
+        # See DEP_60_VERIFIED_2026-08-10.md in the logbook for both arms.
         cp_counts = None
         if cp_active:
             cp_counts = self._exchange_sentinel_counts(num_sentinels)
