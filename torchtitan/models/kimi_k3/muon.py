@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.optim.adamw import adamw as _torch_adamw
 from torch.optim.optimizer import Optimizer
 
 from torchtitan.components.optimizer import OptimizersContainer
@@ -150,21 +151,46 @@ class Muon(Optimizer):
         p.add_(o, alpha=-group["lr"] * scale)
 
     def _adamw_update(self, p, g, group):
+        """AdamW for the params Muon does not orthogonalize, via torch's own kernel.
+
+        This was a hand-rolled clone of torch.optim.adamw. The math was identical --
+        checked before replacing it, not after: over 5 float32 steps the parameters
+        came out BIT-identical and exp_avg_sq identical. The one difference is
+        exp_avg, which drifts to ~1e-7 because torch fuses the first-moment update as
+        a lerp where the clone did mul_ then add_. So this is a reuse change with a
+        declared float32 last-bit difference in momentum state, not a bit-exact
+        refactor, and a long run will not reproduce the clone's trajectory exactly.
+
+        ``step`` is kept as a tensor because that is what the functional API takes.
+        """
         st = self.state[p]
-        if "step" not in st:
-            st["step"] = 0
+        if "exp_avg" not in st:
+            st["step"] = torch.zeros((), dtype=torch.float32, device=p.device)
             st["exp_avg"] = torch.zeros_like(g)
             st["exp_avg_sq"] = torch.zeros_like(g)
-        st["step"] += 1
         b1, b2 = group["adamw_betas"]
-        st["exp_avg"].mul_(b1).add_(g, alpha=1 - b1)
-        st["exp_avg_sq"].mul_(b2).addcmul_(g, g, value=1 - b2)
-        bc1 = 1 - b1 ** st["step"]
-        bc2 = 1 - b2 ** st["step"]
-        denom = (st["exp_avg_sq"].sqrt() / (bc2**0.5)).add_(group["adamw_eps"])
-        if group["weight_decay"]:
-            p.mul_(1 - group["adamw_lr"] * group["weight_decay"])
-        p.addcdiv_(st["exp_avg"], denom, value=-group["adamw_lr"] / bc1)
+        _torch_adamw(
+            [p],
+            [g],
+            [st["exp_avg"]],
+            [st["exp_avg_sq"]],
+            [],
+            [st["step"]],
+            foreach=False,
+            capturable=False,
+            differentiable=False,
+            fused=False,
+            grad_scale=None,
+            found_inf=None,
+            has_complex=False,
+            amsgrad=False,
+            beta1=b1,
+            beta2=b2,
+            lr=group["adamw_lr"],
+            weight_decay=group["weight_decay"],
+            eps=group["adamw_eps"],
+            maximize=False,
+        )
 
 
 # Report sec 2.5 scopes the per-head refinement to the Q, K and V projections:

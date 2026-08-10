@@ -395,10 +395,10 @@ def kimi_k3_mini_vl() -> Trainer.Config:
     # run dies in a CUDA device-side assert. vision_token_id must be the
     # tokenizer's image id, not the LLaVA -200 default -- at -200 the sentinel
     # scan never matches and forward silently takes its text-only branch.
-    import dataclasses as _dc2
+    import dataclasses as _dc
 
-    kc = _dc2.replace(kc, vocab_size=2020)
-    cfg.loss = _dc2.replace(cfg.loss, global_vocab_size=2020)
+    kc = _dc.replace(kc, vocab_size=2020)
+    cfg.loss = _dc.replace(cfg.loss, global_vocab_size=2020)
     cfg.model_spec.model = KimiK3MultimodalSpec(
         kimi_config=kc,
         vision_config=vision,
