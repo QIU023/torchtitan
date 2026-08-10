@@ -564,7 +564,12 @@ def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
 
 
 def _diag_multi_layer(
-    name: str, *, num_layers: int, num_blocks: int | None, moe: bool = False
+    name: str,
+    *,
+    num_layers: int,
+    num_blocks: int | None,
+    moe: bool = False,
+    kda: bool = False,
 ) -> Trainer.Config:
     """DIAGNOSTIC builder: N dense MLA layers with a real AttnRes block count.
 
@@ -582,11 +587,14 @@ def _diag_multi_layer(
     cfg = kimi_k3_mini_block_attn_res()
     cfg.model_spec.flavor = name
     kc = cfg.model_spec.model.kimi_config
+    # kda=True makes every layer KDA. The single-layer builders pin num_blocks=1,
+    # which degenerates AttnRes, so they cannot isolate a KDA x AttnRes interaction;
+    # this is the knob that can.
     kc = _dc.replace(
         kc,
         num_hidden_layers=num_layers,
-        kda_layers=[],
-        full_attn_layers=list(range(1, num_layers + 1)),
+        kda_layers=list(range(1, num_layers + 1)) if kda else [],
+        full_attn_layers=[] if kda else list(range(1, num_layers + 1)),
         first_k_dense_replace=0 if moe else num_layers,
     )
     cfg.model_spec.model = _dc.replace(
@@ -603,6 +611,25 @@ def _diag_multi_layer(
 def kimi_k3_mini_diag_4l_mla() -> Trainer.Config:
     """Four dense MLA layers, 2 AttnRes blocks -- the smallest multi-block case."""
     return _diag_multi_layer("kimi_k3_mini_diag_4l_mla", num_layers=4, num_blocks=2)
+
+
+def kimi_k3_mini_diag_4l_kda() -> Trainer.Config:
+    """Four KDA layers, 2 AttnRes blocks -- the KDA counterpart of diag_4l_mla.
+
+    The arm that isolates a KDA x AttnRes interaction. diag_1l_kda cannot: its
+    num_blocks=1 leaves AttnRes degenerate, so a clean result there says nothing about
+    the two together.
+    """
+    return _diag_multi_layer(
+        "kimi_k3_mini_diag_4l_kda", num_layers=4, num_blocks=2, kda=True
+    )
+
+
+def kimi_k3_mini_diag_4l_kda_noattnres() -> Trainer.Config:
+    """Four KDA layers with AttnRes disabled -- control for the above."""
+    return _diag_multi_layer(
+        "kimi_k3_mini_diag_4l_kda_noattnres", num_layers=4, num_blocks=None, kda=True
+    )
 
 
 def kimi_k3_mini_diag_4l_mla_noattnres() -> Trainer.Config:
