@@ -538,9 +538,44 @@ class MoonViTEncoderLayer(nn.Module):
 
         plan = self._cp_patch_plan
         if plan is not None:
+            # Dynamic CP gathers KV over the patch group with a plain process-group
+            # collective, which needs local tensors. The head-sharded branch above
+            # already dropped to local; the REPLICATED-attention branch has not, and
+            # that is the only configuration where vision TP and dynamic CP ever met
+            # a DTensor here -- it happens when the head count does not divide the TP
+            # ranks (parallelize.py warns and leaves attention replicated), so it was
+            # invisible on any tower whose heads divide.
+            from torch.distributed.tensor import (
+                DTensor as _DT,
+                Replicate as _R,
+            )
+
+            tp_mesh = None
+            if isinstance(q, _DT):
+                if any(not isinstance(p, _R) for p in q.placements):
+                    raise ValueError(
+                        "MoonViT dynamic CP expects replicated attention inputs "
+                        f"when attention is not head-sharded, got {q.placements}"
+                    )
+                tp_mesh = q.device_mesh
+                # Replicate, so the local shard IS the full tensor and both
+                # conversions are exact rather than coercions.
+                #
+                # grad_placements is Replicate, NOT Partial. Every TP rank runs the
+                # same full-head attention and so receives the same full gradient;
+                # summing across them would scale it by tp_size. Partial is right in
+                # the head-sharded branch above for the opposite reason -- the slices
+                # there are disjoint, so each rank's gradient is an additive part.
+                q, k, v = (t.to_local(grad_placements=[_R()]) for t in (q, k, v))
             out = self._attend_gather_kv(q, k, v, plan)
             local_heads = out.size(1)
-            return self.wo(out.reshape(L, local_heads * self.head_dim))
+            out = out.reshape(out.size(0), local_heads * self.head_dim)
+            if tp_mesh is not None:
+                # wo is not in the TP plan in this branch, so distribute_module left
+                # it replicated and it takes a DTensor. Re-wrapping restores exactly
+                # the structure the non-CP replicated path hands it.
+                out = _DT.from_local(out, tp_mesh, [_R()], run_check=False)
+            return self.wo(out)
 
         # Block-diagonal attention over the packed stream: each sample attends
         # only within itself. Done as a per-sample loop over SDPA rather than a
