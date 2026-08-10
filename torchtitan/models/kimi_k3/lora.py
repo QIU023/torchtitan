@@ -879,6 +879,45 @@ def _materialize(t: torch.Tensor) -> torch.Tensor:
     return t.full_tensor() if hasattr(t, "full_tensor") else t
 
 
+# Wrapper segments that appear in ``named_modules()`` paths but NOT in
+# ``state_dict()`` keys, because each wrapper installs a hook that strips its own
+# prefix. Activation checkpointing, FSDP and torch.compile all do this.
+_WRAPPER_SEGMENTS = frozenset(
+    {"_checkpoint_wrapped_module", "_fsdp_wrapped_module", "_orig_mod"}
+)
+
+
+def _state_dict_prefix(mod_name: str, sd: dict) -> str:
+    """The state-dict prefix for a module reached at ``mod_name``.
+
+    These two namings differ once anything wraps the module: activation
+    checkpointing turns ``layers.0.ffn.gate_proj`` into
+    ``layers.0._checkpoint_wrapped_module.ffn.gate_proj`` in ``named_modules()``,
+    while ``state_dict()`` strips it back out. Composing keys from the module path
+    then writes a name nothing else recognises AND leaves the adapter keys in place,
+    because the pops miss too. Observed as
+    ``ValueError: Unmapped tt key: 'layers.0._checkpoint_wrapped_module.ffn.gate_proj.weight'``
+    from a GRPO weight sync -- the merge had silently produced both a bogus merged
+    key and the original LoRA triple.
+
+    An unknown wrapper raises rather than guessing: a wrong name here is a weight
+    that never reaches the rollout engine, which is not a failure that announces
+    itself.
+    """
+    stripped = ".".join(p for p in mod_name.split(".") if p not in _WRAPPER_SEGMENTS)
+    for candidate in (stripped, mod_name):
+        if any(
+            f"{candidate}{suffix}" in sd
+            for suffix in (".base.weight", ".base_qdata", ".lora_a")
+        ):
+            return candidate
+    raise KeyError(
+        f"LoRA module at {mod_name!r} has no matching state_dict entry (tried "
+        f"{stripped!r}); an unrecognised module wrapper is in the path, and "
+        "merging under a guessed name would ship weights nothing can load"
+    )
+
+
 def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Fold LoRA adapters into base weights and return a plain state dict
     keyed by ORIGINAL param names (no ``.base``/``lora_a``/``lora_b``).
@@ -897,6 +936,8 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     for mod_name, module in model.named_modules():
         if not isinstance(module, KimiLoRALinear):
             continue
+        # named_modules() and state_dict() disagree once a wrapper is in the path.
+        prefix = _state_dict_prefix(mod_name, sd)
         if module._quantize_base == "mxfp4":
             base_w = module._dequant_base_mxfp4()
         elif module._quantize_base == "nf4":
@@ -915,7 +956,7 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         lora_b = _materialize(module.lora_b)
         lora_a = _materialize(module.lora_a)
         delta = module._lora_scaling * (lora_b.float() @ lora_a.float())
-        sd[f"{mod_name}.weight"] = (base_w.float() + delta).to(out_dtype).contiguous()
+        sd[f"{prefix}.weight"] = (base_w.float() + delta).to(out_dtype).contiguous()
         for suffix in (
             ".base.weight",
             ".base.bias",
@@ -924,5 +965,5 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             ".lora_a",
             ".lora_b",
         ):
-            sd.pop(f"{mod_name}{suffix}", None)
+            sd.pop(f"{prefix}{suffix}", None)
     return sd

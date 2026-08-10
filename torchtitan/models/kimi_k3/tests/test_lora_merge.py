@@ -286,6 +286,60 @@ class TestMergeMaterializesShardedAdapters(unittest.TestCase):
         self.assertIs(_materialize(t), t)
 
 
+class TestMergeUnderModuleWrappers(unittest.TestCase):
+    """Activation checkpointing renames the module path but not the state dict.
+
+    ``named_modules()`` reports ``...._checkpoint_wrapped_module.ffn.gate_proj`` while
+    ``state_dict()`` strips the segment back out. Composing merged keys from the module
+    path wrote a name nothing recognises and left the adapter keys in place, since the
+    pops missed as well. It surfaced from a GRPO weight sync as
+    ``Unmapped tt key: 'layers.0._checkpoint_wrapped_module.ffn.gate_proj.weight'``.
+    """
+
+    def _wrapped_lora_model(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        from torchtitan.models.kimi_k3 import config_registry as cr
+
+        model = cr.kimi_k3_debugmodel_gated_lora().model_spec.model.build()
+        model.init_weights()
+        # Wrap one real decoder layer, the way apply_ac does.
+        key = next(iter(model.layers))
+        model.layers[key] = checkpoint_wrapper(model.layers[key])
+        return model
+
+    def test_the_wrapper_segment_is_absent_from_state_dict_keys(self):
+        """The premise. If this ever fails, the fix below is solving nothing."""
+        model = self._wrapped_lora_model()
+        paths = [n for n, _ in model.named_modules()]
+        self.assertTrue(any("_checkpoint_wrapped_module" in n for n in paths))
+        self.assertFalse(
+            any("_checkpoint_wrapped_module" in k for k in model.state_dict())
+        )
+
+    def test_merged_keys_use_state_dict_names(self):
+        from torchtitan.models.kimi_k3.lora import merge_lora_state_dict
+
+        merged = merge_lora_state_dict(self._wrapped_lora_model())
+        self.assertFalse(
+            [k for k in merged if "_checkpoint_wrapped_module" in k],
+            "merged key carries a wrapper segment no loader recognises",
+        )
+        self.assertFalse(
+            [k for k in merged if k.endswith((".base.weight", ".lora_a", ".lora_b"))],
+            "adapter keys survived the merge, so the pops missed",
+        )
+
+    def test_an_unrecognised_wrapper_raises(self):
+        """Guessing a name here ships weights nothing can load, in silence."""
+        from torchtitan.models.kimi_k3.lora import _state_dict_prefix
+
+        with self.assertRaises(KeyError):
+            _state_dict_prefix("layers.0._made_up_wrapper.ffn.gate_proj", {})
+
+
 if __name__ == "__main__":
     unittest.main()
 
