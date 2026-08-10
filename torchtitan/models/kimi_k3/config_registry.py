@@ -17,34 +17,15 @@ shared this registry lives outside this folder; it remains runnable
 against earlier history (<= 666cf7ad6).
 """
 
-from collections.abc import Callable
-from functools import partial
-
-import torch.nn as nn
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw, OptimizersContainer
+from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.validate import Validator
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.models.common import (
-    ComplexRoPE,
-    compute_ffn_hidden_dim,
-    Embedding,
-    Linear,
-    RMSNorm,
-    RoPE,
-    TransformerBlock,
-)
-from torchtitan.models.common.attention import ScaledDotProductAttention
-from torchtitan.models.common.config_utils import make_ffn_config, make_gqa_config
-from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
-from torchtitan.models.kimi_k3 import model_registry as attn_res_model_registry
 from torchtitan.models.kimi_k3.model_configs import (  # noqa: F401
     _alternating_kda_mla_layers,
     _BY_NAME,
@@ -64,9 +45,6 @@ from torchtitan.models.kimi_k3.model_configs import (  # noqa: F401
 # ``kimi_linear_`` config-name prefix is preserved for backward compatibility
 # with production launch scripts (only the ``--module`` value changed).
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiLinearStateDictAdapter
-from torchtitan.models.llama3.model import Llama3Model, Llama3TransformerBlock
-from torchtitan.models.llama3.parallelize import parallelize_llama
-from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 
@@ -217,7 +195,6 @@ def kimi_linear_436m_block_attn_res_n4() -> Trainer.Config:
         parallelize_kimi_k3,
         pipeline_kimi_k3_with_cache_adapter,
     )
-    from torchtitan.protocols.model_spec import ModelSpec
 
     cfg = _base_trainer_config("436m")
     kimi_config = build_kimi_linear_config("436m")
@@ -266,7 +243,6 @@ def kimi_linear_447m_aligned_block_attn_res_n4() -> Trainer.Config:
         parallelize_kimi_k3,
         pipeline_kimi_k3_with_cache_adapter,
     )
-    from torchtitan.protocols.model_spec import ModelSpec
 
     cfg = _base_trainer_config("447m_aligned")
     kimi_config = build_kimi_linear_config("447m_aligned")
@@ -391,8 +367,6 @@ def kimi_k3_mini_vl() -> Trainer.Config:
 
     Head count drops to 4 to keep head_dim at 64, matching the released tower.
     """
-    import dataclasses as _dc
-
     from torchtitan.components.tokenizer import MultiModalTokenizer
     from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
     from torchtitan.hf_datasets.multimodal.utils.image import resize_to_patch_budget
@@ -1500,7 +1474,6 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         pipeline_kimi_k3_with_cache_adapter,
     )
     from torchtitan.models.kimi_k3.state_dict_adapter import KimiLinearStateDictAdapter
-    from torchtitan.protocols.model_spec import ModelSpec
 
     kimi_config = build_kimi_linear_config(
         "debugmodel",
@@ -1613,7 +1586,6 @@ def _kimi_linear_48b_attnres_downscale(
     from torchtitan.models.kimi_k3.pipeline_adapter import (
         pipeline_kimi_k3_with_cache_adapter,
     )
-    from torchtitan.protocols.model_spec import ModelSpec
 
     kwargs = {"num_experts": num_experts}
     kcfg = build_kimi_linear_config("48b", **kwargs)
@@ -1778,7 +1750,6 @@ def kimi_linear_528m_l16_block_attn_res() -> Trainer.Config:
     from torchtitan.models.kimi_k3.pipeline_adapter import (
         pipeline_kimi_k3_with_cache_adapter,
     )
-    from torchtitan.protocols.model_spec import ModelSpec
 
     kcfg = _build_528m_l16_config()
     spec = KimiK3Spec(kimi_config=kcfg, num_blocks=8)
@@ -1801,7 +1772,6 @@ def kimi_linear_528m_l16_full_attn_res() -> Trainer.Config:
     from torchtitan.models.kimi_k3.pipeline_adapter import (
         pipeline_kimi_k3_with_cache_adapter,
     )
-    from torchtitan.protocols.model_spec import ModelSpec
 
     kcfg = _build_528m_l16_config()
     spec = KimiK3Spec(kimi_config=kcfg, num_blocks=16)
@@ -1826,7 +1796,6 @@ def kimi_linear_528m_l16_baseline() -> Trainer.Config:
     from torchtitan.models.kimi_k3.pipeline_adapter import (
         pipeline_kimi_k3_with_cache_adapter,
     )
-    from torchtitan.protocols.model_spec import ModelSpec
 
     kcfg = _build_528m_l16_config()
     spec = KimiK3Spec(kimi_config=kcfg, num_blocks=None)

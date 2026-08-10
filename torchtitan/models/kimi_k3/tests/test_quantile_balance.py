@@ -187,6 +187,7 @@ class TestQuantileBalancerRuntime(unittest.TestCase):
 
         with torch.no_grad():
             scores = torch.sigmoid(moe.router.gate(x)).reshape(-1, E)
+
         def cv():
             loads = expert_loads(scores, moe.expert_bias_E, K).float()
             return (loads.std() / loads.mean()).item(), loads

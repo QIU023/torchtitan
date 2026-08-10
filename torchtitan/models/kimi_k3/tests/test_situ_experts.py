@@ -20,7 +20,7 @@ import torch
 
 from torchtitan.models.common.moe import GroupedExperts
 
-from torchtitan.models.kimi_k3.model import KimiK3Config, KimiMoE, situ_and_mul
+from torchtitan.models.kimi_k3.model import KimiMoE, situ_and_mul
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 from torchtitan.models.kimi_k3.moe import KimiSiTUGroupedExperts
 
