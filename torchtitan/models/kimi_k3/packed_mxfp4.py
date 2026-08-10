@@ -102,26 +102,21 @@ def dequantize_mxfp4(
             f"{expected_groups}"
         )
 
-    lo = (packed & 0x0F).long()
-    hi = (packed >> 4).long()
-    table = _e2m1_table(packed.device, torch.float32)
-    # Interleave so nibble order is [b0_lo, b0_hi, b1_lo, b1_hi, ...].
-    values = torch.stack([table[lo], table[hi]], dim=-1).flatten(-2)
+    # torchao's MX dequantizer, not a local nibble table (finding 56). Checked
+    # bit-for-bit before delegating, on the cases that actually distinguish the two:
+    # three shapes at bf16 and float32 are identical, and so are all three E8M0
+    # special values -- 0x00 as 2**-127, 0x7F as 2**0, and 0xFF as NaN. That last one
+    # matters most: it is a fix this function already carries (mapping 0x00 to zero or
+    # letting 0xFF reach exp2(128) = inf is wrong in both directions, and
+    # quantize_mxfp4 emits neither, so the round-trip test cannot see it). Delegating
+    # to something that got it wrong would have reintroduced it.
+    #
+    # float16 targets are NOT equivalent: E8M0 scales reach 2**23, which overflows
+    # fp16, and torchao computes in float32 before casting. Nothing here asks for
+    # fp16; the overflow is real rather than an artifact of either implementation.
+    from torchao.prototype.mx_formats.mx_tensor import to_dtype
 
-    exp = scale.to(torch.int32)
-    # OCP MX: E8M0 encodes the exponent directly, so 0x00 is 2**-127 and only 0xFF is
-    # special (NaN). Mapping 0x00 to zero and letting 0xFF fall through to
-    # exp2(255-127) = inf is wrong in both directions, and quantize_mxfp4 never emits
-    # either value -- so the round-trip test could not see it. An official shard that
-    # does use them would decode to zeros where it meant a tiny scale, and to inf where
-    # it meant NaN.
-    factors = torch.where(
-        exp == 0xFF,
-        torch.full_like(exp, float("nan"), dtype=torch.float32),
-        torch.exp2((exp - _E8M0_BIAS).to(torch.float32)),
-    )
-    factors = factors.repeat_interleave(group_size, dim=-1)
-    return (values * factors).to(dtype)
+    return to_dtype(packed, scale, torch.float4_e2m1fn_x2, group_size, dtype)
 
 
 def quantize_mxfp4(

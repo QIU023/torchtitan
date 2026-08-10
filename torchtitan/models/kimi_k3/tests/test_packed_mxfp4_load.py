@@ -228,3 +228,59 @@ class TestE8M0SpecialCodes(unittest.TestCase):
         self.assertFalse(
             bool(torch.isinf(out).any()), "0xFF decoded to inf; OCP MX defines NaN"
         )
+
+
+class TestDequantMatchesTorchao(unittest.TestCase):
+    """Pin the delegation in finding 56, including the cases that distinguish it.
+
+    ``dequantize_mxfp4`` now calls torchao's MX dequantizer instead of a local nibble
+    table. These are the comparisons that were run before delegating, kept so that a
+    change in torchao is caught here rather than in a checkpoint that decodes wrong.
+
+    The E8M0 special values are the point. A random-scale comparison passes whether or
+    not 0xFF is handled as NaN, because quantize_mxfp4 never emits it -- which is how
+    that bug survived the round-trip test the first time.
+    """
+
+    def _reference(self, packed, scale, group_size, dtype):
+        """The local implementation this replaced, kept only as the test's oracle."""
+        lo = (packed & 0x0F).long()
+        hi = (packed >> 4).long()
+        table = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            device=packed.device, dtype=torch.float32,
+        )
+        values = torch.stack([table[lo], table[hi]], dim=-1).flatten(-2)
+        exp = scale.to(torch.int32)
+        factors = torch.where(
+            exp == 0xFF,
+            torch.full_like(exp, float("nan"), dtype=torch.float32),
+            torch.exp2((exp - 127).to(torch.float32)),
+        ).repeat_interleave(group_size, dim=-1)
+        return (values * factors).to(dtype)
+
+    def test_bit_identical_on_random_data_at_bf16_and_fp32(self):
+        torch.manual_seed(0)
+        for rows, cols in ((4, 64), (3, 32), (8, 128)):
+            for dtype in (torch.bfloat16, torch.float32):
+                packed = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8)
+                scale = torch.randint(100, 150, (rows, cols // 32), dtype=torch.uint8)
+                got = dequantize_mxfp4(packed, scale, dtype=dtype)
+                want = self._reference(packed, scale, 32, dtype)
+                self.assertTrue(
+                    torch.equal(got, want),
+                    f"{rows}x{cols} {dtype}: max diff "
+                    f"{(got.float() - want.float()).abs().max().item()}",
+                )
+
+    def test_e8m0_special_values_agree(self):
+        packed = torch.full((1, 48), 0x22, dtype=torch.uint8)  # every nibble = 1.0
+        for scale_value in (0x00, 0x7F, 0xFF):
+            scale = torch.full((1, 3), scale_value, dtype=torch.uint8)
+            got = dequantize_mxfp4(packed, scale, dtype=torch.float32)
+            want = self._reference(packed, scale, 32, torch.float32)
+            if scale_value == 0xFF:
+                self.assertTrue(got.isnan().all(), "0xFF must decode to NaN, not inf")
+            else:
+                self.assertTrue(torch.equal(got, want), f"scale {scale_value:#04x}")
