@@ -551,7 +551,14 @@ def _diag_single_layer(name: str, *, kda: bool, moe: bool) -> Trainer.Config:
         first_k_dense_replace=0 if moe else 1,
     )
     cfg.model_spec.model = _dc.replace(
-        cfg.model_spec.model, kimi_config=kc, num_blocks=1
+        cfg.model_spec.model,
+        kimi_config=kc,
+        num_blocks=1,
+        # The parent flavor carries K3's block size 12, which cannot describe a
+        # truncated model: a size larger than the layer count is not a partition. These
+        # builders state num_blocks directly, so drop the size and let the model derive
+        # layers_per_block from it.
+        attn_res_block_size=None,
     )
     return cfg
 
@@ -583,7 +590,12 @@ def _diag_multi_layer(
         first_k_dense_replace=0 if moe else num_layers,
     )
     cfg.model_spec.model = _dc.replace(
-        cfg.model_spec.model, kimi_config=kc, num_blocks=num_blocks
+        cfg.model_spec.model,
+        kimi_config=kc,
+        num_blocks=num_blocks,
+        # See _diag_single_layer: the inherited block size describes the full-depth
+        # parent, not this truncation.
+        attn_res_block_size=None,
     )
     return cfg
 

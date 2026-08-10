@@ -49,5 +49,46 @@ class TestFlavorRegistrySweep(unittest.TestCase):
             kimi_k3.model_registry("no_such_flavor")
 
 
+class TestBlockSizeFitsTheModel(unittest.TestCase):
+    """No flavor may declare an AttnRes block size larger than its layer count.
+
+    A size above the layer count is not a partition, and it is what a flavor gets by
+    inheriting one from a full-depth parent and then truncating the layers. Thirteen diag
+    flavors were in that state and none of them could build; they are diagnostic
+    flavors, so the matrix never touches them and nothing noticed.
+
+    Written as a sweep rather than per flavor because the failure came from a builder
+    that several flavors share, and the next one would too.
+    """
+
+    def test_every_zero_argument_flavor(self):
+        import inspect
+
+        from torchtitan.models.kimi_k3 import config_registry as cr
+
+        checked = 0
+        for name in dir(cr):
+            if not (name.startswith("kimi_k3_") or name.startswith("kimi_linear")):
+                continue
+            fn = getattr(cr, name)
+            if not callable(fn) or inspect.signature(fn).parameters:
+                continue
+            with self.subTest(flavor=name):
+                cfg = fn()
+                spec = cfg.model_spec.model
+                size = getattr(spec, "attn_res_block_size", None)
+                layers = spec.kimi_config.num_hidden_layers
+                checked += 1
+                if size is None:
+                    continue
+                self.assertLessEqual(
+                    size,
+                    layers,
+                    f"{name} declares block size {size} over {layers} layers",
+                )
+        # A sweep that swept nothing would pass silently.
+        self.assertGreater(checked, 20)
+
+
 if __name__ == "__main__":
     unittest.main()
