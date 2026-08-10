@@ -101,7 +101,7 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     # moe_intermediate 3072. activated_params 104B per the model card; the
     # tokens/lr/batch entries remain OUR training-recipe choice, not the
     # paper's (the report does not publish the 2.8T optimizer schedule).
-    # Reference: phase13_k3like_48b_posttrain/official_k3/config.json
+    # Reference: the released Kimi K3 config.json.
     _SweepSize("2p8t", 104000, 1400.0, 93, 96, 7168, 3072, 4.0e-4, 4096),
 )
 

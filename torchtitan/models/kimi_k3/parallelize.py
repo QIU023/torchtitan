@@ -1323,7 +1323,7 @@ def apply_fsdp(
     # param group's all-gather, so the weight is unsharded by the time it
     # is read. That ordering inside block_attn_res is therefore
     # load-bearing; do not move the weight access above the norm call.
-    # Verified on both ranks at dp2 (phase13 attnres_fsdp_tail_probe.py).
+    # Verified on both ranks at dp2.
     head_tail: list[nn.Module] = []
     if getattr(model, "norm", None) is not None:
         head_tail.append(model.norm)

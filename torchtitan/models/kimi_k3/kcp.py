@@ -26,14 +26,9 @@ padding instead of the previous rank's tail. fla ships this too:
 the forward and the matching ``dx`` in the backward. Pass
 ``conv1d_kernel_size`` to ``build_cp_context`` and it is wired for you.
 
-This repo previously carried a hand-rolled halo that fetched the neighbour's
-conv state with ``dist.all_gather``. Its forward was bit-exact, but
-``all_gather`` is not autograd-aware, so the gradient each rank owed its left
-neighbour's tail was silently dropped: rank 0's last ``W - 1`` tokens came out
-~60% wrong while every interior token was exact
-(``phase13_k3like_48b_posttrain/conv_halo_grad_probe.py``). An error confined
-to ``W - 1`` boundary tokens per rank does not move a loss curve, which is why
-a forward-only bit-exactness check passed it.
+A hand-rolled halo used to do this with ``dist.all_gather``, which is not
+autograd-aware, so the gradient owed to the left neighbour's tail was dropped while
+the forward stayed bit-exact -- hence using fla's autograd.Function instead.
 
 KCP vs the Ulysses path already in this repo: Ulysses all-to-alls the head axis
 and gives every rank the full sequence for its head subset, so activation memory
