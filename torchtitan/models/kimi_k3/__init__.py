@@ -46,11 +46,6 @@ try:
         resolve_num_blocks,
         SCALING_LAW_TABLE,
     )
-    from torchtitan.models.kimi_k3.multimodal_model import (
-        KimiK3LlavaMultimodalModel,
-        KimiMultimodalConfig,
-        KimiVisionProjector,
-    )
     from torchtitan.models.kimi_k3.parallelize import parallelize_kimi_k3
     from torchtitan.models.kimi_k3.pipeline_adapter import (
         pipeline_kimi_k3_with_cache_adapter,
@@ -70,13 +65,10 @@ __all__ = [
     "KimiK3AttnResModel",
     "KimiK3Config",
     "KimiK3Model",
-    "KimiK3LlavaMultimodalModel",
     "KimiK3Spec",
     "KimiMLAAttention",
     "KimiMLP",
     "KimiMoE",
-    "KimiMultimodalConfig",
-    "KimiVisionProjector",
     "build_kimi_linear_config",
     "flavor_names",
     "model_registry",
