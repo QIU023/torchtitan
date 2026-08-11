@@ -195,3 +195,38 @@ class TestPackVideoGrids(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResizePlanCarriesItsPatchSize(unittest.TestCase):
+    """A plan's grid must match the plan's own dimensions, at any patch size.
+
+    ``patch_grid`` used to divide ``padded_size`` by the module constant while
+    ``navit_resize`` honoured its ``patch_size`` argument for everything else, so a plan
+    built with a non-default patch size described a grid that did not fit it --
+    ``prepare_image`` then died in the view with a shape mismatch. A documented parameter
+    that could not be used.
+
+    Found by trying to use it: forcing a cheap downscale for the PIL parity test needed a
+    small patch size, and that is what tripped it.
+    """
+
+    def test_grid_matches_padded_size_at_every_patch_size(self):
+        for patch_size in (2, 4, 7, 14):
+            plan = navit_resize(
+                768, 768, patch_size=patch_size, merge_kernel_size=2
+            )
+            padded_h, padded_w = plan.padded_size
+            self.assertEqual(
+                plan.patch_grid,
+                (padded_h // patch_size, padded_w // patch_size),
+                f"patch_size={patch_size}: grid disagrees with the plan's own size",
+            )
+
+    def test_prepare_image_accepts_a_non_default_patch_size(self):
+        pixels = torch.rand(3, 768, 768)
+        patches, (frames, h, w) = prepare_image(
+            pixels, patch_size=2, merge_kernel_size=2, already_normalized=True
+        )
+        self.assertEqual(patches.shape[1:], (3, 2, 2))
+        self.assertEqual(patches.shape[0], h * w)
+        self.assertEqual(frames, 1)

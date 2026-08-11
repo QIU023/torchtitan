@@ -59,6 +59,12 @@ class ResizePlan:
     pad_width: int
     pad_height: int
     num_tokens: int
+    # The patch size this plan was computed with. Carried rather than assumed: the
+    # property below used to divide by the module constant, so a plan built with a
+    # non-default patch_size reported a grid that did not match its own dimensions and
+    # prepare_image died in the view. A default keeps every existing constructor call
+    # working.
+    patch_size: int = PATCH_SIZE
 
     @property
     def padded_size(self) -> tuple[int, int]:
@@ -67,7 +73,7 @@ class ResizePlan:
     @property
     def patch_grid(self) -> tuple[int, int]:
         h, w = self.padded_size
-        return h // PATCH_SIZE, w // PATCH_SIZE
+        return h // self.patch_size, w // self.patch_size
 
 
 def navit_resize(
@@ -111,7 +117,7 @@ def navit_resize(
     num_tokens = (
         fixed_output_tokens if fixed_output_tokens is not None else token_h * token_w
     )
-    return ResizePlan(new_w, new_h, pad_w, pad_h, num_tokens)
+    return ResizePlan(new_w, new_h, pad_w, pad_h, num_tokens, patch_size)
 
 
 def normalize_pixels(pixels: torch.Tensor) -> torch.Tensor:
