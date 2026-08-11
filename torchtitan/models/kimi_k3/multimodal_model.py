@@ -32,6 +32,43 @@ from torchtitan.models.kimi_k3.model import KimiK3Config, KimiK3Model, KimiK3Spe
 from torchtitan.models.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
 
 
+from torchtitan.tools.logging import logger
+
+
+def _knob(config, field: str, env: str):
+    """A config field, with its retired environment variable still able to override it.
+
+    Finding 32: these started as env vars, which upstream will not take. The field is the
+    source of truth; the env name is honoured because a dozen recorded repro commands set
+    it, and silently ignoring them would make every one of those documents wrong without
+    saying so. Warned once per variable so the deprecation is visible in a log rather than
+    only in a commit message.
+
+    Booleans follow the original convention exactly -- "0" is off, anything else is on --
+    so a command that worked before behaves identically.
+    """
+    import os
+
+    default = getattr(config, field)
+    raw = os.environ.get(env)
+    if raw is None:
+        return default
+    if env not in _WARNED_KNOBS:
+        _WARNED_KNOBS.add(env)
+        logger.warning(
+            "%s is deprecated; set the %s config field instead. Honouring the "
+            "environment variable for now.",
+            env,
+            field,
+        )
+    if isinstance(default, bool):
+        return raw != "0"
+    return type(default)(raw)
+
+
+_WARNED_KNOBS: set[str] = set()
+
+
 # ----- K3's own vision path ---------------------------------------------- #
 
 
@@ -72,6 +109,15 @@ class KimiK3MultimodalConfig:
     dep_max_images: int = 8
     dep_max_grid_h: int = 32
     dep_max_grid_w: int = 32
+
+    # --- vision CP / scheduling knobs (finding 32) ------------------------- #
+    # These were environment variables. Config fields are the primary source now, with
+    # the old names still honoured as an override so the repro commands recorded across
+    # a dozen documents keep working; see `_knob`.
+    dynamic_cp: bool = True
+    cp_image_shard: bool = True
+    vision_side_stream: bool = False
+    dynamic_cp_min_patches: int = 256
 
 
 class KimiK3MultimodalModel(nn.Module):
@@ -186,7 +232,6 @@ class KimiK3MultimodalModel(nn.Module):
         # changes no arithmetic. The group is the static _cp_group -- only the
         # work assignment is per-batch, so no dynamic mesh is needed.
         # KIMI_VIT_CP_IMAGE_SHARD=0 forces the replicated path for A/B.
-        import os as _os
 
         cp_size = self._cp_world_size()
 
@@ -194,7 +239,7 @@ class KimiK3MultimodalModel(nn.Module):
         # image-level round-robin structurally cannot: fewer images than ranks, or
         # one image so much larger than the rest that whole-image assignment
         # leaves ranks idle. Round-robin then handles the many-small-images case.
-        if cp_size > 1 and _os.environ.get("KIMI_VIT_DYNAMIC_CP", "1") != "0":
+        if cp_size > 1 and _knob(self.config, "dynamic_cp", "KIMI_VIT_DYNAMIC_CP"):
             planned = self._encode_images_dynamic_cp(
                 pixel_values, grid_thw, counts, cp_size
             )
@@ -204,7 +249,7 @@ class KimiK3MultimodalModel(nn.Module):
         if (
             cp_size > 1
             and len(counts) >= cp_size
-            and _os.environ.get("KIMI_VIT_CP_IMAGE_SHARD", "1") != "0"
+            and _knob(self.config, "cp_image_shard", "KIMI_VIT_CP_IMAGE_SHARD")
         ):
             return self._encode_images_cp(pixel_values, grid_thw, counts, cp_size)
 
@@ -227,7 +272,7 @@ class KimiK3MultimodalModel(nn.Module):
             packed = DTensor.from_local(
                 packed, tp_mesh, (Replicate(),), run_check=False
             )
-        if _os.environ.get("KIMI_VIT_SIDE_STREAM") == "1":
+        if _knob(self.config, "vision_side_stream", "KIMI_VIT_SIDE_STREAM"):
             features = self._run_on_vision_stream(
                 lambda: self.vision_tower(packed, grid_thw),
                 packed if isinstance(packed, torch.Tensor) else None,
@@ -358,7 +403,6 @@ class KimiK3MultimodalModel(nn.Module):
         one image, and a mixed stream would let attention run across image
         boundaries. That is enforced here rather than hoped for.
         """
-        import os as _os
 
         import torch.distributed._functional_collectives as funcol
 
@@ -379,7 +423,7 @@ class KimiK3MultimodalModel(nn.Module):
         cfg = self.config.vision_config
         kh, kw = cfg.merge_kernel_size
         merge = kh * kw
-        min_patches = int(_os.environ.get("KIMI_VIT_DYNAMIC_CP_MIN_PATCHES", "256"))
+        min_patches = _knob(self.config, "dynamic_cp_min_patches", "KIMI_VIT_DYNAMIC_CP_MIN_PATCHES")
         large = classify(counts, cp_size, min_patches=min_patches)
         if not large:
             return None
