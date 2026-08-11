@@ -18,6 +18,7 @@ The cross-stage pipeline-parallel cache adapter (``pipeline_adapter.py``)
 is private to this experiment by design -- see the AttnRes RFC history.
 """
 
+from dataclasses import dataclass
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
@@ -77,6 +78,44 @@ __all__ = [
 ]
 
 
+@dataclass(frozen=True)
+class _GraftSuffix:
+    """One post-train graft suffix and the spec flags it implies.
+
+    A table rather than a chain of endswith/elif (finding 36). The ordering rule that
+    made the chain work -- try ``_gated_lora`` before ``_gated``, or the longer name
+    decomposes as the shorter one plus a bogus size -- is now enforced by sorting on
+    length instead of by the order somebody wrote the branches in.
+    """
+
+    suffix: str
+    gated: bool = False
+    lora_rank: int | None = None
+
+
+_GRAFT_SUFFIXES: tuple[_GraftSuffix, ...] = (
+    _GraftSuffix("_gated_lora", gated=True, lora_rank=16),
+    _GraftSuffix("_gated", gated=True),
+)
+
+
+@dataclass(frozen=True)
+class _GraftDecomposition:
+    base_flavor: str
+    gated: bool
+    lora_rank: int | None
+
+
+def _decompose_graft(flavor: str) -> _GraftDecomposition:
+    """Split a flavor into its base name and the graft flags its suffix implies."""
+    for entry in sorted(_GRAFT_SUFFIXES, key=lambda e: -len(e.suffix)):
+        if flavor.endswith(entry.suffix):
+            return _GraftDecomposition(
+                flavor[: -len(entry.suffix)], entry.gated, entry.lora_rank
+            )
+    return _GraftDecomposition(flavor, False, None)
+
+
 def _parse_flavor(flavor: str) -> tuple[str, str]:
     """Parse ``kimi_k3_<size>_<variant>`` -> (size, variant).
 
@@ -120,18 +159,9 @@ def model_registry(flavor: str, attn_backend: str | None = None) -> ModelSpec:
             "MLA=SDPA are fixed in this implementation).",
             attn_backend,
         )
-    # Graft-variant suffixes (post-train flavors): strip and record.
-    gated = False
-    lora_rank = None
-    base_flavor = flavor
-    if base_flavor.endswith("_gated_lora"):
-        base_flavor = base_flavor[: -len("_gated_lora")]
-        gated = True
-        lora_rank = 16
-    elif base_flavor.endswith("_gated"):
-        base_flavor = base_flavor[: -len("_gated")]
-        gated = True
-    size, variant = _parse_flavor(base_flavor)
+    graft = _decompose_graft(flavor)
+    gated, lora_rank = graft.gated, graft.lora_rank
+    size, variant = _parse_flavor(graft.base_flavor)
     kimi_config = build_kimi_linear_config(size)
     num_blocks = resolve_num_blocks(size, variant)
     spec_config = KimiK3Spec(
@@ -160,7 +190,11 @@ def _model_registry_accepts(flavor: str) -> bool:
     """True when :func:`model_registry` can build this flavor's ModelSpec."""
     try:
         model_registry(flavor)
-    except Exception:
+    except (ValueError, KeyError, ImportError):
+        # Only the answers that mean "this name is not one of ours". A bare
+        # `except Exception` here is how 37 flavors went missing once: any bug inside
+        # model_registry reported as "not a flavor" and the name silently vanished from
+        # discovery instead of failing.
         return False
     return True
 
