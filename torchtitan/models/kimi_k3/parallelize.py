@@ -63,7 +63,6 @@ from torchtitan.distributed.activation_checkpoint import ActivationCheckpointing
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
-    disable_fsdp_gradient_division,
 )
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.tools.logging import logger
@@ -1329,16 +1328,8 @@ def apply_fsdp(
             reshard_after_forward=(reshard_after_forward_policy == "always"),
         )
 
-    # The multimodal flavors hand us the WRAPPER, whose children are vision_tower and
-    # language_model -- it has `layers` but no embed_tokens / norm / lm_head, so the old
-    # copy of this function silently left those three inside the root unit. The helper
-    # reads them directly, so give it the text model and root-wrap the wrapper after, the
-    # same shape the vision tower is already handled in (sharded separately, before the
-    # decoder). On a text flavor `decoder is model` and this is a no-op.
-    decoder = getattr(model, "language_model", None) or model
-
     apply_fsdp_to_decoder(
-        decoder,
+        model,
         dp_mesh,
         param_dtype,
         reduce_dtype,
@@ -1352,22 +1343,6 @@ def apply_fsdp(
         enable_symm_mem=enable_symm_mem,
     )
 
-    if decoder is not model:
-        # FSDP2 needs one root for its hook chain, and the wrapper is it. The vision
-        # tower and the decoder are already units, so this only picks up whatever the
-        # wrapper owns directly.
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            cast_forward_inputs=False,
-        )
-        root_config: dict = {"mesh": dp_mesh, "mp_policy": mp_policy}
-        if dp_mesh_dims is not None:
-            root_config["dp_mesh_dims"] = dp_mesh_dims
-        if cpu_offload:
-            root_config["offload_policy"] = CPUOffloadPolicy()
-        fully_shard(model, **root_config)
-        disable_fsdp_gradient_division(model)
 
 
 _fla_dynamo_carveout_done = False

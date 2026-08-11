@@ -134,6 +134,33 @@ class KimiK3MultimodalModel(nn.Module):
                 f"{config.kimi_config.hidden_size}"
             )
 
+    @property
+    def enable_weight_tying(self) -> bool:
+        lm = getattr(self, "language_model", None)
+        return bool(getattr(lm, "enable_weight_tying", False))
+
+    @property
+    def tok_embeddings(self):
+        """The text model's embedding, surfaced for the shared FSDP helper.
+
+        The helper must be called on THIS wrapper rather than on language_model. Handing
+        it the inner model instead makes language_model its own FSDP unit, an extra level
+        between the layers and the root, and that deadlocks every CP cell on an
+        _ALLGATHER_BASE -- measured, multimodal only, text unaffected.
+        """
+        lm = getattr(self, "language_model", None)
+        return getattr(lm, "embed_tokens", None)
+
+    @property
+    def norm(self):
+        lm = getattr(self, "language_model", None)
+        return getattr(lm, "norm", None)
+
+    @property
+    def lm_head(self):
+        lm = getattr(self, "language_model", None)
+        return getattr(lm, "lm_head", None)
+
     def encode_images(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> list[torch.Tensor]:
