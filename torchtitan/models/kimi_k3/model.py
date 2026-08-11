@@ -51,6 +51,7 @@ from torch.distributed.tensor.placement_types import Partial, Replicate
 
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
+from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear as _TTLinear
 from torchtitan.protocols.sharding import ShardingConfig
@@ -364,12 +365,40 @@ def situ_and_mul(
 # ----- Dense SwiGLU MLP --------------------------------------------------- #
 
 
-class KimiMLP(nn.Module):
+class KimiMLP(FeedForward):
     """SwiGLU dense FFN. Used for layer 0 (pre-MoE dense replace) AND
     as the shared-experts module in MoE layers.
 
-    Faithful to ``reference:KimiMLP`` (gate_proj, up_proj, down_proj).
+    Faithful to ``reference:KimiMLP`` (gate_proj, up_proj, down_proj), and reusing
+    ``common.FeedForward`` for the plain SwiGLU case -- finding 7, which the maintainer
+    raised as "should use our fused feed forward".
+
+    The reuse does NOT require renaming the projections, which is what made this look like
+    a checkpoint migration. ``FeedForward.forward`` is
+    ``w2(silu(w1(x)) * w3(x))`` and only READS w1/w2/w3, so the real modules stay
+    registered under the release's names and w1/w2/w3 are read-only properties over them.
+    Properties are not in ``_modules``, so every state-dict key is unchanged and no DCP
+    checkpoint moves. Same mechanism as ``UpstreamFSDPNames``.
+
+    ``forward`` is inherited for ``silu`` and overridden otherwise: ``gelu`` swaps the
+    activation, and ``situ`` (report sec 4.1) is gated over BOTH branches -- it clips the
+    linear branch too -- so it is not expressible as an activation swap inside the shared
+    forward at all.
     """
+
+    # w1/w2/w3 name what FeedForward.forward reads; gate/up/down are what the checkpoint
+    # calls them. Read-only on purpose: FeedForward never assigns to them.
+    @property
+    def w1(self) -> nn.Module:
+        return self.gate_proj
+
+    @property
+    def w2(self) -> nn.Module:
+        return self.down_proj
+
+    @property
+    def w3(self) -> nn.Module:
+        return self.up_proj
 
     def __init__(
         self,
@@ -379,7 +408,11 @@ class KimiMLP(nn.Module):
         situ_beta: float = 4.0,
         situ_linear_beta: float | None = 25.0,
     ) -> None:
-        super().__init__()
+        # Skip FeedForward.__init__, which builds w1/w2/w3 from Linear.Configs. This
+        # class takes plain dimensions and owns the release's names, so only the
+        # forward is inherited; going through the grandparent keeps torchtitan's
+        # Module setup without acquiring the config-driven construction.
+        super(FeedForward, self).__init__()
         self.gate_proj = Linear(
             hidden_size,
             intermediate_size,
@@ -413,6 +446,9 @@ class KimiMLP(nn.Module):
             raise ValueError(f"Unknown hidden_act: {hidden_act}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.hidden_act == "silu":
+            # The shared implementation, verbatim.
+            return super().forward(x)
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         if self.hidden_act == "situ":
