@@ -27,8 +27,6 @@ import pathlib
 import sys
 import unittest
 
-import torch
-
 from torchtitan.models.kimi_k3.vision_preprocess import (
     IMAGE_MEAN,
     IMAGE_STD,
