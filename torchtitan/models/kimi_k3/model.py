@@ -1589,7 +1589,37 @@ class KimiMoE(nn.Module):
 # ----- Decoder layer ------------------------------------------------------- #
 
 
-class KimiDecoderLayer(nn.Module):
+class UpstreamFSDPNames:
+    """Read-only aliases so ``distributed.fsdp.apply_fsdp_to_decoder`` can drive our layout.
+
+    That helper reads five names off a decoder and two off each block, and spells three of
+    them differently from us: ``tok_embeddings`` for our ``embed_tokens``,
+    ``enable_weight_tying`` for the config flag, and ``moe`` / ``moe_enabled`` for our
+    ``ffn._moe`` / ``is_moe``.
+
+    Aliases rather than renames, because the helper only ever READS them -- it makes no
+    assignment to any model attribute. A property is not in ``_modules``, so
+    ``named_parameters()``, ``state_dict()`` and every FQN are untouched, and
+    ``fully_shard(model.tok_embeddings)`` wraps exactly the object ``model.embed_tokens``
+    already refers to. Renaming the submodules instead would have invalidated every DCP
+    checkpoint written so far.
+
+    ``moe`` deliberately raises for a dense block rather than returning None: the helper
+    guards every use with ``getattr(block, "moe_enabled", False)`` and then asserts
+    ``hasattr(block, "moe")``, and ``hasattr`` on a raising property is False, which is the
+    answer a dense block should give.
+    """
+
+    @property
+    def moe_enabled(self) -> bool:
+        return bool(getattr(self, "is_moe", False))
+
+    @property
+    def moe(self):
+        return self.ffn._moe
+
+
+class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
     """One transformer block: pre-norm + attention + residual +
     pre-norm + MoE/MLP + residual.
 
@@ -1704,6 +1734,19 @@ class KimiK3Model(nn.Module):
 
         # Hook for AttnRes subclass + PP adapter.
         self._return_only_new_blocks: bool = False
+
+    @property
+    def tok_embeddings(self):
+        """What ``apply_fsdp_to_decoder`` calls our ``embed_tokens``.
+
+        Returns None on a PP stage that had it stripped, which is what the helper
+        expects and already tests for.
+        """
+        return self.embed_tokens
+
+    @property
+    def enable_weight_tying(self) -> bool:
+        return bool(getattr(self.config, "tie_word_embeddings", False))
 
     def forward(
         self,

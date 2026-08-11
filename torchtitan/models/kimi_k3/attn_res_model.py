@@ -64,6 +64,7 @@ from torchtitan.models.kimi_k3.model import (
     KimiK3Model,
     Linear,
     splice_vision_embeds,
+    UpstreamFSDPNames,
 )
 
 
@@ -96,7 +97,7 @@ def _plain_stream(
 # ----- Per-layer AttnRes wrapper ------------------------------------------ #
 
 
-class KimiAttnResDecoderLayer(nn.Module):
+class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
     """Kimi decoder layer with AttnRes woven around attn and FFN.
 
     Structurally the same as :class:`KimiDecoderLayer` (per-layer KDA/MLA

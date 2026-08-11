@@ -61,9 +61,9 @@ from torchtitan.config import (
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import (
+    apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
     disable_fsdp_gradient_division,
-    get_fsdp_reshard_after_forward_policy,
 )
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.tools.logging import logger
@@ -1272,178 +1272,102 @@ def apply_fsdp(
     reshard_after_forward_policy: str = "default",
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
+    dp_mesh_dims=None,
+    edp_mesh_dims=None,
+    enable_symm_mem: bool = False,
 ) -> None:
-    """FSDP2 fully_shard application tuned for Kimi Linear's module layout.
+    """FSDP2 for the Kimi models: the shared helper, plus the AttnRes tail.
 
-    Module naming (see ``kimi_linear/model.py``):
-      - ``embed_tokens`` (nn.Embedding)
-      - ``layers`` (nn.ModuleList of KimiDecoderLayer or AttnRes variant)
-      - ``norm`` (nn.RMSNorm)
-      - ``lm_head`` (nn.Linear)
-      - [AttnRes only] ``final_attn_res_proj`` + ``final_attn_res_norm``
+    This was a 182-line copy of ``distributed.fsdp.apply_fsdp_to_decoder`` and had
+    fallen behind it in five ways -- no ``enable_symm_mem``, no ``dp_mesh_dims``
+    flattening under full_dtensor, no ``edp_mesh_dims``, no ``Shard(1)`` refinement when
+    the FSDP degree exceeds the expert count, and no EP prefetch wiring. It also
+    nested-wrapped routed experts on ``edp_mesh`` to work around per-param meshes not
+    being expressible in ``shard_placement_fn``; the helper now does that properly via
+    ``ShardPlacementResult``, so the workaround is obsolete rather than merely duplicated.
 
-    Sharding layout mirrors Llama3's apply_fsdp: group embed with
-    {norm, lm_head} only when tied, else put embed alone and
-    {norm, lm_head} together.
+    Delegation is possible without renaming anything: the helper only READS the names it
+    needs, so ``UpstreamFSDPNames`` supplies them as properties and no FQN or checkpoint
+    key moves. See that class for why aliases rather than a rename.
 
-    When ``ep_degree > 1``, MoE expert parameters shard via ``edp_mesh``
-    while non-expert parameters shard via ``dp_mesh`` — this matches
-    the llama4 / deepseek_v3 pattern and avoids the
-    "Cannot concatenate overlapping meshes" error that fires when a
-    single dp_mesh is used for both expert and non-expert params under
-    EP. ``edp_mesh`` is the dp_shard axis with the EP rank dimension
-    factored out (``parallel_dims.get_optional_mesh("efsdp")`` or
-    ``["dp_replicate", "efsdp"]``).
+    What remains ours is the AttnRes output tail.
     """
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
-    )
-    fsdp_config: dict = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    if cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
-
-    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-        reshard_after_forward_policy, pp_enabled
-    )
-
-    # Collect the "output tail" modules. norm + lm_head ALWAYS run
-    # together every forward, so they share an FSDP unit -- that
-    # amortizes a single all-gather over both. final_attn_res_proj and
-    # final_attn_res_norm are AttnRes-only and fire at the very end of
-    # forward (inside block_attn_res), so they get their own unit.
+    # The tail is wrapped BEFORE delegating, for two reasons. FSDP2 requires a child unit
+    # to exist before its parent, and the helper's last act is to wrap the root -- which
+    # would otherwise absorb these two top-level modules into the root unit.
     #
-    # FSDP2 warns that final_attn_res_proj "did not run forward before
-    # backward". That is expected and benign: block_attn_res reads
-    # ``proj.weight`` directly as the pseudo-query rather than calling
-    # proj(...), so no forward hook fires on it. Pairing it with
-    # final_attn_res_norm in ONE unit is what makes it correct -- norm IS
-    # called (``K = norm(V)``) one line earlier and triggers the shared
-    # param group's all-gather, so the weight is unsharded by the time it
-    # is read. That ordering inside block_attn_res is therefore
-    # load-bearing; do not move the weight access above the norm call.
-    # Verified on both ranks at dp2.
-    head_tail: list[nn.Module] = []
-    if getattr(model, "norm", None) is not None:
-        head_tail.append(model.norm)
-    if getattr(model, "lm_head", None) is not None:
-        head_tail.append(model.lm_head)
-
-    attn_res_tail: list[nn.Module] = []
-    if getattr(model, "final_attn_res_proj", None) is not None:
-        attn_res_tail.append(model.final_attn_res_proj)
-    if getattr(model, "final_attn_res_norm", None) is not None:
-        attn_res_tail.append(model.final_attn_res_norm)
-
-    tied = bool(getattr(model, "config", None)) and getattr(
-        model.config, "tie_word_embeddings", False
-    )
-
-    # Under PP, ``embed_tokens`` is stripped on non-first stages and
-    # ``lm_head`` (in head_tail) is stripped on non-last stages; both
-    # become None on PP-stripped ranks. Filter Nones before passing to
-    # fully_shard so the wrap iterates only over real modules.
-    embed = getattr(model, "embed_tokens", None)
-    if tied:
-        # When tied, embed shares storage with lm_head — bundle them
-        # so the shared weight isn't all-gathered twice. Skip the bundle
-        # entirely if no embed module is present on this rank.
-        bundle = [m for m in [embed, *head_tail] if m is not None]
-        if bundle:
-            fully_shard(
-                bundle,
-                **fsdp_config,
-                reshard_after_forward=(reshard_after_forward_policy == "always"),
-            )
-    else:
-        if embed is not None:
-            fully_shard(
-                embed,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
-        if head_tail:
-            fully_shard(
-                head_tail,
-                **fsdp_config,
-                reshard_after_forward=(reshard_after_forward_policy == "always"),
-            )
-
+    # They must share ONE unit, and that is load-bearing rather than an optimization:
+    # block_attn_res reads ``final_attn_res_proj.weight`` directly as the pseudo-query
+    # instead of calling ``proj(...)``, so no forward hook fires on it and FSDP2 warns that
+    # it "did not run forward before backward". Pairing it with final_attn_res_norm is what
+    # makes that correct -- norm IS called one line earlier (``K = norm(V)``) and triggers
+    # the shared param group's all-gather, so the weight is unsharded by the time it is
+    # read. Do not move the weight access above the norm call. Verified on both ranks at
+    # dp2.
+    attn_res_tail = [
+        m
+        for m in (
+            getattr(model, "final_attn_res_proj", None),
+            getattr(model, "final_attn_res_norm", None),
+        )
+        if m is not None
+    ]
     if attn_res_tail:
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        )
+        tail_config: dict = {"mesh": dp_mesh, "mp_policy": mp_policy}
+        if dp_mesh_dims is not None:
+            tail_config["dp_mesh_dims"] = dp_mesh_dims
+        if cpu_offload:
+            tail_config["offload_policy"] = CPUOffloadPolicy()
         fully_shard(
             attn_res_tail,
-            **fsdp_config,
+            **tail_config,
             reshard_after_forward=(reshard_after_forward_policy == "always"),
         )
 
-    # Shard every decoder layer independently so each layer's forward
-    # all-gather / backward reduce-scatter is overlapped with compute.
-    # model.layers is a ModuleDict (str→layer); iterate .values() to
-    # grab the layer modules.
-    #
-    # When EP > 1 and the layer is MoE, the expert ModuleList must
-    # shard via ``edp_mesh`` (the dp_shard axis with the EP dimension
-    # factored out). The pytorch version in this repo does NOT support
-    # per-param ``shard_placement_fn`` returning per-param meshes
-    # (signature is ``Callable[[nn.Parameter], Shard | None]`` only),
-    # so we use the nested-fully_shard pattern: wrap the experts
-    # container as its own FSDP unit on ``edp_mesh`` first, then wrap
-    # the surrounding layer on ``dp_mesh``. FSDP2 treats the inner
-    # unit as a sub-module and only shards the non-expert params at
-    # the layer level, which keeps the meshes orthogonal and avoids
-    # the "Cannot concatenate overlapping meshes" error.
-    use_nested_ep = ep_degree > 1 and edp_mesh is not None
-    edp_fsdp_config = None
-    if use_nested_ep:
-        edp_fsdp_config = {"mesh": edp_mesh, "mp_policy": mp_policy}
-        if cpu_offload:
-            edp_fsdp_config["offload_policy"] = CPUOffloadPolicy()
+    # The multimodal flavors hand us the WRAPPER, whose children are vision_tower and
+    # language_model -- it has `layers` but no embed_tokens / norm / lm_head, so the old
+    # copy of this function silently left those three inside the root unit. The helper
+    # reads them directly, so give it the text model and root-wrap the wrapper after, the
+    # same shape the vision tower is already handled in (sharded separately, before the
+    # decoder). On a text flavor `decoder is model` and this is a no-op.
+    decoder = getattr(model, "language_model", None) or model
 
-    for layer in model.layers.values():
-        layer_is_moe = bool(getattr(layer, "is_moe", False))
-        if use_nested_ep and layer_is_moe:
-            ffn = getattr(layer, "ffn", None)
-            assert (
-                ffn is not None
-                and getattr(ffn, "_moe", None) is not None
-                and hasattr(ffn._moe, "routed_experts")
-            ), (
-                f"layer {getattr(layer, 'layer_idx', '?')} is_moe=True "
-                "but ffn._moe.routed_experts missing; EP-aware FSDP needs "
-                "the standard KimiMoE wrapping."
-            )
-            # Inner unit: routed experts (GroupedExperts) on edp_mesh.
-            fully_shard(
-                ffn._moe.routed_experts.inner_experts,
-                **edp_fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
-        # Outer unit: the whole layer on dp_mesh. FSDP2 sees the
-        # already-wrapped experts as a nested unit and only shards
-        # non-expert params at this level.
-        fully_shard(
-            layer,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
-
-    # Finally, wrap the top-level model so FSDP2 has a single root
-    # module for its pre-/post-forward hook chain. Without this, FSDP
-    # errors at forward with "requires a single root module".
-    fully_shard(
-        model,
-        **fsdp_config,
-        reshard_after_forward=reshard_after_forward,
+    apply_fsdp_to_decoder(
+        decoder,
+        dp_mesh,
+        param_dtype,
+        reduce_dtype,
+        pp_enabled,
+        cpu_offload=cpu_offload,
+        reshard_after_forward_policy=reshard_after_forward_policy,
+        ep_degree=ep_degree,
+        edp_mesh=edp_mesh,
+        dp_mesh_dims=dp_mesh_dims,
+        edp_mesh_dims=edp_mesh_dims,
+        enable_symm_mem=enable_symm_mem,
     )
 
-    # The trainer's loss is local_loss_sum / global_valid_tokens, so
-    # gradients must be SUMMED over the data-parallel axes, not averaged --
-    # FSDP2's default mean-reduction would divide every gradient by the
-    # fsdp mesh size (dp_shard x cp). The shared apply_fsdp_to_decoder does
-    # this for llama3/deepseek_v3/qwen3/gpt_oss; this private copy of the
-    # Llama3 layout must too.
-    disable_fsdp_gradient_division(model)
+    if decoder is not model:
+        # FSDP2 needs one root for its hook chain, and the wrapper is it. The vision
+        # tower and the decoder are already units, so this only picks up whatever the
+        # wrapper owns directly.
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        )
+        root_config: dict = {"mesh": dp_mesh, "mp_policy": mp_policy}
+        if dp_mesh_dims is not None:
+            root_config["dp_mesh_dims"] = dp_mesh_dims
+        if cpu_offload:
+            root_config["offload_policy"] = CPUOffloadPolicy()
+        fully_shard(model, **root_config)
+        disable_fsdp_gradient_division(model)
 
 
 _fla_dynamo_carveout_done = False
