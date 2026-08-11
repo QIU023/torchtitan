@@ -81,6 +81,31 @@ class TestMTPForward(unittest.TestCase):
         del out
 
 
+    def test_chunked_loss_is_rejected_rather_than_silently_materialising_logits(self):
+        """finding 44. The MTP branch used to sit ahead of the _skip_lm_head return.
+
+        A chunked-loss run therefore built a full [B, L, V] logits tensor per MTP depth --
+        the exact allocation chunking exists to avoid, retaining ~1.3 GiB per depth and
+        handing the loss chunk-misaligned labels.
+
+        The check is that it RAISES. Skipping instead would leave take_mtp_logits()
+        returning None and the MTP loss contributing nothing, so the run would look like
+        it was training MTP while it was not.
+        """
+        m = self._model(1)
+        m._skip_lm_head = True
+        with self.assertRaises(ValueError) as caught:
+            m(torch.randint(0, 256, (1, SEQ), device="cuda"))
+        self.assertIn("chunked loss", str(caught.exception))
+
+    def test_the_unchunked_path_is_unaffected(self):
+        m = self._model(1)
+        self.assertFalse(m._skip_lm_head)
+        out = m(torch.randint(0, 256, (1, SEQ), device="cuda"))
+        self.assertEqual(out.shape[-1], 256)
+        self.assertIsNotNone(m._mtp_logits)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "KDA and MoE need CUDA")
 class TestMTPLoss(unittest.TestCase):
     """The loss half. Recorded as blocked on a core interface change; it is not,

@@ -571,6 +571,24 @@ class KimiK3AttnResModel(KimiK3Model):
         if self.mtp_layers is not None and self.lm_head is not None:
             from torchtitan.models.kimi_k3.mtp_loss import put_mtp_logits
 
+            if self._skip_lm_head:
+                # finding 44. This branch used to sit ahead of the _skip_lm_head return,
+                # so a chunked-loss run still materialised a full [B, L, V] logits tensor
+                # PER MTP DEPTH -- exactly the allocation chunking exists to avoid (OOM at
+                # seq 8192), retaining ~1.3 GiB per depth across steps, and handing the
+                # loss chunk-misaligned labels.
+                #
+                # Raised rather than skipped. Skipping would leave take_mtp_logits()
+                # returning None, the MTP loss component contributing nothing, and a run
+                # that looks like it is training MTP while it is not. Making MTP work
+                # under chunked loss means computing its logits per chunk too, which is a
+                # change to mtp_loss rather than a guard here.
+                raise ValueError(
+                    "MTP and chunked loss cannot be combined yet: MTP needs full-vocab "
+                    "logits and ChunkedLossWrapper exists so they are never "
+                    "materialised. Use a non-chunked loss for MTP flavors, or extend "
+                    "mtp_loss to consume per-chunk logits."
+                )
             self._mtp_logits = self._compute_mtp_logits(tokens, h_pre_norm)
             put_mtp_logits(self._mtp_logits)
 

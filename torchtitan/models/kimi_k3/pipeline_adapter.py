@@ -250,50 +250,16 @@ def _reset_rank_caches_for_testing() -> None:
 
 # ----- Local-only grad bridge for own-rank cached commits ------------------ #
 #
-# Producer-side hook + consumer-side ``_LocalCacheCapture`` together
-# replace the prior process-global ``retain_graph=True`` monkey-patch
-# AND the prior ``_LocalCacheAugment`` autograd.Function attempt. Both
-# halves are LOCAL to a single rank: no NCCL, no cross-rank side
-# effects, no collective ops. Their only shared state is a Python dict
-# slot on the rank-local :class:`RankLocalCache`, keyed by
-# ``(mb_index, producer_stage_id, block_idx_within_producer)``.
+# A block committed by an earlier virtual stage and read back by a later one ON THE SAME
+# RANK would otherwise have its forward graph freed by the consumer's backward, and the
+# producer's own backward then fails with "backward through the graph a second time". A
+# producer-side grad hook plus a consumer-side detached leaf sever that link structurally;
+# both halves are rank-local, with no collectives. The detach is load-bearing, and
+# recv-originated blocks are deliberately left attached so PP's SEND_B still carries their
+# gradient to the producing rank.
 #
-# They cover ONE specific autograd liability: a block that stage R
-# commits on this rank during an earlier virtual v, and that a LATER
-# virtual stage on THE SAME rank reads back from the shared cache.
-# Without any intervention, that later stage's backward traverses into
-# stage R's forward graph via the rebuild's stack/cat grad path and
-# FREES IT; stage R's own backward later (from PP SEND_B on the
-# outgoing delta) tries to traverse the same graph and dies with
-# "backward through the graph a second time".
-#
-# Why ``_LocalCacheAugment.apply`` was insufficient: under real PP
-# scheduling (Interleaved1F1B + FSDP + selective AC rerun) the
-# Function's ``forward`` returning a view of the input was not enough
-# to stop autograd from walking from the consumer's ``Capture`` node
-# upstream into ``Augment`` and on into the producer's forward graph
-# during the CONSUMER's backward. The traversal could be observed
-# firing producer-side ``Augment.backward`` inside the consumer
-# stage's ``backward_one_chunk`` -- precisely the freeing the design
-# was meant to prevent.
-#
-# The hook + detach pattern instead severs the link STRUCTURALLY:
-# * ``_install_augment_hook`` registers a tensor grad hook on the
-#   producer block. The hook fires exactly once during the producer
-#   stage's backward (when autograd computes the block's grad on the
-#   outgoing-delta path), pops the matching captured-grad slot, and
-#   sums it into the incoming grad before propagating into the
-#   producer's wrapped model.
-# * ``_LocalCacheCapture.apply`` runs on the CONSUMER side, but its
-#   tensor input is a DETACHED leaf (from the cache). Even if autograd
-#   ignored Capture's None grad return, there is no upstream grad_fn
-#   to traverse. The detach is the load-bearing guarantee.
-#
-# Recv-originated cached blocks (sliced from a prior recv_delta tensor)
-# are NOT detached and NOT wrapped: their grad already flows back
-# through PP's built-in SEND_B to the producer rank via the recv-delta
-# autograd chain, and severing that link would strand the cross-rank
-# grad channel.
+# Full reasoning, including the two designs that did not hold, is in the PR-C body
+# (Raising_PRs/k3_pr_c_pp_attnres/PR_BODY.md, "The local grad bridge").
 
 
 _DBG = os.environ.get("ATTNRES_ADAPTER_DBG") == "1"
