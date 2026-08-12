@@ -94,25 +94,6 @@ def parallelize_kimi_k3(
     Requires context_parallel_load_balancer=None (validated below).
     """
 
-    # DEP gives the vision tower its own pipeline stage, and LoRA adapts none of it: the
-    # tower is not a LoRA target and the embeddings that ride with it are frozen. That
-    # stage then owns zero trainable parameters and the optimizer fails with
-    #   ValueError: Optimizer param_groups pattern '.*' matched no parameters
-    # from components/optimizer.py, which names neither DEP nor LoRA. Measured: every one
-    # of the eight PP cells of the LoRA matrix dies this way with DEP on, and the same
-    # cell trains with DEP off.
-    if parallel_dims.pp_enabled:
-        from torchtitan.models.kimi_k3.pipeline_adapter import dep_enabled
-
-        if dep_enabled() and any(
-            hasattr(m, "lora_a") and hasattr(m, "lora_b") for m in model.modules()
-        ):
-            raise ValueError(
-                "KIMI_VIT_DEP=1 cannot be combined with LoRA yet: DEP puts the vision "
-                "tower on its own pipeline stage, LoRA adapts neither the tower nor the "
-                "embeddings, and a stage with no trainable parameters has no optimizer "
-                "group. Run LoRA without DEP, or make the tower a LoRA target."
-            )
     # Enable TF32 tensor cores for fp32 matmuls (loss aggregation,
     # optimizer master weight updates, fp32 RoPE etc.). bf16 path is
     # unaffected. Speedup ~5-10% on fp32 ops, no measurable accuracy
