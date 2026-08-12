@@ -35,6 +35,33 @@ weights are expected to ship packed MXFP4 + scales; until the exact
 packing is known (2026-07-27 report), any quantization sidecar key or
 sub-byte dtype raises with an explicit message instead of being treated
 as an ordinary value.
+Which mapper decides a key, and why the order is not symmetric
+--------------------------------------------------------------
+The hand-written table goes FIRST, because it carries VALUE transforms (the 4-D
+``A_log`` reshape) that ``hf_key_map`` does not; delegating ahead of it dropped
+those silently, producing shape drift rather than a missing key. ``hf_key_map`` is
+the fallback for everything the table does not know -- the K3 layouts: latent MoE
+(``ffn.latent.*``), the AttnRes tail, gated MLA.
+
+Two keys are exceptions the table DECLINES on purpose, because its answer would
+belong to a different layout:
+
+* **shared experts** are layout-dependent. The table only knows Kimi Linear's
+  ``ffn._moe.shared_experts.w1``, while K3's latent path uses
+  ``ffn.shared_experts.gate_proj``.
+* **``g_proj``** is one release name for two different gates -- KDA's own
+  ``g_proj`` and gated MLA's output gate, which is ``attn_gate_proj`` here -- so
+  resolving it needs the layer type, which only ``hf_key_map`` has. The table
+  returned ``g_proj`` unchanged: a non-None answer that suppressed the fallback and
+  left ``attn_gate_proj`` unwritten, so an official gated-MLA load kept its gates
+  at random init.
+
+Which layout applies is decided the SAME way ``to_hf`` decides it: keys carrying
+the wrapper prefix go to ``hf_key_map``, everything else stays on the table, so a
+multimodal export is in K3 naming and a text-only export in Kimi Linear naming.
+Mirroring that exactly is what closes the round trip -- asking ``hf_key_map`` for a
+text-only model's shared experts returned a K3 path the model does not have, and
+returned it SUCCESSFULLY, so no ``UnmappedKey`` fallback could catch it.
 """
 
 import re
@@ -424,36 +451,12 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                     state_dict[new_key] = stacked
                 continue
 
-            # Hand-written table first: it carries VALUE transforms (the 4-D A_log
-            # reshape) that hf_key_map does not, and delegating ahead of it silently
-            # dropped those, producing shape drift instead of a missing key. hf_key_map
-            # is the fallback for everything the table does not know -- the K3 layouts:
-            # latent MoE (ffn.latent.*), the AttnRes tail, gated MLA. The table also
-            # declines K3 shared experts on purpose (see _hf_key_to_tt) because its
-            # answer there belongs to a different layout.
-            # Shared experts are LAYOUT-DEPENDENT, so hf_key_map decides them: the table
-            # only knows Kimi Linear's ffn._moe.shared_experts.w1 while K3's latent path
-            # uses ffn.shared_experts.gate_proj. For every other key the table goes first
-            # because it also performs value transforms (the 4-D A_log reshape) that
-            # hf_key_map does not.
-            # Which layout applies is decided the SAME way to_hf decides it: to_hf sends
-            # keys carrying the wrapper prefix to hf_key_map and keeps everything else on
-            # its own table, so a multimodal export is in K3 naming and a text-only
-            # export is in Kimi Linear naming. Mirroring that exactly is what makes the
-            # round trip close; asking hf_key_map for a text-only model's shared experts
-            # returned a K3 path the model does not have -- and it returned it
-            # SUCCESSFULLY, so no UnmappedKey fallback could catch it.
+            # Table first, hf_key_map for the two keys it cannot decide (module docstring).
             #
-            # TODO: this is a proxy for "does this model use the latent MoE layout". It
-            # holds for every flavor here because the K3 layouts arrived with the
-            # multimodal ones, and it breaks the day a text-only latent flavor exists.
-            # g_proj joins shared experts as a key the table cannot decide. The release
-            # uses ONE name for two different gates -- KDA's own g_proj and gated MLA's
-            # output gate, which is attn_gate_proj on our side -- so resolving it needs
-            # the layer type, which only hf_key_map has. The table returned g_proj
-            # unchanged, a non-None answer that suppressed the fallback and left
-            # attn_gate_proj unwritten: an official gated-MLA load would keep its gates
-            # at random init.
+            # TODO: the mm_prefix test below is a proxy for "does this model use the
+            # latent MoE layout". It holds for every flavor here because the K3 layouts
+            # arrived with the multimodal ones, and it breaks the day a text-only latent
+            # flavor exists.
             tt_key = None
             if "g_proj" in key or (mm_prefix and "shared_experts" in key):
                 try:
