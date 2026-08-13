@@ -862,11 +862,6 @@ def apply_tp_kimi_k3(
         model,
         tp_mesh,
         {
-            "embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Replicate(),
-                use_local_output=True,
-            ),
             "norm": no_par_local,
             # lm_head is gone from the plan: it declares both halves itself now --
             # weight colwise AND the activation contract that lifts its plain input

@@ -57,6 +57,7 @@ from torchtitan.models.kimi_k3.attn_res import (
     unstack_blocks,
 )
 from torchtitan.models.kimi_k3.model import (
+    Embedding,
     RMSNorm,
     _tp_replicate,
     _tp_shard,
@@ -357,7 +358,11 @@ class KimiK3AttnResModel(KimiK3Model):
         self.num_blocks = num_blocks
         self.num_committed_blocks = -(-n_layers // self.layers_per_block)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            sharding_config=_tp_shard(0),
+        )
         # ModuleDict for pipeline_module_split compatibility — see
         # KimiK3Model.__init__ for the same pattern.
         self.attn_res_gated = gated

@@ -56,6 +56,7 @@ from torchtitan.models.common.decoder_sharding import (
 )
 from torchtitan.models.common.feed_forward import FeedForward
 
+from torchtitan.models.common.embedding import Embedding as _TTEmbedding
 from torchtitan.models.common.linear import Linear as _TTLinear
 from torchtitan.models.common.nn_modules import RMSNorm as _TTRMSNorm
 from torchtitan.protocols.module import Module as _TTModule
@@ -117,6 +118,30 @@ class RMSNorm(_TTRMSNorm):
             eps=eps,
             elementwise_affine=elementwise_affine,
         )
+        if sharding_config is not None:
+            self._sharding_config = sharding_config
+
+
+class Embedding(_TTEmbedding):
+    """Module-protocol Embedding with an ``nn.Embedding``-style constructor.
+
+    Upstream's ``Embedding.forward`` runs VOCAB-PARALLEL once ``parallelize()`` has set
+    ``tp_group`` -- masking out-of-range ids per rank and all-reducing -- which is the job
+    the imperative ``RowwiseParallel`` on ``embed_tokens`` was doing. Both at once is not a
+    valid state, so this class and that plan entry's removal belong to the same change.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        sharding_config: "ShardingConfig | None" = None,
+    ) -> None:
+        nn.Embedding.__init__(self, num_embeddings, embedding_dim)
+        # Set by upstream's __init__ and read by its forward; this constructor bypasses
+        # that __init__, and without it the first forward raises AttributeError.
+        self.tp_group = None
         if sharding_config is not None:
             self._sharding_config = sharding_config
 
@@ -1869,7 +1894,11 @@ class KimiK3Model(nn.Module):
         super().__init__()
         self.config = config
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            sharding_config=_tp_shard(0),
+        )
         # ModuleDict (not ModuleList) so pipeline_module_split preserves
         # layer-id string keys and the adapter's layer_to_stage discovery
         # works unchanged. Matches the attn_res/ experiment's pattern.
