@@ -36,37 +36,12 @@ from torchtitan.tools.logging import logger
 
 
 def _knob(config, field: str, env: str):
-    """A config field, with its retired environment variable still able to override it.
+    """Kept as the local name; the implementation is shared with the topology knobs."""
+    from torchtitan.models.kimi_k3.knobs import resolve_knob
 
-    Finding 32: these started as env vars, which upstream will not take. The field is the
-    source of truth; the env name is honoured because a dozen recorded repro commands set
-    it, and silently ignoring them would make every one of those documents wrong without
-    saying so. Warned once per variable so the deprecation is visible in a log rather than
-    only in a commit message.
-
-    Booleans follow the original convention exactly -- "0" is off, anything else is on --
-    so a command that worked before behaves identically.
-    """
-    import os
-
-    default = getattr(config, field)
-    raw = os.environ.get(env)
-    if raw is None:
-        return default
-    if env not in _WARNED_KNOBS:
-        _WARNED_KNOBS.add(env)
-        logger.warning(
-            "%s is deprecated; set the %s config field instead. Honouring the "
-            "environment variable for now.",
-            env,
-            field,
-        )
-    if isinstance(default, bool):
-        return raw != "0"
-    return type(default)(raw)
+    return resolve_knob(config, field, env)
 
 
-_WARNED_KNOBS: set[str] = set()
 
 
 # ----- K3's own vision path ---------------------------------------------- #
@@ -118,6 +93,16 @@ class KimiK3MultimodalConfig:
     cp_image_shard: bool = True
     vision_side_stream: bool = False
     dynamic_cp_min_patches: int = 256
+
+    # --- vision PP / TP topology (finding 32) ------------------------------ #
+    # These decide the STAGE COUNT and the attention plan, so a launcher that
+    # exported them non-uniformly gave different ranks different topologies and hung
+    # in a collective with nothing naming the cause. Resolved through
+    # ``knobs.register_topology``; the old env names still override, with a warning.
+    vit_dep: bool = False
+    vit_dep_stages: int = 1
+    vit_prefetch: int = 0
+    vit_tp_heads: bool = True
 
 
 class KimiK3MultimodalModel(nn.Module):
@@ -414,7 +399,6 @@ class KimiK3MultimodalModel(nn.Module):
             row_partition,
             subgroup_layout,
         )
-        from torchtitan.tools.logging import logger
 
         subgroups = getattr(self, "_cp_subgroups", None)
         if not subgroups:
@@ -607,8 +591,6 @@ class KimiK3MultimodalModel(nn.Module):
         images it encoded, summed over every rank's token shard.
         """
         import torch.distributed._functional_collectives as funcol
-
-        from torchtitan.tools.logging import logger
 
         group = self._cp_group
         rank = torch.distributed.get_rank(group)

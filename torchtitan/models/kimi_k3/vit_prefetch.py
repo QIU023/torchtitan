@@ -51,7 +51,6 @@ forward, and every extra unit is paid for in resident activations.
 
 from __future__ import annotations
 
-import os
 
 import torch
 
@@ -60,7 +59,9 @@ from torchtitan.tools.logging import logger
 
 def prefetch_depth() -> int:
     """How many micro-batches ahead to encode. 0 disables the prefetch."""
-    return max(0, int(os.environ.get("KIMI_VIT_PREFETCH", "0")))
+    from torchtitan.models.kimi_k3.knobs import topology
+
+    return max(0, topology().vit_prefetch)
 
 
 class VisionPrefetcher:

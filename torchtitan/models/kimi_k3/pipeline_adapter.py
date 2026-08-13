@@ -89,8 +89,10 @@ from torchtitan.tools.logging import logger
 
 
 def adapter_enabled() -> bool:
-    """Env-flag gate: adapter is opt-in until we trust it."""
-    return os.environ.get("TORCHTITAN_ATTNRES_CACHE") == "1"
+    """Config gate: the adapter is opt-in until we trust it."""
+    from torchtitan.models.kimi_k3.knobs import topology
+
+    return topology().attn_res_cache
 
 
 # ----- Rank-shared cache across virtual stages ----------------------------- #
@@ -1249,9 +1251,9 @@ def dep_enabled() -> bool:
     Off by default because it changes the stage count, so a run that enables it
     silently would report a different pipeline shape than the config asked for.
     """
-    import os
+    from torchtitan.models.kimi_k3.knobs import topology
 
-    return os.environ.get("KIMI_VIT_DEP", "0") == "1"
+    return topology().vit_dep
 
 
 def dep_vision_stages() -> int:
@@ -1269,9 +1271,9 @@ def dep_vision_stages() -> int:
     splice, and what crosses each hop is a fixed-capacity patch stream alongside the
     text embeddings. See ``KimiK3ViTStage.set_dep_role``.
     """
-    import os
+    from torchtitan.models.kimi_k3.knobs import topology
 
-    return max(1, int(os.environ.get("KIMI_VIT_DEP_STAGES", "1")))
+    return max(1, topology().vit_dep_stages)
 
 
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
@@ -1442,6 +1444,14 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
       model's forward signature).
     * Otherwise: pass through (plain PP, no cache adapter).
     """
+    # Resolve the topology knobs from config ONCE (finding 32). This entry can run
+    # before parallelize, so whichever comes first registers; register_topology is
+    # idempotent and reports a disagreement rather than letting order decide.
+    from torchtitan.models.kimi_k3.knobs import register_topology
+
+    if hasattr(model, "config"):
+        register_topology(model.config)
+
     from torchtitan.distributed.pipeline_parallel import pipeline_llm
 
     model = _unwrap_multimodal_for_pp(model, kwargs)

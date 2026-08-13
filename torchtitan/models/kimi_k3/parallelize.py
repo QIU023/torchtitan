@@ -141,6 +141,13 @@ def parallelize_kimi_k3(
     Requires context_parallel_load_balancer=None (validated below).
     """
 
+    # Resolve the topology knobs from config ONCE, before anything reads them
+    # (finding 32). Both this and the pipelining entry register; first call wins.
+    from torchtitan.models.kimi_k3.knobs import register_topology
+
+    if hasattr(model, "config"):
+        register_topology(model.config)
+
     # Enable TF32 tensor cores for fp32 matmuls (loss aggregation,
     # optimizer master weight updates, fp32 RoPE etc.). bf16 path is
     # unaffected. Speedup ~5-10% on fp32 ops, no measurable accuracy
@@ -634,14 +641,14 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
     tp_size = tp_mesh.size()
     tp_rank = tp_mesh.get_local_rank()
     num_heads = getattr(blocks[0], "num_heads", 0)
-    # KIMI_VIT_TP_HEADS=0 forces replicated attention. Kept as a verification
+    # vit_tp_heads=False forces replicated attention. Kept as a verification
     # affordance: head sharding changes the summation order of the attention
     # output, so the only way to attribute a numerical difference to it is an
     # A/B on one configuration.
-    import os as _os
+    from torchtitan.models.kimi_k3.knobs import topology as _topology
 
     shard_heads = (
-        _os.environ.get("KIMI_VIT_TP_HEADS", "1") != "0"
+        _topology().vit_tp_heads
         and num_heads >= tp_size
         and num_heads % tp_size == 0
     )
