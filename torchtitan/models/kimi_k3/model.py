@@ -1849,11 +1849,18 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
             )
             self.is_moe = False
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        # input_name declares the activation contract as well as the weight: these two are
+        # migrating off `plan["input_layernorm"] = NoParallel()`, and NoParallel lifted the
+        # input at the module boundary as well as distributing the weight.
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            sharding_config=_tp_replicate(input_name="x"),
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            sharding_config=_tp_replicate(),
+            sharding_config=_tp_replicate(input_name="x"),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

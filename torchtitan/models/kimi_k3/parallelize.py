@@ -904,10 +904,8 @@ def apply_tp_kimi_k3(
         # naturally; downstream KDA strips DTensor at entry via
         # _to_local_if_dtensor; downstream dense MLP's prepare_input
         # accepts both. Plain NoParallel is the most natural choice.
-        plan: dict[str, object] = {
-            "input_layernorm": NoParallel(),
-            "post_attention_layernorm": NoParallel(),
-        }
+        # Both layer norms declare weight AND activation contract themselves (model.py).
+        plan: dict[str, object] = {}
 
         if is_kda:
             # KDA is replicated on the tp axis, with plain-tensor boundaries and
