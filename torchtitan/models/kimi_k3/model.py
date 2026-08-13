@@ -1575,13 +1575,55 @@ class KimiMoE(nn.Module):
             set_moe_sharding_config(
                 moe_cfg,
                 enable_ep=config.moe_enable_ep,
-                enable_sp=False,
+                # EXPERIMENT (EP x TP): with EP on, every layout upstream declares from
+                # the router through the routed+shared add is sequence-parallel over the
+                # flattened (CP, TP) axes -- because the sparse mesh folds tp into efsdp
+                # and tp becomes a token axis inside the MoE region. Keying the DESIRED
+                # layouts on enable_sp alone then asks for S(1) -> P(sum), which DTensor
+                # rejects. Declaring SP when both are on makes src and dst agree.
+                enable_sp=config.moe_enable_ep and config.moe_enable_tp,
                 expert_param_layout={
                     "w1_EFD": spmd.S(1),
                     "w2_EDF": spmd.S(2),
                     "w3_EFD": spmd.S(1),
                 },
             )
+            if config.moe_enable_ep and config.moe_enable_tp:
+                # Make the MoE a self-contained SP island with a REPLICATED external
+                # boundary. Upstream's config assumes SP already arrives, because in its
+                # models TP implies SP for the whole decoder. Ours does not: the layer
+                # hands the FFN a tp-Replicate activation, by design (plain-ish
+                # boundaries are what let PP's P2P, AttnRes's stack and fla's kernels
+                # work). in_src describes what ARRIVES and in_dst what the module WANTS,
+                # so declaring Replicate in / SP inside / Replicate out lets DTensor
+                # insert the scatter and the all-gather instead of asking for the
+                # impossible S(1) -> P(sum).
+                import dataclasses as _dc
+
+                from torchtitan.models.common.decoder_sharding import (
+                    dense_activation_placement,
+                )
+
+                replicated = dense_activation_placement(tp=spmd.R)
+                # router_input_BLD as well as x_BLD. The latent path calls
+                # ``self._moe(to_latent(x), router_input_BLD=x)`` -- report Eq. 11 has the
+                # router read the PRE-latent activation -- and upstream's config knows
+                # only about x_BLD, so that second entry point was arriving Replicate at
+                # a router whose gate declares SP. Both have to be named or the
+                # redistribution reaches one of them.
+                wanted = moe_cfg.sharding_config.in_dst_shardings["x_BLD"]
+                moe_cfg.sharding_config = _dc.replace(
+                    moe_cfg.sharding_config,
+                    in_src_shardings={
+                        "x_BLD": replicated,
+                        "router_input_BLD": replicated,
+                    },
+                    in_dst_shardings={
+                        "x_BLD": wanted,
+                        "router_input_BLD": wanted,
+                    },
+                    out_dst_shardings=replicated,
+                )
         self._moe = moe_cfg.build()
         # Under the latent path the shared experts are ours, at full width.
         self.shared_experts = None
