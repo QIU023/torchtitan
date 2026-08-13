@@ -55,6 +55,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear as _TTLinear
 from torchtitan.models.common.nn_modules import RMSNorm as _TTRMSNorm
+from torchtitan.protocols.module import Module as _TTModule
 from torchtitan.protocols.sharding import ShardingConfig
 
 
@@ -949,7 +950,7 @@ def _local_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     return F.linear(x, weight, bias)
 
 
-class KimiDeltaAttention(nn.Module):
+class KimiDeltaAttention(_TTModule):
     """Kimi Delta Attention — linear-attention variant using
     fla-core's gated delta rule kernel.
 
@@ -1010,6 +1011,31 @@ class KimiDeltaAttention(nn.Module):
         # inside fused_kda_gate as softplus(g + dt_bias). Kept zero-init
         # to reproduce HF reference's default init behavior.
         self.dt_bias = nn.Parameter(torch.zeros(projection_size))
+
+        # Declared here rather than driven by ``plan["self_attn"] = NoParallel(...)``:
+        # A_log and dt_bias are this module's OWN parameters, so only a module-level
+        # declaration can reach them. tp-Replicate matches what NoParallel does, and
+        # keeps every parameter on one mesh for clip_grad_norm_'s stack.
+        #
+        # ``param_init`` is not optional once this class is a Module:
+        # ``_init_self_parameters`` RAISES for own parameters when neither a param_init
+        # map nor ``reset_parameters`` exists, and both of these are initialized above --
+        # so the map re-applies exactly that, rather than leaving a trap for the first
+        # caller that reaches init_states from the root.
+        self._sharding_config = ShardingConfig(
+            state_shardings={
+                "A_log": dense_param_placement(tp=spmd.R),
+                "dt_bias": dense_param_placement(tp=spmd.R),
+            }
+        )
+        self._param_init = {
+            "A_log": lambda t: t.copy_(
+                torch.log(
+                    torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)
+                ).to(t.dtype)
+            ),
+            "dt_bias": lambda t: t.zero_(),
+        }
 
         # Low-rank forget-gate and output-gate projections
         self.f_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
