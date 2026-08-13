@@ -2014,6 +2014,10 @@ class KimiK3Spec:
     # with the plain backbone at step 0). For grafting onto pretrained
     # weights; from-scratch flavors keep the paper's ungated read.
     attn_res_gated: bool = False
+    # Gate for the PP cross-stage cache adapter (finding 32: was
+    # TORCHTITAN_ATTNRES_CACHE). Opt-in, because it changes what crosses a stage
+    # boundary. Resolved through knobs.register_topology.
+    attn_res_cache: bool = False
     # LoRA (module-level; see lora.py). rank=None disables. When set,
     # target projections are wrapped (lora_b zero-init -> step-0
     # identity) and the base freezes EXCEPT the AttnRes graft params

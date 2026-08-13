@@ -34,6 +34,53 @@ Supported parallelism dimensions:
   decoder layer registry matches the llama3 ``model.layers`` iteration
   pattern. Honors all upstream modes (``selective``, ``full``,
   ``memory_budget``, ``none``).
+
+Why KDA is ``NoParallel`` on the tp axis
+----------------------------------------
+The whole ``self_attn`` is registered ``NoParallel``, so every child param
+(q/k/v/o projections, conv1d weights, ``A_log``, ``dt_bias``) becomes a
+``DTensor(Replicate)`` on ``tp_mesh``. Three consequences worth stating once:
+
+* **It is required for FSDP+TP composability.** ``clip_grad_norm_`` stacks
+  per-param grad norms across the parameter list, and the stack fails if some
+  norms live on ``(fsdp, tp)`` and others on ``(fsdp,)`` alone.
+* **The linears compose, the kernels do not.** Inside the KDA forward every
+  linear receives a DTensor input from ``input_layernorm`` and DTensor weights
+  from this wrap, so it produces DTensor. fla-core's triton kernels
+  (``causal_conv1d`` inside ``ShortConvolution``, ``fused_kda_gate``,
+  ``chunk_kda``, ``FusedRMSNormGated``) do not dispatch through DTensor, so
+  ``ShortConvolution.forward`` and ``FusedRMSNormGated.forward`` are shimmed to
+  ``to_local`` weight and input at the kernel boundary and ``from_local`` the
+  output. ``fused_kda_gate`` and ``chunk_kda`` are called explicitly, and their
+  to_local-and-call wrappers live in ``model.py``.
+* **The exit is plain.** ``local_output_grad_placements=Replicate`` ``to_local``s
+  the output at the module exit, matching MLA's ``o_proj`` and the dense MLP's
+  ``down_proj``, so ``attn_out`` is a plain tensor everywhere and both
+  partial-block accumulation and ``block_attn_res`` see one tensor kind.
+
+Why the MoE TP plan wraps LEAVES with ``NoParallel`` rather than the container
+--------------------------------------------------------------------------------
+Four facts, all load-bearing, kept here rather than inline at the call site:
+
+1. **The mechanism.** Registering each leaf with ``NoParallel`` puts its params on
+   ``tp_mesh`` as ``DTensor(Replicate)``. The shared MoE forward ``to_local``s its
+   DTensor input at entry, so gate/experts/shared_experts receive PLAIN x; each
+   leaf's ``prepare_input`` hook converts back to DTensor, runs on DTensor
+   (params are DTensor too, so the matmul composes), and returns plain via
+   ``local_output_grad_placements=Replicate``.
+2. **Why the experts need nothing extra.** ``GroupedExperts.forward`` and
+   ``KimiMLP``'s gate/up/down projections dispatch normally on DTensor because
+   their ops are standard ``F.linear``; ``GroupedExperts`` additionally
+   ``to_local``s its DTensor params before the grouped_mm kernel.
+3. **Why NOT the ``ffn`` container.** The MoE forward strips x with ``to_local``
+   AFTER the parent's ``prepare_input``. Wrapping ``ffn`` or ``_moe`` would make
+   the input a DTensor at MoE entry, ``to_local`` would make it plain, and the
+   gate would then receive plain x while holding DTensor weights -- which errors.
+   Wrapping the gate ITSELF keeps the boundary right.
+4. **Required for FSDP+TP composability.** ``clip_grad_norm_`` stacks per-param
+   grad norms across the whole parameter list, which fails if MoE params live on
+   ``(fsdp,)`` while MLA params live on ``(fsdp, tp)``. ``NoParallel`` promotes
+   the MoE params to ``(fsdp, tp)`` after the FSDP wrap.
 """
 
 from __future__ import annotations
@@ -93,6 +140,13 @@ def parallelize_kimi_k3(
     DTensor), so under TP each rank computes num_heads/(tp*cp) MLA heads.
     Requires context_parallel_load_balancer=None (validated below).
     """
+
+    # Resolve the topology knobs from config ONCE, before anything reads them
+    # (finding 32). Both this and the pipelining entry register; first call wins.
+    from torchtitan.models.kimi_k3.knobs import register_topology
+
+    if hasattr(model, "config"):
+        register_topology(model.config)
 
     # Enable TF32 tensor cores for fp32 matmuls (loss aggregation,
     # optimizer master weight updates, fp32 RoPE etc.). bf16 path is
@@ -587,14 +641,14 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
     tp_size = tp_mesh.size()
     tp_rank = tp_mesh.get_local_rank()
     num_heads = getattr(blocks[0], "num_heads", 0)
-    # KIMI_VIT_TP_HEADS=0 forces replicated attention. Kept as a verification
+    # vit_tp_heads=False forces replicated attention. Kept as a verification
     # affordance: head sharding changes the summation order of the attention
     # output, so the only way to attribute a numerical difference to it is an
     # A/B on one configuration.
-    import os as _os
+    from torchtitan.models.kimi_k3.knobs import topology as _topology
 
     shard_heads = (
-        _os.environ.get("KIMI_VIT_TP_HEADS", "1") != "0"
+        _topology().vit_tp_heads
         and num_heads >= tp_size
         and num_heads % tp_size == 0
     )
@@ -846,33 +900,8 @@ def apply_tp_kimi_k3(
         }
 
         if is_kda:
-            # KDA: register self_attn as NoParallel so all child params
-            # (q/k/v/o projections, conv1d weights, A_log, dt_bias, etc.)
-            # become DTensors on tp_mesh (Replicate). This is required
-            # for FSDP+TP composability: ``clip_grad_norm_`` stacks
-            # per-param grad norms across the parameter list, and stack
-            # fails if some norms live on (fsdp, tp) mesh and others on
-            # (fsdp,) mesh only.
-            #
-            # Inside KDA forward, all linears (q_proj/k_proj/v_proj,
-            # f/g/b projections) receive DTensor input from input_layernorm
-            # and DTensor weights from this NoParallel wrap → produce
-            # DTensor outputs. fla-core triton kernels (causal_conv1d
-            # inside ShortConvolution, fused_kda_gate, chunk_kda,
-            # FusedRMSNormGated) don't dispatch through DTensor, so we
-            # patch ShortConvolution.forward and FusedRMSNormGated.forward
-            # below to to_local their weight + input at the kernel
-            # boundary, then from_local the output. fused_kda_gate and
-            # chunk_kda are called explicitly in KDA forward — those
-            # to_local-and-call wrappers live in model.py.
-            #
-            # local_output_grad_placements=Replicate so the output is
-            # to_local'd at the module exit. This matches MLA's o_proj
-            # (use_local_output=True / output_layouts=Replicate) and the
-            # dense MLP's down_proj (RowwiseParallel use_local_output)
-            # so attn_out is plain Tensor everywhere — partial_block
-            # accumulation and AttnRes block_attn_res both see uniform
-            # plain Tensors.
+            # KDA is replicated on the tp axis, with plain-tensor boundaries and
+            # to_local shims at the fla kernel calls (module docstring).
             plan["self_attn"] = NoParallel(use_local_output=True)
         else:
             # MLA layer: DSv3-style plan.
@@ -964,39 +993,7 @@ def apply_tp_kimi_k3(
                 }
             )
         else:
-            # MoE: register each leaf submodule with NoParallel so all
-            # params live on tp_mesh as DTensor(Replicate). The
-            # torchtitan common MoE forward (at moe.py:403) to_local's
-            # its DTensor input at entry; the gate/experts/shared_experts
-            # then receive plain x. NoParallel-wrapping each leaf
-            # converts plain x → DTensor at the leaf's prepare_input
-            # hook, runs the leaf's forward on DTensor (params are also
-            # DTensor → matmul works), and converts the output back to
-            # plain via local_output_grad_placements=Replicate.
-            #
-            # GroupedExperts.forward and KimiMLP gate_proj/up_proj/down_proj
-            # all dispatch normally on DTensor inputs because their ops
-            # are standard nn.Linear / F.linear (DTensor-friendly).
-            # GroupedExperts additionally to_local's its DTensor params
-            # before the grouped_mm kernel (see moe.py:100-111), so it's
-            # already DTensor-aware.
-            #
-            # The reason we DON'T NoParallel the whole ``ffn`` container:
-            # MoE.forward stripping x via to_local at line 410 happens
-            # AFTER the parent's prepare_input. If we NoParallel-wrapped
-            # ffn or _moe, the input would be DTensor at MoE.forward
-            # entry; to_local would convert to plain; then the gate
-            # would receive plain. With gate.weight as DTensor (from
-            # NoParallel descent), gate(plain_x) errors. Wrapping the
-            # gate ITSELF (instead of the parent) keeps the boundary
-            # correct: input arrives plain, gate's prepare_input wraps
-            # it back to DTensor, the matmul stays DTensor × DTensor.
-            #
-            # Required for FSDP+TP composability: ``clip_grad_norm_``
-            # stacks per-param grad norms across the parameter list.
-            # If MoE params live on (fsdp,) mesh and MLA params live on
-            # (fsdp, tp) mesh, the stack fails. NoParallel wrapping
-            # promotes MoE params to (fsdp, tp) after FSDP wrap.
+            # MoE leaves get NoParallel, not the ffn container (module docstring).
             ffn = getattr(layer, "ffn", None)
             if ffn is None or not hasattr(ffn, "_moe"):
                 raise ValueError(f"MoE layer {layer.layer_idx}: missing ffn._moe")

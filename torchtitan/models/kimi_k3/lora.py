@@ -25,6 +25,32 @@ Semantics:
 * ``trainable_state_dict`` gives the LoRA-only checkpoint payload
   (adapters + AttnRes params), the unit veRL weight-sync ships.
 
+Plain input against a DTensor base weight
+-----------------------------------------
+``forward`` has a branch for a plain input meeting a DTensor ``base.weight`` --
+NoParallel descent puts one there, e.g. MoE shared experts running in
+plain-tensor land, because the MoE ``to_local``s direct-child weights but not one
+nested under a wrapper's ``.base``. That branch bypasses ``self.base`` entirely,
+so the TP style's own collective never runs and cannot cover for a wrong choice.
+WHICH AXIS is sharded therefore decides correctness:
+
+* **Colwise or Replicate**: the local product IS this rank's output shard (or the
+  full output), exactly what a ``use_local_output=True`` style produces. Nothing
+  to reduce.
+* **Rowwise** (``Shard(1)``, the CONTRACTED in_features axis): the local product
+  is only this rank's PARTIAL contribution and must be summed across the mesh.
+  ``to_local()`` drops the DTensor that would have summed it, so a partial value
+  escapes as a plain tensor -- and everything downstream assumes a plain tensor
+  is replicated. Measured cost of getting this wrong: rank-dependent values in
+  the residual stream from MLA's ``o_proj`` onward, layer 0 ``o_proj`` differing
+  by 3.5e-01 against a magnitude of 2.3e-01, every later activation diverging,
+  while the same architecture without LoRA stayed bit-identical.
+
+``o_proj`` is the only site that reaches this branch with a Rowwise base: the MLA
+attention output is built in plain-tensor land, whereas the dense FFN's
+``down_proj`` receives a DTensor from the Colwise gate/up pair and so takes the
+``self.base(x)`` path.
+
 TP for LoRA IS wired (parallelize.apply_tp_kimi_k3): a Colwise/
 Rowwise style on a wrapped projection is redirected to ``.base`` and the
 adapters are distributed to match (Colwise -> lora_a Replicate / lora_b
@@ -463,35 +489,7 @@ class KimiLoRALinear(nn.Module):
         else:
             bw = self.base.weight
             if not x_is_dt and isinstance(bw, DTensor):
-                # Plain input but a DTensor base weight (NoParallel descent,
-                # e.g. MoE shared experts run in plain-tensor land; the MoE
-                # to_locals direct-child weights but not one nested under a
-                # LoRA wrapper's .base). Densify to match the plain compute.
-                #
-                # WHICH AXIS is sharded decides whether the local matmul is the
-                # whole answer, and this branch bypasses ``self.base`` entirely
-                # -- so the style's own collective does not run and cannot cover
-                # for a wrong choice here:
-                #
-                # * Colwise / Replicate weight: the local product IS this rank's
-                #   output shard (or the full output), which is exactly what a
-                #   ``use_local_output=True`` style produces. Nothing to reduce.
-                # * Rowwise weight (Shard(1), the CONTRACTED in_features axis):
-                #   the local product is only this rank's PARTIAL contribution
-                #   and must be summed across the mesh. ``to_local()`` drops the
-                #   DTensor that would have summed it, so the partial value
-                #   escapes as a plain tensor -- and a plain tensor is assumed
-                #   replicated by everything downstream. That put rank-dependent
-                #   values into the residual stream from MLA's o_proj onward
-                #   (measured: layer 0 o_proj output differed by 3.5e-01 against
-                #   a magnitude of 2.3e-01, and every activation after it
-                #   diverged, while the same architecture without LoRA was
-                #   bit-identical).
-                #
-                # o_proj is the only site that reaches here with a Rowwise base:
-                # the MLA attention output is built in plain-tensor land, whereas
-                # the dense FFN's down_proj receives a DTensor from the Colwise
-                # gate/up pair and so takes the ``self.base(x)`` path below.
+                # Plain input, DTensor base weight: reduce iff Rowwise (module docstring).
                 bb = self.base.bias
                 if isinstance(bb, DTensor):
                     bb = bb.to_local()
