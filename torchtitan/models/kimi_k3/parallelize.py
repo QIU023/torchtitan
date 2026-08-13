@@ -280,6 +280,21 @@ def parallelize_kimi_k3(
             "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
             parallel_dims.ep,
         )
+    # Declarative sharding, after EP so the MoE subtrees are already parallelized and
+    # before AC so the checkpointed unit sees the distributed parameters. Step 1 of the
+    # migration to upstream's declarative path: this only ACTIVATES declarations that
+    # already exist -- no plan is removed here, so the imperative plan and the
+    # declarations are both in effect and their agreement is what the matrix checks.
+    entered = _drive_declarative_sharding(model, parallel_dims)
+    if entered:
+        from collections import Counter
+
+        logger.info(
+            "Declarative sharding: entered parallelize() on %d outermost Modules: %s",
+            len(entered),
+            dict(Counter(entered)),
+        )
+
     if ac_config is not None:
         # Caveat for KDA layers: ``selective`` mode recomputes ops not
         # marked MUST_SAVE during backward; fla-core's chunk_kda kernel is
@@ -1257,6 +1272,55 @@ def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
         moe.parallelize(parallel_dims)
         moe_layers_wrapped += 1
     logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
+
+
+def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -> int:
+    """Start upstream's declarative sharding from a plain-``nn.Module`` root.
+
+    ``Module.parallelize`` recurses through its own children and looks THROUGH
+    non-``Module`` containers, but something has to call it. Our containers
+    (``KimiDecoderLayer``, ``KimiK3Model``, ``KimiMoE``) are plain ``nn.Module``, so
+    nothing ever did -- which left the 64 modules that already carry a
+    ``sharding_config`` declaring into the void. Measured with a probe: after this
+    driver they hold DTensors with exactly the declared placements
+    (``gate_proj`` Shard(0), ``down_proj`` Shard(1), ``q_a_proj`` Replicate).
+
+    Already-parallelized subtrees are SKIPPED rather than re-entered:
+    ``Module.parallelize`` raises on a second call, and ``apply_ep_kimi_k3`` calls it on
+    each MoE itself. Skipping the whole subtree is correct because that call already
+    recursed into it.
+
+    Returns the class names entered, so a small count can be READ rather than guessed --
+    with TP on the imperative plan covers most modules and only a handful remain.
+    """
+    from torch.distributed.tensor import DTensor as _DTensor
+
+    from torchtitan.protocols.module import Module as _TTModule
+
+    def _already_distributed(m: nn.Module) -> bool:
+        """Has the imperative plan (or an earlier pass) already distributed this subtree?
+
+        ``_distribute_states`` raises "already a DTensor with placements ..." on a second
+        distribution of the same weight, and during the migration BOTH mechanisms are
+        live: ``apply_tp_kimi_k3`` covers some of the same modules the declarations do.
+        Skipping what is already distributed makes this driver activate exactly the
+        declarations the imperative plan does NOT cover, so imperative pieces can be
+        deleted one at a time and the declarations take over as they go.
+        """
+        return any(isinstance(p, _DTensor) for p in m.parameters())
+
+    entered: list[str] = []
+    queue = list(model.children())
+    while queue:
+        child = queue.pop()
+        if isinstance(child, _TTModule) and not getattr(child, "_parallelized", False):
+            if not _already_distributed(child):
+                child.parallelize(parallel_dims)
+                entered.append(type(child).__name__)
+                continue
+            # Partially covered: descend so the children the plan missed still get theirs.
+        queue.extend(child.children())
+    return entered
 
 
 def apply_fsdp(
