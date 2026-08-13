@@ -147,8 +147,8 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         proj_cfg = AttnResProjection.Config(dim=d, sharding_config=_tp_replicate())
         self.attn_res_proj = AttnResProjection(proj_cfg)
         self.mlp_res_proj = AttnResProjection(proj_cfg)
-        self.attn_res_norm = RMSNorm(d, eps=config.rms_norm_eps)
-        self.mlp_res_norm = RMSNorm(d, eps=config.rms_norm_eps)
+        self.attn_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.mlp_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         # Graft gate: per-read scalar alpha, zero-init, so at step 0 the
         # model is exactly the plain backbone (adapter-correctness anchor).
         # h = partial + alpha * (mix - partial): alpha=0 makes the read the
@@ -266,8 +266,8 @@ class KimiK3MTPLayer(nn.Module):
     def __init__(self, config, layer_idx: int, *, gated: bool) -> None:
         super().__init__()
         d = config.hidden_size
-        self.enorm = RMSNorm(d, eps=config.rms_norm_eps)
-        self.hnorm = RMSNorm(d, eps=config.rms_norm_eps)
+        self.enorm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.hnorm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.eh_proj = Linear(2 * d, d, bias=False, sharding_config=_tp_shard(0))
         self.gated = gated
         self.block = KimiAttnResDecoderLayer(config, layer_idx, gated=gated)
@@ -380,7 +380,7 @@ class KimiK3AttnResModel(KimiK3Model):
             if num_mtp
             else None
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.lm_head = Linear(
             config.hidden_size,
             config.vocab_size,
@@ -397,7 +397,9 @@ class KimiK3AttnResModel(KimiK3Model):
             )
         )
         self.final_attn_res_norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            sharding_config=_tp_replicate(),
         )
         if gated:
             self.final_attn_res_alpha = nn.Parameter(torch.zeros(1))

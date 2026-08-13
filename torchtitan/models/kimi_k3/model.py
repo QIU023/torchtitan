@@ -590,7 +590,7 @@ class KimiMLAAttention(nn.Module):
                 bias=False,
                 sharding_config=_tp_replicate(),
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
             self.q_b_proj = Linear(
                 self.q_lora_rank,
                 self.num_heads * self.q_head_dim,
@@ -603,7 +603,7 @@ class KimiMLAAttention(nn.Module):
             bias=False,
             sharding_config=_tp_replicate(),
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.kv_b_proj = Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1772,9 +1772,11 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
             )
             self.is_moe = False
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            sharding_config=_tp_replicate(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1825,7 +1827,7 @@ class KimiK3Model(nn.Module):
                 for i in range(config.num_hidden_layers)
             }
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.lm_head = Linear(
             config.hidden_size,
             config.vocab_size,
