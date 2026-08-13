@@ -1227,11 +1227,20 @@ def apply_tp_kimi_k3(
             for p in ffn._moe.parameters():
                 expert_param_ids.add(id(p))
     for module in model.modules():
+        # A module that DECLARES its own placements is skipped here for the same reason
+        # the expert params are: this sweep would promote its weight to Replicate before
+        # the declarative driver runs, and the driver then finds a placement that
+        # disagrees with the declaration. The sweep exists so clip_grad_norm_ sees every
+        # parameter on one mesh, and a declared module reaches that mesh by its own
+        # declaration instead.
+        declared = getattr(module, "_sharding_config", None)
+        declared_names = set(declared.state_shardings or {}) if declared else set()
         for name, p in list(module._parameters.items()):
             if (
                 p is not None
                 and not isinstance(p, DTensor)
                 and id(p) not in expert_param_ids
+                and name not in declared_names
             ):
                 module._parameters[name] = nn.Parameter(
                     distribute_tensor(p.data, tp_mesh, [Replicate()]),
@@ -1285,40 +1294,30 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
     driver they hold DTensors with exactly the declared placements
     (``gate_proj`` Shard(0), ``down_proj`` Shard(1), ``q_a_proj`` Replicate).
 
-    Already-parallelized subtrees are SKIPPED rather than re-entered:
-    ``Module.parallelize`` raises on a second call, and ``apply_ep_kimi_k3`` calls it on
-    each MoE itself. Skipping the whole subtree is correct because that call already
-    recursed into it.
+    The skip is keyed on ``_parallelized`` ONLY, not on "already holds a DTensor param".
+    That distinction is the whole migration: the imperative plan distributes a weight
+    without installing an activation contract, and a driver that skipped such a module
+    left it in a dead state -- distributed weight, plain input, "got mixed torch.Tensor
+    and DTensor" at the first op. ``_distribute_states`` is safe to reach on an
+    already-distributed param: its docstring says an already-DTensor param means a sibling
+    distributed it, and it skips while verifying the placements agree.
+
+    ``_parallelized`` still guards the subtrees ``apply_ep_kimi_k3`` parallelized itself,
+    because ``Module.parallelize`` raises on a second call.
 
     Returns the class names entered, so a small count can be READ rather than guessed --
     with TP on the imperative plan covers most modules and only a handful remain.
     """
-    from torch.distributed.tensor import DTensor as _DTensor
-
     from torchtitan.protocols.module import Module as _TTModule
-
-    def _already_distributed(m: nn.Module) -> bool:
-        """Has the imperative plan (or an earlier pass) already distributed this subtree?
-
-        ``_distribute_states`` raises "already a DTensor with placements ..." on a second
-        distribution of the same weight, and during the migration BOTH mechanisms are
-        live: ``apply_tp_kimi_k3`` covers some of the same modules the declarations do.
-        Skipping what is already distributed makes this driver activate exactly the
-        declarations the imperative plan does NOT cover, so imperative pieces can be
-        deleted one at a time and the declarations take over as they go.
-        """
-        return any(isinstance(p, _DTensor) for p in m.parameters())
 
     entered: list[str] = []
     queue = list(model.children())
     while queue:
         child = queue.pop()
         if isinstance(child, _TTModule) and not getattr(child, "_parallelized", False):
-            if not _already_distributed(child):
-                child.parallelize(parallel_dims)
-                entered.append(type(child).__name__)
-                continue
-            # Partially covered: descend so the children the plan missed still get theirs.
+            child.parallelize(parallel_dims)
+            entered.append(type(child).__name__)
+            continue
         queue.extend(child.children())
     return entered
 

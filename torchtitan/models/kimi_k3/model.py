@@ -459,29 +459,31 @@ class KimiMLP(FeedForward):
         hidden_act: Literal["silu", "gelu", "situ"] = "silu",
         situ_beta: float = 4.0,
         situ_linear_beta: float | None = 25.0,
+        *,
+        tp_replicated: bool = False,
     ) -> None:
         # Skip FeedForward.__init__, which builds w1/w2/w3 from Linear.Configs. This
         # class takes plain dimensions and owns the release's names, so only the
         # forward is inherited; going through the grandparent keeps torchtitan's
         # Module setup without acquiring the config-driven construction.
         super(FeedForward, self).__init__()
+        # This class serves TWO roles with OPPOSITE tp intents, and the declaration has to
+        # follow the caller rather than the class: the dense FFN is genuinely
+        # tensor-parallel (colwise, colwise, rowwise), while a MoE layer's shared_experts
+        # runs replicated -- the shared MoE forward to_locals its input, so its leaves are
+        # NoParallel (see the module docstring). Hard-coding colwise/rowwise here made the
+        # declaration disagree with the plan on every MoE layer, which only surfaced once
+        # the driver stopped skipping already-distributed modules.
+        colwise = _tp_replicate() if tp_replicated else _tp_shard(0)
+        rowwise = _tp_replicate() if tp_replicated else _tp_shard(1)
         self.gate_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            sharding_config=_tp_shard(0),
+            hidden_size, intermediate_size, bias=False, sharding_config=colwise
         )
         self.up_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            sharding_config=_tp_shard(0),
+            hidden_size, intermediate_size, bias=False, sharding_config=colwise
         )
         self.down_proj = Linear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            sharding_config=_tp_shard(1),
+            intermediate_size, hidden_size, bias=False, sharding_config=rowwise
         )
         self.hidden_act = hidden_act
         self._situ_beta = situ_beta
@@ -1709,6 +1711,7 @@ class KimiMoE(nn.Module):
             self.shared_experts = KimiMLP(
                 config.hidden_size,
                 shared_dim,
+                tp_replicated=True,
                 hidden_act=config.hidden_act,
                 situ_beta=config.activation_situ_beta,
                 situ_linear_beta=config.activation_situ_linear_beta,
