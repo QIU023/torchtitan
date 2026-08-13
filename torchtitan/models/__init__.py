@@ -11,6 +11,9 @@ _supported_models = frozenset(
         "gpt_oss",
         "kimi_k2_7",
         "kimi_k3",
+        # Vendored copy of the upstream K3 reference model, registered alongside ours so
+        # both run in the same tree during the alignment migration.
+        "kimi_k3_up",
         "llama3",
         "muse_glimmer",
         "qwen3",
