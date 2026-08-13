@@ -54,6 +54,7 @@ from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear as _TTLinear
+from torchtitan.models.common.nn_modules import RMSNorm as _TTRMSNorm
 from torchtitan.protocols.sharding import ShardingConfig
 
 
@@ -67,6 +68,33 @@ def _tp_shard(dim: int) -> ShardingConfig:
 def _tp_replicate() -> ShardingConfig:
     """Weight replicated on the tp axis (the NoParallel case)."""
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
+
+
+class RMSNorm(_TTRMSNorm):
+    """Module-protocol RMSNorm with an ``nn.RMSNorm``-style constructor.
+
+    Same reason as :class:`Linear`: the upstream class is Config-driven, and a plain
+    ``nn.RMSNorm`` cannot carry a ``sharding_config`` at all -- it is not a torchtitan
+    ``Module``, so the declarative path cannot see it and the norms had to be driven by
+    the imperative TP plan. Taking positional args keeps every call site readable.
+    """
+
+    def __init__(
+        self,
+        normalized_shape: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        *,
+        sharding_config: "ShardingConfig | None" = None,
+    ) -> None:
+        nn.RMSNorm.__init__(
+            self,
+            normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+        )
+        if sharding_config is not None:
+            self._sharding_config = sharding_config
 
 
 class Linear(_TTLinear):
@@ -562,7 +590,7 @@ class KimiMLAAttention(nn.Module):
                 bias=False,
                 sharding_config=_tp_replicate(),
             )
-            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = Linear(
                 self.q_lora_rank,
                 self.num_heads * self.q_head_dim,
@@ -575,7 +603,7 @@ class KimiMLAAttention(nn.Module):
             bias=False,
             sharding_config=_tp_replicate(),
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1374,7 +1402,7 @@ class KimiLatentMoEProjection(nn.Module):
         super().__init__()
         self.down = Linear(hidden_size, latent_size, bias=False)
         self.up = Linear(latent_size, hidden_size, bias=False)
-        self.norm = nn.RMSNorm(latent_size, eps=rms_norm_eps) if use_norm else None
+        self.norm = RMSNorm(latent_size, eps=rms_norm_eps) if use_norm else None
 
     def to_latent(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(x)
@@ -1744,8 +1772,8 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
             )
             self.is_moe = False
 
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -1797,7 +1825,7 @@ class KimiK3Model(nn.Module):
                 for i in range(config.num_hidden_layers)
             }
         )
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(
             config.hidden_size,
             config.vocab_size,
