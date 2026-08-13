@@ -60,7 +60,7 @@ from torchtitan.models.common.embedding import Embedding as _TTEmbedding
 from torchtitan.models.common.linear import Linear as _TTLinear
 from torchtitan.models.common.nn_modules import RMSNorm as _TTRMSNorm
 from torchtitan.protocols.module import Module as _TTModule
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 
 def _tp_shard(dim: int, *, input_name: str | None = None) -> ShardingConfig:
@@ -82,6 +82,38 @@ def _tp_shard(dim: int, *, input_name: str | None = None) -> ShardingConfig:
         # lift via ``DTensor.from_local`` actually runs.
         cfg["in_src_shardings"] = {input_name: dense_activation_placement(tp=spmd.R)}
     return ShardingConfig(**cfg)
+
+
+def _tp_embedding() -> ShardingConfig:
+    """Vocab-parallel embedding, matching upstream's ``tok_embeddings`` declaration."""
+    replicated_in = dense_activation_placement(tp=spmd.R)
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
+        in_src_shardings={"input": replicated_in},
+        in_dst_shardings={"input": replicated_in},
+        out_src_shardings=dense_activation_placement(tp=spmd.P),
+        out_dst_shardings=dense_activation_placement(tp=spmd.R),
+        local_map=LocalMapConfig(in_grad_placements=None),
+    )
+
+
+def _tp_rowwise(input_name: str = "input") -> ShardingConfig:
+    """Weight ``S(1)`` with the OUTPUT contract upstream's rowwise uses.
+
+    The output of a rowwise matmul is ``Partial`` on the tp axis; declaring
+    ``out_src=P, out_dst=R`` is what makes DTensor insert the all-reduce. That is what
+    llama3's ``attention.wo`` and ``feed_forward.w2`` declare, and it is the difference
+    between a module that can leave the imperative plan and one that cannot: the
+    imperative form ends with ``use_local_output=True`` and returns a PLAIN tensor, which
+    the declarative vocabulary has no field for. Both ends of a residual add have to agree,
+    so the projections feeding one migrate together or not at all.
+    """
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(1))},
+        in_src_shardings={input_name: dense_activation_placement(tp=spmd.S(-1))},
+        out_src_shardings=dense_activation_placement(tp=spmd.P),
+        out_dst_shardings=dense_activation_placement(tp=spmd.R),
+    )
 
 
 def _tp_replicate(*, input_name: str | None = None) -> ShardingConfig:
@@ -500,7 +532,9 @@ class KimiMLP(FeedForward):
         # declaration disagree with the plan on every MoE layer, which only surfaced once
         # the driver stopped skipping already-distributed modules.
         colwise = _tp_replicate() if tp_replicated else _tp_shard(0)
-        rowwise = _tp_replicate() if tp_replicated else _tp_shard(1)
+        # The rowwise leaf ends a residual branch, so it needs the all-reduce contract,
+        # not just a sharded weight -- see _tp_rowwise.
+        rowwise = _tp_replicate() if tp_replicated else _tp_rowwise()
         self.gate_proj = Linear(
             hidden_size, intermediate_size, bias=False, sharding_config=colwise
         )
@@ -665,7 +699,7 @@ class KimiMLAAttention(nn.Module):
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
-            sharding_config=_tp_shard(1),
+            sharding_config=_tp_rowwise(),
         )
 
         # Gated MLA. K3 (tech report Eq. 7):
@@ -1901,10 +1935,15 @@ class KimiK3Model(nn.Module):
         super().__init__()
         self.config = config
 
+        # Upstream's tok_embeddings shape: the forward computes on local tensors and
+        # returns a plain one, and local_map is what wraps that back into a DTensor with
+        # the declared placements (in from in_dst, out from out_src). This is how the
+        # residual stream starts as a DTensor rather than a plain tensor -- the piece that
+        # makes an all-DTensor stream expressible at all.
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
-            sharding_config=_tp_shard(0),
+            sharding_config=_tp_embedding(),
         )
         # ModuleDict (not ModuleList) so pipeline_module_split preserves
         # layer-id string keys and the adapter's layer_to_stage discovery

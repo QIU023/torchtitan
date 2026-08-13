@@ -990,16 +990,9 @@ def apply_tp_kimi_k3(
                     raise ValueError(
                         f"layer {layer.layer_idx} dense ffn missing '{name}'"
                     )
-            plan.update(
-                {
-                    "ffn.gate_proj": ColwiseParallel(use_local_output=False),
-                    "ffn.up_proj": ColwiseParallel(use_local_output=False),
-                    "ffn.down_proj": RowwiseParallel(
-                        output_layouts=Replicate(),
-                        use_local_output=True,
-                    ),
-                }
-            )
+            # The dense FFN declares its own colwise/rowwise, including the rowwise
+            # all-reduce contract (model.py). It migrates together with the attention
+            # output below because both ends of a residual add have to agree on kind.
         else:
             # MoE leaves get NoParallel, not the ffn container (module docstring).
             ffn = getattr(layer, "ffn", None)
