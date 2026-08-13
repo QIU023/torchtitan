@@ -67,6 +67,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 
+# The wrapper and the placement helper live in model.py; model.py does not
+# import this file, so there is no cycle.
+from torchtitan.models.kimi_k3.model import _tp_replicate, RMSNorm
+
 
 @dataclass
 class CPPatchPlan:
@@ -421,12 +425,12 @@ class MoonViTEncoderLayer(nn.Module):
         self._tp_head_slice: tuple[int, int] | None = None
         # Dynamic CP: set when this rank holds a patch shard of one large image.
         self._cp_patch_plan: CPPatchPlan | None = None
-        self.norm0 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm0 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.wqkv = nn.Linear(
             config.hidden_size, 3 * config.qkv_hidden_size, bias=False
         )
         self.wo = nn.Linear(config.qkv_hidden_size, config.hidden_size, bias=False)
-        self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.mlp = MoonViTMLP(config)
 
     def _attend_gather_kv(
@@ -659,8 +663,10 @@ class PatchMergerMLPV2(nn.Module):
             nn.GELU(),
             nn.Linear(merged, config.text_hidden_size, bias=False),
         )
-        self.post_norm = nn.RMSNorm(
-            config.text_hidden_size, eps=config.projector_ln_eps
+        self.post_norm = RMSNorm(
+            config.text_hidden_size,
+            eps=config.projector_ln_eps,
+            sharding_config=_tp_replicate(),
         )
 
     def forward(self, merged: list[torch.Tensor] | torch.Tensor):
@@ -689,7 +695,7 @@ class MoonViTEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             MoonViTEncoderLayer(config) for _ in range(config.num_hidden_layers)
         )
-        self.final_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
 
     def set_cp_patch_plan(self, plan: CPPatchPlan | None) -> None:
         """Apply (or clear) a dynamic-CP patch partition on every block.
