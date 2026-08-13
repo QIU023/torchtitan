@@ -385,7 +385,7 @@ class KimiK3AttnResModel(KimiK3Model):
             config.hidden_size,
             config.vocab_size,
             bias=False,
-            sharding_config=_tp_shard(0),
+            sharding_config=_tp_shard(0, input_name="input"),
         )
 
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm

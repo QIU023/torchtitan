@@ -50,7 +50,10 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate
 
 from torchtitan.models.common.attention import ScaledDotProductAttention
-from torchtitan.models.common.decoder_sharding import dense_param_placement
+from torchtitan.models.common.decoder_sharding import (
+    dense_activation_placement,
+    dense_param_placement,
+)
 from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear as _TTLinear
@@ -59,16 +62,36 @@ from torchtitan.protocols.module import Module as _TTModule
 from torchtitan.protocols.sharding import ShardingConfig
 
 
-def _tp_shard(dim: int) -> ShardingConfig:
-    """Weight sharded on ``dim`` of the tp axis; colwise is 0, rowwise is 1."""
-    return ShardingConfig(
-        state_shardings={"weight": dense_param_placement(tp=spmd.S(dim))}
-    )
+def _tp_shard(dim: int, *, input_name: str | None = None) -> ShardingConfig:
+    """Weight sharded on ``dim`` of the tp axis; colwise is 0, rowwise is 1.
+
+    ``input_name`` also declares the ACTIVATION contract, and without it a declaration
+    is only half of what the imperative styles do. ``_redistribute_inputs`` wraps a plain
+    tensor via ``DTensor.from_local`` when ``in_src_shardings`` names it -- so a module
+    fed plain activations needs that name, or its distributed weight meets a plain input
+    and the op rejects the mixture ("got mixed torch.Tensor and DTensor"). The name is
+    the forward PARAMETER name: ``input`` for Linear, ``x`` for RMSNorm.
+    """
+    cfg = {"state_shardings": {"weight": dense_param_placement(tp=spmd.S(dim))}}
+    if input_name is not None:
+        # tp=R, not tp=I. A plain activation IS replicated across the tp ranks, and the
+        # difference is not cosmetic: ``_redistribute_inputs`` resolves a mesh from the
+        # declared layouts and skips the input when that resolves to None, which is what
+        # ``I`` ("not distributed on this axis") gives. ``R`` names the tp axis, so the
+        # lift via ``DTensor.from_local`` actually runs.
+        cfg["in_src_shardings"] = {input_name: dense_activation_placement(tp=spmd.R)}
+    return ShardingConfig(**cfg)
 
 
-def _tp_replicate() -> ShardingConfig:
-    """Weight replicated on the tp axis (the NoParallel case)."""
-    return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
+def _tp_replicate(*, input_name: str | None = None) -> ShardingConfig:
+    """Weight replicated on the tp axis (the NoParallel case).
+
+    See ``_tp_shard`` for why ``input_name`` matters.
+    """
+    cfg = {"state_shardings": {"weight": dense_param_placement(tp=spmd.R)}}
+    if input_name is not None:
+        cfg["in_src_shardings"] = {input_name: dense_activation_placement(tp=spmd.R)}
+    return ShardingConfig(**cfg)
 
 
 class RMSNorm(_TTRMSNorm):
@@ -1858,7 +1881,7 @@ class KimiK3Model(nn.Module):
             config.hidden_size,
             config.vocab_size,
             bias=False,
-            sharding_config=_tp_shard(0),
+            sharding_config=_tp_shard(0, input_name="input"),
         )
 
         if config.tie_word_embeddings:

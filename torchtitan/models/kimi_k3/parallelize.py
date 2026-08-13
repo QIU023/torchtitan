@@ -868,11 +868,11 @@ def apply_tp_kimi_k3(
                 use_local_output=True,
             ),
             "norm": no_par_local,
-            "lm_head": ColwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Replicate(),
-                use_local_output=True,
-            ),
+            # lm_head is gone from the plan: it declares both halves itself now --
+            # weight colwise AND the activation contract that lifts its plain input
+            # (_tp_shard(0, input_name="input") in model.py). First module migrated
+            # this way; the rest follow one at a time so each one's screening cell
+            # names the module if it is wrong.
         },
     )
 
