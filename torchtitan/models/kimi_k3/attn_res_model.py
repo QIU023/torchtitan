@@ -265,6 +265,13 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
                 "forward_tensor_carrier does not carry plain_stream"
             )
 
+        # EVERY layer, not just the model's entry. In the list path
+        # block_attn_res runs at the top of each layer, so its stack-and-cast
+        # round trip normalised the stream once per layer; an FFN or MoE that
+        # returns a DTensor was silently unwrapped by the next layer's
+        # aggregation. Doing this only at the entry was measured to be too
+        # narrow -- the same input_layernorm failed on a later layer instead.
+        x_BLD = _plain_residual_stream(x_BLD)
         B, L, D = x_BLD.shape
         prefix_sum_BLD: torch.Tensor | None = x_BLD
 
