@@ -920,14 +920,12 @@ def apply_tp_kimi_k3(
         }
 
         if is_kda:
-            # MEASURED: KDA cannot take its declaration alone. Removing this
-            # entry fails tp2 with "aten.cat.default got mixed torch.Tensor and
-            # DTensor". It does strip DTensor at the fla kernel call sites
-            # (_to_local_if_dtensor), which is what made it look like a
-            # candidate, but its OUTPUT stays a DTensor and AttnRes then
-            # concatenates it against the plain residual stream. Same class as
-            # the norms: it moves when the stream does.
-            plan["self_attn"] = NoParallel(use_local_output=False)
+            # KDA takes its own declaration now. It used to fail with
+            # "aten.cat.default got mixed" because its output stayed a DTensor
+            # while AttnRes concatenated it against a plain stream; the stream is
+            # a DTensor now, so the mismatch is gone. It already strips DTensor
+            # at the fla kernel call sites itself (_to_local_if_dtensor).
+            pass
         else:
             # MLA layer: DSv3-style plan.
             # NOTE: ``kv_a_proj_with_mqa`` is NOT sharded — its output
@@ -1246,9 +1244,20 @@ def apply_tp_kimi_k3(
     # That is why declarations kept looking inert: the sweep, not the imperative
     # plan, was doing their work.
     for module in model.modules():
-        if getattr(module, "_sharding_config", None) is not None:
-            continue
+        cfg = getattr(module, "_sharding_config", None)
+        declared = set(cfg.state_shardings or ()) if cfg is not None else set()
         for name, p in list(module._parameters.items()):
+            # Skip a declared parameter only once the declaration has ACTUALLY
+            # been applied. Three mechanisms can each believe another handled it:
+            # the imperative plan distributes a module's children, so
+            # _already_distributed reports that subtree done and the driver skips
+            # the PARENT -- whose own declared parameters then never get
+            # distributed, while this sweep skips them for being declared.
+            # Measured exactly that way: 18 plain gradients at clip time, the
+            # A_log and dt_bias of the nine KDA layers, and clip_grad_norm_ died
+            # with "aten._foreach_mul_.Tensor got mixed".
+            if name in declared and isinstance(p, DTensor):
+                continue
             if (
                 p is not None
                 and not isinstance(p, DTensor)
