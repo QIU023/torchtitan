@@ -794,6 +794,20 @@ class KimiK3MultimodalModel(nn.Module):
             else torch.cat(list(features), dim=0)
         )
         mask = (input_ids == sentinel).unsqueeze(-1).expand_as(text)
+        if isinstance(text, DTensor):
+            # The text stream is a DTensor now; the vision tower still hands out
+            # plain tensors because its TP is a separate mechanism
+            # (_apply_tp_moonvit_mlp), so LIFT the vision side to the text
+            # stream's layout rather than unwrapping the stream. Both are
+            # Replicate on the tp axis here, so this is metadata only.
+            flat = DTensor.from_local(
+                flat.to(text.to_local().dtype), text.device_mesh, text.placements,
+                run_check=False,
+            )
+            mask = DTensor.from_local(
+                mask, text.device_mesh, text.placements, run_check=False
+            )
+            return text.masked_scatter(mask, flat)
         return text.masked_scatter(mask, flat.to(text.dtype))
 
     def _splice(
