@@ -124,14 +124,7 @@ def pipeline_llm(
 
     pp_schedule = _build_pipeline_schedule(
         parallelism=parallelism,
-        # Since #3856 the dataloader emits ONE pipeline microbatch per fetch,
-        # so n_microbatches must be counted in microbatches. Passing the local
-        # batch here counts the split twice and PP dies with "Expecting N
-        # arg_mbs but got 1".
-        local_batch_size=(
-            training.local_batch_size
-            // parallelism.pipeline_parallel_microbatch_size
-        ),
+        local_batch_size=training.local_batch_size,
         stages=stages,
         loss_fn=loss_fn,
     )
