@@ -293,7 +293,6 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         # returns a DTensor was silently unwrapped by the next layer's
         # aggregation. Doing this only at the entry was measured to be too
         # narrow -- the same input_layernorm failed on a later layer instead.
-        x_BLD = _plain_residual_stream(x_BLD)
         B, L, D = x_BLD.shape
         prefix_sum_BLD: torch.Tensor | None = x_BLD
 
@@ -649,7 +648,7 @@ class KimiK3AttnResModel(KimiK3Model):
                     partial_block.shape[0] * partial_block.shape[1], 0, D
                 )
             )
-            x = _plain_residual_stream(partial_block)
+            x = partial_block
             for layer_key, layer in self.layers.items():
                 is_block_start = int(layer_key) % self.layers_per_block == 0
                 x, carrier = layer(carrier, x, is_block_start)
