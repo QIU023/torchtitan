@@ -16,11 +16,11 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.context_parallel import apply_cp_to_forward
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
 )
+from torchtitan.models.kimi_k3_up.cp_ulysses import apply_ulysses_cp
 from torchtitan.models.kimi_k3_up.model import KimiK3Model
 
 
@@ -36,11 +36,11 @@ def parallelize_kimi_k3(
 ) -> nn.Module:
     """Apply FSDP2 and CP while keeping the model's eager reference forward path.
 
-    CP uses core's ``apply_cp_to_forward`` rather than a model-local
-    implementation. Their MLA builds a ``ScaledDotProductAttention`` as its
-    ``inner_attention``, which is one of the two types that helper handles, so
-    ring attention over the sequence comes for free -- the same path llama3
-    takes.
+    CP is Ulysses, not core's ring path. Core's ``apply_cp_to_forward`` routes
+    an SDPA inner attention onto the CP dispatcher, and measured there K3's MLA
+    fails inside the dispatcher's accumulation while llama3 passes the same cell
+    on the same tree. Ulysses also needs nothing from the attention kernel,
+    which is what makes it the portable choice here. See ``cp_ulysses``.
 
     KDA is a separate problem and is NOT covered here.
     ``prepare_context_parallel_input`` shards the sequence before the first
@@ -83,8 +83,10 @@ def parallelize_kimi_k3(
         )
 
     if parallel_dims.cp_enabled:
-        mla_inner = [
-            block.attention.inner_attention
+        # Ulysses wraps the ATTENTION module, not its inner attention: the
+        # all-to-all has to sit around the projections, which live one level up.
+        mla_blocks = [
+            block.attention
             for block in model.layers.values()
             if block.attention is not None
         ]
@@ -98,8 +100,8 @@ def parallelize_kimi_k3(
                 "than an error. Use a full-attention flavor until the KDA path "
                 "lands."
             )
-        # Before parallelize(), per apply_cp_to_forward's contract.
-        apply_cp_to_forward(mla_inner, parallel_dims.get_mesh("cp"))
+        # Before parallelize(), matching core's helper contract.
+        apply_ulysses_cp(mla_blocks, parallel_dims.get_mesh("cp"))
 
     dp_mesh_names = (
         ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
