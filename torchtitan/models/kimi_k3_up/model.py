@@ -652,10 +652,13 @@ class KimiK3Model(Decoder):
         def update_from_config(self, *, config, **kwargs) -> None:
             del kwargs
             parallelism = config.parallelism
+            # Context parallel is handled in parallelize.py, which wires core's
+            # apply_cp_to_forward and rejects it only for models that have a KDA
+            # layer. Listing it here as well would reject it before that check
+            # ever runs.
             unsupported = {
                 "tensor parallel": parallelism.tensor_parallel_degree,
                 "pipeline parallel": parallelism.pipeline_parallel_degree,
-                "context parallel": parallelism.context_parallel_degree,
                 "expert parallel": parallelism.expert_parallel_degree,
             }
             enabled = [name for name, degree in unsupported.items() if degree > 1]
