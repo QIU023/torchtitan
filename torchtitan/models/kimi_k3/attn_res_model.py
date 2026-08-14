@@ -48,8 +48,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
+from torchtitan.models.common.embedding import Embedding as _TTEmbedding
 from torchtitan.models.kimi_k3.attn_res import (
     block_attn_res_tensor,
     AttnResProjection,
@@ -470,7 +471,17 @@ class KimiK3AttnResModel(KimiK3Model):
         self.num_blocks = num_blocks
         self.num_committed_blocks = -(-n_layers // self.layers_per_block)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # torchtitan's Embedding, not nn.Embedding. It runs vocab-parallel in
+        # its own forward -- to_local the weight, chunk the vocab, all-reduce --
+        # and never produces a DTensor partial. Ours went through
+        # RowwiseParallel instead, which makes DTensor do the vocab split and
+        # yields MaskPartial; that meets the plain P(sum) coming out of the
+        # now-declared AttnRes projections inside block_attn_res_tensor, and
+        # DTensor has no conversion between two partial types. Every upstream
+        # model uses this class for exactly this reason.
+        self.embed_tokens = _TTEmbedding.Config(
+            num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+        ).build()
         # ModuleDict for pipeline_module_split compatibility — see
         # KimiK3Model.__init__ for the same pattern.
         self.attn_res_gated = gated
@@ -648,7 +659,28 @@ class KimiK3AttnResModel(KimiK3Model):
                     partial_block.shape[0] * partial_block.shape[1], 0, D
                 )
             )
+            # Lift the stream once, here. torchtitan's Embedding returns a
+            # plain tensor (it does vocab-parallel itself and never makes a
+            # DTensor), while every declared module inside a layer produces one.
+            # Upstream models get this for free because a layer's first op is a
+            # norm, whose declaration lifts its input; AttnRes's first op is the
+            # carrier cat, which has no declaration to do it.
             x = partial_block
+            _tpm = getattr(self, "_tp_mesh", None)
+            if _tpm is not None:
+                # Lift each independently. The text path arrives plain from the
+                # vocab-parallel Embedding, but the multimodal path arrives as a
+                # DTensor from _splice -- and gating both on x's kind left the
+                # carrier plain there, so the carrier cat inside
+                # block_attn_res_tensor met one of each.
+                if not isinstance(x, DTensor):
+                    x = DTensor.from_local(
+                        x, _tpm, (Replicate(),), run_check=False
+                    )
+                if not isinstance(carrier, DTensor):
+                    carrier = DTensor.from_local(
+                        carrier, _tpm, (Replicate(),), run_check=False
+                    )
             for layer_key, layer in self.layers.items():
                 is_block_start = int(layer_key) % self.layers_per_block == 0
                 x, carrier = layer(carrier, x, is_block_start)
