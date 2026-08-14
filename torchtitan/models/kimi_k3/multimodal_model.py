@@ -523,7 +523,17 @@ class KimiK3MultimodalModel(nn.Module):
             feats = self.vision_tower(local, local_grid, plan)
             if isinstance(feats, torch.Tensor):
                 feats = [feats]
-            feats = [f.to_local() if isinstance(f, DTensor) else f for f in feats]
+            # to_local on the VALUE is not enough: the gradient flowing back into
+            # funcol.all_gather_tensor is its transpose, a reduce_scatter, and
+            # _c10d_functional.reduce_scatter_tensor has no DTensor sharding
+            # strategy. So the gradient must be plain too, which means leaving
+            # DTensor land here rather than merely unwrapping the forward value.
+            feats = [
+                f.to_local(grad_placements=(Replicate(),))
+                if isinstance(f, DTensor)
+                else f
+                for f in feats
+            ]
             local_feat = torch.cat(feats, dim=0)
 
             gathered = funcol.all_gather_tensor(
