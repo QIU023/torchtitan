@@ -20,6 +20,7 @@ from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
 )
+from torchtitan.models.kimi_k3_up.cp_kcp import apply_kcp
 from torchtitan.models.kimi_k3_up.cp_ulysses import apply_ulysses_cp
 from torchtitan.models.kimi_k3_up.model import KimiK3Model
 
@@ -42,12 +43,10 @@ def parallelize_kimi_k3(
     on the same tree. Ulysses also needs nothing from the attention kernel,
     which is what makes it the portable choice here. See ``cp_ulysses``.
 
-    KDA is a separate problem and is NOT covered here.
-    ``prepare_context_parallel_input`` shards the sequence before the first
-    layer, so every layer sees a shard, and KDA's recurrence has to be made
-    aware of that (fla's merged KCP). Until that lands, CP is rejected for any
-    model that has a KDA layer rather than silently producing a model whose
-    linear-attention layers run on a shard as if it were the whole sequence.
+    KDA takes KCP (``cp_kcp``): the recurrence gets fla's prefix-scan context
+    and the short convolutions exchange their halo. It carries one constraint
+    Ulysses does not -- fla's CP path packs the batch into a single sequence, so
+    local_batch_size must be 1.
     """
     del dump_folder
 
@@ -90,18 +89,25 @@ def parallelize_kimi_k3(
             for block in model.layers.values()
             if block.attention is not None
         ]
-        kda_blocks = [b for b in model.layers.values() if b.delta_attention is not None]
-        if kda_blocks:
+        kda_blocks = [
+            b.delta_attention
+            for b in model.layers.values()
+            if b.delta_attention is not None
+        ]
+        if kda_blocks and training.local_batch_size != 1:
+            # fla's causal_conv1d_cp asserts [1, T, D]: the CP path is built for
+            # cu_seqlens packing, where the batch IS one packed sequence. Caught
+            # here rather than at the first KDA forward, which is several minutes
+            # of startup later.
             raise NotImplementedError(
-                f"Context parallel needs KDA-aware linear attention, and this "
-                f"model has {len(kda_blocks)} KDA layer(s). Sharding the "
-                "sequence would leave their recurrence running on a shard as "
-                "if it were the whole sequence, which is silently wrong rather "
-                "than an error. Use a full-attention flavor until the KDA path "
-                "lands."
+                "KCP requires training.local_batch_size == 1 (fla's CP path packs "
+                f"the batch into one sequence), got {training.local_batch_size}."
             )
         # Before parallelize(), matching core's helper contract.
-        apply_ulysses_cp(mla_blocks, parallel_dims.get_mesh("cp"))
+        cp_mesh = parallel_dims.get_mesh("cp")
+        apply_ulysses_cp(mla_blocks, cp_mesh)
+        if kda_blocks:
+            apply_kcp(kda_blocks, cp_mesh)
 
     dp_mesh_names = (
         ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
