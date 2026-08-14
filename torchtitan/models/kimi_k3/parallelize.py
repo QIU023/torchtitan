@@ -891,14 +891,16 @@ def apply_tp_kimi_k3(
     if getattr(model, "final_attn_res_norm", None) is not None:
         parallelize_module(model, tp_mesh, {"final_attn_res_norm": no_par_local})
 
-    # MLA inner_attention input plan (DSv3 mirror): q/k/v arrive sharded
-    # on the head axis (transposed to dim 1 inside KimiMLAAttention.forward
-    # before SDPA), use_local_output=False converts them to plain Tensors
-    # before the SDPA kernel dispatcher sees them.
+    # MLA inner_attention: the ONE place use_local_output=True survives the
+    # residual-stream flip. q/k/v arrive head-sharded and SDPA has no DTensor
+    # rule, so the kernel must see plain tensors -- the same reason the fla
+    # kernels get _to_local_if_dtensor at their call sites. Setting it False with
+    # everything else made every tp>1 cell die inside
+    # F.scaled_dot_product_attention with the operands at Shard(1).
     inner_attn_plan = PrepareModuleInput(
         input_layouts=(Shard(1), Shard(1), Shard(1)),
         desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
-        use_local_output=False,
+        use_local_output=True,
     )
 
     # Per-layer plan. Each layer is a KimiDecoderLayer (or AttnRes
