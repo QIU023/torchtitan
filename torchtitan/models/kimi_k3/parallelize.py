@@ -1072,14 +1072,11 @@ def apply_tp_kimi_k3(
 
         # AttnRes per-layer modules: each layer has TWO pseudo-queries
         # + TWO RMSNorms, all NoParallel.
-        for name in (
-            "attn_res_proj",
-            "attn_res_norm",
-            "mlp_res_proj",
-            "mlp_res_norm",
-        ):
-            if hasattr(layer, name) and getattr(layer, name) is not None:
-                plan[name] = no_par_local
+        # The four per-layer AttnRes modules DECLARE their placement, and the
+        # final sweep no longer claims declared modules, so the declarative
+        # driver now distributes them. The NoParallel entries that used to be
+        # here made the driver skip the subtree, which is what kept the
+        # declarations inert.
 
         # LoRA-aware TP: a Colwise/Rowwise style can't target a
         # KimiLoRALinear (ColwiseParallel needs nn.Linear). Redirect the
