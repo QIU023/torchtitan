@@ -652,9 +652,13 @@ class KimiK3Model(Decoder):
         def update_from_config(self, *, config, **kwargs) -> None:
             del kwargs
             parallelism = config.parallelism
+            # Context and pipeline parallel are handled in parallelize.py and
+            # pipeline.py, which can see the built model -- CP's rejection depends
+            # on whether any layer is KDA and on local_batch_size, neither of which
+            # this config-level check can evaluate. Listing them here would reject
+            # them before those checks ever run.
             unsupported = {
                 "tensor parallel": parallelism.tensor_parallel_degree,
-                "context parallel": parallelism.context_parallel_degree,
                 "expert parallel": parallelism.expert_parallel_degree,
             }
             enabled = [name for name, degree in unsupported.items() if degree > 1]

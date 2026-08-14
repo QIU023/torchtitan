@@ -121,3 +121,15 @@ def kimi_k3_up_mini_block_attn_res() -> Trainer.Config:
         checkpoint=CheckpointManager.Config(interval=10, last_save_model_only=False),
         activation_checkpoint=None,
     )
+
+
+def kimi_k3_up_mini_full_attn() -> Trainer.Config:
+    """The all-MLA variant of the text flavor, so CP can be verified alone."""
+    import dataclasses as _dc
+
+    cfg = kimi_k3_up_mini_block_attn_res()
+    cfg.model_spec = model_registry("mini_full_attn")
+    cfg.loss = _dc.replace(
+        cfg.loss, loss_fn=CrossEntropyLoss.Config(global_vocab_size=2016)
+    )
+    return cfg

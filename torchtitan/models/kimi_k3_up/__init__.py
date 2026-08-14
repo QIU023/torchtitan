@@ -546,9 +546,48 @@ def _mini_block_attn_res(attn_backend: str) -> KimiK3Model.Config:
     )
 
 
+def _mini_full_attn(attn_backend: str) -> KimiK3Model.Config:
+    """The text screening topology with every layer full attention.
+
+    A step, not a product flavor. Context parallel shards the sequence before
+    the first layer, so a KDA layer would run its recurrence on a shard as if
+    it were the whole sequence -- wrong, and silently so. This flavor removes
+    KDA entirely, which makes CP verifiable on its own before the KDA-aware
+    path exists. Everything else matches _mini_block_attn_res exactly, so the
+    two differ in one property.
+    """
+    if attn_backend != "eager":
+        raise ValueError("Kimi K3 v1 only provides the 'eager' backend.")
+
+    dim = 512
+    return _kimi_k3_config(
+        dim=dim,
+        vocab_size=2016,
+        num_layers=21,
+        full_attention_layers=set(range(1, 22)),
+        attn_res_block_size=12,
+        num_heads=4,
+        q_lora_rank=128,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=896,
+        latent_dim=256,
+        expert_hidden_dim=224,
+        num_experts=8,
+        top_k=2,
+        num_shared_experts=2,
+        vision_encoder=None,
+    )
+
+
 kimi_k3_configs = {
     "debugmodel": _debugmodel,
     "mini_block_attn_res": _mini_block_attn_res,
+    "mini_full_attn": _mini_full_attn,
 }
 
 
