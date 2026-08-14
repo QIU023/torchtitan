@@ -67,42 +67,26 @@ def block_attn_res(
         Aggregated hidden state [B, T, D].
     """
     V = torch.stack(blocks + [partial_block], dim=0)  # [N+1, B, T, D]
-    # ORDER IS LOAD-BEARING under FSDP2: ``proj.weight`` is read directly
-    # below (never through proj.forward), so no FSDP pre-forward hook fires
-    # on proj. ``norm`` shares proj's FSDP param group, so calling it HERE
-    # is what all-gathers proj.weight. Moving the weight access above this
-    # line would read a sharded param. See apply_fsdp's attn_res_tail note.
-    # FP32 for the whole of alpha, matching the release: the official
-    # _apply_attn_res (modeling_kimi_linear.py) floats BEFORE the norm, so the
-    # variance and rsqrt are FP32 too. Not a nicety -- proj is zero-initialized,
-    # so the pseudo-query gradient is a difference of nearly equal terms
-    # (6x to 15x cancellation measured on this model) and bf16 is where that
-    # costs. Normalizing in the stream dtype and floating after leaves 3.6e-3
+    # ORDER IS LOAD-BEARING under FSDP2: proj.weight is read directly below,
+    # never through proj.forward, so nothing all-gathers it except this call
+    # to norm, which shares proj's FSDP param group. See apply_fsdp's
+    # attn_res_tail note.
+    #
+    # Float BEFORE the norm so variance and rsqrt are fp32 too, matching the
+    # release. proj is zero-initialized, so the pseudo-query gradient is a
+    # difference of nearly equal terms (6x to 15x cancellation here) and bf16
+    # is where that costs: normalizing in the stream dtype leaves 3.6e-3
     # relative error against the release form.
     K = norm(V.float())
-    # proj.weight is [1, D]; squeeze to [D] and contract with K's channel dim.
-    # Under TP, proj is wrapped with NoParallel, which makes proj.weight a
-    # DTensor(Replicate) on the tp mesh dim. The downstream einsum mixes
-    # ``query`` with the plain Tensor ``K``, which would raise "mixed Tensor
-    # and DTensor". We strip the DTensor wrapping here at the use-site (every
-    # TP rank has the full local copy under Replicate placement, so to_local
-    # is a no-op data-wise but unwraps the DTensor for the einsum dispatcher).
-    #
-    # Backward gradient placement on the tp axis. The gradient w.r.t.
-    # ``query`` is ``sum_{n,b,t} grad_logits * K``. Both factors are
-    # replicated across the tp axis here: ``K``/``V`` are replicated in the
-    # forward, and the rowwise ``o_proj`` / ``down_proj`` that feed them are
-    # applied with ``local_output_grad_placements=(Replicate(),)`` (see
-    # parallelize.py), so the gradient arriving at ``h`` is replicated too.
-    # Every tp rank therefore computes the FULL gradient, not a partial
-    # contribution -- the default ``to_local()`` placement (Replicate on tp)
-    # is the correct spec, and requesting Partial makes the backward sum tp
-    # identical copies, inflating ``proj.weight.grad`` by exactly tp.
-    #
-    # Measured on one dense MLA layer from a shared seed checkpoint, varying
-    # only tp: with Partial, dp2/dp2xtp2 = 0.4999 and dp2/dp2xtp4 = 0.2501 on
-    # both AttnRes projections (exactly 1/tp) while all 18 other parameters
-    # sat at 1.0000; with the default placement all parameters sit at 1.0000.
+    # Under TP, proj is NoParallel-wrapped so proj.weight is DTensor(Replicate)
+    # and the einsum below would mix it with the plain K. to_local unwraps it;
+    # its default Replicate grad placement is the correct spec, because K and V
+    # are replicated on the tp axis in the forward and the rowwise projections
+    # feeding them use local_output_grad_placements=(Replicate(),), so every tp
+    # rank already computes the full gradient. Requesting Partial instead sums
+    # tp identical copies and inflates proj.weight.grad by exactly tp
+    # (measured: 1/tp on both AttnRes projections at tp2 and tp4, all other
+    # parameters unaffected).
     weight = proj.weight
     if isinstance(weight, DTensor):
         weight = weight.to_local()
