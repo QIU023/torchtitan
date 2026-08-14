@@ -876,17 +876,14 @@ def apply_tp_kimi_k3(
         },
     )
 
-    # AttnRes-only top-level tail modules. Linear(d, 1) and RMSNorm(d):
-    # neither is shardable, both must live on the TP mesh.
-    if getattr(model, "final_attn_res_proj", None) is not None:
-        parallelize_module(
-            model,
-            tp_mesh,
-            {
-                "final_attn_res_proj": no_par_local,
-                "final_attn_res_norm": no_par_local,
-            },
-        )
+    # Only the NORM stays imperative. Declaring both fails with
+    # "aten.mul.Tensor got mixed" -- the norm is CALLED as a module, so a declared
+    # weight meets the plain residual stream inside rms_norm, and the declarative
+    # vocabulary has no output-side to_local. The proj's weight is read directly at
+    # the use site in block_attn_res, which already unwraps a DTensor, so it does
+    # not need the plan.
+    if getattr(model, "final_attn_res_norm", None) is not None:
+        parallelize_module(model, tp_mesh, {"final_attn_res_norm": no_par_local})
 
     # MLA inner_attention input plan (DSv3 mirror): q/k/v arrive sharded
     # on the head axis (transposed to dim 1 inside KimiMLAAttention.forward
@@ -1226,7 +1223,15 @@ def apply_tp_kimi_k3(
             # conflict with the declared shardings.
             for p in ffn._moe.parameters():
                 expert_param_ids.add(id(p))
+    # Skip modules that DECLARE their own placement. The sweep runs inside
+    # apply_tp, which is before _drive_declarative_sharding, so without this it
+    # promotes every declared-but-not-yet-distributed parameter first -- and the
+    # driver then finds the whole tree already distributed and enters nothing.
+    # That is why declarations kept looking inert: the sweep, not the imperative
+    # plan, was doing their work.
     for module in model.modules():
+        if getattr(module, "_sharding_config", None) is not None:
+            continue
         for name, p in list(module._parameters.items()):
             if (
                 p is not None
