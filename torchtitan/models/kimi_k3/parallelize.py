@@ -912,12 +912,14 @@ def apply_tp_kimi_k3(
         }
 
         if is_kda:
-            # KDA needs no plan entry: KimiDeltaAttention carries its own
-            # sharding_config, and unlike a norm it strips DTensor at the fla
-            # kernel call sites itself (_to_local_if_dtensor), so the
-            # plain-tensor boundary the imperative NoParallel used to provide
-            # already lives inside the module.
-            pass
+            # MEASURED: KDA cannot take its declaration alone. Removing this
+            # entry fails tp2 with "aten.cat.default got mixed torch.Tensor and
+            # DTensor". It does strip DTensor at the fla kernel call sites
+            # (_to_local_if_dtensor), which is what made it look like a
+            # candidate, but its OUTPUT stays a DTensor and AttnRes then
+            # concatenates it against the plain residual stream. Same class as
+            # the norms: it moves when the stream does.
+            plan["self_attn"] = NoParallel(use_local_output=True)
         else:
             # MLA layer: DSv3-style plan.
             # NOTE: ``kv_a_proj_with_mqa`` is NOT sharded — its output
