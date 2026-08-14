@@ -264,9 +264,27 @@ class KimiK3MultimodalModel(nn.Module):
             )
         else:
             features = self.vision_tower(packed, grid_thw)
+        # grad_placements is required, not optional, now that the residual
+        # stream is a DTensor. to_local's default makes the BACKWARD re-wrap the
+        # incoming gradient with the forward placements, which sends a DTensor
+        # gradient back into the tower -- and the tower's dynamic-CP path runs
+        # hand-written collectives whose transpose (reduce_scatter) has no
+        # DTensor sharding strategy.
+        #
+        # --debug.detect-anomaly named this line after six attempts spent on the
+        # dynamic-CP path itself; the failing forward was its sibling, the
+        # replicated path, which every batch also goes through.
+        gp = (Replicate(),)
         if isinstance(features, torch.Tensor):
-            return features.to_local() if isinstance(features, DTensor) else features
-        return [f.to_local() if isinstance(f, DTensor) else f for f in features]
+            return (
+                features.to_local(grad_placements=gp)
+                if isinstance(features, DTensor)
+                else features
+            )
+        return [
+            f.to_local(grad_placements=gp) if isinstance(f, DTensor) else f
+            for f in features
+        ]
 
     def _vision_stream(self):
         """A dedicated CUDA stream for the tower, created once per module.
