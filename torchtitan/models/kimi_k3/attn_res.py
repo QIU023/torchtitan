@@ -72,19 +72,14 @@ def block_attn_res(
     # on proj. ``norm`` shares proj's FSDP param group, so calling it HERE
     # is what all-gathers proj.weight. Moving the weight access above this
     # line would read a sharded param. See apply_fsdp's attn_res_tail note.
-    K = norm(V)
-    # FP32 for the whole of alpha, matching the release. The official
-    # _apply_attn_res (modeling_kimi_linear.py) does v.float(), normalizes,
-    # scores and mixes in FP32, and casts back only at the end.
-    #
-    # This is not a precision nicety here. proj is zero-initialized, so the
-    # block softmax starts uniform and the pseudo-query gradient is a
-    # difference of nearly equal terms -- measured at 6x to 15x cancellation
-    # on this model. bf16 is exactly where that costs. The previous code cast
-    # DOWN to the stream dtype at this point and again at the query, to match
-    # FSDP mixed precision; the cast back to V.dtype now happens once, at the
-    # end, on the result.
-    K = K.float()
+    # FP32 for the whole of alpha, matching the release: the official
+    # _apply_attn_res (modeling_kimi_linear.py) floats BEFORE the norm, so the
+    # variance and rsqrt are FP32 too. Not a nicety -- proj is zero-initialized,
+    # so the pseudo-query gradient is a difference of nearly equal terms
+    # (6x to 15x cancellation measured on this model) and bf16 is where that
+    # costs. Normalizing in the stream dtype and floating after leaves 3.6e-3
+    # relative error against the release form.
+    K = norm(V.float())
     # proj.weight is [1, D]; squeeze to [D] and contract with K's channel dim.
     # Under TP, proj is wrapped with NoParallel, which makes proj.weight a
     # DTensor(Replicate) on the tp mesh dim. The downstream einsum mixes
