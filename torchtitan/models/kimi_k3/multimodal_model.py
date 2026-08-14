@@ -807,7 +807,18 @@ class KimiK3MultimodalModel(nn.Module):
             mask = DTensor.from_local(
                 mask, text.device_mesh, text.placements, run_check=False
             )
-            return text.masked_scatter(mask, flat)
+            # aten.masked_scatter has no DTensor rule. Build the scattered
+            # result positionally instead: the sentinel positions are exactly
+            # the vision slots, in order, so a scatter along the flattened token
+            # axis is the same operation and does have a DTensor rule.
+            local_text = text.to_local()
+            idx = mask[..., 0].to_local().reshape(-1).nonzero(as_tuple=True)[0]
+            out = local_text.reshape(-1, local_text.shape[-1]).clone()
+            out[idx] = flat.to_local().to(out.dtype)
+            return DTensor.from_local(
+                out.view_as(local_text), text.device_mesh, text.placements,
+                run_check=False,
+            )
         return text.masked_scatter(mask, flat.to(text.dtype))
 
     def _splice(
