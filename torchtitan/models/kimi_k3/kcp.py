@@ -44,12 +44,19 @@ import torch
 import torch.distributed as dist
 
 
-def conv_with_halo(conv, x_local: torch.Tensor, cp_context) -> torch.Tensor:
-    """Run a ``ShortConvolution`` on a sequence-sharded input, exactly.
+def conv_with_halo(
+    conv, x_local: torch.Tensor, cp_context, activation: str | None = None
+) -> torch.Tensor:
+    """Run a depthwise causal conv on a sequence-sharded input, exactly.
 
     Thin adapter over fla's ``causal_conv1d_cp``: unpack the depthwise weight
     the way ``ShortConvolution.forward`` does and hand over the CP context,
     which must have been built with ``conv1d_kernel_size`` set.
+
+    ``activation`` defaults to reading ``conv.activation``, which fla's
+    ``ShortConvolution`` carries. A plain ``nn.Conv1d`` does not -- the upstream
+    K3 model applies its SiLU outside the conv -- so those call sites pass the
+    name explicitly rather than getting a second copy of this function.
     """
     from einops import rearrange
     from fla.modules.conv.cp.ops import causal_conv1d_cp
@@ -58,7 +65,7 @@ def conv_with_halo(conv, x_local: torch.Tensor, cp_context) -> torch.Tensor:
         x=x_local,
         weight=rearrange(conv.weight, "d 1 w -> d w"),
         bias=conv.bias,
-        activation=conv.activation,
+        activation=getattr(conv, "activation", None) if activation is None else activation,
         cp_context=cp_context,
     )
 
