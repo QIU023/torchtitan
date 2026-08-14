@@ -888,6 +888,19 @@ class KimiMLAAttention(nn.Module):
             attn_BLE = attn_BLE * _to_local_if_dtensor(
                 self._attn_gate(x, attn_BLE.shape[-1])
             )
+        # Ulysses runs its all-to-alls on plain local tensors, so everything
+        # above is plain by design. Re-wrap before o_proj: the residual stream is
+        # a DTensor, and leaving this plain was measured to hand o_proj -- and
+        # only o_proj -- a plain input on tp x cp cells, which is what failed the
+        # three remaining LoRA cells.
+        if isinstance(x, DTensor) and not isinstance(attn_BLE, DTensor):
+            # Shard(-1): o_proj is Rowwise under TP, so its input is sharded on
+            # the contracted axis. Replicate here gives "a and b must have same
+            # reduction dim" -- the local width is num_heads/tp * v_head_dim.
+            attn_BLE = DTensor.from_local(
+                attn_BLE, x.device_mesh, (Shard(attn_BLE.dim() - 1),),
+                run_check=False,
+            )
         out = self.o_proj(attn_BLE)
         return out
 
