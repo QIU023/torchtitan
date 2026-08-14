@@ -190,6 +190,24 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
 
     def forward(
         self,
+        blocks,
+        partial_block: torch.Tensor,
+        is_block_start: bool,
+        plain_stream: torch.Tensor | None = None,
+    ):
+        # Dispatch on the carrier's type rather than exposing
+        # forward_tensor_carrier as a method the model calls directly. Calling
+        # it directly bypasses nn.Module.__call__, so FSDP2's pre-forward hook
+        # never fires and the parameters stay sharded -- measured as
+        # input_layernorm meeting a plain input against a DTensor(S(0)) weight.
+        if isinstance(blocks, torch.Tensor):
+            return self.forward_tensor_carrier(partial_block, blocks, is_block_start)
+        return self._forward_list_carrier(
+            blocks, partial_block, is_block_start, plain_stream
+        )
+
+    def _forward_list_carrier(
+        self,
         blocks: list[torch.Tensor],
         partial_block: torch.Tensor,
         is_block_start: bool,
@@ -628,7 +646,7 @@ class KimiK3AttnResModel(KimiK3Model):
             x = _plain_residual_stream(partial_block)
             for layer_key, layer in self.layers.items():
                 is_block_start = int(layer_key) % self.layers_per_block == 0
-                x, carrier = layer.forward_tensor_carrier(x, carrier, is_block_start)
+                x, carrier = layer(carrier, x, is_block_start)
             partial_block = x
             block_list = [
                 c.view(partial_block.shape[0], partial_block.shape[1], D)
