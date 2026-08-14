@@ -1223,7 +1223,15 @@ def apply_tp_kimi_k3(
             # conflict with the declared shardings.
             for p in ffn._moe.parameters():
                 expert_param_ids.add(id(p))
+    # Skip modules that DECLARE their own placement. The sweep runs inside
+    # apply_tp, which is before _drive_declarative_sharding, so without this it
+    # promotes every declared-but-not-yet-distributed parameter first -- and the
+    # driver then finds the whole tree already distributed and enters nothing.
+    # That is why declarations kept looking inert: the sweep, not the imperative
+    # plan, was doing their work.
     for module in model.modules():
+        if getattr(module, "_sharding_config", None) is not None:
+            continue
         for name, p in list(module._parameters.items()):
             if (
                 p is not None
