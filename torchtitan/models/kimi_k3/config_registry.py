@@ -468,6 +468,16 @@ def kimi_k3_mini_block_attn_res() -> Trainer.Config:
     )
     cfg.loss = CrossEntropyLoss.Config(global_vocab_size=2016)
     cfg.hf_assets_path = "./tests/assets/tokenizer"
+    # bfloat16, matching both multimodal arms. training.dtype reaches the model
+    # itself, while mixed_precision_param only reaches parameters through FSDP,
+    # so under float32 every layout WITHOUT FSDP or CP ran KDA on fp32 operands.
+    # This GPU allows 101376 bytes of dynamic shared memory per block and that
+    # kernel asks for 108160, so dp1/pp2/tp2 and maxdeg pp4/pp8/tp4 died where
+    # fsdp2 and cp2 passed -- six of the eighteen cells, every run, for a reason
+    # that has nothing to do with what any of them was testing. The multimodal
+    # twin fixed this the same way when it was written; the text flavor was
+    # left on the float32 default.
+    cfg.training = _dc.replace(cfg.training, dtype="bfloat16")
     return cfg
 
 
