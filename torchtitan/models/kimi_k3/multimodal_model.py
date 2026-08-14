@@ -105,6 +105,29 @@ class KimiK3MultimodalConfig:
     vit_tp_heads: bool = True
 
 
+class _PlainGradBoundary(torch.autograd.Function):
+    """Identity forward; forces the incoming gradient to be a plain tensor.
+
+    The vision tower must stay plain in BOTH directions. Its TP and its dynamic
+    CP are separate mechanisms from the decoder's, and the CP path runs
+    hand-written collectives whose transpose is a reduce_scatter --
+    _c10d_functional.reduce_scatter_tensor has no DTensor sharding strategy.
+
+    to_local() alone is not enough and grad_placements is the wrong knob: the
+    first re-wraps the gradient with the forward placements, the second states
+    which placements to re-wrap WITH. Neither can say "do not re-wrap". That is
+    what this states, and only an autograd.Function can.
+    """
+
+    @staticmethod
+    def forward(ctx, x):  # type: ignore[override]
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        return grad.to_local() if isinstance(grad, DTensor) else grad
+
+
 class KimiK3MultimodalModel(nn.Module):
     """MoonViT-V2 + Kimi Linear backbone, wired as the release has it.
 
@@ -264,9 +287,17 @@ class KimiK3MultimodalModel(nn.Module):
             )
         else:
             features = self.vision_tower(packed, grid_thw)
+        # --debug.detect-anomaly named this line after six attempts spent on the
+        # dynamic-CP path; the failing forward was its sibling, the replicated
+        # path, which every batch also goes through.
+        def _seal(f):
+            if isinstance(f, DTensor):
+                f = f.to_local()
+            return _PlainGradBoundary.apply(f)
+
         if isinstance(features, torch.Tensor):
-            return features.to_local() if isinstance(features, DTensor) else features
-        return [f.to_local() if isinstance(f, DTensor) else f for f in features]
+            return _seal(features)
+        return [_seal(f) for f in features]
 
     def _vision_stream(self):
         """A dedicated CUDA stream for the tower, created once per module.
@@ -523,7 +554,15 @@ class KimiK3MultimodalModel(nn.Module):
             feats = self.vision_tower(local, local_grid, plan)
             if isinstance(feats, torch.Tensor):
                 feats = [feats]
-            feats = [f.to_local() if isinstance(f, DTensor) else f for f in feats]
+            # Same boundary as the replicated path: to_local unwraps the value
+            # but its backward re-wraps the gradient, and the all_gather below
+            # has a reduce_scatter transpose with no DTensor rule.
+            feats = [
+                _PlainGradBoundary.apply(
+                    f.to_local() if isinstance(f, DTensor) else f
+                )
+                for f in feats
+            ]
             local_feat = torch.cat(feats, dim=0)
 
             gathered = funcol.all_gather_tensor(
