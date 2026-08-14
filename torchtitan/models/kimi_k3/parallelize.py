@@ -868,9 +868,15 @@ def apply_tp_kimi_k3(
                 use_local_output=False,
             ),
             "norm": no_par_local,
+            # Shard(-1), not Replicate: core's cross-entropy has a
+            # vocab-parallel path for exactly this placement
+            # (_LossParallelCrossEntropy), and gathering back to Replicate meant
+            # the loss saw a DTensor it had no branch for once the residual
+            # stream stopped being unwrapped. This is also what upstream's models
+            # do -- their lm_head output is vocab-parallel.
             "lm_head": ColwiseParallel(
                 input_layouts=Replicate(),
-                output_layouts=Replicate(),
+                output_layouts=Shard(-1),
                 use_local_output=False,
             ),
         },
