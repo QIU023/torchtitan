@@ -552,6 +552,9 @@ kimi_k3_configs = {
 }
 
 
+from torchtitan.models.kimi_k3_up.pipeline import pipeline_kimi_k3_up  # noqa: E402
+
+
 def model_registry(
     flavor: str,
     attn_backend: str = "eager",
@@ -568,7 +571,7 @@ def model_registry(
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_kimi_k3,
-        pipelining_fn=None,
+        pipelining_fn=pipeline_kimi_k3_up,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=KimiK3StateDictAdapter,
     )

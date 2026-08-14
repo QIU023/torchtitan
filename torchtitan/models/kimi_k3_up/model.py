@@ -654,7 +654,6 @@ class KimiK3Model(Decoder):
             parallelism = config.parallelism
             unsupported = {
                 "tensor parallel": parallelism.tensor_parallel_degree,
-                "pipeline parallel": parallelism.pipeline_parallel_degree,
                 "context parallel": parallelism.context_parallel_degree,
                 "expert parallel": parallelism.expert_parallel_degree,
             }
