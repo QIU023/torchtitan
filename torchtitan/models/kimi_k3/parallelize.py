@@ -185,6 +185,13 @@ def parallelize_kimi_k3(
         # plain tensors that need to be converted back into the TP
         # mesh's local view before aggregation).
         model._tp_mesh = tp_mesh
+        # Also on the language model. The AttnRes layer loop lives there and
+        # reads _tp_mesh to lift the stream at its entry; with the mesh only on
+        # the multimodal wrapper the getattr returned None, the lift never ran,
+        # and the plain carrier met a DTensor prefix_sum in the carrier cat.
+        _lm = getattr(model, "language_model", None)
+        if _lm is not None:
+            _lm._tp_mesh = tp_mesh
         logger.info(
             "Applied DSv3-style TP plan tp_degree=%d.",
             parallel_dims.tp,
@@ -870,11 +877,12 @@ def apply_tp_kimi_k3(
         model,
         tp_mesh,
         {
-            "embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Replicate(),
-                use_local_output=False,
-            ),
+            # embed_tokens has NO entry: torchtitan's Embedding runs
+            # vocab-parallel in its own forward once parallelize() sets
+            # tp_group, and produces an ordinary tensor. RowwiseParallel made
+            # DTensor do the split instead, whose MaskPartial cannot be
+            # redistributed against the P(sum) the declared AttnRes projections
+            # produce. Every upstream model relies on the module, not the style.
             "norm": no_par_local,
             # Shard(-1), not Replicate: core's cross-entropy has a
             # vocab-parallel path for exactly this placement
