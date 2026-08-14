@@ -876,17 +876,11 @@ def apply_tp_kimi_k3(
         },
     )
 
-    # AttnRes-only top-level tail modules. Linear(d, 1) and RMSNorm(d):
-    # neither is shardable, both must live on the TP mesh.
-    if getattr(model, "final_attn_res_proj", None) is not None:
-        parallelize_module(
-            model,
-            tp_mesh,
-            {
-                "final_attn_res_proj": no_par_local,
-                "final_attn_res_norm": no_par_local,
-            },
-        )
+    # The AttnRes tail (Linear(d, 1) and RMSNorm(d), neither shardable) is
+    # DECLARED -- both carry sharding_config=_tp_replicate() at construction, so
+    # _drive_declarative_sharding distributes them. The imperative NoParallel plan
+    # that used to be here was redundant and, worse, it made the driver skip the
+    # subtree, so the declaration was inert.
 
     # MLA inner_attention input plan (DSv3 mirror): q/k/v arrive sharded
     # on the head axis (transposed to dim 1 inside KimiMLAAttention.forward
