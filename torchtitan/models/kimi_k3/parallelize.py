@@ -876,11 +876,14 @@ def apply_tp_kimi_k3(
         },
     )
 
-    # The AttnRes tail (Linear(d, 1) and RMSNorm(d), neither shardable) is
-    # DECLARED -- both carry sharding_config=_tp_replicate() at construction, so
-    # _drive_declarative_sharding distributes them. The imperative NoParallel plan
-    # that used to be here was redundant and, worse, it made the driver skip the
-    # subtree, so the declaration was inert.
+    # Only the NORM stays imperative. Declaring both fails with
+    # "aten.mul.Tensor got mixed" -- the norm is CALLED as a module, so a declared
+    # weight meets the plain residual stream inside rms_norm, and the declarative
+    # vocabulary has no output-side to_local. The proj's weight is read directly at
+    # the use site in block_attn_res, which already unwraps a DTensor, so it does
+    # not need the plan.
+    if getattr(model, "final_attn_res_norm", None) is not None:
+        parallelize_module(model, tp_mesh, {"final_attn_res_norm": no_par_local})
 
     # MLA inner_attention input plan (DSv3 mirror): q/k/v arrive sharded
     # on the head axis (transposed to dim 1 inside KimiMLAAttention.forward
