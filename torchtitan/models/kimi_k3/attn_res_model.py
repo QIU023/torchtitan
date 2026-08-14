@@ -51,6 +51,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
 from torchtitan.models.kimi_k3.attn_res import (
+    block_attn_res_tensor,
     AttnResProjection,
     block_attn_res,
     stack_blocks,
@@ -205,6 +206,64 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         if self.attn_res_gated:
             plain_stream = plain_stream + ffn_out
         return blocks, partial_block, plain_stream
+
+    def forward_tensor_carrier(
+        self,
+        x_BLD: torch.Tensor,
+        block_residual_TND: torch.Tensor,
+        is_block_start: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward`` with the block history as one ``[T, N, D]`` tensor.
+
+        Same arithmetic as ``forward``; the three Python accumulators collapse
+        to two tensors that are both in the signature. That is the point: no
+        ``sharding_config`` can reach a value the model holds in a local, which
+        is what stopped the declarative TP migration -- ``ffn_out`` became a
+        DTensor while ``partial_block`` stayed plain and the residual add died
+        with "aten.add.Tensor got mixed". A column of a threaded tensor can be
+        declared; a list element cannot.
+
+        The running partial sum rides inside ``x_BLD`` rather than travelling
+        as its own argument, which is what gets the count down from three
+        carriers to two.
+
+        Bitwise equality with ``forward`` is the gate, not loss convergence --
+        see ``matrix_scripts/carrier_equivalence_probe.py``.
+        """
+        if self.attn_res_gated:
+            # plain_stream is a THIRD accumulator and only the gated graft has
+            # it. Off in all three matrix arms, so it keeps the list path until
+            # the tensor form is proven, rather than being ported blind.
+            raise NotImplementedError(
+                "gated AttnRes still uses the list carrier; "
+                "forward_tensor_carrier does not carry plain_stream"
+            )
+
+        B, L, D = x_BLD.shape
+        prefix_sum_BLD: torch.Tensor | None = x_BLD
+
+        if block_residual_TND.shape[1] > 0:
+            x_BLD = block_attn_res_tensor(
+                prefix_sum_BLD, block_residual_TND, self.attn_res_proj,
+                self.attn_res_norm,
+            )
+
+        if is_block_start:
+            block_residual_TND = torch.cat(
+                (block_residual_TND, prefix_sum_BLD.reshape(-1, 1, D)), dim=1
+            )
+            prefix_sum_BLD = None
+
+        attn_out = self.self_attn(self.input_layernorm(x_BLD))
+        prefix_sum_BLD = (
+            attn_out if prefix_sum_BLD is None else prefix_sum_BLD + attn_out
+        )
+
+        h_BLD = block_attn_res_tensor(
+            prefix_sum_BLD, block_residual_TND, self.mlp_res_proj, self.mlp_res_norm
+        )
+        ffn_out = self.ffn(self.post_attention_layernorm(h_BLD))
+        return prefix_sum_BLD + ffn_out, block_residual_TND
 
 
 # ----- Top-level AttnRes-woven model -------------------------------------- #

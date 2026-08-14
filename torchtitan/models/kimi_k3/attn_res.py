@@ -97,6 +97,34 @@ def block_attn_res(
     return h.to(V.dtype)
 
 
+def block_attn_res_tensor(
+    prefix_sum_BLD: torch.Tensor,
+    block_residual_TND: torch.Tensor,
+    proj: nn.Linear,
+    norm: nn.Module,
+) -> torch.Tensor:
+    """``block_attn_res`` with the block history as one ``[T, N, D]`` tensor.
+
+    Same computation, different container: the values are the committed blocks
+    followed by the current partial, which is exactly what the list form stacks.
+    Bitwise equality with ``block_attn_res`` is the gate.
+    """
+    B, L, D = prefix_sum_BLD.shape
+    values_TND = torch.cat(
+        (block_residual_TND, prefix_sum_BLD.reshape(-1, 1, D)), dim=1
+    )
+    # Same order as block_attn_res: float BEFORE the norm, and the norm call is
+    # what all-gathers proj.weight under FSDP2 (see the note there).
+    keys_TND = norm(values_TND.float())
+    weight = proj.weight
+    if isinstance(weight, DTensor):
+        weight = weight.to_local()
+    query_D = weight.squeeze(0).float()
+    probs_TN = F.softmax(torch.einsum("d,tnd->tn", query_D, keys_TND), dim=-1)
+    out_TD = torch.einsum("tn,tnd->td", probs_TN, values_TND.float())
+    return out_TD.to(values_TND.dtype).view(B, L, D)
+
+
 class AttnResProjection(_TTLinear):
     """Pseudo-query projection for AttnRes (D -> 1, no bias).
 
