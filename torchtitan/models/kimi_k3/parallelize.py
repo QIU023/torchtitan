@@ -912,9 +912,12 @@ def apply_tp_kimi_k3(
         }
 
         if is_kda:
-            # KDA is replicated on the tp axis, with plain-tensor boundaries and
-            # to_local shims at the fla kernel calls (module docstring).
-            plan["self_attn"] = NoParallel(use_local_output=True)
+            # KDA needs no plan entry: KimiDeltaAttention carries its own
+            # sharding_config, and unlike a norm it strips DTensor at the fla
+            # kernel call sites itself (_to_local_if_dtensor), so the
+            # plain-tensor boundary the imperative NoParallel used to provide
+            # already lives inside the module.
+            pass
         else:
             # MLA layer: DSv3-style plan.
             # NOTE: ``kv_a_proj_with_mqa`` is NOT sharded — its output
@@ -1072,11 +1075,17 @@ def apply_tp_kimi_k3(
 
         # AttnRes per-layer modules: each layer has TWO pseudo-queries
         # + TWO RMSNorms, all NoParallel.
-        # The four per-layer AttnRes modules DECLARE their placement, and the
-        # final sweep no longer claims declared modules, so the declarative
-        # driver now distributes them. The NoParallel entries that used to be
-        # here made the driver skip the subtree, which is what kept the
-        # declarations inert.
+        # The two per-layer pseudo-queries move to their declarations; the two
+        # NORMS stay imperative. Measured, twice: proj.weight is read directly
+        # inside block_attn_res, which already unwraps a DTensor, so a declared
+        # Replicate is fine there. A norm is CALLED as a module, so a declared
+        # weight meets the plain residual stream inside rms_norm and every tp>1
+        # cell dies with "aten.mul.Tensor got mixed". The declarative vocabulary
+        # has no output-side to_local, which is what use_local_output=True does
+        # here, so the norms cannot move until the whole stream is DTensor.
+        for name in ("attn_res_norm", "mlp_res_norm"):
+            if hasattr(layer, name) and getattr(layer, name) is not None:
+                plan[name] = no_par_local
 
         # LoRA-aware TP: a Colwise/Rowwise style can't target a
         # KimiLoRALinear (ColwiseParallel needs nn.Linear). Redirect the
