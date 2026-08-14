@@ -634,24 +634,16 @@ class CrossStageCacheAdapter(nn.Module):
             f"expected {len(incoming_block_indices)}, got {len(recv_list)}."
         )
 
-        # Pull earlier cached blocks out of the rank cache.
-        # * Recv-originated entries (``producer_rank != self.pp_rank``)
-        #   were stored attached to their ``recv_delta_tensor``. Leave
-        #   them unwrapped so grad flows back via that tensor and PP's
-        #   built-in ``SEND_B`` drains it to the producer rank.
-        # * Own-rank cached commits (``producer_rank == self.pp_rank``)
-        #   were stored DETACHED (see ``_finish_forward``). We set
-        #   ``requires_grad=True`` on the detached leaf and wrap it in
-        #   :class:`_LocalCacheCapture` so autograd reaches Capture
-        #   during THIS stage's backward. Capture deposits the grad
-        #   in the rank-local slot; the matching producer-side grad
-        #   hook (installed by ``_install_augment_hook``) pops the
-        #   slot and sums it into the producer's own incoming grad
-        #   when the producer's backward runs. Because the cached
-        #   tensor is detached, autograd physically cannot walk from
-        #   Capture's input into the producer's forward graph -- the
-        #   guarantee the previous ``_LocalCacheAugment.apply`` pattern
-        #   failed to provide under real PP + FSDP + AC rerun.
+        # Pull earlier cached blocks out of the rank cache. Recv-originated
+        # entries were stored attached to their recv_delta_tensor, so leaving
+        # them unwrapped lets PP's own SEND_B drain their grad to the producer
+        # rank. Own-rank commits were stored DETACHED (see _finish_forward), so
+        # they need requires_grad plus a _LocalCacheCapture wrapper: Capture
+        # deposits the grad in a rank-local slot and the producer-side hook
+        # from _install_augment_hook sums it in when the producer's backward
+        # runs. Routing it through a slot rather than the graph is the point --
+        # detached means autograd cannot walk into the producer and free its
+        # saved tensors early.
         earlier_blocks_raw = list(self._cache.get_blocks(mb))
         earlier_meta = list(self._cache.get_meta(mb))
         cached_indices = [layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta]
@@ -737,24 +729,15 @@ class CrossStageCacheAdapter(nn.Module):
                     (producer_rank, producer_stage, block_idx_in_producer),
                 )
 
-        # Append own commits. For each new block we:
-        # 1) Register a tensor grad hook on the block so its OWN backward
-        #    pops any captured-grad slot deposited by a later same-rank
-        #    virtual stage's :class:`_LocalCacheCapture` and sums it
-        #    with the incoming grad. The hook fires ONCE per mb, during
-        #    THIS stage's own backward, strictly after autograd has
-        #    reached the block from the outgoing-delta path.
-        # 2) Store a DETACHED copy in the rank cache. Detaching severs
-        #    the cached tensor from the producer's forward graph so a
-        #    later same-rank consumer's backward physically cannot walk
-        #    into the producer and free its saved tensors early (the
-        #    root cause of the double-backward crash the prior
-        #    ``_LocalCacheAugment.apply + view`` pattern hit under real
-        #    PP + FSDP + AC rerun).
-        # 3) The outgoing-delta path uses the attached block directly,
-        #    so grad from the next stage's SEND_B flows back through
-        #    the block's own grad_fn -> the producer stage's wrapped
-        #    model, where the hook sums in captured grad.
+        # Append own commits. Each new block gets a grad hook that, during THIS
+        # stage's backward, sums in any grad a later same-rank virtual stage's
+        # _LocalCacheCapture deposited; the outgoing-delta path uses the
+        # attached block, so the next stage's SEND_B reaches the same grad_fn.
+        # The RANK CACHE gets a DETACHED copy: that severs it from the
+        # producer's forward graph, so a later same-rank consumer's backward
+        # physically cannot walk into the producer and free its saved tensors
+        # early -- the double-backward crash the previous
+        # _LocalCacheAugment.apply + view pattern hit under PP + FSDP + AC.
         new_blocks_list = unstack_blocks(new_blocks_tensor)
         for local_idx, blk in enumerate(new_blocks_list):
             slot_key = (mb, self.stage_id, local_idx)
