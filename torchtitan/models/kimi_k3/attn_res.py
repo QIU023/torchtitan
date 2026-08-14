@@ -107,7 +107,7 @@ class AttnResProjection(_TTLinear):
     ``param_init`` must zero-initialize the weight for training stability.
 
     NOTE: filter via ``filter_fqns`` to keep AttnRes pseudo-queries in
-    high precision — the zero-init carrier story relies on small
+    high precision -- the zero-init carrier story relies on small
     deltas accumulating, which rowwise FP8 quantization noise would
     destroy.
     """
