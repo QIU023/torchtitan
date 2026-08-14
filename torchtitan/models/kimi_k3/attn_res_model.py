@@ -171,9 +171,13 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         # NoParallel in the imperative plan -- the output dim is 1, so there
         # is nothing to shard; declared here so the module carries its own
         # placement like every other linear after the migration.
+        # .build(), not AttnResProjection(cfg): _sharding_config is assigned inside
+        # Config.build, so calling the class drops the declaration silently. Every
+        # AttnRes pseudo-query in this model was constructed that way, so the
+        # comment above described an intent the code never carried out.
         proj_cfg = AttnResProjection.Config(dim=d, sharding_config=_tp_replicate())
-        self.attn_res_proj = AttnResProjection(proj_cfg)
-        self.mlp_res_proj = AttnResProjection(proj_cfg)
+        self.attn_res_proj = proj_cfg.build()
+        self.mlp_res_proj = proj_cfg.build()
         self.attn_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         self.mlp_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         # Graft gate: per-read scalar alpha, zero-init, so at step 0 the
@@ -501,11 +505,13 @@ class KimiK3AttnResModel(KimiK3Model):
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm
         # before lm_head). Same ``AttnResProjection`` shared with the
         # attn_res/ experiment.
-        self.final_attn_res_proj = AttnResProjection(
-            AttnResProjection.Config(
-                dim=config.hidden_size, sharding_config=_tp_replicate()
-            )
-        )
+        # .build(), not AttnResProjection(Config(...)): _sharding_config is
+        # assigned inside Config.build, so constructing the class directly drops
+        # the declaration silently -- the module then looks declared in the source
+        # and is invisible to the declarative driver.
+        self.final_attn_res_proj = AttnResProjection.Config(
+            dim=config.hidden_size, sharding_config=_tp_replicate()
+        ).build()
         self.final_attn_res_norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
