@@ -87,10 +87,10 @@ def block_attn_res(
     # tp identical copies and inflates proj.weight.grad by exactly tp
     # (measured: 1/tp on both AttnRes projections at tp2 and tp4, all other
     # parameters unaffected).
-    weight = proj.weight
-    if isinstance(weight, DTensor):
-        weight = weight.to_local()
-    query = weight.squeeze(0).float()
+    # No to_local: with the residual stream a DTensor, K is one too, and
+    # unwrapping only the query is what makes the einsum mixed. Both operands are
+    # Replicate on the tp axis, so the contraction is local either way.
+    query = proj.weight.squeeze(0).float()
     logits = torch.einsum("d,nbtd->nbt", query, K)
     weights = F.softmax(logits, dim=0)
     h = torch.einsum("nbt,nbtd->btd", weights, V.float())
@@ -116,10 +116,11 @@ def block_attn_res_tensor(
     # Same order as block_attn_res: float BEFORE the norm, and the norm call is
     # what all-gathers proj.weight under FSDP2 (see the note there).
     keys_TND = norm(values_TND.float())
-    weight = proj.weight
-    if isinstance(weight, DTensor):
-        weight = weight.to_local()
-    query_D = weight.squeeze(0).float()
+    # No to_local here. With the residual stream a DTensor, keys_TND is one too,
+    # and unwrapping only the query is what makes the einsum mixed. Both operands
+    # are Replicate on the tp axis, so the contraction is local either way -- the
+    # difference is purely whether DTensor's dispatcher can see it.
+    query_D = proj.weight.squeeze(0).float()
     probs_TN = F.softmax(torch.einsum("d,tnd->tn", query_D, keys_TND), dim=-1)
     out_TD = torch.einsum("tn,tnd->td", probs_TN, values_TND.float())
     return out_TD.to(values_TND.dtype).view(B, L, D)

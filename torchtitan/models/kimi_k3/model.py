@@ -47,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Partial, Replicate
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
@@ -770,6 +770,14 @@ class KimiMLAAttention(nn.Module):
         )  # (B, T, H, v_head_dim)
 
         attn_out = attn_out.reshape(B, T, -1)  # (B, T, H*Dv)
+        # SDPA has no DTensor rule, so inner_attention hands back a plain local
+        # tensor. Re-wrap it on the way out, the same shape as the fla kernels'
+        # _to_local_if_dtensor round trip: the unwrap is a kernel-call detail and
+        # must not leak into the residual stream, which is DTensor end to end.
+        if isinstance(x, DTensor) and not isinstance(attn_out, DTensor):
+            attn_out = DTensor.from_local(
+                attn_out, x.device_mesh, (Shard(2),), run_check=False
+            ).redistribute(placements=(Replicate(),))
         if self.mla_gated:
             attn_out = attn_out * self._attn_gate(x, attn_out.shape[-1])
         out = self.o_proj(attn_out)

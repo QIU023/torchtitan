@@ -157,7 +157,7 @@ def parallelize_kimi_k3(
     if parallel_dims.tp_enabled:
         # TP plan modeled on ``deepseek_v3/parallelize.py``.
         # Key idea: every module boundary in the forward emits a plain
-        # Tensor (use_local_output=True / output_layouts=Replicate())
+        # Tensor (use_local_output=False / output_layouts=Replicate())
         # so:
         #   * the stack inside ``block_attn_res`` aggregates plain
         #     Tensors uniformly across MLA-output / KDA-output / partial
@@ -165,7 +165,7 @@ def parallelize_kimi_k3(
         #   * fla-core triton kernels inside KDA see plain Tensors and
         #     dispatch normally;
         #   * SDPA in ``KimiMLAInnerAttention`` runs on plain Tensors
-        #     thanks to ``prepare_module_input(use_local_output=True)``.
+        #     thanks to ``prepare_module_input(use_local_output=False)``.
         #
         # The TP collectives still fire — ColwiseParallel produces
         # DTensor(Shard) intermediates internally and RowwiseParallel
@@ -681,7 +681,7 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
         # Layouts pinned rather than defaulted. encode_images lifts the
         # tower activations into DTensors at the boundary, so the block
         # residual is a DTensor and fc1 must hand back a DTensor too --
-        # use_local_output=True here fails the add on mixed Tensor/DTensor.
+        # use_local_output=False here fails the add on mixed Tensor/DTensor.
         plan[f"encoder.blocks.{i}.mlp.fc0"] = ColwiseParallel(
             input_layouts=Replicate(),
             output_layouts=Shard(-1),
@@ -739,8 +739,8 @@ def apply_tp_kimi_k3(
       mixed plain/DTensor inputs raises ``mixed Tensor and DTensor``.
 
     To satisfy all three, every Colwise/Rowwise plan emits
-    ``use_local_output=True`` (or ``output_layouts=Replicate()`` plus
-    ``use_local_output=True``), and every NoParallel call passes
+    ``use_local_output=False`` (or ``output_layouts=Replicate()`` plus
+    ``use_local_output=False``), and every NoParallel call passes
     ``local_output_grad_placements=(Replicate(),)`` so the output is
     converted back to a plain Tensor at the module boundary. The TP
     collectives still fire (Colwise → DTensor(Shard) inside Linear's
@@ -763,7 +763,7 @@ def apply_tp_kimi_k3(
         compatible with sharding on the concatenated last dim).
       - ``kv_a_layernorm``: NoParallel (single-half normalization).
       - ``kv_b_proj``: ColwiseParallel (out = H * (qk_nope + v_head_dim)).
-      - ``inner_attention``: prepare_module_input(use_local_output=True)
+      - ``inner_attention``: prepare_module_input(use_local_output=False)
         with sequence-axis placements — strips DTensor wrapping before
         SDPA's mem-efficient cutlass kernel sees q/k/v.
       - ``o_proj``: RowwiseParallel (in_features sharded, output
@@ -780,7 +780,7 @@ def apply_tp_kimi_k3(
       ``_to_local_if_dtensor`` in model.py).
 
     * **dense MLP**: gate_proj / up_proj ColwiseParallel; down_proj
-      RowwiseParallel(output_layouts=Replicate(), use_local_output=True).
+      RowwiseParallel(output_layouts=Replicate(), use_local_output=False).
 
     * **MoE FFN**: NoParallel on the ``ffn`` container (EP handles the
       real parallelization on a separate axis).
@@ -798,12 +798,12 @@ def apply_tp_kimi_k3(
     Plus the symmetric backward all-reduces.
     """
     # Plain-output NoParallel: ``output_layout=Replicate()`` (default) plus
-    # ``use_local_output=True`` produces a plain torch.Tensor at the module
+    # ``use_local_output=False`` produces a plain torch.Tensor at the module
     # exit. ``NoParallel._prepare_output_fn`` ends in a bare ``to_local()``,
     # so the backward placement defaults to the output layout, Replicate:
     # the incoming local gradient is taken to be the same on every tp rank
     # and already complete.
-    no_par_local = NoParallel(use_local_output=True)
+    no_par_local = NoParallel(use_local_output=False)
 
     # fla-core triton kernels (causal_conv1d in ShortConvolution,
     # fused_norm_gated in FusedRMSNormGated) do not dispatch through
@@ -824,7 +824,7 @@ def apply_tp_kimi_k3(
         logger.info("Bound DTensor-safe fla forwards on %d modules.", n_fla)
 
     # Top-level layout: embed, output norm, lm_head.
-    # Both embed and lm_head emit plain Tensors (use_local_output=True)
+    # Both embed and lm_head emit plain Tensors (use_local_output=False)
     # so the AttnRes top-level forward composes cleanly with the
     # block-stacking path.
     # The multimodal wrapper keeps the text model at .language_model, so the
@@ -865,13 +865,19 @@ def apply_tp_kimi_k3(
             "embed_tokens": RowwiseParallel(
                 input_layouts=Replicate(),
                 output_layouts=Replicate(),
-                use_local_output=True,
+                use_local_output=False,
             ),
             "norm": no_par_local,
+            # Shard(-1), not Replicate: core's cross-entropy has a
+            # vocab-parallel path for exactly this placement
+            # (_LossParallelCrossEntropy), and gathering back to Replicate meant
+            # the loss saw a DTensor it had no branch for once the residual
+            # stream stopped being unwrapped. This is also what upstream's models
+            # do -- their lm_head output is vocab-parallel.
             "lm_head": ColwiseParallel(
                 input_layouts=Replicate(),
-                output_layouts=Replicate(),
-                use_local_output=True,
+                output_layouts=Shard(-1),
+                use_local_output=False,
             ),
         },
     )
@@ -885,10 +891,12 @@ def apply_tp_kimi_k3(
     if getattr(model, "final_attn_res_norm", None) is not None:
         parallelize_module(model, tp_mesh, {"final_attn_res_norm": no_par_local})
 
-    # MLA inner_attention input plan (DSv3 mirror): q/k/v arrive sharded
-    # on the head axis (transposed to dim 1 inside KimiMLAAttention.forward
-    # before SDPA), use_local_output=True converts them to plain Tensors
-    # before the SDPA kernel dispatcher sees them.
+    # MLA inner_attention: the ONE place use_local_output=True survives the
+    # residual-stream flip. q/k/v arrive head-sharded and SDPA has no DTensor
+    # rule, so the kernel must see plain tensors -- the same reason the fla
+    # kernels get _to_local_if_dtensor at their call sites. Setting it False with
+    # everything else made every tp>1 cell die inside
+    # F.scaled_dot_product_attention with the operands at Shard(1).
     inner_attn_plan = PrepareModuleInput(
         input_layouts=(Shard(1), Shard(1), Shard(1)),
         desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
@@ -919,7 +927,7 @@ def apply_tp_kimi_k3(
             # candidate, but its OUTPUT stays a DTensor and AttnRes then
             # concatenates it against the plain residual stream. Same class as
             # the norms: it moves when the stream does.
-            plan["self_attn"] = NoParallel(use_local_output=True)
+            plan["self_attn"] = NoParallel(use_local_output=False)
         else:
             # MLA layer: DSv3-style plan.
             # NOTE: ``kv_a_proj_with_mqa`` is NOT sharded — its output
@@ -933,7 +941,7 @@ def apply_tp_kimi_k3(
             # emits DTensor (Shard or Replicate) — the MLA forward's
             # split/cat/view/transpose/expand operations all dispatch
             # through DTensor. Only at SDPA (inner_attention) we
-            # convert to plain via use_local_output=True; o_proj emits
+            # convert to plain via use_local_output=False; o_proj emits
             # plain to match the rest of the model's plain-boundary
             # convention.
             # Q: either the direct projection or K3's compression pair.
@@ -971,7 +979,7 @@ def apply_tp_kimi_k3(
                     "self_attn.inner_attention": inner_attn_plan,
                     "self_attn.o_proj": RowwiseParallel(
                         output_layouts=Replicate(),
-                        use_local_output=True,
+                        use_local_output=False,
                     ),
                 }
             )
@@ -986,7 +994,7 @@ def apply_tp_kimi_k3(
             # matched to the local attention output in both cases.
             if getattr(layer.self_attn, "attn_gate_proj", None) is not None:
                 plan["self_attn.attn_gate_proj"] = ColwiseParallel(
-                    use_local_output=True,
+                    use_local_output=False,
                 )
 
         # FFN path.
@@ -1005,7 +1013,7 @@ def apply_tp_kimi_k3(
                     "ffn.up_proj": ColwiseParallel(use_local_output=False),
                     "ffn.down_proj": RowwiseParallel(
                         output_layouts=Replicate(),
-                        use_local_output=True,
+                        use_local_output=False,
                     ),
                 }
             )
@@ -1083,7 +1091,7 @@ def apply_tp_kimi_k3(
         # Replicate is fine there. A norm is CALLED as a module, so a declared
         # weight meets the plain residual stream inside rms_norm and every tp>1
         # cell dies with "aten.mul.Tensor got mixed". The declarative vocabulary
-        # has no output-side to_local, which is what use_local_output=True does
+        # has no output-side to_local, which is what use_local_output=False does
         # here, so the norms cannot move until the whole stream is DTensor.
         for name in ("attn_res_norm", "mlp_res_norm"):
             if hasattr(layer, name) and getattr(layer, name) is not None:

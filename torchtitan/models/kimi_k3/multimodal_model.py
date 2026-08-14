@@ -794,6 +794,31 @@ class KimiK3MultimodalModel(nn.Module):
             else torch.cat(list(features), dim=0)
         )
         mask = (input_ids == sentinel).unsqueeze(-1).expand_as(text)
+        if isinstance(text, DTensor):
+            # The text stream is a DTensor now; the vision tower still hands out
+            # plain tensors because its TP is a separate mechanism
+            # (_apply_tp_moonvit_mlp), so LIFT the vision side to the text
+            # stream's layout rather than unwrapping the stream. Both are
+            # Replicate on the tp axis here, so this is metadata only.
+            flat = DTensor.from_local(
+                flat.to(text.to_local().dtype), text.device_mesh, text.placements,
+                run_check=False,
+            )
+            mask = DTensor.from_local(
+                mask, text.device_mesh, text.placements, run_check=False
+            )
+            # aten.masked_scatter has no DTensor rule. Build the scattered
+            # result positionally instead: the sentinel positions are exactly
+            # the vision slots, in order, so a scatter along the flattened token
+            # axis is the same operation and does have a DTensor rule.
+            local_text = text.to_local()
+            idx = mask[..., 0].to_local().reshape(-1).nonzero(as_tuple=True)[0]
+            out = local_text.reshape(-1, local_text.shape[-1]).clone()
+            out[idx] = flat.to_local().to(out.dtype)
+            return DTensor.from_local(
+                out.view_as(local_text), text.device_mesh, text.placements,
+                run_check=False,
+            )
         return text.masked_scatter(mask, flat.to(text.dtype))
 
     def _splice(
