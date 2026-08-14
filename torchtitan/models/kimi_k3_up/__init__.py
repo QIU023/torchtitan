@@ -504,8 +504,51 @@ def _debugmodel(attn_backend: str) -> KimiK3Model.Config:
     )
 
 
+def _mini_block_attn_res(attn_backend: str) -> KimiK3Model.Config:
+    """Our text-only screening topology, expressed on the upstream config tree.
+
+    This is the flavor the three-arm matrix uses as its text instrument
+    (``kimi_k3_mini_block_attn_res``): 21 layers at dim 512, deep enough that
+    AttnRes commits more than one block, with no vision tower so a failure has
+    no multimodal path to hide in. Every extent is read off our own registry.
+
+    Migration step 2's gate. What their generator does NOT express, and so is
+    dropped here rather than silently defaulted: the latent-MoE norm toggle
+    (theirs always norms), the router activation and expert grouping, and every
+    post-train graft (LoRA, MXFP4 QAT, gated AttnRes, per-head Muon). None of
+    them are on in this flavor, which is why it is the one that ports first.
+    """
+    if attn_backend != "eager":
+        raise ValueError("Kimi K3 v1 only provides the 'eager' backend.")
+
+    dim = 512
+    return _kimi_k3_config(
+        dim=dim,
+        vocab_size=2016,
+        num_layers=21,
+        full_attention_layers={4, 8, 12, 16, 20, 21},
+        attn_res_block_size=12,
+        num_heads=4,
+        q_lora_rank=128,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=896,
+        latent_dim=256,
+        expert_hidden_dim=224,
+        num_experts=8,
+        top_k=2,
+        num_shared_experts=2,
+        vision_encoder=None,
+    )
+
+
 kimi_k3_configs = {
     "debugmodel": _debugmodel,
+    "mini_block_attn_res": _mini_block_attn_res,
 }
 
 
