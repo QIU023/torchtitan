@@ -286,6 +286,14 @@ def parallelize_kimi_k3(
     # already exist -- no plan is removed here, so the imperative plan and the
     # declarations are both in effect and their agreement is what the matrix checks.
     entered = _drive_declarative_sharding(model, parallel_dims)
+    if parallel_dims.tp_enabled:
+        _sweep_remaining_to_replicate(
+            model,
+            parallel_dims.get_mesh("tp"),
+            skip_expert_params=(
+                parallel_dims.ep_enabled or _model_has_moe(model)
+            ),
+        )
     if entered:
         from collections import Counter
 
@@ -1005,16 +1013,11 @@ def apply_tp_kimi_k3(
                     raise ValueError(
                         f"layer {layer.layer_idx} dense ffn missing '{name}'"
                     )
-            plan.update(
-                {
-                    "ffn.gate_proj": ColwiseParallel(use_local_output=False),
-                    "ffn.up_proj": ColwiseParallel(use_local_output=False),
-                    "ffn.down_proj": RowwiseParallel(
-                        output_layouts=Replicate(),
-                        use_local_output=False,
-                    ),
-                }
-            )
+            # The dense FFN takes its declarations. Colwise/Rowwise here and
+            # Shard(0)/Shard(1) there are the same split written twice, and once
+            # the driver stops skipping these modules only one of them can act --
+            # "already a DTensor with placements (Replicate(),), but its
+            # sharding_config expects (Shard(dim=0),)".
         else:
             # MoE leaves get NoParallel, not the ffn container (module docstring).
             ffn = getattr(layer, "ffn", None)
@@ -1046,11 +1049,14 @@ def apply_tp_kimi_k3(
                 for n in ("down", "up", "norm"):
                     if getattr(latent, n, None) is not None:
                         plan[f"ffn.latent.{n}"] = no_par_local
-            # Under the latent path the shared experts hang off KimiMoE
-            # itself (Eq. 11 adds them at full width), not off ffn._moe.
-            if getattr(layer.ffn, "shared_experts", None) is not None:
-                for n in ("gate_proj", "up_proj", "down_proj"):
-                    plan[f"ffn.shared_experts.{n}"] = no_par_local
+            # The shared experts (which under the latent path hang off KimiMoE
+            # itself, not off ffn._moe) take their declarations: Shard(0) on the
+            # two up-projections, Shard(1) on the down-projection -- the ordinary
+            # SwiGLU split. The NoParallel entries that were here replicated them
+            # on a premise the residual-stream flip removed, that the MoE gets a
+            # plain x, and the declaration probe found this as 36 of 36
+            # mismatches: 12 layers x 3 projections, all "has Replicate,
+            # declared Shard".
             # experts (GroupedExperts): the forward already to_local's
             # its DTensor params before the grouped_mm kernel call (see
             # moe.py:100-111). Wrapping the module with NoParallel
@@ -1207,6 +1213,54 @@ def apply_tp_kimi_k3(
                         ),
                     )
 
+
+def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
+    """Expert Parallel plan for kimi_linear MoE flavors.
+
+    Calls ``_moe.parallelize(parallel_dims)`` on every MoE layer: the
+    upstream common MoE distributes its GroupedExperts states over the
+    "ep" mesh (per-Module sharding_config) and wires the token
+    dispatcher's ep/tp meshes for all-to-all dispatch + combine.
+
+    Layers without MoE (``layer.is_moe == False``, i.e. dense MLP at
+    the first ``first_k_dense_replace`` indices) are skipped — they
+    have no experts to shard.
+    """
+    moe_layers_wrapped = 0
+    for layer in model.layers.values():
+        if not bool(getattr(layer, "is_moe", False)):
+            continue
+        ffn = getattr(layer, "ffn", None)
+        if ffn is None:
+            continue
+        # KimiMoE wraps the torchtitan common MoE as self._moe. Upstream
+        # removed the standalone ExpertParallel style: EP is now module-
+        # internal -- MoE.parallelize(parallel_dims) distributes the
+        # GroupedExperts states over the "ep" mesh via each Module's
+        # sharding_config and wires the token dispatcher's ep/tp meshes.
+        moe = getattr(ffn, "_moe", None)
+        if moe is None or not hasattr(moe, "parallelize"):
+            raise ValueError(
+                f"layer {layer.layer_idx} MoE ffn missing a parallelizable "
+                "_moe; EP needs the standard torchtitan MoE wrapping."
+            )
+        moe.parallelize(parallel_dims)
+        moe_layers_wrapped += 1
+    logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
+
+
+def _sweep_remaining_to_replicate(
+    model: nn.Module, tp_mesh: DeviceMesh, skip_expert_params: bool = False
+) -> None:
+    """Promote whatever nothing else distributed to DTensor(Replicate) on tp_mesh.
+
+    Called AFTER the declarative driver, not from inside apply_tp. Running it
+    first meant it claimed declared-but-not-yet-distributed parameters, and the
+    driver then found them distributed with the wrong placement and refused --
+    every shared_experts projection reported 'has Replicate, declared Shard'.
+    Its purpose is the leftovers, and it can only tell what is left over once
+    everything with an opinion has spoken.
+    """
     # Final sweep: any remaining plain Tensor parameters (typically
     # ``A_log``, ``dt_bias`` on KDA layers' self_attn that NoParallel
     # didn't catch because they're bare ``nn.Parameter``s on the
@@ -1269,40 +1323,6 @@ def apply_tp_kimi_k3(
                 )
 
 
-def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
-    """Expert Parallel plan for kimi_linear MoE flavors.
-
-    Calls ``_moe.parallelize(parallel_dims)`` on every MoE layer: the
-    upstream common MoE distributes its GroupedExperts states over the
-    "ep" mesh (per-Module sharding_config) and wires the token
-    dispatcher's ep/tp meshes for all-to-all dispatch + combine.
-
-    Layers without MoE (``layer.is_moe == False``, i.e. dense MLP at
-    the first ``first_k_dense_replace`` indices) are skipped — they
-    have no experts to shard.
-    """
-    moe_layers_wrapped = 0
-    for layer in model.layers.values():
-        if not bool(getattr(layer, "is_moe", False)):
-            continue
-        ffn = getattr(layer, "ffn", None)
-        if ffn is None:
-            continue
-        # KimiMoE wraps the torchtitan common MoE as self._moe. Upstream
-        # removed the standalone ExpertParallel style: EP is now module-
-        # internal -- MoE.parallelize(parallel_dims) distributes the
-        # GroupedExperts states over the "ep" mesh via each Module's
-        # sharding_config and wires the token dispatcher's ep/tp meshes.
-        moe = getattr(ffn, "_moe", None)
-        if moe is None or not hasattr(moe, "parallelize"):
-            raise ValueError(
-                f"layer {layer.layer_idx} MoE ffn missing a parallelizable "
-                "_moe; EP needs the standard torchtitan MoE wrapping."
-            )
-        moe.parallelize(parallel_dims)
-        moe_layers_wrapped += 1
-    logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
-
 
 def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -> int:
     """Start upstream's declarative sharding from a plain-``nn.Module`` root.
@@ -1337,7 +1357,12 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
         declarations the imperative plan does NOT cover, so imperative pieces can be
         deleted one at a time and the declarations take over as they go.
         """
-        return any(isinstance(p, _DTensor) for p in m.parameters())
+        # recurse=False: the question is whether THIS module's own parameters
+        # are distributed. parallelize() only touches what the module declares,
+        # so a parent whose children the imperative plan covered is not done --
+        # with recursion it counted as done and its own declared parameters were
+        # never distributed.
+        return any(isinstance(p, _DTensor) for p in m.parameters(recurse=False))
 
     entered: list[str] = []
     queue = list(model.children())
