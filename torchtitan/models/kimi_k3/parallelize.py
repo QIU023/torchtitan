@@ -870,11 +870,12 @@ def apply_tp_kimi_k3(
         model,
         tp_mesh,
         {
-            "embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Replicate(),
-                use_local_output=False,
-            ),
+            # embed_tokens has NO entry: torchtitan's Embedding runs
+            # vocab-parallel in its own forward once parallelize() sets
+            # tp_group, and produces an ordinary tensor. RowwiseParallel made
+            # DTensor do the split instead, whose MaskPartial cannot be
+            # redistributed against the P(sum) the declared AttnRes projections
+            # produce. Every upstream model relies on the module, not the style.
             "norm": no_par_local,
             # Shard(-1), not Replicate: core's cross-entropy has a
             # vocab-parallel path for exactly this placement
