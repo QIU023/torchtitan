@@ -149,18 +149,27 @@ class AttnResProjection(_TTLinear):
 
 
 def stack_blocks(blocks: list[torch.Tensor]) -> torch.Tensor:
-    """Stack a list of [B, T, D] blocks into a [N, B, T, D] tensor.
+    """Stack per-block tensors into the ``[T, N, D]`` carrier.
 
-    Used when crossing a pipeline parallel stage boundary: the list becomes
-    a tensor so PipelineStage can send it via P2P send/recv.
+    ``T`` is ``B * L`` flattened and ``N`` is the block axis, which is the
+    layout the upstream K3 model threads through its block signature. Nothing
+    downstream needs B or L back: the pipeline adapter slices and stacks along
+    the block axis and reasons about block INDICES, never about batch or
+    sequence extents.
+
+    Used when crossing a pipeline stage boundary, where the list has to become
+    one tensor for P2P send/recv.
     """
-    return torch.stack(blocks, dim=0)
+    if not blocks:
+        raise ValueError("stack_blocks needs at least one block to infer D")
+    D = blocks[0].shape[-1]
+    return torch.stack([b.reshape(-1, D) for b in blocks], dim=1)
 
 
 def unstack_blocks(blocks_tensor: torch.Tensor) -> list[torch.Tensor]:
-    """Inverse of ``stack_blocks``.
+    """Inverse of ``stack_blocks``: the columns of a ``[T, N, D]`` carrier.
 
-    Returns a list of [B, T, D] views into the stacked tensor. Views share
-    storage with the input so autograd gradients flow back correctly.
+    Returns ``[T, D]`` views, one per block. Views share storage with the input
+    so autograd gradients flow back correctly.
     """
-    return [blocks_tensor[i] for i in range(blocks_tensor.shape[0])]
+    return [blocks_tensor[:, i] for i in range(blocks_tensor.shape[1])]

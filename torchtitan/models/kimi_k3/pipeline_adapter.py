@@ -539,9 +539,9 @@ class CrossStageCacheAdapter(nn.Module):
 
     @staticmethod
     def _has_blocks_signature(args) -> bool:
-        """True if ``args[1]`` is a 4-D block tensor (middle/last stage)."""
+        """True if ``args[1]`` is the [T, N, D] block carrier (middle/last stage)."""
         return (
-            len(args) >= 2 and isinstance(args[1], torch.Tensor) and args[1].dim() == 4
+            len(args) >= 2 and isinstance(args[1], torch.Tensor) and args[1].dim() == 3
         )
 
     def _call_wrapped_naive(self, args, kwargs):
@@ -576,12 +576,12 @@ class CrossStageCacheAdapter(nn.Module):
             return partial_out, new_blocks_out
 
         expected_K = len(self._layout.delta_to_send(self.stage_id))
-        if expected_K == new_blocks_out.shape[0]:
+        if expected_K == new_blocks_out.shape[1]:
             return partial_out, new_blocks_out
 
         per_block_shape = (
             new_blocks_out.shape[1:]
-            if new_blocks_out.shape[0] > 0
+            if new_blocks_out.shape[1] > 0
             else partial_out.shape
         )
         # requires_grad must mirror the runtime delta emission: torch >= 2.12
@@ -674,7 +674,7 @@ class CrossStageCacheAdapter(nn.Module):
         pairs.sort(key=lambda p: p[0])
         ordered_blocks = [p[1] for p in pairs]
         blocks_tensor = (
-            torch.stack(ordered_blocks, dim=0) if ordered_blocks else recv_delta_tensor
+            torch.stack(ordered_blocks, dim=1) if ordered_blocks else recv_delta_tensor
         )
 
         wrapped_ret = self.wrapped(partial, *rest, blocks=blocks_tensor, **kwargs)
@@ -708,8 +708,8 @@ class CrossStageCacheAdapter(nn.Module):
         layout = self._layout
         assert layout is not None
         my_commits = layout.commits_at(self.stage_id)
-        assert new_blocks_tensor.shape[0] == len(my_commits), (
-            f"Wrapped model returned {new_blocks_tensor.shape[0]} new "
+        assert new_blocks_tensor.shape[1] == len(my_commits), (
+            f"Wrapped model returned {new_blocks_tensor.shape[1]} new "
             f"blocks at stage {self.stage_id}, expected {len(my_commits)}."
         )
 
@@ -790,9 +790,9 @@ class CrossStageCacheAdapter(nn.Module):
                 )
 
         out_blocks_tensor = (
-            torch.stack(send_pieces, dim=0)
+            torch.stack(send_pieces, dim=1)
             if send_pieces
-            else partial_out.new_zeros((0, *partial_out.shape))
+            else partial_out.new_zeros((partial_out.shape[0] * partial_out.shape[1], 0, partial_out.shape[-1]))
         )
         partial_out = self._keepalive_touch(partial_out, prev_recv_tensor)
         return partial_out, out_blocks_tensor

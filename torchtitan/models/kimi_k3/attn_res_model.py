@@ -572,12 +572,35 @@ class KimiK3AttnResModel(KimiK3Model):
         plain_stream = (
             _plain_stream(block_list, partial_block) if self.attn_res_gated else None
         )
-        for layer_key, layer in self.layers.items():
-            layer_idx = int(layer_key)
-            is_block_start = layer_idx % self.layers_per_block == 0
-            block_list, partial_block, plain_stream = layer(
-                block_list, partial_block, is_block_start, plain_stream
+        if self.attn_res_gated:
+            # The gated graft carries a third accumulator that the tensor
+            # carrier has no column for, so it keeps the list path.
+            for layer_key, layer in self.layers.items():
+                is_block_start = int(layer_key) % self.layers_per_block == 0
+                block_list, partial_block, plain_stream = layer(
+                    block_list, partial_block, is_block_start, plain_stream
+                )
+        else:
+            # Tensor carrier: the block history is one [T, N, D] tensor and the
+            # running partial sum rides inside the hidden state. Bitwise equal
+            # to the list path -- see matrix_scripts/carrier_equivalence_probe.py.
+            D = partial_block.shape[-1]
+            carrier = (
+                torch.stack([b.reshape(-1, D) for b in block_list], dim=1)
+                if block_list
+                else partial_block.new_zeros(
+                    partial_block.shape[0] * partial_block.shape[1], 0, D
+                )
             )
+            x = partial_block
+            for layer_key, layer in self.layers.items():
+                is_block_start = int(layer_key) % self.layers_per_block == 0
+                x, carrier = layer.forward_tensor_carrier(x, carrier, is_block_start)
+            partial_block = x
+            block_list = [
+                c.view(partial_block.shape[0], partial_block.shape[1], D)
+                for c in unstack_blocks(carrier)
+            ]
 
         is_last_stage = self.lm_head is not None
 
@@ -589,7 +612,7 @@ class KimiK3AttnResModel(KimiK3Model):
                     # This stage span covers no block boundary — emit a
                     # zero-first-dim tensor so the adapter's P2P handoff
                     # preserves a static per-stage shape.
-                    empty = partial_block.new_zeros((0, *partial_block.shape))
+                    empty = partial_block.new_zeros((partial_block.shape[0] * partial_block.shape[1], 0, partial_block.shape[-1]))
                     return partial_block, empty
                 return partial_block, stack_blocks(new_blocks)
             if not block_list:
@@ -602,7 +625,7 @@ class KimiK3AttnResModel(KimiK3Model):
                 # and a zero-first-dim new_zeros is not guaranteed to satisfy
                 # that. VP4 is what surfaced it -- VP1 never sends an empty
                 # stack because every rank's single stage spans a boundary.
-                empty = partial_block.new_zeros((0, *partial_block.shape)).contiguous()
+                empty = partial_block.new_zeros((partial_block.shape[0] * partial_block.shape[1], 0, partial_block.shape[-1])).contiguous()
                 return partial_block, empty
             return partial_block, stack_blocks(block_list)
 
