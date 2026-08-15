@@ -37,10 +37,22 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Placement:
-    """Encode ``microbatch`` at ``slot`` in this rank's action list."""
+    """Encode ``microbatch`` immediately before the action named by ``anchor``.
+
+    Anchored on the following action's IDENTITY rather than on a slot index,
+    because the index does not survive lowering: the runtime iterates
+    ``pipeline_order_with_comms``, which inserts SEND/RECV actions and contains no
+    idle entries at all, so "slot 37" means nothing there. The relative order of the
+    compute actions is the same in both representations, so the first real action
+    after the bubble run is a stable name for the position.
+
+    ``anchor`` is ``(computation_type_name, stage_index, microbatch_index)``.
+    ``slot`` is kept for reporting and for the occupancy check against the simulator.
+    """
 
     slot: int
     microbatch: int
+    anchor: tuple[str, int, int]
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,7 @@ def plan_for_rank(
     vision_microbatches: int,
     cost_ratio: float,
     upfront: int,
+    vision_stage: int = 0,
 ) -> BubblePlan:
     """Walk one rank's action list and place the encodes.
 
@@ -88,17 +101,57 @@ def plan_for_rank(
     """
     if cost_ratio <= 0:
         raise ValueError(f"cost_ratio must be positive, got {cost_ratio}")
+    # Where each micro-batch's features are CONSUMED: the vision-owning stage's forward
+    # of that micro-batch. A bubble after that point cannot pay for the encode, however
+    # much budget has accumulated -- the consumer has already run. Without this the walk
+    # happily placed micro-batch 8's encode before micro-batch 14's forward, which reads
+    # as a successful placement and is a wrong answer.
+    consume_slot: dict[int, int] = {}
+    for slot, action in enumerate(actions):
+        if action is None:
+            continue
+        mb = getattr(action, "microbatch_index", None)
+        if mb is None or "FORWARD" not in str(getattr(action, "computation_type", "")):
+            continue
+        if int(getattr(action, "stage_index", -1)) != vision_stage:
+            continue
+        consume_slot.setdefault(int(mb), slot)
     pending = [m for m in range(vision_microbatches) if m >= upfront]
     placed: list[Placement] = []
     budget = 0.0
     idle = 0
+    armed: list[tuple[int, int]] = []  # (slot, microbatch) awaiting an anchor
     for slot, action in enumerate(actions):
         if action is None:
             budget += 1.0
             idle += 1
-            if pending and budget >= cost_ratio:
-                budget -= cost_ratio
-                placed.append(Placement(slot=slot, microbatch=pending.pop(0)))
+            # Spend on the earliest pending micro-batch whose consumer is still ahead.
+            if budget >= cost_ratio:
+                for k, mb in enumerate(pending):
+                    if consume_slot.get(mb, 1 << 30) > slot:
+                        budget -= cost_ratio
+                        armed.append((slot, pending.pop(k)))
+                        break
+            continue
+        # First real action after one or more paid-for bubbles: it names the position.
+        if armed:
+            anchor = (
+                str(getattr(action, "computation_type", "?")),
+                int(getattr(action, "stage_index", -1)),
+                int(
+                    action.microbatch_index
+                    if getattr(action, "microbatch_index", None) is not None
+                    else -1
+                ),
+            )
+            for slot_i, mb in armed:
+                placed.append(Placement(slot=slot_i, microbatch=mb, anchor=anchor))
+            armed = []
+    # Bubbles at the very end of the list have no following action, so nothing can be
+    # anchored to them: the encode would run after its own consumer. Those go back to
+    # the synchronous set rather than being placed somewhere they cannot help.
+    pending.extend(mb for _, mb in armed)
+    pending.sort()
     return BubblePlan(
         rank=rank,
         upfront=tuple(range(min(upfront, vision_microbatches))),
@@ -116,6 +169,7 @@ def build_plans(
     n_microbatches: int,
     cost_ratio: float,
     upfront: int | None = None,
+    vision_stage: int = 0,
 ) -> dict[int, BubblePlan]:
     """Plans for every rank of an Interleaved1F1B schedule.
 
@@ -165,5 +219,6 @@ def build_plans(
             vision_microbatches=n_microbatches,
             cost_ratio=cost_ratio,
             upfront=upfront,
+            vision_stage=vision_stage,
         )
     return plans
