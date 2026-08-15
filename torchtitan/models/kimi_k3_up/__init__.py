@@ -504,94 +504,9 @@ def _debugmodel(attn_backend: str) -> KimiK3Model.Config:
     )
 
 
-def _mini_block_attn_res(attn_backend: str) -> KimiK3Model.Config:
-    """Our text-only screening topology, expressed on the upstream config tree.
-
-    This is the flavor the three-arm matrix uses as its text instrument
-    (``kimi_k3_mini_block_attn_res``): 21 layers at dim 512, deep enough that
-    AttnRes commits more than one block, with no vision tower so a failure has
-    no multimodal path to hide in. Every extent is read off our own registry.
-
-    Migration step 2's gate. What their generator does NOT express, and so is
-    dropped here rather than silently defaulted: the latent-MoE norm toggle
-    (theirs always norms), the router activation and expert grouping, and every
-    post-train graft (LoRA, MXFP4 QAT, gated AttnRes, per-head Muon). None of
-    them are on in this flavor, which is why it is the one that ports first.
-    """
-    if attn_backend != "eager":
-        raise ValueError("Kimi K3 v1 only provides the 'eager' backend.")
-
-    dim = 512
-    return _kimi_k3_config(
-        dim=dim,
-        vocab_size=2016,
-        num_layers=21,
-        full_attention_layers={4, 8, 12, 16, 20, 21},
-        attn_res_block_size=12,
-        num_heads=4,
-        q_lora_rank=128,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        kda_head_dim=128,
-        conv_kernel_size=4,
-        dense_hidden_dim=896,
-        latent_dim=256,
-        expert_hidden_dim=224,
-        num_experts=8,
-        top_k=2,
-        num_shared_experts=2,
-        vision_encoder=None,
-    )
-
-
-def _mini_full_attn(attn_backend: str) -> KimiK3Model.Config:
-    """The text screening topology with every layer full attention.
-
-    A step, not a product flavor. Context parallel shards the sequence before
-    the first layer, so a KDA layer would run its recurrence on a shard as if
-    it were the whole sequence -- wrong, and silently so. This flavor removes
-    KDA entirely, which makes CP verifiable on its own before the KDA-aware
-    path exists. Everything else matches _mini_block_attn_res exactly, so the
-    two differ in one property.
-    """
-    if attn_backend != "eager":
-        raise ValueError("Kimi K3 v1 only provides the 'eager' backend.")
-
-    dim = 512
-    return _kimi_k3_config(
-        dim=dim,
-        vocab_size=2016,
-        num_layers=21,
-        full_attention_layers=set(range(1, 22)),
-        attn_res_block_size=12,
-        num_heads=4,
-        q_lora_rank=128,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        kda_head_dim=128,
-        conv_kernel_size=4,
-        dense_hidden_dim=896,
-        latent_dim=256,
-        expert_hidden_dim=224,
-        num_experts=8,
-        top_k=2,
-        num_shared_experts=2,
-        vision_encoder=None,
-    )
-
-
 kimi_k3_configs = {
     "debugmodel": _debugmodel,
-    "mini_block_attn_res": _mini_block_attn_res,
-    "mini_full_attn": _mini_full_attn,
 }
-
-
-from torchtitan.models.kimi_k3_up.pipeline import pipeline_kimi_k3_up  # noqa: E402
 
 
 def model_registry(
@@ -610,7 +525,7 @@ def model_registry(
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_kimi_k3,
-        pipelining_fn=pipeline_kimi_k3_up,
+        pipelining_fn=None,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=KimiK3StateDictAdapter,
     )

@@ -652,30 +652,18 @@ class KimiK3Model(Decoder):
         def update_from_config(self, *, config, **kwargs) -> None:
             del kwargs
             parallelism = config.parallelism
-            # Context and pipeline parallel are handled in parallelize.py and
-            # pipeline.py, which can see the built model -- CP's rejection depends
-            # on whether any layer is KDA and on local_batch_size, neither of which
-            # this config-level check can evaluate. Listing them here would reject
-            # them before those checks ever run.
-            # EP remains unsupported, and for a structural reason rather than a
-            # missing implementation: core's declarative EP writes
-            # moe.routed_experts.inner_experts and reads the dispatcher from
-            # moe.routed_experts.token_dispatcher, and this config flattens both.
-            # See the note at the end of sharding.py.
-            if parallelism.expert_parallel_degree > 1:
+            unsupported = {
+                "tensor parallel": parallelism.tensor_parallel_degree,
+                "pipeline parallel": parallelism.pipeline_parallel_degree,
+                "context parallel": parallelism.context_parallel_degree,
+                "expert parallel": parallelism.expert_parallel_degree,
+            }
+            enabled = [name for name, degree in unsupported.items() if degree > 1]
+            if enabled:
                 raise NotImplementedError(
-                    "Kimi K3 does not support expert parallel yet: core's "
-                    "declarative EP requires the routed_experts/inner_experts "
-                    "config nesting that KimiLatentMoE.Config flattens."
+                    "Kimi K3 eager reference supports FSDP2 data parallelism only; "
+                    f"disable {', '.join(enabled)}."
                 )
-            from torchtitan.models.kimi_k3_up.sharding import (
-                set_kimi_k3_sharding_config,
-            )
-
-            set_kimi_k3_sharding_config(
-                self,
-                enable_sp=parallelism.enable_sequence_parallel,
-            )
             dataloader = getattr(config, "dataloader", None)
             if getattr(dataloader, "packing_buffer_size", 0) > 0:
                 raise NotImplementedError(
