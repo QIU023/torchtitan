@@ -1447,8 +1447,23 @@ class KimiLatentMoEProjection(nn.Module):
         rms_norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
-        self.down = Linear(hidden_size, latent_size, bias=False)
-        self.up = Linear(latent_size, hidden_size, bias=False)
+        # Replicated, NOT the column/row pair a SwiGLU would use. down's output
+        # goes straight into the MoE, whose in_src_shardings expects Replicate --
+        # the SP-island boundary that makes EP x TP work. Declaring Shard(0) here
+        # gives the MoE a Shard(dim=2) activation and it refuses:
+        # "MoE.x_BLD: input DTensor has placements (Shard(dim=2),), but
+        # in_src_shardings expects (Replicate(),)". up is replicated to match.
+        self.down = Linear(
+            hidden_size, latent_size, bias=False, sharding_config=_tp_replicate()
+        )
+        self.up = Linear(
+            latent_size, hidden_size, bias=False, sharding_config=_tp_replicate()
+        )
+        # No declaration on this norm. It sits on the MoE's OUTPUT side, where
+        # the value arrives plain (the MoE unwraps at its boundary), so a declared
+        # DTensor weight meets a plain input inside _fused_rms_norm. It keeps its
+        # imperative NoParallel entry, like the AttnRes norms did before the
+        # residual-stream flip reached them.
         self.norm = RMSNorm(latent_size, eps=rms_norm_eps) if use_norm else None
 
     def to_latent(self, x: torch.Tensor) -> torch.Tensor:
