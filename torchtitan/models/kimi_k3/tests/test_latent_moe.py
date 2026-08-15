@@ -88,7 +88,7 @@ class TestLatentMoEWiring(unittest.TestCase):
         )
 
     def test_latent_path_builds_with_the_right_widths(self):
-        moe = KimiMoE(self._cfg(48))
+        moe = KimiMoE.make_config(self._cfg(48)).build()
         self.assertEqual(moe.latent_size, 48)
         # entry/exit are full-width <-> latent
         self.assertEqual(moe.latent.down.weight.shape, (48, 64))
@@ -101,14 +101,14 @@ class TestLatentMoEWiring(unittest.TestCase):
         self.assertEqual(moe._moe.router.gate.weight.shape[-1], 64)
 
     def test_shared_experts_are_full_width_and_ours(self):
-        moe = KimiMoE(self._cfg(48))
+        moe = KimiMoE.make_config(self._cfg(48)).build()
         # Eq. 11 adds the shared branch at full width, outside the latent
         self.assertIsNotNone(moe.shared_experts)
         self.assertEqual(moe.shared_experts.gate_proj.weight.shape[-1], 64)
         self.assertIsNone(moe._moe.shared_experts)
 
     def test_non_latent_keeps_shared_inside_the_inner_moe(self):
-        moe = KimiMoE(self._cfg(None))
+        moe = KimiMoE.make_config(self._cfg(None)).build()
         self.assertIsNone(moe.latent_size)
         self.assertIsNone(moe.shared_experts)
         self.assertIsNotNone(moe._moe.shared_experts)
@@ -116,7 +116,7 @@ class TestLatentMoEWiring(unittest.TestCase):
     def test_none_keeps_the_conventional_path_constructible(self):
         # not asserting a forward (routed dispatch is GPU-only), only that the
         # non-latent config still builds as it did before the release
-        KimiMoE(self._cfg(None))
+        KimiMoE.make_config(self._cfg(None)).build()
 
 
 if __name__ == "__main__":

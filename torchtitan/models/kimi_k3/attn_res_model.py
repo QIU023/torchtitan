@@ -50,7 +50,10 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate
 
+from dataclasses import dataclass
+
 from torchtitan.models.common.embedding import Embedding as _TTEmbedding
+from torchtitan.protocols.module import Module as _TTModule
 from torchtitan.models.kimi_k3.attn_res import (
     block_attn_res_tensor,
     AttnResProjection,
@@ -100,7 +103,7 @@ def _plain_stream(
 # ----- Per-layer AttnRes wrapper ------------------------------------------ #
 
 
-class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
+class KimiAttnResDecoderLayer(_TTModule, UpstreamFSDPNames):
     """Kimi decoder layer with AttnRes woven around attn and FFN.
 
     Structurally the same as :class:`KimiDecoderLayer` (per-layer KDA/MLA
@@ -120,17 +123,57 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
     t=0 training is equivalent to standard residuals).
     """
 
-    def __init__(
-        self,
-        config: KimiK3Config,
-        layer_idx: int,
-        gated: bool = False,
-    ) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(_TTModule.Config):
+        """This block plus the four AttnRes reads.
+
+        ``base`` is the plain block's own config, so the attention/FFN choice and
+        the norms are described once and this class only adds the residual reads.
+        """
+
+        layer_idx: int
+        base: "KimiDecoderLayer.Config"
+        attention_res_proj: "AttnResProjection.Config"
+        ffn_res_proj: "AttnResProjection.Config"
+        attention_res_norm: "RMSNorm.Config"
+        ffn_res_norm: "RMSNorm.Config"
+        attn_res_gated: bool = False
+
+    @staticmethod
+    def make_config(
+        config: KimiK3Config, layer_idx: int, gated: bool = False
+    ) -> "KimiAttnResDecoderLayer.Config":
+        """The one place this class reads the flat config."""
+        d = config.hidden_size
+
+        def _norm() -> "RMSNorm.Config":
+            return RMSNorm.Config(
+                normalized_shape=d,
+                eps=config.rms_norm_eps,
+                sharding_config=_tp_replicate(),
+            )
+
+        return KimiAttnResDecoderLayer.Config(
+            layer_idx=layer_idx,
+            base=KimiDecoderLayer.make_config(config, layer_idx),
+            attention_res_proj=AttnResProjection.Config(
+                dim=d, sharding_config=_tp_replicate()
+            ),
+            ffn_res_proj=AttnResProjection.Config(
+                dim=d, sharding_config=_tp_replicate()
+            ),
+            attention_res_norm=_norm(),
+            ffn_res_norm=_norm(),
+            attn_res_gated=gated,
+        )
+
+    def __init__(self, config: "KimiAttnResDecoderLayer.Config") -> None:
         super().__init__()
-        # Reuse the base KimiDecoderLayer entirely — we just delegate
+        gated = config.attn_res_gated
+        # Reuse the base KimiDecoderLayer entirely -- we just delegate
         # to its sub-modules rather than calling its forward.
-        base = KimiDecoderLayer(config, layer_idx)
-        self.layer_idx = layer_idx
+        base = config.base.build()
+        self.layer_idx = config.layer_idx
         self.attention = base.attention
         self.delta_attention = base.delta_attention
         self.moe = base.moe
@@ -140,7 +183,6 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         self.is_linear_attn = base.is_linear_attn
         self.is_moe = base.is_moe
 
-        d = config.hidden_size
         # AttnRes params: two pseudo-queries + two RMSNorms per layer.
         # ``AttnResProjection`` is the shared Linear(d, 1, bias=False)
         # wrapper from attn_res/; its weight [1, d] is the pseudo-query
@@ -152,11 +194,10 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         # Config.build, so calling the class drops the declaration silently. Every
         # AttnRes pseudo-query in this model was constructed that way, so the
         # comment above described an intent the code never carried out.
-        proj_cfg = AttnResProjection.Config(dim=d, sharding_config=_tp_replicate())
-        self.attention_res_proj = proj_cfg.build()
-        self.ffn_res_proj = proj_cfg.build()
-        self.attention_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.ffn_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.attention_res_proj = config.attention_res_proj.build()
+        self.ffn_res_proj = config.ffn_res_proj.build()
+        self.attention_res_norm = config.attention_res_norm.build()
+        self.ffn_res_norm = config.ffn_res_norm.build()
         # Graft gate: per-read scalar alpha, zero-init, so at step 0 the
         # model is exactly the plain backbone (adapter-correctness anchor).
         # h = partial + alpha * (mix - partial): alpha=0 makes the read the
@@ -378,11 +419,13 @@ class KimiK3MTPLayer(nn.Module):
     def __init__(self, config, layer_idx: int, *, gated: bool) -> None:
         super().__init__()
         d = config.hidden_size
-        self.enorm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.hnorm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.eh_proj = Linear(2 * d, d, bias=False, sharding_config=_tp_shard(0))
+        self.enorm = RMSNorm.Config(normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
+        self.hnorm = RMSNorm.Config(normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
+        self.eh_proj = Linear.Config(in_features=2 * d, out_features=d, bias=False, sharding_config=_tp_shard(0)).build()
         self.gated = gated
-        self.block = KimiAttnResDecoderLayer(config, layer_idx, gated=gated)
+        self.block = KimiAttnResDecoderLayer.make_config(
+            config, layer_idx, gated=gated
+        ).build()
 
     def forward(self, h: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         fused = self.eh_proj(torch.cat([self.hnorm(h), self.enorm(emb)], dim=-1))
@@ -485,7 +528,9 @@ class KimiK3AttnResModel(KimiK3Model):
         self.attn_res_gated = gated
         self.layers = nn.ModuleDict(
             {
-                str(i): KimiAttnResDecoderLayer(config, i, gated=gated)
+                str(i): KimiAttnResDecoderLayer.make_config(
+                    config, i, gated=gated
+                ).build()
                 for i in range(n_layers)
             }
         )
@@ -502,13 +547,13 @@ class KimiK3AttnResModel(KimiK3Model):
             if num_mtp
             else None
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.lm_head = Linear(
-            config.hidden_size,
-            config.vocab_size,
+        self.norm = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
+        self.lm_head = Linear.Config(
+            in_features=config.hidden_size,
+            out_features=config.vocab_size,
             bias=False,
             sharding_config=_tp_shard(0),
-        )
+        ).build()
 
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm
         # before lm_head). Same ``AttnResProjection`` shared with the
@@ -520,11 +565,11 @@ class KimiK3AttnResModel(KimiK3Model):
         self.output_res_proj = AttnResProjection.Config(
             dim=config.hidden_size, sharding_config=_tp_replicate()
         ).build()
-        self.output_res_norm = RMSNorm(
-            config.hidden_size,
+        self.output_res_norm = RMSNorm.Config(
+            normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
             sharding_config=_tp_replicate(),
-        )
+        ).build()
         if gated:
             self.output_res_alpha = nn.Parameter(torch.zeros(1))
 

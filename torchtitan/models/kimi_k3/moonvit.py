@@ -425,12 +425,12 @@ class MoonViTEncoderLayer(nn.Module):
         self._tp_head_slice: tuple[int, int] | None = None
         # Dynamic CP: set when this rank holds a patch shard of one large image.
         self._cp_patch_plan: CPPatchPlan | None = None
-        self.norm0 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.norm0 = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
         self.wqkv = nn.Linear(
             config.hidden_size, 3 * config.qkv_hidden_size, bias=False
         )
         self.wo = nn.Linear(config.qkv_hidden_size, config.hidden_size, bias=False)
-        self.norm1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.norm1 = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
         self.mlp = MoonViTMLP(config)
 
     def _attend_gather_kv(
@@ -663,11 +663,11 @@ class PatchMergerMLPV2(nn.Module):
             nn.GELU(),
             nn.Linear(merged, config.text_hidden_size, bias=False),
         )
-        self.post_norm = RMSNorm(
-            config.text_hidden_size,
+        self.post_norm = RMSNorm.Config(
+            normalized_shape=config.text_hidden_size,
             eps=config.projector_ln_eps,
             sharding_config=_tp_replicate(),
-        )
+        ).build()
 
     def forward(self, merged: list[torch.Tensor] | torch.Tensor):
         if isinstance(merged, (list, tuple)):
@@ -695,7 +695,7 @@ class MoonViTEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             MoonViTEncoderLayer(config) for _ in range(config.num_hidden_layers)
         )
-        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.final_layernorm = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
 
     def set_cp_patch_plan(self, plan: CPPatchPlan | None) -> None:
         """Apply (or clear) a dynamic-CP patch partition on every block.

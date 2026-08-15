@@ -52,9 +52,10 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.embedding import Embedding
 
-from torchtitan.models.common.linear import Linear as _TTLinear
-from torchtitan.models.common.nn_modules import RMSNorm as _TTRMSNorm
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.module import Module as _TTModule
 from torchtitan.protocols.sharding import ShardingConfig
 
@@ -69,65 +70,6 @@ def _tp_shard(dim: int) -> ShardingConfig:
 def _tp_replicate() -> ShardingConfig:
     """Weight replicated on the tp axis (the NoParallel case)."""
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
-
-
-class RMSNorm(_TTRMSNorm):
-    """Module-protocol RMSNorm with an ``nn.RMSNorm``-style constructor.
-
-    Same reason as :class:`Linear`: the upstream class is Config-driven, and a plain
-    ``nn.RMSNorm`` cannot carry a ``sharding_config`` at all -- it is not a torchtitan
-    ``Module``, so the declarative path cannot see it and the norms had to be driven by
-    the imperative TP plan. Taking positional args keeps every call site readable.
-    """
-
-    def __init__(
-        self,
-        normalized_shape: int,
-        eps: float = 1e-5,
-        elementwise_affine: bool = True,
-        *,
-        sharding_config: "ShardingConfig | None" = None,
-    ) -> None:
-        nn.RMSNorm.__init__(
-            self,
-            normalized_shape,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-        )
-        if sharding_config is not None:
-            self._sharding_config = sharding_config
-
-
-class Linear(_TTLinear):
-    """Module-protocol-compliant Linear with ``nn.Linear``-style constructor.
-
-    Inherits from ``torchtitan.models.common.linear.Linear`` (= ``nn.Linear
-    + Module``) so instances satisfy
-    ``Float8LinearConverter.verify_module_protocol`` (see
-    torchtitan/components/quantization/float8.py:185, which checks for
-    exactly that ``Linear`` class). Overrides ``__init__`` to accept
-    ``nn.Linear``-style positional args instead of the parent's
-    ``Config``-based constructor, avoiding a global rewrite of all 18
-    call sites in this experiment.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        *,
-        sharding_config: "ShardingConfig | None" = None,
-    ) -> None:
-        nn.Linear.__init__(self, in_features, out_features, bias=bias)
-        # Declarative sharding, the upstream convention. Module.Config.build()
-        # normally sets this attribute; this constructor bypasses Config, so it
-        # sets it directly. None leaves the module exactly as before, which is
-        # what lets the TP plan in parallelize.py keep driving the modules that
-        # have not been migrated yet -- the two forms coexist during the
-        # migration and the plan is removed per module as each one moves.
-        if sharding_config is not None:
-            self._sharding_config = sharding_config
 
 
 try:
@@ -182,7 +124,9 @@ def splice_vision_embeds(
     return h.masked_scatter(scatter_mask.unsqueeze(-1).expand_as(h), source)
 
 
-# ----- Config -------------------------------------------------------------- #
+# Our own Linear/RMSNorm adapters used to live here. They existed only to accept
+# nn-style positional args, which no construction site needs now that every
+# module builds its children from configs; core's classes are used directly.
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1674,7 +1618,7 @@ class KimiLatentMoEProjection(_TTModule):
         return self.up(self.norm(u) if self.norm is not None else u)
 
 
-class KimiMoE(nn.Module):
+class KimiMoE(_TTModule):
     """Kimi's sigmoid-gated grouped-topk MoE, implemented via
     torchtitan's training-capable MoE primitives.
 
@@ -1701,8 +1645,29 @@ class KimiMoE(nn.Module):
     mirrors DSv3's auxiliary-loss-free routing protocol.
     """
 
-    def __init__(self, config: KimiK3Config) -> None:
-        super().__init__()
+    @dataclass(kw_only=True, slots=True)
+    class Config(_TTModule.Config):
+        """The latent MoE's config tree.
+
+        ``moe`` is core's MoE.Config, because this class composes core's MoE
+        rather than re-implementing it -- that composition is what makes expert
+        parallel 16 lines (``_moe.parallelize(parallel_dims)``) instead of a
+        hand-written dispatcher.
+        """
+
+        moe: "MoE.Config"
+        latent_size: int | None = None
+        latent: "KimiLatentMoEProjection.Config | None" = None
+        shared_experts: "KimiMLP.Config | None" = None
+
+    @staticmethod
+    def make_config(config: KimiK3Config) -> "KimiMoE.Config":
+        """Translate Kimi's flat knobs into this module's config tree.
+
+        The body was already assembling core's MoE.Config; it now returns
+        that tree instead of building it in place, which is what lets a
+        sharding.py reach these sub-configs before build().
+        """
         from torchtitan.models.common.config_utils import make_token_dispatcher_config
 
         # Full reuse: torchtitan.models.common.moe.MoE already wires
@@ -1724,17 +1689,18 @@ class KimiMoE(nn.Module):
         # an RMSNorm on the aggregate. The router still reads the FULL-WIDTH
         # token (sec 2.3.3: s_i = Sigmoid(W_r x_i)), which is why MoE.forward
         # takes a separate router_input.
-        self.latent_size = config.routed_expert_hidden_size
+        latent_cfg = None
+        latent_size: int | None = config.routed_expert_hidden_size
         expert_dim = (
-            config.hidden_size if self.latent_size is None else self.latent_size
+            config.hidden_size if latent_size is None else latent_size
         )
-        if self.latent_size is not None:
-            self.latent = KimiLatentMoEProjection.make_config(
+        if latent_size is not None:
+            latent_cfg = KimiLatentMoEProjection.make_config(
                 config.hidden_size,
-                self.latent_size,
+                latent_size,
                 use_norm=config.latent_moe_use_norm,
                 rms_norm_eps=config.rms_norm_eps,
-            ).build()
+            )
 
         router_cfg = TokenChoiceTopKRouter.Config(
             num_experts=config.num_experts,
@@ -1807,7 +1773,7 @@ class KimiMoE(nn.Module):
         # torchtitan's FeedForward for consistency with MoE.Config;
         # the SwiGLU math is identical.
         shared_cfg = None
-        if config.num_shared_experts > 0 and self.latent_size is None:
+        if config.num_shared_experts > 0 and latent_size is None:
             if config.hidden_act == "situ":
                 raise ValueError(
                     'hidden_act="situ" with shared experts requires the latent '
@@ -1915,18 +1881,35 @@ class KimiMoE(nn.Module):
                     },
                     out_dst_shardings=replicated,
                 )
-        self._moe = moe_cfg.build()
+
         # Under the latent path the shared experts are ours, at full width.
-        self.shared_experts = None
-        if config.num_shared_experts > 0 and self.latent_size is not None:
+        shared_experts_cfg = None
+        if config.num_shared_experts > 0 and latent_size is not None:
             shared_dim = config.moe_intermediate_size * config.num_shared_experts
-            self.shared_experts = KimiMLP.make_config(
+            shared_experts_cfg = KimiMLP.make_config(
                 config.hidden_size,
                 shared_dim,
                 hidden_act=config.hidden_act,
                 situ_beta=config.activation_situ_beta,
                 situ_linear_beta=config.activation_situ_linear_beta,
-            ).build()
+            )
+
+        return KimiMoE.Config(
+            latent_size=latent_size,
+            latent=latent_cfg,
+            moe=moe_cfg,
+            shared_experts=shared_experts_cfg,
+        )
+
+    def __init__(self, config: "KimiMoE.Config") -> None:
+        super().__init__()
+        self.latent_size = config.latent_size
+        self.latent = config.latent.build() if config.latent is not None else None
+        self._moe = config.moe.build()
+        self.shared_experts = (
+            config.shared_experts.build() if config.shared_experts is not None else None
+        )
+
 
     @property
     def routed_experts(self):
@@ -1997,69 +1980,95 @@ class UpstreamFSDPNames:
         return bool(getattr(self, "is_moe", False))
 
 
-class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
+class KimiDecoderLayer(_TTModule, UpstreamFSDPNames):
     """One transformer block: pre-norm + attention + residual +
     pre-norm + MoE/MLP + residual.
 
     Faithful to ``reference:KimiDecoderLayer``.
     """
 
-    def __init__(self, config: KimiK3Config, layer_idx: int) -> None:
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
+    @dataclass(kw_only=True, slots=True)
+    class Config(_TTModule.Config):
+        """One hybrid block. Attention and FFN are each an XOR pair.
 
-        # Attention: KDA vs MLA by layer index. Two attributes with one of them
-        # None, the upstream layout -- the type is then readable off the module
-        # tree, so parallelize and FSDP can collect MLA blocks without asking
-        # the config which layers are linear.
-        self.attention: nn.Module | None = None
-        self.delta_attention: nn.Module | None = None
+        The layer type is readable off the populated field rather than by asking
+        the model config, which is what lets parallelize and FSDP collect the MLA
+        blocks without a config lookup.
+        """
+
+        layer_idx: int
+        hidden_size: int
+        input_layernorm: "RMSNorm.Config"
+        post_attention_layernorm: "RMSNorm.Config"
+        attention: "KimiMLAAttention.Config | None" = None
+        delta_attention: "KimiDeltaAttention.Config | None" = None
+        moe: "KimiMoE.Config | None" = None
+        feed_forward: "KimiMLP.Config | None" = None
+
+    @staticmethod
+    def make_config(
+        config: KimiK3Config, layer_idx: int
+    ) -> "KimiDecoderLayer.Config":
+        """The one place this class reads the flat config."""
+        def _norm() -> "RMSNorm.Config":
+            return RMSNorm.Config(
+                normalized_shape=config.hidden_size,
+                eps=config.rms_norm_eps,
+                sharding_config=_tp_replicate(),
+            )
+
+        cfg = KimiDecoderLayer.Config(
+            layer_idx=layer_idx,
+            hidden_size=config.hidden_size,
+            input_layernorm=_norm(),
+            post_attention_layernorm=_norm(),
+        )
+        # Attention: KDA vs MLA by layer index.
         if config.is_kda_layer(layer_idx):
-            self.delta_attention = KimiDeltaAttention.make_config(
-                config, layer_idx
-            ).build()
-            self.is_linear_attn = True
+            cfg.delta_attention = KimiDeltaAttention.make_config(config, layer_idx)
         elif config.is_mla:
-            self.attention = KimiMLAAttention.make_config(config, layer_idx).build()
-            self.is_linear_attn = False
+            cfg.attention = KimiMLAAttention.make_config(config, layer_idx)
         else:
-            # Reachable: a config with none of the MLA dims set and
-            # mla_use_nope False is constructible, it is just not a model this
-            # port implements. That makes it a configuration error rather than a
-            # missing feature, hence ValueError.
+            # Reachable: a config with none of the MLA dims set and mla_use_nope
+            # False is constructible, it is just not a model this port implements.
             raise ValueError(
                 f"Layer {layer_idx}: neither KDA nor MLA configured. Set the "
                 "MLA head dims (or mla_use_nope) or list the layer in kda_layers."
             )
-
-        # FFN: dense MLP for the first `first_k_dense_replace` layers, MoE otherwise.
-        # Kimi's reference uses `layer_idx >= first_k_dense_replace` AND
-        # `layer_idx % moe_layer_freq == 0`; we follow that.
-        # Two attributes with one of them None, the upstream layout.
-        self.moe: nn.Module | None = None
-        self.feed_forward: nn.Module | None = None
+        # FFN: dense MLP for the first `first_k_dense_replace` layers, MoE
+        # otherwise. Kimi's reference uses `layer_idx >= first_k_dense_replace`
+        # AND `layer_idx % moe_layer_freq == 0`; we follow that.
         if (
             config.is_moe
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         ):
-            self.moe = KimiMoE(config)
-            self.is_moe = True
+            cfg.moe = KimiMoE.make_config(config)
         else:
-            self.feed_forward = KimiMLP.make_config(
+            cfg.feed_forward = KimiMLP.make_config(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-            ).build()
-            self.is_moe = False
+            )
+        return cfg
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            sharding_config=_tp_replicate(),
+    def __init__(self, config: "KimiDecoderLayer.Config") -> None:
+        super().__init__()
+        self.layer_idx = config.layer_idx
+        self.hidden_size = config.hidden_size
+        self.attention = config.attention.build() if config.attention is not None else None
+        self.delta_attention = (
+            config.delta_attention.build() if config.delta_attention is not None else None
         )
+        self.is_linear_attn = self.delta_attention is not None
+        self.moe = config.moe.build() if config.moe is not None else None
+        self.feed_forward = (
+            config.feed_forward.build() if config.feed_forward is not None else None
+        )
+        self.is_moe = self.moe is not None
+        self.input_layernorm = config.input_layernorm.build()
+        self.post_attention_layernorm = config.post_attention_layernorm.build()
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Attention block
@@ -2087,7 +2096,7 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
 # ----- Top-level model ----------------------------------------------------- #
 
 
-class KimiK3Model(nn.Module):
+class KimiK3Model(_TTModule):
     """Kimi Linear stack: embed -> decoder layers -> final RMSNorm -> LM head.
 
     No KV cache, no generation path. Training / loss is expected to be
@@ -2103,29 +2112,68 @@ class KimiK3Model(nn.Module):
     # See the note at the _skip_lm_head check in forward.
     _skip_lm_head: bool = False
 
-    def __init__(self, config: KimiK3Config) -> None:
-        super().__init__()
-        self.config = config
+    @dataclass(kw_only=True, slots=True)
+    class Config(_TTModule.Config):
+        """The trunk's config tree.
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        ``tok_embeddings``, ``norm`` and ``lm_head`` carry the names core's
+        ``set_decoder_sharding_config`` writes to; the module attribute for the
+        first stays ``embed_tokens``, the release's name, so no checkpoint key
+        moves. ``layers`` is walked by our own sharding.py -- that helper
+        deliberately does not walk it.
+
+        ``kimi_config`` rides along because the flat config is still read after
+        construction: ``register_topology(model.config)`` in parallelize and the
+        pipeline adapter, plus init_weights' initializer_range.
+        """
+
+        kimi_config: KimiK3Config
+        tok_embeddings: "Embedding.Config"
+        layers: list["KimiDecoderLayer.Config"]
+        norm: "RMSNorm.Config"
+        lm_head: "Linear.Config"
+
+    @staticmethod
+    def make_config(config: KimiK3Config) -> "KimiK3Model.Config":
+        """The one place the trunk reads the flat config."""
+        return KimiK3Model.Config(
+            kimi_config=config,
+            tok_embeddings=Embedding.Config(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            ),
+            layers=[
+                KimiDecoderLayer.make_config(config, i)
+                for i in range(config.num_hidden_layers)
+            ],
+            norm=RMSNorm.Config(
+                normalized_shape=config.hidden_size,
+                eps=config.rms_norm_eps,
+                sharding_config=_tp_replicate(),
+            ),
+            lm_head=Linear.Config(
+                in_features=config.hidden_size,
+                out_features=config.vocab_size,
+                bias=False,
+                sharding_config=_tp_shard(0),
+            ),
+        )
+
+    def __init__(self, config: "KimiK3Model.Config") -> None:
+        super().__init__()
+        self.config = config.kimi_config
+
+        self.embed_tokens = config.tok_embeddings.build()
         # ModuleDict (not ModuleList) so pipeline_module_split preserves
         # layer-id string keys and the adapter's layer_to_stage discovery
         # works unchanged. Matches the attn_res/ experiment's pattern.
         self.layers = nn.ModuleDict(
-            {
-                str(i): KimiDecoderLayer(config, i)
-                for i in range(config.num_hidden_layers)
-            }
+            {str(i): c.build() for i, c in enumerate(config.layers)}
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.lm_head = Linear(
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            sharding_config=_tp_shard(0),
-        )
+        self.norm = config.norm.build()
+        self.lm_head = config.lm_head.build()
 
-        if config.tie_word_embeddings:
+        if self.config.tie_word_embeddings:
             # Not used on 48B-A3B (tie_word_embeddings=False) but kept for
             # smaller debug flavors that might tie.
             self.lm_head.weight = self.embed_tokens.weight
@@ -2428,7 +2476,7 @@ class KimiK3Spec:
         from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
 
         if self.num_blocks is None:
-            model = KimiK3Model(self.kimi_config)
+            model = KimiK3Model.make_config(self.kimi_config).build()
         else:
             model = KimiK3AttnResModel(
                 self.kimi_config,

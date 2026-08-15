@@ -174,7 +174,7 @@ class KimiK3MultimodalModel(nn.Module):
         self.config = config
         self.vision_tower = MoonViT(config.vision_config)
         if config.num_blocks is None:
-            self.language_model = KimiK3Model(config.kimi_config)
+            self.language_model = KimiK3Model.make_config(config.kimi_config).build()
         else:
             self.language_model = KimiK3AttnResModel(
                 config.kimi_config,

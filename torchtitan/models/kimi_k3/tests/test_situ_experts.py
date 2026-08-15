@@ -31,7 +31,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
             cfg = build_kimi_linear_config(size, vocab_size=256)
             self.assertEqual(cfg.hidden_act, "situ", size)
             with torch.device("meta"):
-                moe = KimiMoE(cfg)
+                moe = KimiMoE.make_config(cfg).build()
             experts = moe._moe.routed_experts.inner_experts
             self.assertIsInstance(experts, KimiSiTUGroupedExperts, size)
             self.assertEqual(experts.situ_beta, 4.0)
@@ -41,7 +41,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
         cfg = build_kimi_linear_config("48b", vocab_size=256)
         self.assertEqual(cfg.hidden_act, "silu")
         with torch.device("meta"):
-            moe = KimiMoE(cfg)
+            moe = KimiMoE.make_config(cfg).build()
         experts = moe._moe.routed_experts.inner_experts
         self.assertIsInstance(experts, GroupedExperts)
         self.assertNotIsInstance(experts, KimiSiTUGroupedExperts)
@@ -52,7 +52,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
         # converters all key off these names.
         cfg = build_kimi_linear_config("k3mini", vocab_size=256)
         with torch.device("meta"):
-            moe = KimiMoE(cfg)
+            moe = KimiMoE.make_config(cfg).build()
         names = {n for n, _ in moe._moe.routed_experts.inner_experts.named_parameters()}
         self.assertEqual(names, {"w1_EFD", "w2_EDF", "w3_EFD"})
 
@@ -122,7 +122,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
         cfg.routed_expert_hidden_size = None  # non-latent + situ + shared
         with self.assertRaisesRegex(ValueError, "latent MoE path"):
             with torch.device("meta"):
-                KimiMoE(cfg)
+                KimiMoE.make_config(cfg).build()
 
 
 if __name__ == "__main__":

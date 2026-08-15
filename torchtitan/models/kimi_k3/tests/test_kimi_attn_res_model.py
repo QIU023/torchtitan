@@ -69,7 +69,7 @@ def _dense_mla_only_config(num_hidden_layers: int = 4) -> KimiK3Config:
 class TestKimiAttnResDecoderLayer(unittest.TestCase):
     def test_attn_res_params_present(self):
         cfg = _dense_mla_only_config()
-        layer = KimiAttnResDecoderLayer(cfg, layer_idx=0)
+        layer = KimiAttnResDecoderLayer.make_config(cfg, layer_idx=0).build()
         names = {n for n, _ in layer.named_children()}
         for expected in (
             "attention_res_proj",
@@ -91,7 +91,7 @@ class TestKimiAttnResDecoderLayer(unittest.TestCase):
 
     def test_forward_threads_blocks_and_partial(self):
         cfg = _dense_mla_only_config()
-        layer = KimiAttnResDecoderLayer(cfg, layer_idx=0)
+        layer = KimiAttnResDecoderLayer.make_config(cfg, layer_idx=0).build()
 
         B, T, D = 2, 16, cfg.hidden_size
         blocks = [torch.randn(B, T, D) for _ in range(2)]
