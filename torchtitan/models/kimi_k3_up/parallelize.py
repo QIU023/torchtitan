@@ -35,7 +35,7 @@ def parallelize_kimi_k3(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> nn.Module:
-    """Apply FSDP2 and CP while keeping the model's eager reference forward path.
+    """Apply FSDP2, TP and CP while keeping the model's eager reference forward path.
 
     CP is Ulysses, not core's ring path. Core's ``apply_cp_to_forward`` routes
     an SDPA inner attention onto the CP dispatcher, and measured there K3's MLA
@@ -50,18 +50,11 @@ def parallelize_kimi_k3(
     """
     del dump_folder
 
-    unsupported_parallelisms = [
-        name
-        for name, enabled in (
-            ("tensor parallel", parallel_dims.tp_enabled),
-            ("expert parallel", parallel_dims.ep_enabled),
-        )
-        if enabled
-    ]
-    if unsupported_parallelisms:
+    if parallel_dims.ep_enabled:
         raise NotImplementedError(
-            "Kimi K3 eager reference currently supports FSDP2 data parallelism "
-            f"only; disable {', '.join(unsupported_parallelisms)}."
+            "Kimi K3 does not support expert parallel yet: core's declarative EP "
+            "requires the routed_experts/inner_experts config nesting that "
+            "KimiLatentMoE.Config flattens. See the note in sharding.py."
         )
     if parallelism.spmd_backend != "default":
         raise NotImplementedError(
@@ -79,6 +72,12 @@ def parallelize_kimi_k3(
         raise NotImplementedError(
             "Kimi K3 eager FSDP2 does not support parameter CPU offload yet."
         )
+
+    if parallel_dims.tp_enabled:
+        # One call, no imperative plan: sharding.py populated every sub-config
+        # at config time and Module.parallelize applies whatever the enabled
+        # mesh supports. This is llama3's and deepseek_v3's shape.
+        model.parallelize(parallel_dims)
 
     if parallel_dims.cp_enabled:
         # Ulysses wraps the ATTENTION module, not its inner attention: the
