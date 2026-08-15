@@ -1052,11 +1052,13 @@ def apply_tp_kimi_k3(
             # keeps the plain-tensor boundary convention -- without this the
             # promoted DTensor weights meet a plain activation inside the
             # RMSNorm (mixed-operand crash).
+            # down and up take their declarations (both Replicate -- the MoE's
+            # in_src_shardings requires it). The NORM keeps its plan entry: it is
+            # on the MoE's output side where the value arrives plain, so a
+            # declared weight would meet a plain input inside _fused_rms_norm.
             latent = getattr(layer.ffn, "latent", None)
-            if latent is not None:
-                for n in ("down", "up", "norm"):
-                    if getattr(latent, n, None) is not None:
-                        plan[f"ffn.latent.{n}"] = no_par_local
+            if latent is not None and getattr(latent, "norm", None) is not None:
+                plan["ffn.latent.norm"] = no_par_local
             # The shared experts (which under the latent path hang off KimiMoE
             # itself, not off ffn._moe) take their declarations: Shard(0) on the
             # two up-projections, Shard(1) on the down-projection -- the ordinary
