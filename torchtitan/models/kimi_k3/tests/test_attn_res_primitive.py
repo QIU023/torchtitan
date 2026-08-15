@@ -153,14 +153,18 @@ class TestStackUnstackBlocks(unittest.TestCase):
     """Tests for stack_blocks / unstack_blocks round-trip."""
 
     def test_roundtrip(self):
-        B, T, D = 2, 3, 8
-        blocks = [torch.randn(B, T, D) for _ in range(4)]
+        # The carrier is [T, N, D] with T = B * L flattened, so the round trip
+        # preserves values but not the [B, L, D] block shape -- nothing
+        # downstream needs B or L back, only the block INDEX.
+        B, L, D = 2, 3, 8
+        blocks = [torch.randn(B, L, D) for _ in range(4)]
         stacked = stack_blocks(blocks)
-        self.assertEqual(stacked.shape, torch.Size([4, B, T, D]))
+        self.assertEqual(stacked.shape, torch.Size([B * L, 4, D]))
         unstacked = unstack_blocks(stacked)
         self.assertEqual(len(unstacked), 4)
         for orig, recon in zip(blocks, unstacked):
-            self.assertTrue(torch.equal(orig, recon))
+            self.assertEqual(recon.shape, torch.Size([B * L, D]))
+            self.assertTrue(torch.equal(orig.reshape(B * L, D), recon))
 
     def test_roundtrip_preserves_grad(self):
         """Round-trip must keep autograd connections to the source tensors."""
