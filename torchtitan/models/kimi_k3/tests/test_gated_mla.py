@@ -58,14 +58,14 @@ class TestGatedMLA(unittest.TestCase):
         torch.manual_seed(0)
         cfg = _cfg()
         with torch.device("cuda"):
-            plain = KimiK3Model(cfg)
+            plain = KimiK3Model.make_config(cfg).build()
             plain.init_weights()
             # near-identity is the per_head_graft promise, not K3's
-            gated = KimiK3Model(
+            gated = KimiK3Model.make_config(
                 dataclasses.replace(
                     cfg, mla_gated=True, attn_gate_param="per_head_graft"
                 )
-            )
+            ).build()
             gated.init_weights()
         gated.load_state_dict(plain.state_dict(), strict=False)
         tok = torch.randint(0, 2016, (2, 96), device="cuda")

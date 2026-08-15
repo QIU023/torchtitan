@@ -44,7 +44,7 @@ _ARTIFACT = (
 
 def _k3mini_model() -> KimiK3Model:
     with torch.device("meta"):
-        return KimiK3Model(build_kimi_linear_config("k3mini", vocab_size=256))
+        return KimiK3Model.make_config(build_kimi_linear_config("k3mini", vocab_size=256)).build()
 
 
 class TestQuantScope(unittest.TestCase):

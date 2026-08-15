@@ -37,7 +37,7 @@ _SENTINEL = 1234.5
 
 def _model() -> KimiK3Model:
     cfg = build_kimi_linear_config("k3mini", vocab_size=256)
-    return KimiK3Model(cfg)
+    return KimiK3Model.make_config(cfg).build()
 
 
 def _expert_params(model):

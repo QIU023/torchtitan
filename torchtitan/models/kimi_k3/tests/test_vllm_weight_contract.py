@@ -60,7 +60,7 @@ _KDA_1BASED_FULL = {4, 8, 12, 16, 20, 21}
 def _exported_names():
     cfg = build_kimi_linear_config("k3mini", vocab_size=256)
     with torch.device("meta"):
-        model = KimiK3Model(cfg)
+        model = KimiK3Model.make_config(cfg).build()
     kda = {
         i
         for i in range(cfg.num_hidden_layers)

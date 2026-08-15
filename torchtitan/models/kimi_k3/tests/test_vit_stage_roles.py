@@ -94,7 +94,7 @@ def _stage(cfg):
 
     torch.manual_seed(0)
     tower = MoonViT(cfg.vision_config)
-    lm = KimiK3Model(cfg.kimi_config)
+    lm = KimiK3Model.make_config(cfg.kimi_config).build()
     stage = KimiK3ViTStage.from_parts(cfg, tower, lm).to(torch.float32)
     torch.manual_seed(0)
     stage.init_weights()

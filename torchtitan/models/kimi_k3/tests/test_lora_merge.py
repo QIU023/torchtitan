@@ -387,7 +387,7 @@ class TestLoRAWrapperTransparency(unittest.TestCase):
         from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 
         with torch.device("meta"):
-            model = KimiK3Model(build_kimi_linear_config("k3mini", vocab_size=256))
+            model = KimiK3Model.make_config(build_kimi_linear_config("k3mini", vocab_size=256)).build()
         apply_lora(model, rank=8, alpha=16.0)
         leaves = {
             fqn.rsplit(".", 1)[1]

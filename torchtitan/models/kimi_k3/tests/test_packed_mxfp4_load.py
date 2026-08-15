@@ -96,7 +96,7 @@ class TestSyntheticOfficialCheckpointLoad(unittest.TestCase):
     def _model(self):
         cfg = build_kimi_linear_config("k3mini", vocab_size=256)
         with torch.device("meta"):
-            m = KimiK3Model(cfg)
+            m = KimiK3Model.make_config(cfg).build()
         m.to_empty(device="cpu")
         m.init_weights()
         return m, cfg
