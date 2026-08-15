@@ -1075,7 +1075,10 @@ class KimiDeltaAttention(_TTModule):
             self.hidden_size, self.head_dim, bias=False,
             sharding_config=_tp_replicate(),
         )
-        self.f_b_proj = Linear(self.head_dim, projection_size, bias=False)
+        self.f_b_proj = Linear(
+            self.head_dim, projection_size, bias=False,
+            sharding_config=_tp_replicate(),
+        )
         # Output gate. K3 (report Eq. 6) makes W_g full rank; Kimi Linear
         # factored it through head_dim. Both feed the same
         # FusedRMSNormGated(o, g) = Sigmoid(g) (.) RMSNorm(o~) below.
@@ -1107,7 +1110,12 @@ class KimiDeltaAttention(_TTModule):
             eps=config.rms_norm_eps,
             activation="sigmoid",
         )
-        self.o_proj = Linear(projection_size, self.hidden_size, bias=False)
+        # Replicate, unlike MLA's o_proj: KDA's core runs on plain tensors, so
+        # this projection's input is not head-sharded and has nothing to reduce.
+        self.o_proj = Linear(
+            projection_size, self.hidden_size, bias=False,
+            sharding_config=_tp_replicate(),
+        )
 
     def _output_gate_raw(self, x: torch.Tensor) -> torch.Tensor:
         """Pre-sigmoid output-gate logits, flat ``[..., H * head_dim]``.
