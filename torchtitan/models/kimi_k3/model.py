@@ -992,9 +992,21 @@ class KimiDeltaAttention(_TTModule):
         projection_size = self.head_dim * self.num_heads
         projection_k_size = projection_size  # k heads == v heads for Kimi
 
-        self.q_proj = Linear(self.hidden_size, projection_k_size, bias=False)
-        self.k_proj = Linear(self.hidden_size, projection_k_size, bias=False)
-        self.v_proj = Linear(self.hidden_size, projection_size, bias=False)
+        # Replicate, matching what NoParallel gave them. Their outputs feed the
+        # fla kernels, which KDA unwraps at the call site
+        # (_to_local_if_dtensor), so the kernels still see plain tensors.
+        self.q_proj = Linear(
+            self.hidden_size, projection_k_size, bias=False,
+            sharding_config=_tp_replicate(),
+        )
+        self.k_proj = Linear(
+            self.hidden_size, projection_k_size, bias=False,
+            sharding_config=_tp_replicate(),
+        )
+        self.v_proj = Linear(
+            self.hidden_size, projection_size, bias=False,
+            sharding_config=_tp_replicate(),
+        )
 
         # Short causal convolutions with silu activation on q/k/v
         self.q_conv1d = ShortConvolution(
@@ -1059,14 +1071,23 @@ class KimiDeltaAttention(_TTModule):
         }
 
         # Low-rank forget-gate and output-gate projections
-        self.f_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
-        self.f_b_proj = Linear(self.head_dim, projection_size, bias=False)
+        self.f_a_proj = Linear(
+            self.hidden_size, self.head_dim, bias=False,
+            sharding_config=_tp_replicate(),
+        )
+        self.f_b_proj = Linear(
+            self.head_dim, projection_size, bias=False,
+            sharding_config=_tp_replicate(),
+        )
         # Output gate. K3 (report Eq. 6) makes W_g full rank; Kimi Linear
         # factored it through head_dim. Both feed the same
         # FusedRMSNormGated(o, g) = Sigmoid(g) (.) RMSNorm(o~) below.
         self.use_full_rank_gate = config.kda_use_full_rank_gate
         if self.use_full_rank_gate:
-            self.g_proj = Linear(self.hidden_size, projection_size, bias=False)
+            self.g_proj = Linear(
+                self.hidden_size, projection_size, bias=False,
+                sharding_config=_tp_replicate(),
+            )
         else:
             self.g_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
             self.g_b_proj = Linear(self.head_dim, projection_size, bias=False)
@@ -1078,7 +1099,10 @@ class KimiDeltaAttention(_TTModule):
             )
 
         # Beta: per-head, per-token scalar (delta-rule learning rate)
-        self.b_proj = Linear(self.hidden_size, self.num_heads, bias=False)
+        self.b_proj = Linear(
+            self.hidden_size, self.num_heads, bias=False,
+            sharding_config=_tp_replicate(),
+        )
 
         # Output RMSNorm with sigmoid-gated modulation from g, then o_proj
         self.o_norm = FusedRMSNormGated(
@@ -1086,7 +1110,12 @@ class KimiDeltaAttention(_TTModule):
             eps=config.rms_norm_eps,
             activation="sigmoid",
         )
-        self.o_proj = Linear(projection_size, self.hidden_size, bias=False)
+        # Replicate, unlike MLA's o_proj: KDA's core runs on plain tensors, so
+        # this projection's input is not head-sharded and has nothing to reduce.
+        self.o_proj = Linear(
+            projection_size, self.hidden_size, bias=False,
+            sharding_config=_tp_replicate(),
+        )
 
     def _output_gate_raw(self, x: torch.Tensor) -> torch.Tensor:
         """Pre-sigmoid output-gate logits, flat ``[..., H * head_dim]``.
