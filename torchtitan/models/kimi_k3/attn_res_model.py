@@ -100,32 +100,6 @@ def _plain_stream(
 # ----- Per-layer AttnRes wrapper ------------------------------------------ #
 
 
-def _plain_residual_stream(x: torch.Tensor) -> torch.Tensor:
-    """Bring the residual stream to a plain tensor at the model's entry.
-
-    This model's boundary convention is plain tensors -- PP P2P, the AttnRes
-    aggregation and the fla kernels all require it -- and the embedding is
-    declarative since migration step A, so what arrives here can be a DTensor.
-
-    It used to be converted by ACCIDENT. The list carrier's first layer called
-    ``block_attn_res`` with an empty block list, which looks like a no-op and is
-    not: it stacks, aggregates in fp32 and returns ``.to(V.dtype)``, and that
-    round trip dropped the DTensor wrapping. The tensor carrier follows
-    upstream's "skip the aggregation until a block is committed" guard, which
-    removed the conversion along with the call -- and ``input_layernorm`` then
-    met a DTensor input against a plain weight.
-
-    Upstream can skip it because their embedding is not declarative. Naming the
-    conversion here means the next person to move this guard does not silently
-    delete a second job it was never advertised to do.
-
-    NOTE for the declarative TP migration: the end state is a residual stream
-    that STAYS a DTensor rather than being unwrapped here, so this is a
-    placeholder for the boundary, not the boundary's final form.
-    """
-    return x.to_local() if isinstance(x, DTensor) else x
-
-
 class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
     """Kimi decoder layer with AttnRes woven around attn and FFN.
 
