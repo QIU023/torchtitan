@@ -1828,12 +1828,17 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        # Attention: KDA vs MLA by layer index
+        # Attention: KDA vs MLA by layer index. Two attributes with one of them
+        # None, the upstream layout -- the type is then readable off the module
+        # tree, so parallelize and FSDP can collect MLA blocks without asking
+        # the config which layers are linear.
+        self.attention: nn.Module | None = None
+        self.delta_attention: nn.Module | None = None
         if config.is_kda_layer(layer_idx):
-            self.self_attn: nn.Module = KimiDeltaAttention(config, layer_idx)
+            self.delta_attention = KimiDeltaAttention(config, layer_idx)
             self.is_linear_attn = True
         elif config.is_mla:
-            self.self_attn = KimiMLAAttention(config, layer_idx)
+            self.attention = KimiMLAAttention(config, layer_idx)
             self.is_linear_attn = False
         else:
             # Reachable: a config with none of the MLA dims set and
@@ -1874,7 +1879,11 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
         # Attention block
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x)
+        if self.attention is not None:
+            x = self.attention(x)
+        else:
+            assert self.delta_attention is not None
+            x = self.delta_attention(x)
         x = residual + x
 
         # FFN block
@@ -2081,10 +2090,15 @@ class KimiK3Model(nn.Module):
                 # pass above only covers their nn.Linear children).
                 m.reset_parameters()
 
-        # Pass 2: KDA per-layer raw Parameters (A_log, dt_bias) that
-        # don't belong to any nn.Module subclass we can dispatch on.
+        # Pass 2: per-layer raw Parameters that don't belong to any nn.Module
+        # subclass we can dispatch on -- KDA's A_log and dt_bias, and the MLA
+        # output gate's graft init below. Both attention kinds reach this loop:
+        # keying it on one of the two attribute names skips the other's init
+        # silently, which is how the gated-MLA near-identity test caught this.
         for layer in self.layers.values():
-            attn = getattr(layer, "self_attn", None)
+            attn = getattr(layer, "delta_attention", None) or getattr(
+                layer, "attention", None
+            )
             if attn is None:
                 continue
             if hasattr(attn, "A_log"):
@@ -2462,8 +2476,9 @@ class KimiK3Float8Spec(KimiK3Spec):
     parallelize/init), mirroring the converter's ``module_filter_fn``
     semantics: all dims divisible by 16, filtered FQNs skipped.
     Additionally every Linear inside a :class:`KimiDeltaAttention` is
-    skipped structurally -- KDA and MLA layers share the ``self_attn``
-    attribute name, so no FQN substring can express "KDA only".
+    skipped structurally. A name-based filter is now expressible too, since
+    KDA lives under ``delta_attention`` and MLA under ``attention``, but the
+    structural skip does not depend on the spelling staying that way.
     ``init_weights`` still covers swapped modules because torchao's
     ``Float8Linear`` subclasses ``nn.Linear``.
     """

@@ -76,7 +76,7 @@ class TestKimiAttnResDecoderLayer(unittest.TestCase):
             "ffn_res_proj",
             "attention_res_norm",
             "ffn_res_norm",
-            "self_attn",
+            "attention",
             "ffn",
             "input_layernorm",
             "post_attention_layernorm",

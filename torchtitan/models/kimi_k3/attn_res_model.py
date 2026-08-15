@@ -131,7 +131,8 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         # to its sub-modules rather than calling its forward.
         base = KimiDecoderLayer(config, layer_idx)
         self.layer_idx = layer_idx
-        self.self_attn = base.self_attn
+        self.attention = base.attention
+        self.delta_attention = base.delta_attention
         self.ffn = base.ffn
         self.input_layernorm = base.input_layernorm
         self.post_attention_layernorm = base.post_attention_layernorm
@@ -166,6 +167,17 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         if gated:
             self.attention_res_alpha = nn.Parameter(torch.zeros(1))
             self.ffn_res_alpha = nn.Parameter(torch.zeros(1))
+
+    def _attention(self, h: torch.Tensor) -> torch.Tensor:
+        """Whichever of the two attention attributes this layer has.
+
+        The layout is upstream's: MLA layers hold ``attention``, KDA layers
+        hold ``delta_attention``, and the other is None.
+        """
+        if self.attention is not None:
+            return self.attention(h)
+        assert self.delta_attention is not None
+        return self.delta_attention(h)
 
     def forward(
         self,
@@ -211,7 +223,7 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
             partial_block = None
 
         # Attention sub-layer (KDA or MLA).
-        attn_out = self.self_attn(self.input_layernorm(h))
+        attn_out = self._attention(self.input_layernorm(h))
         partial_block = attn_out if partial_block is None else partial_block + attn_out
         if self.attn_res_gated:
             plain_stream = plain_stream + attn_out
@@ -283,7 +295,7 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
             )
             prefix_sum_BLD = None
 
-        attn_out = self.self_attn(self.input_layernorm(x_BLD))
+        attn_out = self._attention(self.input_layernorm(x_BLD))
         prefix_sum_BLD = (
             attn_out if prefix_sum_BLD is None else prefix_sum_BLD + attn_out
         )

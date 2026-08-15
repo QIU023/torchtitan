@@ -75,15 +75,17 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
     def test_a_log_reshape_from_hf(self):
         spec, sd = _build_state_dict("kimi_linear_194m_block_attn_res")
         adapter = KimiLinearStateDictAdapter(spec.model, hf_assets_path=None)
-        a_log_keys = [k for k in sd if k.endswith("self_attn.A_log")]
+        a_log_keys = [k for k in sd if k.endswith("delta_attention.A_log")]
         self.assertTrue(a_log_keys)
         h = sd[a_log_keys[0]].shape[0]
-        hf_style = {
-            "model."
-            + a_log_keys[0].replace("layers.", "layers.", 1): torch.zeros(1, 1, h, 1)
-        }
+        # The file spells the module self_attn for both attention kinds; ours is
+        # delta_attention on a KDA layer. Prefixing our own key with "model."
+        # only produced a valid HF key while the two spellings coincided.
+        hf_key = "model." + a_log_keys[0].replace(
+            "delta_attention.", "self_attn.", 1
+        )
         # from_hf must flatten [1,1,H,1] -> [H]
-        out = adapter.from_hf({f"model.{a_log_keys[0]}": torch.zeros(1, 1, h, 1)})
+        out = adapter.from_hf({hf_key: torch.zeros(1, 1, h, 1)})
         self.assertEqual(tuple(out[a_log_keys[0]].shape), (h,))
 
     def test_packed_weights_rejected(self):

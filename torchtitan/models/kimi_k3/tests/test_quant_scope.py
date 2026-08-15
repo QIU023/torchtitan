@@ -82,7 +82,8 @@ class TestQuantScope(unittest.TestCase):
         self.assertEqual(offenders, [], "no nn.Linear may be in K3's MXFP4 scope")
         # and the named non-expert components are explicitly ignored
         for fqn in (
-            "layers.1.self_attn.o_proj",
+            "layers.1.attention.o_proj",
+            "layers.2.delta_attention.o_proj",
             "layers.1.ffn.shared_experts.gate_proj",
             "layers.1.ffn.latent.down",
             "layers.1.ffn._moe.router.gate",

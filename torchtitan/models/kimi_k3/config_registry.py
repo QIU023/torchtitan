@@ -265,7 +265,7 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     Wraps :func:`kimi_linear_447m_aligned_block_attn_res_n4` and adds a
     Float8LinearConverter with the ``rowwise`` recipe. Excluded from the
     swap: every Linear inside a KDA layer (structurally, via
-    KimiK3Float8Spec -- KDA and MLA share the ``self_attn`` name so
+    KimiK3Float8Spec -- the skip is structural rather than by name, so
     no FQN substring can single out KDA), the MLA low-rank down-proj
     (``kv_a_proj_with_mqa``), the AttnRes projections, and the
     vocab/router heads -- those layers have either non-16-aligned

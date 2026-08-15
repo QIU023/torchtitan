@@ -15,7 +15,7 @@ which sets ``initial_load_in_hf=True``) work.
 Key-space notes:
 
 * tt keys are the KimiLinear(AttnRes)Model module tree: ``layers.{i}.
-  self_attn.*`` (KDA and MLA share the attribute name; per-key names
+  attention.*`` / ``delta_attention.*`` (per-key names
   already match HF), ``ffn.{gate,up,down}_proj`` on dense layers,
   ``ffn._moe.{router.gate,expert_bias,experts.w*,shared_experts.w*}``
   on MoE layers, plus the AttnRes extras (``attention_res_proj`` etc. and
@@ -333,17 +333,25 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         idx_s, _, sub = rest.partition(".")
         prefix = f"model.layers.{idx_s}"
 
-        # self_attn.* is passed through because the Kimi-Linear-48B naming this
-        # adapter was written for matches ours leaf for leaf. K3 breaks that for
-        # exactly one leaf: our attn_gate_proj is the release's g_proj. Passing
-        # it through emitted our own name and the checkpoint load then failed on
-        # a key nothing writes, so the renamed leaves have to fall through to
-        # hf_key_map instead of being caught here.
-        if sub in _PASSTHROUGH_LAYER_TAGS or (
-            sub.startswith("self_attn.")
+        # The attention leaves match the Kimi-Linear-48B naming this adapter was
+        # written for, so only the module name is translated below. K3 breaks the
+        # leaf match for exactly one: our attn_gate_proj is the release's g_proj.
+        # Emitting our own name made the checkpoint load fail on a key nothing
+        # writes, so the renamed leaves fall through to hf_key_map instead of
+        # being caught here.
+        attn_attr = next(
+            (a for a in ("attention.", "delta_attention.") if sub.startswith(a)),
+            None,
+        )
+        if sub in _PASSTHROUGH_LAYER_TAGS:
+            return f"{prefix}.{sub}"
+        if (
+            attn_attr is not None
             and sub.split(".")[1] not in _ATTN_LEAVES_RENAMED_BY_HF_KEY_MAP
         ):
-            return f"{prefix}.{sub}"
+            # The 48B naming spells both attention types self_attn, so our two
+            # attributes collapse onto the single HF one.
+            return f"{prefix}.self_attn.{sub[len(attn_attr):]}"
         for proj in ("gate_proj", "up_proj", "down_proj"):
             if sub == f"ffn.{proj}.weight":
                 return f"{prefix}.mlp.{proj}.weight"
@@ -504,8 +512,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
 
         return state_dict
 
-    @staticmethod
-    def _hf_key_to_tt(key: str, value: Any) -> tuple[str | None, Any]:
+    def _hf_key_to_tt(self, key: str, value: Any) -> tuple[str | None, Any]:
         """Single-tensor HF -> tt key mapping (experts handled separately).
 
         Returns (None, value) for HF keys with no tt destination (e.g.
@@ -529,7 +536,19 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 and value.dim() == 4
             ):
                 value = value.reshape(-1)
-            return f"{tt_prefix}.{sub}", value
+            # The file spells both attention types self_attn; we hold MLA under
+            # attention and KDA under delta_attention, so the layer index picks
+            # the attribute. No leaf name can do it: o_proj exists on both.
+            # Through is_kda_layer, the SAME predicate the constructor used --
+            # kda_layers_zero_based answers a different question (it renumbers
+            # for CHECKPOINT key indices) and disagrees on layer 0.
+            attr = (
+                "delta_attention"
+                if self.kimi_config.is_kda_layer(int(idx_s))
+                else "attention"
+            )
+            leaf = sub[len("self_attn.") :]
+            return f"{tt_prefix}.{attr}.{leaf}", value
 
         # Dense MLP (both HF prefixes)
         for proj in ("gate_proj", "up_proj", "down_proj"):

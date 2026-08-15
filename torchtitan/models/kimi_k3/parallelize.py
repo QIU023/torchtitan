@@ -37,7 +37,7 @@ Supported parallelism dimensions:
 
 Why KDA is ``NoParallel`` on the tp axis
 ----------------------------------------
-The whole ``self_attn`` is registered ``NoParallel``, so every child param
+The whole ``delta_attention`` is registered ``NoParallel``, so every child param
 (q/k/v/o projections, conv1d weights, ``A_log``, ``dt_bias``) becomes a
 ``DTensor(Replicate)`` on ``tp_mesh``. Three consequences worth stating once:
 
@@ -495,7 +495,7 @@ def _patch_fla_for_dtensor() -> dict:
 
     Both classes wrap fla-core triton kernels (``causal_conv1d``,
     ``fused_norm_gated``) that take raw tensor pointers and don't
-    dispatch through DTensor. Under TP, KDA's self_attn is
+    dispatch through DTensor. Under TP, KDA's delta_attention is
     NoParallel-wrapped — child params are DTensor(Replicate) on tp_mesh
     and inputs arrive as DTensor too. Calling the triton kernel with
     DTensor crashes.
@@ -787,7 +787,7 @@ def apply_tp_kimi_k3(
     * **KDA layer (KimiDeltaAttention)**: NOT TP-wrapped. KDA's body is
       almost entirely fla-core triton kernels; sharding heads requires
       a ring-recurrence variant of ``chunk_kda`` that fla-core doesn't
-      provide. Leaving KDA self_attn unwrapped means its parameters
+      provide. Leaving KDA delta_attention unwrapped means its parameters
       remain plain Tensors (FSDP shards them on the FSDP axis,
       replicated across TP ranks — accepting compute redundancy on the
       TP axis for a clean kernel-safety story). The KDA forward
@@ -823,7 +823,7 @@ def apply_tp_kimi_k3(
     # fla-core triton kernels (causal_conv1d in ShortConvolution,
     # fused_norm_gated in FusedRMSNormGated) do not dispatch through
     # DTensor: they call triton kernels directly on the data pointers
-    # of x and weight. Under TP, KDA's self_attn is NoParallel-wrapped,
+    # of x and weight. Under TP, KDA's delta_attention is NoParallel-wrapped,
     # so ShortConvolution and FusedRMSNormGated submodules have DTensor
     # weights and receive DTensor inputs — which would crash inside
     # the triton call. We patch their forward methods to to_local both
@@ -962,17 +962,17 @@ def apply_tp_kimi_k3(
             # The pair registers exactly like the KV pair below -- the
             # compression stays replicated (its output is q_lora_rank, not a
             # head-sharded axis) and only the expansion is Colwise.
-            if getattr(layer.self_attn, "q_lora_rank", None) is None:
+            if getattr(layer.attention, "q_lora_rank", None) is None:
                 q_plan = {
-                    "self_attn.q_proj": ColwiseParallel(
+                    "attention.q_proj": ColwiseParallel(
                         use_local_output=False,
                     ),
                 }
             else:
                 q_plan = {
-                    "self_attn.q_a_proj": NoParallel(),
-                    "self_attn.q_a_layernorm": NoParallel(),
-                    "self_attn.q_b_proj": ColwiseParallel(
+                    "attention.q_a_proj": NoParallel(),
+                    "attention.q_a_layernorm": NoParallel(),
+                    "attention.q_b_proj": ColwiseParallel(
                         use_local_output=False,
                     ),
                 }
@@ -985,13 +985,13 @@ def apply_tp_kimi_k3(
                     # subsequent kv_a_layernorm + cat with k_pass_expanded
                     # all run consistently in DTensor space (mirrors DSv3's
                     # ``wkv_a`` registration).
-                    "self_attn.kv_a_proj_with_mqa": NoParallel(),
-                    "self_attn.kv_a_layernorm": NoParallel(),
-                    "self_attn.kv_b_proj": ColwiseParallel(
+                    "attention.kv_a_proj_with_mqa": NoParallel(),
+                    "attention.kv_a_layernorm": NoParallel(),
+                    "attention.kv_b_proj": ColwiseParallel(
                         use_local_output=False,
                     ),
-                    "self_attn.inner_attention": inner_attn_plan,
-                    "self_attn.o_proj": RowwiseParallel(
+                    "attention.inner_attention": inner_attn_plan,
+                    "attention.o_proj": RowwiseParallel(
                         output_layouts=Replicate(),
                         use_local_output=False,
                     ),
@@ -1006,8 +1006,8 @@ def apply_tp_kimi_k3(
             # per-head variant is [num_heads] and K3's full-rank variant is
             # [num_heads * v_head_dim], so Colwise keeps the local gate width
             # matched to the local attention output in both cases.
-            if getattr(layer.self_attn, "attn_gate_proj", None) is not None:
-                plan["self_attn.attn_gate_proj"] = ColwiseParallel(
+            if getattr(layer.attention, "attn_gate_proj", None) is not None:
+                plan["attention.attn_gate_proj"] = ColwiseParallel(
                     use_local_output=False,
                 )
 
@@ -1272,9 +1272,9 @@ def _sweep_remaining_to_replicate(
     everything with an opinion has spoken.
     """
     # Final sweep: any remaining plain Tensor parameters (typically
-    # ``A_log``, ``dt_bias`` on KDA layers' self_attn that NoParallel
+    # ``A_log``, ``dt_bias`` on KDA layers' delta_attention that NoParallel
     # didn't catch because they're bare ``nn.Parameter``s on the
-    # ``self_attn`` module rather than children) — promote them to
+    # ``delta_attention`` module rather than children) — promote them to
     # DTensor(Replicate) on tp_mesh. This is required so that under
     # FSDP+TP all params live on the same (fsdp, tp) 2D mesh, satisfying
     # the cross-param mesh consistency check inside
@@ -1575,7 +1575,7 @@ def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> N
     Recompile-limit handling: KimiDecoderLayer alternates between
     KDA and MLA attention (3:1 by layer index). Default dynamo
     recompile_limit=8 is too small — the type check on
-    ``self_attn`` triggers a recompile per attention class, and once
+    the attention module triggers a recompile per attention class, and once
     the limit is hit dynamo silently falls back to eager for
     affected frames. We bump recompile_limit + cache_size_limit so
     each layer-flavor compiles cleanly on first hit and stays cached.

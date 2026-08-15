@@ -61,6 +61,11 @@ _EXTRA_IGNORE_PATTERNS: tuple[str, ...] = (
     r".*ffn\.latent\..*",
     # MoE router ("MoE routers", ibid). Ours is router.gate.
     r".*router\.gate.*",
+    # HF calls both attention types self_attn, so the official pattern above
+    # stopped covering ours when MLA moved to "attention" and KDA to
+    # "delta_attention". The trailing dot is what keeps this off
+    # attention_res_proj, which is a graft parameter and not attention.
+    r".*attention\..*",
 )
 
 _IGNORE_RE = re.compile(

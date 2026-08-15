@@ -119,11 +119,11 @@ class TestOfficialKeyCoverage(unittest.TestCase):
         mla_key = f"language_model.model.layers.{mla_layer}.self_attn.g_proj.weight"
         self.assertEqual(
             official_to_titan(kda_key, kda_layers=_KDA_0BASED)[0],
-            f"layers.{kda_layer}.self_attn.g_proj.weight",
+            f"layers.{kda_layer}.delta_attention.g_proj.weight",
         )
         self.assertEqual(
             official_to_titan(mla_key, kda_layers=_KDA_0BASED)[0],
-            f"layers.{mla_layer}.self_attn.attn_gate_proj.weight",
+            f"layers.{mla_layer}.attention.attn_gate_proj.weight",
         )
 
     def test_router_bias_is_mapped_as_a_buffer(self):

@@ -176,13 +176,18 @@ def official_to_titan(key: str, *, kda_layers: set[int]) -> tuple[str, str]:
     if head == "self_attn":
         leaf = tail.split(".", 1)[1]
         name = leaf.rsplit(".", 1)[0] if leaf.endswith(".weight") else leaf
+        # The release calls both attention types self_attn; we hold MLA under
+        # attention and KDA under delta_attention, so the layer type picks the
+        # attribute -- the same resolution g_proj already needed.
+        mla = _mla_layer(idx, kda_layers)
+        attn_attr = "attention" if mla else "delta_attention"
         if name == "g_proj":
             # KDA keeps g_proj; MLA's gate is attn_gate_proj on our side.
-            ours = "g_proj" if not _mla_layer(idx, kda_layers) else "attn_gate_proj"
-            return f"layers.{idx}.self_attn.{ours}.weight", "param"
+            ours = "attn_gate_proj" if mla else "g_proj"
+            return f"layers.{idx}.{attn_attr}.{ours}.weight", "param"
         if name in _ATTN_SAME:
             suffix = ".weight" if leaf.endswith(".weight") else ""
-            return f"layers.{idx}.self_attn.{name}{suffix}", "param"
+            return f"layers.{idx}.{attn_attr}.{name}{suffix}", "param"
         raise UnmappedKey(key)
 
     if head == "mlp":
@@ -276,8 +281,10 @@ def titan_to_official(
     if stem in inv_layer:
         return f"{prefix}{inv_layer[stem]}.weight"
 
-    if tail.startswith("self_attn."):
-        leaf = tail[len("self_attn.") :]
+    for attn_attr in ("attention.", "delta_attention."):
+        if not tail.startswith(attn_attr):
+            continue
+        leaf = tail[len(attn_attr) :]
         name = leaf.rsplit(".", 1)[0] if leaf.endswith(".weight") else leaf
         official = "g_proj" if name in ("g_proj", "attn_gate_proj") else name
         suffix = ".weight" if leaf.endswith(".weight") else ""
