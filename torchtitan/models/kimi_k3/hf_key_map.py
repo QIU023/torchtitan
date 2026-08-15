@@ -25,7 +25,7 @@ Naming differences worth knowing, in rough order of how easy they are to miss:
   per-layer pair ``attention_res_proj`` / ``attention_res_norm`` and the final one
   ``output_res_proj``.
 * The MoE layers' module is ``block_sparse_moe``; the single dense layer's is
-  ``mlp``. Both map into our ``ffn``.
+  ``mlp``. They map onto our ``moe`` and ``feed_forward``.
 * Routed experts use ``w1`` / ``w2`` / ``w3`` while the SHARED experts use
   ``gate_proj`` / ``up_proj`` / ``down_proj`` -- the same block uses both
   conventions, so a single global rename gets one of them wrong. w1 is the gate,
@@ -193,24 +193,24 @@ def official_to_titan(key: str, *, kda_layers: set[int]) -> tuple[str, str]:
     if head == "mlp":
         # the single dense layer (first_k_dense_replace)
         leaf = tail.split(".", 1)[1]
-        return f"layers.{idx}.ffn.{leaf}", "param"
+        return f"layers.{idx}.feed_forward.{leaf}", "param"
 
     if head == "block_sparse_moe":
         leaf = tail.split(".", 1)[1]
         first = leaf.split(".", 1)[0]
         if first in _MOE_BLOCK_RENAME:
-            return f"layers.{idx}.ffn.{_MOE_BLOCK_RENAME[first]}.weight", "param"
+            return f"layers.{idx}.moe.{_MOE_BLOCK_RENAME[first]}.weight", "param"
         if first == "shared_experts":
-            return f"layers.{idx}.ffn.{leaf}", "param"
+            return f"layers.{idx}.moe.{leaf}", "param"
         if leaf == "gate.weight":
-            return f"layers.{idx}.ffn._moe.router.gate.weight", "param"
+            return f"layers.{idx}.moe._moe.router.gate.weight", "param"
         if leaf == "gate.e_score_correction_bias":
-            return f"layers.{idx}.ffn._moe.expert_bias_E", "buffer"
+            return f"layers.{idx}.moe._moe.expert_bias_E", "buffer"
         em = re.match(r"^experts\.(\d+)\.(w[123])\.(.+)$", leaf)
         if em:
             expert, w, suffix = int(em.group(1)), em.group(2), em.group(3)
             base = (
-                f"layers.{idx}.ffn._moe.routed_experts.inner_experts."
+                f"layers.{idx}.moe._moe.routed_experts.inner_experts."
                 f"{EXPERT_W_TO_SUFFIXED[w]}"
             )
             if suffix == "weight_packed":
@@ -290,8 +290,12 @@ def titan_to_official(
         suffix = ".weight" if leaf.endswith(".weight") else ""
         return f"{prefix}self_attn.{official}{suffix}"
 
-    if tail.startswith("ffn."):
-        leaf = tail[len("ffn.") :]
+    if tail.startswith("feed_forward."):
+        # the dense layer: HF calls it mlp
+        return f"{prefix}mlp.{tail[len('feed_forward.'):]}"
+
+    if tail.startswith("moe."):
+        leaf = tail[len("moe.") :]
         base = leaf.rsplit(".weight", 1)[0]
         if base in inv_moe:
             return f"{prefix}block_sparse_moe.{inv_moe[base]}.weight"

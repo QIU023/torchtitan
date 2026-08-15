@@ -16,8 +16,8 @@ Key-space notes:
 
 * tt keys are the KimiLinear(AttnRes)Model module tree: ``layers.{i}.
   attention.*`` / ``delta_attention.*`` (per-key names
-  already match HF), ``ffn.{gate,up,down}_proj`` on dense layers,
-  ``ffn._moe.{router.gate,expert_bias,experts.w*,shared_experts.w*}``
+  already match HF), ``feed_forward.{gate,up,down}_proj`` on dense layers,
+  ``moe._moe.{router.gate,expert_bias,experts.w*,shared_experts.w*}``
   on MoE layers, plus the AttnRes extras (``attention_res_proj`` etc. and
   the model-level ``final_attn_res_*``).
 * HF checkpoints appear with two MoE prefixes in the wild: the official
@@ -41,14 +41,14 @@ The hand-written table goes FIRST, because it carries VALUE transforms (the 4-D
 ``A_log`` reshape) that ``hf_key_map`` does not; delegating ahead of it dropped
 those silently, producing shape drift rather than a missing key. ``hf_key_map`` is
 the fallback for everything the table does not know -- the K3 layouts: latent MoE
-(``ffn.latent.*``), the AttnRes tail, gated MLA.
+(``moe.latent.*``), the AttnRes tail, gated MLA.
 
 Two keys are exceptions the table DECLINES on purpose, because its answer would
 belong to a different layout:
 
 * **shared experts** are layout-dependent. The table only knows Kimi Linear's
-  ``ffn._moe.shared_experts.w1``, while K3's latent path uses
-  ``ffn.shared_experts.gate_proj``.
+  ``moe._moe.shared_experts.w1``, while K3's latent path uses
+  ``moe.shared_experts.gate_proj``.
 * **``g_proj``** is one release name for two different gates -- KDA's own
   ``g_proj`` and gated MLA's output gate, which is ``attn_gate_proj`` here -- so
   resolving it needs the layer type, which only ``hf_key_map`` has. The table
@@ -255,8 +255,8 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 # keys). Trained graft/adapter params ship as the
                 # fork-native trainable_state_dict payload instead.
                 continue
-            if ".ffn._moe.routed_experts.inner_experts." in key:
-                # layers.{i}.ffn._moe.routed_experts.inner_experts.w1_EFD
+            if ".moe._moe.routed_experts.inner_experts." in key:
+                # layers.{i}.moe._moe.routed_experts.inner_experts.w1_EFD
                 # -> per-expert HF linears
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 layer_num = re.search(r"\d+", key).group(0)
@@ -353,14 +353,14 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             # attributes collapse onto the single HF one.
             return f"{prefix}.self_attn.{sub[len(attn_attr):]}"
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            if sub == f"ffn.{proj}.weight":
+            if sub == f"feed_forward.{proj}.weight":
                 return f"{prefix}.mlp.{proj}.weight"
-        if sub == "ffn._moe.router.gate.weight":
+        if sub == "moe._moe.router.gate.weight":
             return f"{prefix}.block_sparse_moe.gate.weight"
-        if sub == "ffn._moe.expert_bias_E":
+        if sub == "moe._moe.expert_bias_E":
             return f"{prefix}.block_sparse_moe.gate.e_score_correction_bias"
-        if sub.startswith("ffn._moe.shared_experts."):
-            tail = sub[len("ffn._moe.shared_experts.") :]
+        if sub.startswith("moe._moe.shared_experts."):
+            tail = sub[len("moe._moe.shared_experts.") :]
             w_tag, _, suff = tail.partition(".")
             return f"{prefix}.block_sparse_moe.shared_experts.{_W_TO_HF[w_tag]}.{suff}"
         # K3's layout (latent MoE projections, the released AttnRes and gate
@@ -435,7 +435,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
                 if w_tag not in ("w1", "w2", "w3"):
                     raise ValueError(f"Unknown expert projection in {key!r}")
                 titan_abstract_key = (
-                    "layers.{}.ffn._moe.routed_experts.inner_experts."
+                    "layers.{}.moe._moe.routed_experts.inner_experts."
                     + _EXPERT_W_SUFFIXED[w_tag]
                 )
                 new_key = mm_prefix + titan_abstract_key.format(layer_num)
@@ -553,7 +553,7 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         # Dense MLP (both HF prefixes)
         for proj in ("gate_proj", "up_proj", "down_proj"):
             if sub == f"mlp.{proj}.weight":
-                return f"{tt_prefix}.ffn.{proj}.weight", value
+                return f"{tt_prefix}.feed_forward.{proj}.weight", value
 
         # Router / bias (both HF prefixes)
         router_m = re.match(
@@ -563,8 +563,8 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
         if router_m is not None:
             tail = router_m.group(1)
             if tail == "weight":
-                return f"{tt_prefix}.ffn._moe.router.gate.weight", value
-            return f"{tt_prefix}.ffn._moe.expert_bias_E", value
+                return f"{tt_prefix}.moe._moe.router.gate.weight", value
+            return f"{tt_prefix}.moe._moe.expert_bias_E", value
 
         # Shared experts (both HF prefixes, both naming styles)
         shared_m = re.match(
@@ -576,11 +576,11 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             if w_tag not in ("w1", "w2", "w3"):
                 raise ValueError(f"Unknown shared-expert projection in {key!r}")
             # Kimi Linear's layout. K3's latent MoE names the same tensor
-            # ffn.shared_experts.gate_proj, so from_hf asks hf_key_map FIRST for these
+            # moe.shared_experts.gate_proj, so from_hf asks hf_key_map FIRST for these
             # and uses this answer only when hf_key_map declines -- see the
             # shared-expert branch there. Returning it unconditionally wrote a key that
             # exists in another layout, which no fallback could detect.
-            return f"{tt_prefix}.ffn._moe.shared_experts.{w_tag}.{suff}", value
+            return f"{tt_prefix}.moe._moe.shared_experts.{w_tag}.{suff}", value
 
         # Unknown per-layer key: skip with a debug note rather than failing
         # (multimodal exports carry vision/projector keys the LM ignores).

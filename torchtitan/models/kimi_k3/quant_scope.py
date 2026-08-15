@@ -55,10 +55,10 @@ OFFICIAL_IGNORE_PATTERNS: tuple[str, ...] = (
 # official patterns alone would under-match. Both additions are non-expert
 # components the report explicitly lists as staying in higher precision.
 _EXTRA_IGNORE_PATTERNS: tuple[str, ...] = (
-    # HF calls the dense/shared FFN "mlp"; we call it "ffn".
-    r".*ffn\.(gate|up|down)_proj.*",
+    # HF calls the dense/shared FFN "mlp"; ours is feed_forward.
+    r".*feed_forward\.(gate|up|down)_proj.*",
     # latent MoE projections ("latent MoE projections" in report sec 4.1.4)
-    r".*ffn\.latent\..*",
+    r".*moe\.latent\..*",
     # MoE router ("MoE routers", ibid). Ours is router.gate.
     r".*router\.gate.*",
     # HF calls both attention types self_attn, so the official pattern above

@@ -103,16 +103,16 @@ class TestSyntheticOfficialCheckpointLoad(unittest.TestCase):
 
     @staticmethod
     def _first_moe_layer(model) -> str:
-        # layer 0 is dense (first_k_dense_replace), so its ffn has no _moe
+        # layer 0 is dense (first_k_dense_replace), so it has no moe at all
         for name, layer in model.layers.items():
-            if hasattr(layer.ffn, "_moe"):
+            if getattr(layer, "moe", None) is not None:
                 return name
         raise AssertionError("k3mini must have a MoE layer")
 
     def test_official_keys_drive_a_complete_expert_load(self):
         model, cfg = self._model()
         layer_idx = int(self._first_moe_layer(model))
-        experts = model.layers[str(layer_idx)].ffn._moe.routed_experts.inner_experts
+        experts = model.layers[str(layer_idx)].moe._moe.routed_experts.inner_experts
 
         # Build the synthetic checkpoint slice with OFFICIAL key names.
         torch.manual_seed(0)
@@ -162,7 +162,7 @@ class TestSyntheticOfficialCheckpointLoad(unittest.TestCase):
         mode that cost this repo every recorded MoE loss."""
         model, cfg = self._model()
         layer_idx = int(self._first_moe_layer(model))
-        experts = model.layers[str(layer_idx)].ffn._moe.routed_experts.inner_experts
+        experts = model.layers[str(layer_idx)].moe._moe.routed_experts.inner_experts
         shape = experts._parameters["w1_EFD"].shape
         tensors = {}
         for e in range(cfg.num_experts - 1):  # deliberately one short
@@ -175,7 +175,7 @@ class TestSyntheticOfficialCheckpointLoad(unittest.TestCase):
     def test_wrong_shape_is_rejected(self):
         model, cfg = self._model()
         layer_idx = int(self._first_moe_layer(model))
-        experts = model.layers[str(layer_idx)].ffn._moe.routed_experts.inner_experts
+        experts = model.layers[str(layer_idx)].moe._moe.routed_experts.inner_experts
         tensors = {}
         for name in ("w1_EFD", "w2_EDF", "w3_EFD"):
             for e in range(cfg.num_experts):

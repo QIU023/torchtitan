@@ -289,11 +289,11 @@ class TestMergeMaterializesShardedAdapters(unittest.TestCase):
 class TestMergeUnderModuleWrappers(unittest.TestCase):
     """Activation checkpointing renames the module path but not the state dict.
 
-    ``named_modules()`` reports ``...._checkpoint_wrapped_module.ffn.gate_proj`` while
+    ``named_modules()`` reports ``...._checkpoint_wrapped_module.feed_forward.gate_proj`` while
     ``state_dict()`` strips the segment back out. Composing merged keys from the module
     path wrote a name nothing recognises and left the adapter keys in place, since the
     pops missed as well. It surfaced from a GRPO weight sync as
-    ``Unmapped tt key: 'layers.0._checkpoint_wrapped_module.ffn.gate_proj.weight'``.
+    ``Unmapped tt key: 'layers.0._checkpoint_wrapped_module.feed_forward.gate_proj.weight'``.
     """
 
     def _wrapped_lora_model(self):
@@ -337,7 +337,7 @@ class TestMergeUnderModuleWrappers(unittest.TestCase):
         from torchtitan.models.kimi_k3.lora import _state_dict_prefix
 
         with self.assertRaises(KeyError):
-            _state_dict_prefix("layers.0._made_up_wrapper.ffn.gate_proj", {})
+            _state_dict_prefix("layers.0._made_up_wrapper.feed_forward.gate_proj", {})
 
 
 if __name__ == "__main__":

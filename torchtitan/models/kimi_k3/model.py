@@ -1756,6 +1756,18 @@ class KimiMoE(nn.Module):
                 situ_linear_beta=config.activation_situ_linear_beta,
             )
 
+    @property
+    def routed_experts(self):
+        """The composed core MoE's routed experts.
+
+        ``distributed.fsdp.apply_fsdp_to_decoder`` reaches the grouped-GEMM child
+        as ``block.moe.routed_experts.inner_experts``, which is upstream's flat
+        layout. We compose core's MoE instead of re-implementing it, so the path
+        needs one forward. A property is not in ``_modules``, so no parameter FQN
+        changes and the object it returns is the one core already sharded.
+        """
+        return self._moe.routed_experts
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.latent_size is None:
             out = self._moe(x)
@@ -1801,19 +1813,16 @@ class UpstreamFSDPNames:
     already refers to. Renaming the submodules instead would have invalidated every DCP
     checkpoint written so far.
 
-    ``moe`` deliberately raises for a dense block rather than returning None: the helper
-    guards every use with ``getattr(block, "moe_enabled", False)`` and then asserts
-    ``hasattr(block, "moe")``, and ``hasattr`` on a raising property is False, which is the
-    answer a dense block should give.
+    ``moe`` is no longer among them: the MoE layer's own attribute is now called that,
+    matching upstream, and a class-level property would SHADOW the module -- normal
+    attribute lookup finds the property, and ``nn.Module.__getattr__`` only runs when
+    that fails. The helper reaches the experts through ``KimiMoE.routed_experts``
+    instead, which forwards into the composed core MoE.
     """
 
     @property
     def moe_enabled(self) -> bool:
         return bool(getattr(self, "is_moe", False))
-
-    @property
-    def moe(self):
-        return self.ffn._moe
 
 
 class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
@@ -1853,15 +1862,18 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
         # FFN: dense MLP for the first `first_k_dense_replace` layers, MoE otherwise.
         # Kimi's reference uses `layer_idx >= first_k_dense_replace` AND
         # `layer_idx % moe_layer_freq == 0`; we follow that.
+        # Two attributes with one of them None, the upstream layout.
+        self.moe: nn.Module | None = None
+        self.feed_forward: nn.Module | None = None
         if (
             config.is_moe
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         ):
-            self.ffn: nn.Module = KimiMoE(config)
+            self.moe = KimiMoE(config)
             self.is_moe = True
         else:
-            self.ffn = KimiMLP(
+            self.feed_forward = KimiMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -1889,7 +1901,11 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
         # FFN block
         residual = x
         x = self.post_attention_layernorm(x)
-        x = self.ffn(x)
+        if self.moe is not None:
+            x = self.moe(x)
+        else:
+            assert self.feed_forward is not None
+            x = self.feed_forward(x)
         x = residual + x
         return x
 

@@ -133,7 +133,8 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         self.layer_idx = layer_idx
         self.attention = base.attention
         self.delta_attention = base.delta_attention
-        self.ffn = base.ffn
+        self.moe = base.moe
+        self.feed_forward = base.feed_forward
         self.input_layernorm = base.input_layernorm
         self.post_attention_layernorm = base.post_attention_layernorm
         self.is_linear_attn = base.is_linear_attn
@@ -178,6 +179,17 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
             return self.attention(h)
         assert self.delta_attention is not None
         return self.delta_attention(h)
+
+    def _feed_forward(self, h: torch.Tensor) -> torch.Tensor:
+        """Whichever of the two FFN attributes this layer has.
+
+        MoE layers hold ``moe``, the dense ones ``feed_forward``, and the
+        other is None -- upstream's layout.
+        """
+        if self.moe is not None:
+            return self.moe(h)
+        assert self.feed_forward is not None
+        return self.feed_forward(h)
 
     def forward(
         self,
@@ -236,7 +248,7 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
             )
 
         # FFN sub-layer (MoE or dense SwiGLU).
-        ffn_out = self.ffn(self.post_attention_layernorm(h))
+        ffn_out = self._feed_forward(self.post_attention_layernorm(h))
         partial_block = partial_block + ffn_out
         if self.attn_res_gated:
             plain_stream = plain_stream + ffn_out
@@ -303,7 +315,7 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         h_BLD = block_attn_res_tensor(
             prefix_sum_BLD, block_residual_TND, self.ffn_res_proj, self.ffn_res_norm
         )
-        ffn_out = self.ffn(self.post_attention_layernorm(h_BLD))
+        ffn_out = self._feed_forward(self.post_attention_layernorm(h_BLD))
         return prefix_sum_BLD + ffn_out, block_residual_TND
 
 

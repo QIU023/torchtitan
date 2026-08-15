@@ -129,7 +129,7 @@ class TestOfficialKeyCoverage(unittest.TestCase):
     def test_router_bias_is_mapped_as_a_buffer(self):
         k = "language_model.model.layers.1.block_sparse_moe.gate.e_score_correction_bias"
         ours, kind = official_to_titan(k, kda_layers=_KDA_0BASED)
-        self.assertEqual(ours, "layers.1.ffn._moe.expert_bias_E")
+        self.assertEqual(ours, "layers.1.moe._moe.expert_bias_E")
         self.assertEqual(kind, "buffer")
 
     def test_routed_and_shared_experts_use_different_conventions(self):
@@ -144,14 +144,14 @@ class TestOfficialKeyCoverage(unittest.TestCase):
             "language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight",
             kda_layers=_KDA_0BASED,
         )
-        self.assertEqual(shared, "layers.1.ffn.shared_experts.gate_proj.weight")
+        self.assertEqual(shared, "layers.1.moe.shared_experts.gate_proj.weight")
 
     def test_dense_layer_and_moe_layers_both_land_on_ffn(self):
         dense, _ = official_to_titan(
             "language_model.model.layers.0.mlp.gate_proj.weight",
             kda_layers=_KDA_0BASED,
         )
-        self.assertEqual(dense, "layers.0.ffn.gate_proj.weight")
+        self.assertEqual(dense, "layers.0.feed_forward.gate_proj.weight")
 
     def test_vision_keys_map_onto_the_tower(self):
         for k in (
@@ -186,7 +186,7 @@ class TestOfficialKeyCoverage(unittest.TestCase):
 
     def test_expert_round_trip_needs_the_expert_index(self):
         ours = (
-            "layers.1.ffn._moe.routed_experts.inner_experts.w2_EDF"
+            "layers.1.moe._moe.routed_experts.inner_experts.w2_EDF"
         )
         with self.assertRaisesRegex(UnmappedKey, "expert_idx"):
             titan_to_official(ours, kda_layers=_KDA_0BASED)

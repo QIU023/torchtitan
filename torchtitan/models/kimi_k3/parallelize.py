@@ -72,8 +72,8 @@ Four facts, all load-bearing, kept here rather than inline at the call site:
    ``KimiMLP``'s gate/up/down projections dispatch normally on DTensor because
    their ops are standard ``F.linear``; ``GroupedExperts`` additionally
    ``to_local``s its DTensor params before the grouped_mm kernel.
-3. **Why NOT the ``ffn`` container.** The MoE forward strips x with ``to_local``
-   AFTER the parent's ``prepare_input``. Wrapping ``ffn`` or ``_moe`` would make
+3. **Why NOT the ``moe`` container.** The MoE forward strips x with ``to_local``
+   AFTER the parent's ``prepare_input``. Wrapping ``moe`` or ``moe._moe`` would make
    the input a DTensor at MoE entry, ``to_local`` would make it plain, and the
    gate would then receive plain x while holding DTensor weights -- which errors.
    Wrapping the gate ITSELF keeps the boundary right.
@@ -633,7 +633,7 @@ def _bind_fla_dtensor_shims(model: nn.Module) -> int:
 
 
 def _model_has_moe(model: nn.Module) -> bool:
-    """True if any layer carries a KimiMoE ffn (module-internal MoE
+    """True if any layer carries a KimiMoE (module-internal MoE
     parallelization applies)."""
     return any(bool(getattr(layer, "is_moe", False)) for layer in model.layers.values())
 
@@ -797,7 +797,7 @@ def apply_tp_kimi_k3(
     * **dense MLP**: gate_proj / up_proj ColwiseParallel; down_proj
       RowwiseParallel(output_layouts=Replicate(), use_local_output=False).
 
-    * **MoE FFN**: NoParallel on the ``ffn`` container (EP handles the
+    * **MoE FFN**: NoParallel on the ``moe`` container (EP handles the
       real parallelization on a separate axis).
 
     * **Per-layer norms** (``input_layernorm``, ``post_attention_layernorm``):
@@ -1013,13 +1013,13 @@ def apply_tp_kimi_k3(
 
         # FFN path.
         if not is_moe:
-            ffn = getattr(layer, "ffn", None)
+            ffn = getattr(layer, "feed_forward", None)
             if ffn is None:
-                raise ValueError(f"layer {layer.layer_idx}: missing dense ffn")
+                raise ValueError(f"layer {layer.layer_idx}: missing dense feed_forward")
             for name in ("gate_proj", "up_proj", "down_proj"):
                 if not hasattr(ffn, name):
                     raise ValueError(
-                        f"layer {layer.layer_idx} dense ffn missing '{name}'"
+                        f"layer {layer.layer_idx} dense feed_forward missing '{name}'"
                     )
             # The dense FFN takes its declarations. Colwise/Rowwise here and
             # Shard(0)/Shard(1) there are the same split written twice, and once
@@ -1027,10 +1027,10 @@ def apply_tp_kimi_k3(
             # "already a DTensor with placements (Replicate(),), but its
             # sharding_config expects (Shard(dim=0),)".
         else:
-            # MoE leaves get NoParallel, not the ffn container (module docstring).
-            ffn = getattr(layer, "ffn", None)
+            # MoE leaves get NoParallel, not the moe container (module docstring).
+            ffn = getattr(layer, "moe", None)
             if ffn is None or not hasattr(ffn, "_moe"):
-                raise ValueError(f"MoE layer {layer.layer_idx}: missing ffn._moe")
+                raise ValueError(f"MoE layer {layer.layer_idx}: missing moe._moe")
             if moe_module_parallel:
                 # The post-merge module-internal MoE path owns ALL MoE
                 # parallelization (sharding configs declared at config
@@ -1044,7 +1044,7 @@ def apply_tp_kimi_k3(
                 # router.gate: NoParallel boundary -- gate(plain x) becomes
                 # gate(DTensor x), gate.weight is DTensor, gate forward
                 # produces DTensor, exits as plain via local_output.
-                plan["ffn._moe.router.gate"] = no_par_local
+                plan["moe._moe.router.gate"] = no_par_local
             # Stable LatentMoE: the shared down/up pair and the latent
             # RMSNorm are full-width<->latent maps with no head axis, so they
             # are Replicate-on-tp like the router gate. Registering them keeps
@@ -1056,9 +1056,9 @@ def apply_tp_kimi_k3(
             # in_src_shardings requires it). The NORM keeps its plan entry: it is
             # on the MoE's output side where the value arrives plain, so a
             # declared weight would meet a plain input inside _fused_rms_norm.
-            latent = getattr(layer.ffn, "latent", None)
+            latent = getattr(layer.moe, "latent", None)
             if latent is not None and getattr(latent, "norm", None) is not None:
-                plan["ffn.latent.norm"] = no_par_local
+                plan["moe.latent.norm"] = no_par_local
             # The shared experts (which under the latent path hang off KimiMoE
             # itself, not off ffn._moe) take their declarations: Shard(0) on the
             # two up-projections, Shard(1) on the down-projection -- the ordinary
@@ -1095,7 +1095,7 @@ def apply_tp_kimi_k3(
                 # torchtitan/models/common/feed_forward.py.
                 for n in ("w1", "w2", "w3"):
                     if hasattr(shared, n):
-                        plan[f"ffn._moe.shared_experts.{n}"] = no_par_local
+                        plan[f"moe._moe.shared_experts.{n}"] = no_par_local
 
         # AttnRes per-layer modules: each layer has TWO pseudo-queries
         # + TWO RMSNorms, all NoParallel.
@@ -1202,7 +1202,7 @@ def apply_tp_kimi_k3(
         # This mirrors llama4's design: TP plan touches router.gate +
         # shared_experts only; routed experts are EP/ETP territory.
         if is_moe and not skip_expert_params:
-            ffn = layer.ffn
+            ffn = layer.moe
             # Post-merge common MoE tree: routed experts live at
             # _moe.routed_experts.inner_experts with shape-suffixed
             # params (w1_EFD / w2_EDF / w3_EFD).
@@ -1291,7 +1291,7 @@ def _sweep_remaining_to_replicate(
         for layer in model.layers.values():
             if not bool(getattr(layer, "is_moe", False)):
                 continue
-            ffn = getattr(layer, "ffn", None)
+            ffn = getattr(layer, "moe", None)
             if ffn is None or getattr(ffn, "_moe", None) is None:
                 continue
             # Exclude the ENTIRE _moe subtree: the module-internal MoE

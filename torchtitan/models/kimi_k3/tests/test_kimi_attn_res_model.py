@@ -76,12 +76,18 @@ class TestKimiAttnResDecoderLayer(unittest.TestCase):
             "ffn_res_proj",
             "attention_res_norm",
             "ffn_res_norm",
-            "attention",
-            "ffn",
             "input_layernorm",
             "post_attention_layernorm",
         ):
             self.assertIn(expected, names)
+        # Attention and FFN are each a pair with one member None (upstream's
+        # layout), and which member depends on the layer type -- named_children
+        # reports only the one that exists. Asserting the pair rather than a
+        # spelling keeps this test from depending on the fixture's layer type.
+        for pair in (("attention", "delta_attention"), ("moe", "feed_forward")):
+            self.assertEqual(
+                len(names & set(pair)), 1, f"exactly one of {pair} must exist"
+            )
 
     def test_forward_threads_blocks_and_partial(self):
         cfg = _dense_mla_only_config()

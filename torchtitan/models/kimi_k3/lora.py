@@ -890,12 +890,12 @@ def _state_dict_prefix(mod_name: str, sd: dict) -> str:
     """The state-dict prefix for a module reached at ``mod_name``.
 
     These two namings differ once anything wraps the module: activation
-    checkpointing turns ``layers.0.ffn.gate_proj`` into
-    ``layers.0._checkpoint_wrapped_module.ffn.gate_proj`` in ``named_modules()``,
+    checkpointing turns ``layers.0.feed_forward.gate_proj`` into
+    ``layers.0._checkpoint_wrapped_module.feed_forward.gate_proj`` in ``named_modules()``,
     while ``state_dict()`` strips it back out. Composing keys from the module path
     then writes a name nothing else recognises AND leaves the adapter keys in place,
     because the pops miss too. Observed as
-    ``ValueError: Unmapped tt key: 'layers.0._checkpoint_wrapped_module.ffn.gate_proj.weight'``
+    ``ValueError: Unmapped tt key: 'layers.0._checkpoint_wrapped_module.feed_forward.gate_proj.weight'``
     from a GRPO weight sync -- the merge had silently produced both a bogus merged
     key and the original LoRA triple.
 

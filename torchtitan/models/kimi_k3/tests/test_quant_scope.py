@@ -84,18 +84,18 @@ class TestQuantScope(unittest.TestCase):
         for fqn in (
             "layers.1.attention.o_proj",
             "layers.2.delta_attention.o_proj",
-            "layers.1.ffn.shared_experts.gate_proj",
-            "layers.1.ffn.latent.down",
-            "layers.1.ffn._moe.router.gate",
+            "layers.1.moe.shared_experts.gate_proj",
+            "layers.1.moe.latent.down",
+            "layers.1.moe._moe.router.gate",
             "lm_head",
         ):
             self.assertTrue(is_ignored(fqn), f"{fqn} should be ignored")
 
     def test_dense_ffn_ignored_under_both_naming_conventions(self):
-        # HF calls it mlp; we call it ffn. Both must be ignored.
+        # HF calls it mlp; ours is feed_forward. Both must be ignored.
         self.assertTrue(is_ignored("model.layers.0.mlp.gate_proj"))
-        self.assertTrue(is_ignored("layers.0.ffn.gate_proj"))
-        self.assertTrue(is_ignored("layers.0.ffn.down_proj"))
+        self.assertTrue(is_ignored("layers.0.feed_forward.gate_proj"))
+        self.assertTrue(is_ignored("layers.0.feed_forward.down_proj"))
 
     def test_unclassified_modules_default_to_high_precision(self):
         # positive predicate: something we have never seen must NOT be
@@ -107,7 +107,7 @@ class TestQuantScope(unittest.TestCase):
         n = apply_mxfp4_qat(model)
         self.assertEqual(n, len(quantizable_modules(model)))
         self.assertEqual(apply_mxfp4_qat(model), 0)
-        experts = model.layers["1"].ffn._moe.routed_experts.inner_experts
+        experts = model.layers["1"].moe._moe.routed_experts.inner_experts
         self.assertTrue(type(experts).__name__.startswith("MXFP4QAT"))
         # masters stay registered under their original names, so the
         # state-dict adapter and expert sharding are unaffected

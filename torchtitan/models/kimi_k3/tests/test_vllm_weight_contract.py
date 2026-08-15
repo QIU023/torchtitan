@@ -146,7 +146,7 @@ class TestVLLMWeightContract(unittest.TestCase):
             "attn_gate_proj",
             "output_res_proj",
             "output_res_norm",
-            "ffn",
+            "moe",
         }
         for k in self.exported:
             parts = set(k.split("."))
