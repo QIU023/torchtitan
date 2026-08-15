@@ -72,10 +72,10 @@ class TestKimiAttnResDecoderLayer(unittest.TestCase):
         layer = KimiAttnResDecoderLayer(cfg, layer_idx=0)
         names = {n for n, _ in layer.named_children()}
         for expected in (
-            "attn_res_proj",
-            "mlp_res_proj",
-            "attn_res_norm",
-            "mlp_res_norm",
+            "attention_res_proj",
+            "ffn_res_proj",
+            "attention_res_norm",
+            "ffn_res_norm",
             "self_attn",
             "ffn",
             "input_layernorm",
@@ -114,9 +114,9 @@ class TestKimiK3AttnResModel(unittest.TestCase):
         # Pseudo-queries init to zero per paper.
         model.init_weights()
         for layer in model.layers.values():
-            self.assertTrue(torch.all(layer.attn_res_proj.weight == 0))
-            self.assertTrue(torch.all(layer.mlp_res_proj.weight == 0))
-        self.assertTrue(torch.all(model.final_attn_res_proj.weight == 0))
+            self.assertTrue(torch.all(layer.attention_res_proj.weight == 0))
+            self.assertTrue(torch.all(layer.ffn_res_proj.weight == 0))
+        self.assertTrue(torch.all(model.output_res_proj.weight == 0))
 
     def test_instantiate_block_attnres(self):
         """Block AttnRes N=2: 4 layers, 2 blocks, 2 layers per block."""

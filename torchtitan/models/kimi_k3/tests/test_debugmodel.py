@@ -52,7 +52,7 @@ class TestKimiDebugModel(unittest.TestCase):
         logits.sum().backward()
         # AttnRes projections get gradients (zero-init but on the path).
         for name, p in model.named_parameters():
-            if name.endswith("attn_res_proj.weight"):
+            if name.endswith("attention_res_proj.weight"):
                 self.assertIsNotNone(p.grad, f"no grad at {name}")
                 break
 

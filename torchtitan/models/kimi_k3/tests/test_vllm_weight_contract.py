@@ -144,8 +144,8 @@ class TestVLLMWeightContract(unittest.TestCase):
             "w3_EFD",
             "latent",
             "attn_gate_proj",
-            "final_attn_res_proj",
-            "final_attn_res_norm",
+            "output_res_proj",
+            "output_res_norm",
             "ffn",
         }
         for k in self.exported:

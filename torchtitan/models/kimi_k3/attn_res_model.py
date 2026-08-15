@@ -109,10 +109,10 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
     and returns the updated ``(blocks, partial_block)``.
 
     Four extra AttnRes params (per layer):
-      * ``attn_res_proj`` — pseudo-query for pre-attention aggregation
-      * ``attn_res_norm`` — RMSNorm for keys in that aggregation
-      * ``mlp_res_proj``  — pseudo-query for pre-FFN aggregation
-      * ``mlp_res_norm``  — RMSNorm for keys in that aggregation
+      * ``attention_res_proj`` — pseudo-query for pre-attention aggregation
+      * ``attention_res_norm`` — RMSNorm for keys in that aggregation
+      * ``ffn_res_proj``  — pseudo-query for pre-FFN aggregation
+      * ``ffn_res_norm``  — RMSNorm for keys in that aggregation
 
     ``_*_proj`` are Linear(d, 1, bias=False). Their weight vector IS
     the per-layer pseudo-query ``w_l``. :meth:`init_weights` zero-inits
@@ -151,10 +151,10 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         # AttnRes pseudo-query in this model was constructed that way, so the
         # comment above described an intent the code never carried out.
         proj_cfg = AttnResProjection.Config(dim=d, sharding_config=_tp_replicate())
-        self.attn_res_proj = proj_cfg.build()
-        self.mlp_res_proj = proj_cfg.build()
-        self.attn_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.mlp_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.attention_res_proj = proj_cfg.build()
+        self.ffn_res_proj = proj_cfg.build()
+        self.attention_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
+        self.ffn_res_norm = RMSNorm(d, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
         # Graft gate: per-read scalar alpha, zero-init, so at step 0 the
         # model is exactly the plain backbone (adapter-correctness anchor).
         # h = partial + alpha * (mix - partial): alpha=0 makes the read the
@@ -164,8 +164,8 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         # zero-init read, matching all historical numerics evidence.
         self.attn_res_gated = gated
         if gated:
-            self.attn_res_alpha = nn.Parameter(torch.zeros(1))
-            self.mlp_res_alpha = nn.Parameter(torch.zeros(1))
+            self.attention_res_alpha = nn.Parameter(torch.zeros(1))
+            self.ffn_res_alpha = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -194,14 +194,14 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
     ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor | None]:
         # Pre-attention aggregation (paper Figure 2, pre-attention step).
         h = block_attn_res(
-            blocks, partial_block, self.attn_res_proj, self.attn_res_norm
+            blocks, partial_block, self.attention_res_proj, self.attention_res_norm
         )
         if self.attn_res_gated:
             # plain_stream is accumulated SEQUENTIALLY (same op order as
             # the plain backbone) so alpha=0 is bit-identical to it;
             # reconstructing sum(blocks)+partial would reorder additions.
             assert plain_stream is not None
-            h = plain_stream + _scalar_local(self.attn_res_alpha, plain_stream) * (
+            h = plain_stream + _scalar_local(self.attention_res_alpha, plain_stream) * (
                 h - plain_stream
             )
 
@@ -217,9 +217,9 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
             plain_stream = plain_stream + attn_out
 
         # Pre-FFN aggregation (paper Figure 2, pre-FFN step).
-        h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm)
+        h = block_attn_res(blocks, partial_block, self.ffn_res_proj, self.ffn_res_norm)
         if self.attn_res_gated:
-            h = plain_stream + _scalar_local(self.mlp_res_alpha, plain_stream) * (
+            h = plain_stream + _scalar_local(self.ffn_res_alpha, plain_stream) * (
                 h - plain_stream
             )
 
@@ -273,8 +273,8 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
 
         if block_residual_TND.shape[1] > 0:
             x_BLD = block_attn_res_tensor(
-                prefix_sum_BLD, block_residual_TND, self.attn_res_proj,
-                self.attn_res_norm,
+                prefix_sum_BLD, block_residual_TND, self.attention_res_proj,
+                self.attention_res_norm,
             )
 
         if is_block_start:
@@ -289,7 +289,7 @@ class KimiAttnResDecoderLayer(nn.Module, UpstreamFSDPNames):
         )
 
         h_BLD = block_attn_res_tensor(
-            prefix_sum_BLD, block_residual_TND, self.mlp_res_proj, self.mlp_res_norm
+            prefix_sum_BLD, block_residual_TND, self.ffn_res_proj, self.ffn_res_norm
         )
         ffn_out = self.ffn(self.post_attention_layernorm(h_BLD))
         return prefix_sum_BLD + ffn_out, block_residual_TND
@@ -376,7 +376,7 @@ class KimiK3AttnResModel(KimiK3Model):
 
       * per-layer :class:`KimiAttnResDecoderLayer` in place of
         :class:`KimiDecoderLayer`
-      * one final aggregation (``final_attn_res_proj`` + norm) before
+      * one final aggregation (``output_res_proj`` + norm) before
         ``norm`` + ``lm_head`` on the last stage
       * ``layers_per_block`` attribute so block-start detection is
         layout-table-compatible with the cross-stage cache adapter.
@@ -493,16 +493,16 @@ class KimiK3AttnResModel(KimiK3Model):
         # assigned inside Config.build, so constructing the class directly drops
         # the declaration silently -- the module then looks declared in the source
         # and is invisible to the declarative driver.
-        self.final_attn_res_proj = AttnResProjection.Config(
+        self.output_res_proj = AttnResProjection.Config(
             dim=config.hidden_size, sharding_config=_tp_replicate()
         ).build()
-        self.final_attn_res_norm = RMSNorm(
+        self.output_res_norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             sharding_config=_tp_replicate(),
         )
         if gated:
-            self.final_attn_res_alpha = nn.Parameter(torch.zeros(1))
+            self.output_res_alpha = nn.Parameter(torch.zeros(1))
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -695,12 +695,12 @@ class KimiK3AttnResModel(KimiK3Model):
         h_final = block_attn_res(
             block_list,
             partial_block,
-            self.final_attn_res_proj,
-            self.final_attn_res_norm,
+            self.output_res_proj,
+            self.output_res_norm,
         )
         if self.attn_res_gated:
             h_final = plain_stream + _scalar_local(
-                self.final_attn_res_alpha, plain_stream
+                self.output_res_alpha, plain_stream
             ) * (h_final - plain_stream)
         # Keep the PRE-norm hidden state for MTP. The reference feeds MTP's hnorm the
         # unnormalised state (hnorm(h_pre_norm)); passing the already-normalised one
@@ -829,12 +829,12 @@ class KimiK3AttnResModel(KimiK3Model):
         # meta -> to_empty -> init. Garbage alphas are a step-0 NaN, and garbage
         # pseudo-queries violate the paper's zero-init requirement silently.
         def _zero_attn_res(block) -> None:
-            for name in ("attn_res_proj", "mlp_res_proj"):
+            for name in ("attention_res_proj", "ffn_res_proj"):
                 m = getattr(block, name, None)
                 if m is not None:
                     nn.init.zeros_(m.weight)
             # Graft-gate alphas start at exact zero (identity anchor).
-            for name in ("attn_res_alpha", "mlp_res_alpha"):
+            for name in ("attention_res_alpha", "ffn_res_alpha"):
                 a = getattr(block, name, None)
                 if isinstance(a, nn.Parameter):
                     nn.init.zeros_(a)
@@ -846,8 +846,8 @@ class KimiK3AttnResModel(KimiK3Model):
                 block = getattr(mtp, "block", None)
                 if block is not None:
                     _zero_attn_res(block)
-        if self.final_attn_res_proj is not None:
-            nn.init.zeros_(self.final_attn_res_proj.weight)
-        a = getattr(self, "final_attn_res_alpha", None)
+        if self.output_res_proj is not None:
+            nn.init.zeros_(self.output_res_proj.weight)
+        a = getattr(self, "output_res_alpha", None)
         if isinstance(a, nn.Parameter):
             nn.init.zeros_(a)

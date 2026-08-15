@@ -18,7 +18,7 @@ Key-space notes:
   self_attn.*`` (KDA and MLA share the attribute name; per-key names
   already match HF), ``ffn.{gate,up,down}_proj`` on dense layers,
   ``ffn._moe.{router.gate,expert_bias,experts.w*,shared_experts.w*}``
-  on MoE layers, plus the AttnRes extras (``attn_res_proj`` etc. and
+  on MoE layers, plus the AttnRes extras (``attention_res_proj`` etc. and
   the model-level ``final_attn_res_*``).
 * HF checkpoints appear with two MoE prefixes in the wild: the official
   Kimi export style (``mlp.*`` with gate_proj/up_proj/down_proj expert
@@ -98,9 +98,9 @@ _DIRECT_MAP_FROM_HF = {
     "model.embed_tokens.weight": "embed_tokens.weight",
     "model.norm.weight": "norm.weight",
     "lm_head.weight": "lm_head.weight",
-    "model.final_attn_res_proj.weight": "final_attn_res_proj.weight",
-    "model.final_attn_res_norm.weight": "final_attn_res_norm.weight",
-    "model.final_attn_res_alpha": "final_attn_res_alpha",
+    "model.output_res_proj.weight": "output_res_proj.weight",
+    "model.output_res_norm.weight": "output_res_norm.weight",
+    "model.output_res_alpha": "output_res_alpha",
 }
 
 # Attention leaves whose released name differs from ours, so they must reach
@@ -109,12 +109,12 @@ _DIRECT_MAP_FROM_HF = {
 _ATTN_LEAVES_RENAMED_BY_HF_KEY_MAP = frozenset({"attn_gate_proj"})
 
 _PASSTHROUGH_LAYER_TAGS = (
-    "attn_res_alpha",
-    "mlp_res_alpha",
-    "attn_res_proj.weight",
-    "attn_res_norm.weight",
-    "mlp_res_proj.weight",
-    "mlp_res_norm.weight",
+    "attention_res_alpha",
+    "ffn_res_alpha",
+    "attention_res_proj.weight",
+    "attention_res_norm.weight",
+    "ffn_res_proj.weight",
+    "ffn_res_norm.weight",
     "input_layernorm.weight",
     "post_attention_layernorm.weight",
 )
@@ -243,8 +243,9 @@ class KimiLinearStateDictAdapter(MoEStateDictAdapter):
             # the online read path fills the real param in place.
             key = key.replace(".base.weight", ".weight").replace(".base.bias", ".bias")
             if (
-                "attn_res" in key
-                or "mlp_res" in key
+                "attention_res" in key
+                or "ffn_res" in key
+                or "output_res" in key
                 or "lora_a" in key
                 or "lora_b" in key
             ):

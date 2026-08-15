@@ -768,7 +768,7 @@ def apply_tp_kimi_k3(
       - ``embed_tokens``: RowwiseParallel (vocab dim sharded; no SP).
       - ``norm``: NoParallel.
       - ``lm_head``: ColwiseParallel (vocab dim sharded; output local).
-      - ``final_attn_res_proj`` / ``final_attn_res_norm`` (AttnRes
+      - ``output_res_proj`` / ``output_res_norm`` (AttnRes
         only): NoParallel — output dim 1 / RMSNorm cannot be sharded.
 
     * **MLA layer (KimiMLAAttention)**:
@@ -803,8 +803,8 @@ def apply_tp_kimi_k3(
     * **Per-layer norms** (``input_layernorm``, ``post_attention_layernorm``):
       NoParallel.
 
-    * **AttnRes per-layer modules** (``attn_res_proj``, ``attn_res_norm``,
-      ``mlp_res_proj``, ``mlp_res_norm``): NoParallel each.
+    * **AttnRes per-layer modules** (``attention_res_proj``, ``attention_res_norm``,
+      ``ffn_res_proj``, ``ffn_res_norm``): NoParallel each.
 
     Collectives per forward pass (summed across layers):
     - 1 all-reduce per dense-MLP layer (down_proj rowwise)
@@ -904,8 +904,8 @@ def apply_tp_kimi_k3(
     # vocabulary has no output-side to_local. The proj's weight is read directly at
     # the use site in block_attn_res, which already unwraps a DTensor, so it does
     # not need the plan.
-    if getattr(model, "final_attn_res_norm", None) is not None:
-        parallelize_module(model, tp_mesh, {"final_attn_res_norm": no_par_local})
+    if getattr(model, "output_res_norm", None) is not None:
+        parallelize_module(model, tp_mesh, {"output_res_norm": no_par_local})
 
     # MLA inner_attention: the ONE place use_local_output=True survives the
     # residual-stream flip. q/k/v arrive head-sharded and SDPA has no DTensor
@@ -920,7 +920,7 @@ def apply_tp_kimi_k3(
     )
 
     # Per-layer plan. Each layer is a KimiDecoderLayer (or AttnRes
-    # subclass with attn_res_proj + attn_res_norm).
+    # subclass with attention_res_proj + attention_res_norm).
     for layer in model.layers.values():
         is_moe = bool(getattr(layer, "is_moe", False))
         is_kda = bool(getattr(layer, "is_linear_attn", False))
@@ -1107,7 +1107,7 @@ def apply_tp_kimi_k3(
         # cell dies with "aten.mul.Tensor got mixed". The declarative vocabulary
         # has no output-side to_local, which is what use_local_output=False does
         # here, so the norms cannot move until the whole stream is DTensor.
-        for name in ("attn_res_norm", "mlp_res_norm"):
+        for name in ("attention_res_norm", "ffn_res_norm"):
             if hasattr(layer, name) and getattr(layer, name) is not None:
                 plan[name] = no_par_local
 
@@ -1423,9 +1423,9 @@ def apply_fsdp(
     # would otherwise absorb these two top-level modules into the root unit.
     #
     # They must share ONE unit, and that is load-bearing rather than an optimization:
-    # block_attn_res reads ``final_attn_res_proj.weight`` directly as the pseudo-query
+    # block_attn_res reads ``output_res_proj.weight`` directly as the pseudo-query
     # instead of calling ``proj(...)``, so no forward hook fires on it and FSDP2 warns that
-    # it "did not run forward before backward". Pairing it with final_attn_res_norm is what
+    # it "did not run forward before backward". Pairing it with output_res_norm is what
     # makes that correct -- norm IS called one line earlier (``K = norm(V)``) and triggers
     # the shared param group's all-gather, so the weight is unsharded by the time it is
     # read. Do not move the weight access above the norm call. Verified on both ranks at
@@ -1433,8 +1433,8 @@ def apply_fsdp(
     attn_res_tail = [
         m
         for m in (
-            getattr(model, "final_attn_res_proj", None),
-            getattr(model, "final_attn_res_norm", None),
+            getattr(model, "output_res_proj", None),
+            getattr(model, "output_res_norm", None),
         )
         if m is not None
     ]

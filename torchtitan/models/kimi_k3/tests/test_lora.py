@@ -95,7 +95,11 @@ class TestKimiLoRA(unittest.TestCase):
             self.assertTrue(named[k].requires_grad, k)
             self.assertIsNotNone(named[k].grad, k)
         # AttnRes graft params train full-param (alpha exception).
-        graft_keys = [k for k in named if "attn_res" in k or "mlp_res" in k]
+        graft_keys = [
+            k
+            for k in named
+            if "attention_res" in k or "ffn_res" in k or "output_res" in k
+        ]
         self.assertTrue(graft_keys)
         for k in graft_keys:
             self.assertTrue(named[k].requires_grad, k)
@@ -123,7 +127,11 @@ class TestKimiLoRA(unittest.TestCase):
         self.assertLess(trainable / total, 0.2)
         for k in payload:
             self.assertTrue(
-                "lora_a" in k or "lora_b" in k or "attn_res" in k or "mlp_res" in k,
+                "lora_a" in k
+                or "lora_b" in k
+                or "attention_res" in k
+                or "ffn_res" in k
+                or "output_res" in k,
                 k,
             )
 

@@ -212,7 +212,7 @@ class TestLoRAMerge(unittest.TestCase):
         )
 
         spec, m = self._graft_lora_model()
-        graft = "attn_res", "mlp_res"
+        graft = "attention_res", "ffn_res", "output_res"
         train = {n for n, p in m.named_parameters() if p.requires_grad}
         # every trainable is either a LoRA adapter or a graft param
         for n in train:

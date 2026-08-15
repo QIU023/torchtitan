@@ -992,7 +992,7 @@ def _install_step_drop_patch(
 
 # ----- FQN-split injection ------------------------------------------------- #
 
-_ATTN_RES_EXTRA_LAST_STAGE_FQNS = ("final_attn_res_proj", "final_attn_res_norm")
+_ATTN_RES_EXTRA_LAST_STAGE_FQNS = ("output_res_proj", "output_res_norm")
 
 
 # ----- Custom pipelining_fn ------------------------------------------------ #
@@ -1001,7 +1001,7 @@ _ATTN_RES_EXTRA_LAST_STAGE_FQNS = ("final_attn_res_proj", "final_attn_res_norm")
 # ----- Kimi Linear / K3 pipelining wiring (merged from kimi_linear/) ----- #
 
 # Kimi-specific FQNs injected into the last PP stage when AttnRes is enabled.
-_KIMI_ATTN_RES_LAST_STAGE_FQNS = ("final_attn_res_proj", "final_attn_res_norm")
+_KIMI_ATTN_RES_LAST_STAGE_FQNS = ("output_res_proj", "output_res_norm")
 
 
 def _kimi_llm_fqns(
@@ -1191,12 +1191,12 @@ def _register_mm_prefix_hooks(part: nn.Module) -> None:
     Only the stage owning ``embed_tokens`` is re-wrapped as the multimodal
     model, so its parameters are named ``language_model.*``. Every other stage
     is the bare text model and names them ``layers.*``,
-    ``final_attn_res_norm.weight`` and so on -- while a non-PP save, and the
+    ``output_res_norm.weight`` and so on -- while a non-PP save, and the
     first stage's own save, use the prefixed form.
 
     That split namespace makes ANY checkpoint unloadable under PP for this
     model, not just a seed checkpoint: a resume fails with
-    "Missing key in checkpoint state_dict: final_attn_res_norm.weight". Cold
+    "Missing key in checkpoint state_dict: output_res_norm.weight". Cold
     starts never noticed because they load nothing.
 
     Fixed in the checkpoint path rather than by re-wrapping every stage: the

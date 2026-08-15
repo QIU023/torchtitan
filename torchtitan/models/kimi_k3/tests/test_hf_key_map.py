@@ -106,7 +106,7 @@ class TestOfficialKeyCoverage(unittest.TestCase):
             "language_model.model.layers.7.self_attention_res_proj.weight",
             kda_layers=_KDA_0BASED,
         )[0]
-        self.assertEqual(ours, "layers.7.attn_res_proj.weight")
+        self.assertEqual(ours, "layers.7.attention_res_proj.weight")
 
     def test_g_proj_resolves_by_layer_type(self):
         """The release calls both output gates g_proj. Ours are named

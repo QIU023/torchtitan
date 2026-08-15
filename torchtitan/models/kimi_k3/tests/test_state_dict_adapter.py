@@ -39,7 +39,13 @@ class TestKimiLinearStateDictAdapter(unittest.TestCase):
         # the HF key space (official checkpoints must load into graft
         # flavors without phantom read keys); the round trip covers the
         # backbone exactly.
-        backbone = {k for k in sd if "attn_res" not in k and "mlp_res" not in k}
+        backbone = {
+            k
+            for k in sd
+            if "attention_res" not in k
+            and "ffn_res" not in k
+            and "output_res" not in k
+        }
         self.assertEqual(set(back), backbone)
         for k in backbone:
             self.assertEqual(
@@ -195,8 +201,9 @@ class TestMultimodalRoundTrip(unittest.TestCase):
         expected = {
             k
             for k in sd
-            if "attn_res" not in k
-            and "mlp_res" not in k
+            if "attention_res" not in k
+            and "ffn_res" not in k
+            and "output_res" not in k
             and k.startswith("language_model.")
         }
         missing = sorted(expected - set(back))
@@ -212,7 +219,7 @@ class TestMultimodalRoundTrip(unittest.TestCase):
         for k, v in sd.items():
             if not k.startswith("language_model."):
                 continue
-            if "attn_res" in k or "mlp_res" in k:
+            if "attention_res" in k or "ffn_res" in k or "output_res" in k:
                 continue
             if k in back:
                 self.assertEqual(

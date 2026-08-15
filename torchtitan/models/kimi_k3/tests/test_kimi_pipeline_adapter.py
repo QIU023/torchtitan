@@ -54,7 +54,7 @@ class TestKimiFQNRemapping(unittest.TestCase):
         """Last-stage AttnRes extras are exactly the two final modules."""
         self.assertEqual(
             _KIMI_ATTN_RES_LAST_STAGE_FQNS,
-            ("final_attn_res_proj", "final_attn_res_norm"),
+            ("output_res_proj", "output_res_norm"),
         )
 
 

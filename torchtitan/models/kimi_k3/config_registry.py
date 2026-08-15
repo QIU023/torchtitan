@@ -295,9 +295,9 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
             "lm_head",
             "router.gate",
             "kv_a_proj_with_mqa",
-            "attn_res_proj",
-            "mlp_res_proj",
-            "final_attn_res_proj",
+            "attention_res_proj",
+            "ffn_res_proj",
+            "output_res_proj",
         ],
     ).build()
     if not converter.enabled:
@@ -1016,7 +1016,7 @@ def kimi_k3_debugmodel_report_arch() -> Trainer.Config:
 
     The other report deviation on that PR's side -- no final aggregation over
     block representations (sec 2.2) -- needs no flavor here: our AttnRes model
-    already carries final_attn_res_proj / final_attn_res_norm, so both flavors
+    already carries output_res_proj / output_res_norm, so both flavors
     have it.
     """
     import dataclasses as _dc

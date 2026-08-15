@@ -22,8 +22,8 @@ Naming differences worth knowing, in rough order of how easy they are to miss:
 * Block Attention Residuals ARE in the release, as ``self_attention_res_proj`` /
   ``self_attention_res_norm`` (93 each) plus ``mlp_res_proj`` / ``mlp_res_norm``,
   with the final aggregation at ``model.output_attn_res_proj``. We call the
-  per-layer pair ``attn_res_proj`` / ``attn_res_norm`` and the final one
-  ``final_attn_res_proj``.
+  per-layer pair ``attention_res_proj`` / ``attention_res_norm`` and the final one
+  ``output_res_proj``.
 * The MoE layers' module is ``block_sparse_moe``; the single dense layer's is
   ``mlp``. Both map into our ``ffn``.
 * Routed experts use ``w1`` / ``w2`` / ``w3`` while the SHARED experts use
@@ -55,10 +55,10 @@ TEXT_ONLY_LM_HEAD = "lm_head.weight"
 
 # Per-layer names that differ only by spelling.
 _LAYER_RENAME = {
-    "self_attention_res_proj": "attn_res_proj",
-    "self_attention_res_norm": "attn_res_norm",
-    "mlp_res_proj": "mlp_res_proj",
-    "mlp_res_norm": "mlp_res_norm",
+    "self_attention_res_proj": "attention_res_proj",
+    "self_attention_res_norm": "attention_res_norm",
+    "mlp_res_proj": "ffn_res_proj",
+    "mlp_res_norm": "ffn_res_norm",
     "input_layernorm": "input_layernorm",
     "post_attention_layernorm": "post_attention_layernorm",
 }
@@ -160,9 +160,9 @@ def official_to_titan(key: str, *, kda_layers: set[int]) -> tuple[str, str]:
     if rest == "norm.weight":
         return "norm.weight", "param"
     if rest == "output_attn_res_proj.weight":
-        return "final_attn_res_proj.weight", "param"
+        return "output_res_proj.weight", "param"
     if rest == "output_attn_res_norm.weight":
-        return "final_attn_res_norm.weight", "param"
+        return "output_res_norm.weight", "param"
 
     m = _LAYER_RE.match(rest)
     if m is None:
@@ -261,9 +261,9 @@ def titan_to_official(
         return VISION_PREFIX + key[len("vision_tower.") :]
     if key in ("embed_tokens.weight", "norm.weight"):
         return TEXT_PREFIX + key
-    if key == "final_attn_res_proj.weight":
+    if key == "output_res_proj.weight":
         return TEXT_PREFIX + "output_attn_res_proj.weight"
-    if key == "final_attn_res_norm.weight":
+    if key == "output_res_norm.weight":
         return TEXT_PREFIX + "output_attn_res_norm.weight"
 
     m = _LAYER_RE.match(key)

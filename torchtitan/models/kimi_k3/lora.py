@@ -105,8 +105,9 @@ DEFAULT_LORA_TARGETS: tuple[str, ...] = (
 # Params that stay full-param trainable under base-freeze: the AttnRes
 # graft set (new zero-init params; the "alpha-fullparam exception").
 _FULLPARAM_EXCEPTION_MARKERS: tuple[str, ...] = (
-    "attn_res",
-    "mlp_res",
+    "attention_res",
+    "ffn_res",
+    "output_res",
 )
 
 
