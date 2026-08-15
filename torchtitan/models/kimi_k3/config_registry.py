@@ -1274,6 +1274,22 @@ def kimi_k3_debugmodel_report_arch_lora() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_debugmodel_report_arch_pp8vp4_lora() -> Trainer.Config:
+    """The multimodal PP8xVP4 stress flavor with LoRA rank 8, nothing else.
+
+    Exists because the DEP prefetch experiment's gate is the pp8xvp4 cell on BOTH
+    the multimodal and the LoRA path, and the LoRA path has its own interaction
+    with the cross-stage adapter: only the adapters are trainable, so the skip-edge
+    gradients the adapter routes are the only gradients some stages produce.
+    ``lora_rank`` is the only field that differs from the flavor it derives from,
+    which keeps any per-cell difference attributable to the adapter path.
+    """
+    cfg = kimi_k3_debugmodel_report_arch_pp8vp4()
+    cfg.model_spec.flavor = "kimi_k3_debugmodel_report_arch_pp8vp4_lora"
+    cfg.model_spec.model.lora_rank = 8
+    return cfg
+
+
 def kimi_k3_mini_diag_4l_mla_lora() -> Trainer.Config:
     """Dense (no MoE) + AttnRes + LoRA rank 8 -- the LoRA gradient control.
 
