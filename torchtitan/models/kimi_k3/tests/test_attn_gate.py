@@ -40,18 +40,18 @@ def _cfg(param):
 
 class TestAttnGate(unittest.TestCase):
     def test_full_rank_shape_is_per_channel_no_bias(self):
-        attn = KimiMLAAttention(_cfg("full_rank"), layer_idx=0)
+        attn = KimiMLAAttention.make_config(_cfg("full_rank"), layer_idx=0).build()
         self.assertEqual(attn.attn_gate_proj.weight.shape, (H * DV, D))
         self.assertIsNone(attn.attn_gate_proj.bias)
 
     def test_per_head_shape_has_bias(self):
-        attn = KimiMLAAttention(_cfg("per_head_graft"), layer_idx=0)
+        attn = KimiMLAAttention.make_config(_cfg("per_head_graft"), layer_idx=0).build()
         self.assertEqual(attn.attn_gate_proj.weight.shape, (H, D))
         self.assertIsNotNone(attn.attn_gate_proj.bias)
 
     def test_full_rank_gate_equals_sigmoid_projection(self):
         torch.manual_seed(0)
-        attn = KimiMLAAttention(_cfg("full_rank"), layer_idx=0)
+        attn = KimiMLAAttention.make_config(_cfg("full_rank"), layer_idx=0).build()
         x = torch.randn(2, 3, D)
         torch.testing.assert_close(
             attn._attn_gate(x, H * DV), torch.sigmoid(attn.attn_gate_proj(x))
@@ -59,7 +59,7 @@ class TestAttnGate(unittest.TestCase):
 
     def test_per_head_gate_expands_across_v_head_dim(self):
         torch.manual_seed(0)
-        attn = KimiMLAAttention(_cfg("per_head_graft"), layer_idx=0)
+        attn = KimiMLAAttention.make_config(_cfg("per_head_graft"), layer_idx=0).build()
         x = torch.randn(2, 3, D)
         g = attn._attn_gate(x, H * DV)
         self.assertEqual(g.shape, (2, 3, H * DV))
@@ -73,7 +73,7 @@ class TestAttnGate(unittest.TestCase):
         torch.manual_seed(0)
         x = torch.randn(2, 5, D)
         for param in ("full_rank", "per_head_graft"):
-            attn = KimiMLAAttention(_cfg(param), layer_idx=0)
+            attn = KimiMLAAttention.make_config(_cfg(param), layer_idx=0).build()
             out = attn(x)
             out = out[0] if isinstance(out, tuple) else out
             self.assertEqual(out.shape, (2, 5, D), param)
@@ -82,10 +82,10 @@ class TestAttnGate(unittest.TestCase):
     def test_gate_actually_modulates(self):
         torch.manual_seed(0)
         x = torch.randn(2, 5, D)
-        gated = KimiMLAAttention(_cfg("full_rank"), layer_idx=0)
+        gated = KimiMLAAttention.make_config(_cfg("full_rank"), layer_idx=0).build()
         plain_cfg = _cfg("full_rank")
         plain_cfg.mla_gated = False
-        plain = KimiMLAAttention(plain_cfg, layer_idx=0)
+        plain = KimiMLAAttention.make_config(plain_cfg, layer_idx=0).build()
         plain.load_state_dict(
             {k: v for k, v in gated.state_dict().items() if "attn_gate" not in k}
         )

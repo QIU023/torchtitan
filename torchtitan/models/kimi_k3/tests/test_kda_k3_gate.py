@@ -44,7 +44,7 @@ def _cfg(**kw):
 
 class TestKDAFullRankGate(unittest.TestCase):
     def test_low_rank_is_the_default(self):
-        kda = KimiDeltaAttention(_cfg(), layer_idx=0)
+        kda = KimiDeltaAttention.make_config(_cfg(), layer_idx=0).build()
         self.assertFalse(kda.use_full_rank_gate)
         self.assertTrue(hasattr(kda, "g_a_proj"))
         self.assertFalse(hasattr(kda, "g_proj"))
@@ -52,36 +52,36 @@ class TestKDAFullRankGate(unittest.TestCase):
         self.assertEqual(kda.g_b_proj.weight.shape, (H * HD, D if False else HD))
 
     def test_full_rank_shape(self):
-        kda = KimiDeltaAttention(_cfg(kda_use_full_rank_gate=True), layer_idx=0)
+        kda = KimiDeltaAttention.make_config(_cfg(kda_use_full_rank_gate=True), layer_idx=0).build()
         self.assertTrue(kda.use_full_rank_gate)
         self.assertFalse(hasattr(kda, "g_a_proj"))
         # one full projection hidden -> H * head_dim, no bottleneck
         self.assertEqual(kda.g_proj.weight.shape, (H * HD, D))
 
     def test_full_rank_has_more_capacity_than_low_rank(self):
-        low = KimiDeltaAttention(_cfg(), layer_idx=0)
-        full = KimiDeltaAttention(_cfg(kda_use_full_rank_gate=True), layer_idx=0)
+        low = KimiDeltaAttention.make_config(_cfg(), layer_idx=0).build()
+        full = KimiDeltaAttention.make_config(_cfg(kda_use_full_rank_gate=True), layer_idx=0).build()
         n_low = low.g_a_proj.weight.numel() + low.g_b_proj.weight.numel()
         self.assertGreater(full.g_proj.weight.numel(), n_low)
 
     def test_gate_helper_matches_each_parameterization(self):
         torch.manual_seed(0)
         x = torch.randn(2, 5, D)
-        low = KimiDeltaAttention(_cfg(), layer_idx=0)
+        low = KimiDeltaAttention.make_config(_cfg(), layer_idx=0).build()
         torch.testing.assert_close(
             low._output_gate_raw(x), low.g_b_proj(low.g_a_proj(x))
         )
-        full = KimiDeltaAttention(_cfg(kda_use_full_rank_gate=True), layer_idx=0)
+        full = KimiDeltaAttention.make_config(_cfg(kda_use_full_rank_gate=True), layer_idx=0).build()
         torch.testing.assert_close(full._output_gate_raw(x), full.g_proj(x))
 
 
 class TestKDALowerBoundedDecay(unittest.TestCase):
     def test_default_keeps_kimi_linear_form(self):
-        kda = KimiDeltaAttention(_cfg(), layer_idx=0)
+        kda = KimiDeltaAttention.make_config(_cfg(), layer_idx=0).build()
         self.assertIsNone(kda.gate_lower_bound)
 
     def test_official_value_is_plumbed(self):
-        kda = KimiDeltaAttention(_cfg(kda_gate_lower_bound=-5.0), layer_idx=0)
+        kda = KimiDeltaAttention.make_config(_cfg(kda_gate_lower_bound=-5.0), layer_idx=0).build()
         self.assertEqual(kda.gate_lower_bound, -5.0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused_kda_gate is Triton")

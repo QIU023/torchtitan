@@ -102,7 +102,7 @@ def _absorbed_forward(attn: KimiMLAAttention, x: torch.Tensor) -> torch.Tensor:
 class TestMLALatentAbsorption(unittest.TestCase):
     def _check(self, cfg: KimiK3Config) -> float:
         torch.manual_seed(0)
-        attn = KimiMLAAttention(cfg, layer_idx=0).double()
+        attn = KimiMLAAttention.make_config(cfg, layer_idx=0).build().double()
         for p in attn.parameters():
             torch.nn.init.normal_(p, std=0.02)
         x = torch.randn(2, 12, cfg.hidden_size, dtype=torch.float64)
@@ -138,7 +138,7 @@ class TestMLALatentAbsorption(unittest.TestCase):
 
     def test_gate_is_channel_wise_on_x_not_per_head(self):
         cfg = _cfg(mla_gated=True, attn_gate_param="full_rank")
-        attn = KimiMLAAttention(cfg, layer_idx=0)
+        attn = KimiMLAAttention.make_config(cfg, layer_idx=0).build()
         # Eq. 7's W_g is full rank: one gate per ungated-output channel
         self.assertEqual(
             attn.attn_gate_proj.weight.shape,

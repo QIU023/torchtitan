@@ -429,40 +429,66 @@ class KimiMLP(FeedForward):
     def w3(self) -> nn.Module:
         return self.up_proj
 
-    def __init__(
-        self,
+    @dataclass(kw_only=True, slots=True)
+    class Config(FeedForward.Config):
+        """Config-driven construction, inheriting w1/w2/w3 from the parent.
+
+        The FIELDS are core's w1/w2/w3 so that core's ``set_dense_ffn_sharding``
+        and the rest of ``decoder_sharding`` apply to this config unchanged. The
+        ATTRIBUTES the fields build into keep the release's names -- w1 becomes
+        ``gate_proj``, w3 ``up_proj``, w2 ``down_proj`` -- so no checkpoint key
+        moves. That works because a declaration rides on the ``Linear.Config``
+        instance rather than on the attribute it lands in.
+        """
+
+        hidden_act: Literal["silu", "gelu", "situ"] = "silu"
+        situ_beta: float = 4.0
+        situ_linear_beta: float | None = 25.0
+
+    @staticmethod
+    def make_config(
         hidden_size: int,
         intermediate_size: int,
         hidden_act: Literal["silu", "gelu", "situ"] = "silu",
         situ_beta: float = 4.0,
         situ_linear_beta: float | None = 25.0,
-    ) -> None:
-        # Skip FeedForward.__init__, which builds w1/w2/w3 from Linear.Configs. This
-        # class takes plain dimensions and owns the release's names, so only the
-        # forward is inherited; going through the grandparent keeps torchtitan's
-        # Module setup without acquiring the config-driven construction.
+    ) -> "KimiMLP.Config":
+        """The dimensions-in form, until the flavor builder owns the tree.
+
+        Callers still think in dimensions; this is the one place that turns them
+        into the three ``Linear.Config``s, so hoisting the whole tree into a
+        flavor builder later is a move rather than a rewrite.
+        """
+
+        def _lin(fan_in: int, fan_out: int, dim: int) -> Linear.Config:
+            return Linear.Config(
+                in_features=fan_in,
+                out_features=fan_out,
+                bias=False,
+                sharding_config=_tp_shard(dim),
+            )
+
+        return KimiMLP.Config(
+            w1=_lin(hidden_size, intermediate_size, 0),
+            w3=_lin(hidden_size, intermediate_size, 0),
+            w2=_lin(intermediate_size, hidden_size, 1),
+            hidden_act=hidden_act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+
+    def __init__(self, config: "KimiMLP.Config") -> None:
+        # Skip FeedForward.__init__, which would build w1/w2/w3 as attributes of
+        # those names. This class owns the release's names, so only the forward is
+        # inherited; the grandparent call keeps torchtitan's Module setup.
         super(FeedForward, self).__init__()
-        self.gate_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            sharding_config=_tp_shard(0),
-        )
-        self.up_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            sharding_config=_tp_shard(0),
-        )
-        self.down_proj = Linear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            sharding_config=_tp_shard(1),
-        )
+        self.gate_proj = config.w1.build()
+        self.up_proj = config.w3.build()
+        self.down_proj = config.w2.build()
+        hidden_act = config.hidden_act
         self.hidden_act = hidden_act
-        self._situ_beta = situ_beta
-        self._situ_linear_beta = situ_linear_beta
+        self._situ_beta = config.situ_beta
+        self._situ_linear_beta = config.situ_linear_beta
         if hidden_act == "silu":
             self.act_fn = F.silu
         elif hidden_act == "gelu":
@@ -533,7 +559,7 @@ def _cp_all_to_all_headseq(
     return out.permute(1, 2, 0, 3, 4).reshape(B, t_loc, cp * h_loc, K).contiguous()
 
 
-class KimiMLAAttention(nn.Module):
+class KimiMLAAttention(_TTModule):
     """Multi-head Latent Attention, Kimi NoPE variant.
 
     Faithful port of ``reference:KimiMLAAttention``. Key differences
@@ -554,10 +580,128 @@ class KimiMLAAttention(nn.Module):
     torchtitan training doesn't invoke incremental decoding.
     """
 
-    def __init__(self, config: KimiK3Config, layer_idx: int) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(_TTModule.Config):
+        """Config-driven Gated MLA.
+
+        The Q path is either a single projection or the low-rank pair, so those
+        child configs are optional and exactly one group is populated; the same
+        is true of the output gate, which only exists when the layer is gated.
+        """
+
+        layer_idx: int
+        hidden_size: int
+        num_attention_heads: int
+        kv_lora_rank: int
+        qk_nope_head_dim: int
+        qk_rope_head_dim: int
+        v_head_dim: int
+        mla_use_nope: bool
+        kv_a_proj_with_mqa: "Linear.Config"
+        kv_a_layernorm: "RMSNorm.Config"
+        kv_b_proj: "Linear.Config"
+        o_proj: "Linear.Config"
+        q_lora_rank: int | None = None
+        mla_gated: bool = False
+        attn_gate_param: str = "full_rank"
+        q_proj: "Linear.Config | None" = None
+        q_a_proj: "Linear.Config | None" = None
+        q_a_layernorm: "RMSNorm.Config | None" = None
+        q_b_proj: "Linear.Config | None" = None
+        attn_gate_proj: "Linear.Config | None" = None
+        inner_attention: "ScaledDotProductAttention.Config" = field(
+            default_factory=ScaledDotProductAttention.Config
+        )
+
+    @staticmethod
+    def make_config(
+        config: KimiK3Config, layer_idx: int
+    ) -> "KimiMLAAttention.Config":
+        """Turn the flat model config into this module's config tree.
+
+        The one place that reads the flat config for MLA, so hoisting the tree
+        into a flavor builder later is a move rather than a rewrite.
+        """
+        heads = config.num_attention_heads
+        q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
+        def _lin(fan_in, fan_out, *, bias=False, sharding=None):
+            return Linear.Config(
+                in_features=fan_in,
+                out_features=fan_out,
+                bias=bias,
+                sharding_config=sharding,
+            )
+
+        cfg = KimiMLAAttention.Config(
+            layer_idx=layer_idx,
+            hidden_size=config.hidden_size,
+            num_attention_heads=heads,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            mla_use_nope=config.mla_use_nope,
+            q_lora_rank=config.q_lora_rank,
+            mla_gated=config.mla_gated,
+            attn_gate_param=config.attn_gate_param,
+            kv_a_proj_with_mqa=_lin(
+                config.hidden_size,
+                config.kv_lora_rank + config.qk_rope_head_dim,
+                sharding=_tp_replicate(),
+            ),
+            kv_a_layernorm=RMSNorm.Config(
+                normalized_shape=config.kv_lora_rank,
+                eps=config.rms_norm_eps,
+                sharding_config=_tp_replicate(),
+            ),
+            kv_b_proj=_lin(
+                config.kv_lora_rank,
+                heads * (config.qk_nope_head_dim + config.v_head_dim),
+                sharding=_tp_shard(0),
+            ),
+            o_proj=_lin(
+                heads * config.v_head_dim,
+                config.hidden_size,
+                sharding=_tp_shard(1),
+            ),
+        )
+        if config.q_lora_rank is None:
+            # 48B-A3B path: Q straight to H * q_head_dim.
+            cfg.q_proj = _lin(config.hidden_size, heads * q_head_dim)
+        else:
+            # K3 path (official config: q_lora_rank=1536). Same shape as DSv3's
+            # wq_a/wq_b pair: the compression stays replicated because its output
+            # is the lora rank, not a head axis, and only the expansion shards.
+            cfg.q_a_proj = _lin(
+                config.hidden_size, config.q_lora_rank, sharding=_tp_replicate()
+            )
+            cfg.q_a_layernorm = RMSNorm.Config(
+                normalized_shape=config.q_lora_rank,
+                eps=config.rms_norm_eps,
+                sharding_config=_tp_replicate(),
+            )
+            cfg.q_b_proj = _lin(
+                config.q_lora_rank, heads * q_head_dim, sharding=_tp_shard(0)
+            )
+        if config.mla_gated:
+            # Gated MLA, report Eq. 7. full_rank gates per (head, v_head_dim);
+            # the graft variant gates per head with a bias so a large positive
+            # init makes sigmoid(gate) ~= 1 and the layer starts near identity.
+            if config.attn_gate_param == "full_rank":
+                cfg.attn_gate_proj = _lin(
+                    config.hidden_size, heads * config.v_head_dim,
+                    sharding=_tp_shard(0),
+                )
+            else:
+                cfg.attn_gate_proj = _lin(
+                    config.hidden_size, heads, bias=True, sharding=_tp_shard(0)
+                )
+        return cfg
+
+    def __init__(self, config: "KimiMLAAttention.Config") -> None:
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
+        self.layer_idx = config.layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
 
@@ -569,95 +713,44 @@ class KimiMLAAttention(nn.Module):
         self.use_nope = config.mla_use_nope
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.scaling = self.q_head_dim**-0.5
+        self.mla_gated = config.mla_gated
+        self.attn_gate_param = config.attn_gate_param
 
         assert self.use_nope, (
             "Only mla_use_nope=True is currently supported (Kimi 48B-A3B "
             "config). RoPE-on-MLA is not ported."
         )
 
-        if self.q_lora_rank is None:
-            # 48B-A3B path: Q straight to H * q_head_dim.
-            self.q_proj = Linear(
-                self.hidden_size, self.num_heads * self.q_head_dim, bias=False
-            )
+        # Exactly one Q group is populated by make_config.
+        if config.q_proj is not None:
+            self.q_proj = config.q_proj.build()
         else:
-            # K3 path (official config: q_lora_rank=1536). Same shape as
-            # DSv3's wq_a/wq_b pair, and the same structure this class
-            # already uses for KV (kv_a_proj_with_mqa -> kv_a_layernorm ->
-            # kv_b_proj), so the TP plan reuses that registration pattern.
-            self.q_a_proj = Linear(
-                self.hidden_size,
-                self.q_lora_rank,
-                bias=False,
-                sharding_config=_tp_replicate(),
-            )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-            self.q_b_proj = Linear(
-                self.q_lora_rank,
-                self.num_heads * self.q_head_dim,
-                bias=False,
-                sharding_config=_tp_shard(0),
-            )
-        self.kv_a_proj_with_mqa = Linear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-            sharding_config=_tp_replicate(),
-        )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps, sharding_config=_tp_replicate())
-        self.kv_b_proj = Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            sharding_config=_tp_shard(0),
-        )
-        self.o_proj = Linear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            sharding_config=_tp_shard(1),
-        )
-
-        # Gated MLA. K3 (tech report Eq. 7):
-        #     y_t = W_o [ Sigmoid(W_g x_t) (.) o~_t ]
-        # with W_g FULL RANK, i.e. one gate value per output channel of the
-        # ungated attention output (num_heads * v_head_dim), applied before
-        # W_o. The per-head variant is this repo's graft-preserving
-        # alternative -- see KimiK3Config.attn_gate_param.
-        self.mla_gated = config.mla_gated
-        self.attn_gate_param = config.attn_gate_param
-        if self.mla_gated:
-            if self.attn_gate_param == "full_rank":
-                self.attn_gate_proj = Linear(
-                    self.hidden_size,
-                    self.num_heads * self.v_head_dim,
-                    bias=False,
-                    sharding_config=_tp_shard(0),
-                )
-            else:
-                self.attn_gate_proj = Linear(
-                    self.hidden_size,
-                    self.num_heads,
-                    bias=True,
-                    sharding_config=_tp_shard(0),
-                )
+            assert config.q_a_proj is not None
+            assert config.q_a_layernorm is not None
+            assert config.q_b_proj is not None
+            self.q_a_proj = config.q_a_proj.build()
+            self.q_a_layernorm = config.q_a_layernorm.build()
+            self.q_b_proj = config.q_b_proj.build()
+        self.kv_a_proj_with_mqa = config.kv_a_proj_with_mqa.build()
+        self.kv_a_layernorm = config.kv_a_layernorm.build()
+        self.kv_b_proj = config.kv_b_proj.build()
+        self.o_proj = config.o_proj.build()
+        if config.attn_gate_proj is not None:
+            self.attn_gate_proj = config.attn_gate_proj.build()
 
         # SDPA-only sub-module so the TP plan can wrap it with
-        # use_local_output=True (DSv3 pattern). Has no parameters.
-        # torchtitan's own SDPA module rather than a local copy. It brings the
-        # backend priority list (cuDNN, then flash, then math) that a bare
+        # use_local_output=True (DSv3 pattern). Has no parameters. torchtitan's
+        # own SDPA module rather than a local copy: it brings the backend
+        # priority list (cuDNN, then flash, then math) that a bare
         # F.scaled_dot_product_attention call leaves to the default dispatcher,
-        # and it is the type the upstream CP dispatcher recognises -- see the
-        # note in parallelize.py about why MLA does its own CP today.
+        # and it is the type the upstream CP dispatcher recognises.
         #
-        # Kept as a submodule for the same reason DSv3 does: apply_tp_kimi_k3
-        # wraps this call with PrepareModuleInput(use_local_output=True), so q/k/v
-        # are plain Tensors before SDPA's kernel dispatcher runs. Without that,
-        # the mem-efficient cutlass path fails with "aten.bmm got mixed Tensor
-        # and DTensor".
-        self.inner_attention = ScaledDotProductAttention(
-            ScaledDotProductAttention.Config()
-        )
+        # Kept as a submodule for the same reason DSv3 does: apply_tp wraps this
+        # call with PrepareModuleInput(use_local_output=True), so q/k/v are plain
+        # Tensors before SDPA's kernel dispatcher runs. Without that, the
+        # mem-efficient cutlass path fails with "aten.bmm got mixed Tensor and
+        # DTensor".
+        self.inner_attention = config.inner_attention.build()
 
     def _attn_gate(self, x: torch.Tensor, width: int) -> torch.Tensor:
         """Sigmoid output gate, broadcastable onto ``[..., width]``.
@@ -980,10 +1073,87 @@ class KimiDeltaAttention(_TTModule):
     fixed-seqlen doesn't exercise those).
     """
 
-    def __init__(self, config: KimiK3Config, layer_idx: int) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(_TTModule.Config):
+        """Config-driven KDA.
+
+        The scalar fields deliberately carry the SAME names as the flat model
+        config's, so the constructor body reads them unchanged. fla's
+        ``ShortConvolution`` and ``FusedRMSNormGated`` are not Configurable, so
+        they stay constructed from scalars here rather than from child configs --
+        upstream avoids that by using core's Conv1d and its own gated norm, and we
+        keep fla's fused kernels deliberately (they are on every KDA layer's
+        critical path).
+        """
+
+        layer_idx: int
+        hidden_size: int
+        kda_short_conv_kernel_size: int
+        kda_head_dim: int
+        kda_num_heads: int
+        kda_use_full_rank_gate: bool
+        kda_gate_lower_bound: float
+        kda_cp_mode: str
+        rms_norm_eps: float
+        q_proj: "Linear.Config"
+        k_proj: "Linear.Config"
+        v_proj: "Linear.Config"
+        f_a_proj: "Linear.Config"
+        f_b_proj: "Linear.Config"
+        b_proj: "Linear.Config"
+        o_proj: "Linear.Config"
+        g_proj: "Linear.Config | None" = None
+        g_a_proj: "Linear.Config | None" = None
+        g_b_proj: "Linear.Config | None" = None
+
+    @staticmethod
+    def make_config(
+        config: KimiK3Config, layer_idx: int
+    ) -> "KimiDeltaAttention.Config":
+        """The one place that reads the flat config for KDA."""
+        projection_size = config.kda_head_dim * config.kda_num_heads
+
+        def _lin(fan_in, fan_out, *, replicate=True):
+            # Replicate throughout, matching what NoParallel gave these. Their
+            # outputs feed the fla kernels, which KDA unwraps at the call site
+            # (_to_local_if_dtensor), so the kernels see plain tensors either way.
+            return Linear.Config(
+                in_features=fan_in,
+                out_features=fan_out,
+                bias=False,
+                sharding_config=_tp_replicate() if replicate else None,
+            )
+
+        cfg = KimiDeltaAttention.Config(
+            layer_idx=layer_idx,
+            hidden_size=config.hidden_size,
+            kda_short_conv_kernel_size=config.kda_short_conv_kernel_size,
+            kda_head_dim=config.kda_head_dim,
+            kda_num_heads=config.kda_num_heads,
+            kda_use_full_rank_gate=config.kda_use_full_rank_gate,
+            kda_gate_lower_bound=config.kda_gate_lower_bound,
+            kda_cp_mode=config.kda_cp_mode,
+            rms_norm_eps=config.rms_norm_eps,
+            q_proj=_lin(config.hidden_size, projection_size),
+            k_proj=_lin(config.hidden_size, projection_size),
+            v_proj=_lin(config.hidden_size, projection_size),
+            f_a_proj=_lin(config.hidden_size, config.kda_head_dim),
+            f_b_proj=_lin(config.kda_head_dim, projection_size),
+            b_proj=_lin(config.hidden_size, config.kda_num_heads),
+            o_proj=_lin(projection_size, config.hidden_size),
+        )
+        # K3 (report Eq. 6) makes the output gate full rank; Kimi Linear factored
+        # it through head_dim. Both feed the same FusedRMSNormGated.
+        if config.kda_use_full_rank_gate:
+            cfg.g_proj = _lin(config.hidden_size, projection_size)
+        else:
+            cfg.g_a_proj = _lin(config.hidden_size, config.kda_head_dim, replicate=False)
+            cfg.g_b_proj = _lin(config.kda_head_dim, projection_size, replicate=False)
+        return cfg
+
+    def __init__(self, config: "KimiDeltaAttention.Config") -> None:
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
+        self.layer_idx = config.layer_idx
         self.hidden_size = config.hidden_size
         self.conv_size = config.kda_short_conv_kernel_size
         self.head_dim = config.kda_head_dim
@@ -995,18 +1165,9 @@ class KimiDeltaAttention(_TTModule):
         # Replicate, matching what NoParallel gave them. Their outputs feed the
         # fla kernels, which KDA unwraps at the call site
         # (_to_local_if_dtensor), so the kernels still see plain tensors.
-        self.q_proj = Linear(
-            self.hidden_size, projection_k_size, bias=False,
-            sharding_config=_tp_replicate(),
-        )
-        self.k_proj = Linear(
-            self.hidden_size, projection_k_size, bias=False,
-            sharding_config=_tp_replicate(),
-        )
-        self.v_proj = Linear(
-            self.hidden_size, projection_size, bias=False,
-            sharding_config=_tp_replicate(),
-        )
+        self.q_proj = config.q_proj.build()
+        self.k_proj = config.k_proj.build()
+        self.v_proj = config.v_proj.build()
 
         # Short causal convolutions with silu activation on q/k/v
         self.q_conv1d = ShortConvolution(
@@ -1071,26 +1232,17 @@ class KimiDeltaAttention(_TTModule):
         }
 
         # Low-rank forget-gate and output-gate projections
-        self.f_a_proj = Linear(
-            self.hidden_size, self.head_dim, bias=False,
-            sharding_config=_tp_replicate(),
-        )
-        self.f_b_proj = Linear(
-            self.head_dim, projection_size, bias=False,
-            sharding_config=_tp_replicate(),
-        )
+        self.f_a_proj = config.f_a_proj.build()
+        self.f_b_proj = config.f_b_proj.build()
         # Output gate. K3 (report Eq. 6) makes W_g full rank; Kimi Linear
         # factored it through head_dim. Both feed the same
         # FusedRMSNormGated(o, g) = Sigmoid(g) (.) RMSNorm(o~) below.
         self.use_full_rank_gate = config.kda_use_full_rank_gate
         if self.use_full_rank_gate:
-            self.g_proj = Linear(
-                self.hidden_size, projection_size, bias=False,
-                sharding_config=_tp_replicate(),
-            )
+            self.g_proj = config.g_proj.build()
         else:
-            self.g_a_proj = Linear(self.hidden_size, self.head_dim, bias=False)
-            self.g_b_proj = Linear(self.head_dim, projection_size, bias=False)
+            self.g_a_proj = config.g_a_proj.build()
+            self.g_b_proj = config.g_b_proj.build()
         self.gate_lower_bound = config.kda_gate_lower_bound
         self.cp_mode = config.kda_cp_mode
         if self.cp_mode not in ("ulysses", "kcp"):
@@ -1099,10 +1251,7 @@ class KimiDeltaAttention(_TTModule):
             )
 
         # Beta: per-head, per-token scalar (delta-rule learning rate)
-        self.b_proj = Linear(
-            self.hidden_size, self.num_heads, bias=False,
-            sharding_config=_tp_replicate(),
-        )
+        self.b_proj = config.b_proj.build()
 
         # Output RMSNorm with sigmoid-gated modulation from g, then o_proj
         self.o_norm = FusedRMSNormGated(
@@ -1112,10 +1261,7 @@ class KimiDeltaAttention(_TTModule):
         )
         # Replicate, unlike MLA's o_proj: KDA's core runs on plain tensors, so
         # this projection's input is not head-sharded and has nothing to reduce.
-        self.o_proj = Linear(
-            projection_size, self.hidden_size, bias=False,
-            sharding_config=_tp_replicate(),
-        )
+        self.o_proj = config.o_proj.build()
 
     def _output_gate_raw(self, x: torch.Tensor) -> torch.Tensor:
         """Pre-sigmoid output-gate logits, flat ``[..., H * head_dim]``.
@@ -1455,7 +1601,7 @@ class KimiDeltaAttention(_TTModule):
 # ----- MoE (training-capable via torchtitan.models.common.moe) ------------ #
 
 
-class KimiLatentMoEProjection(nn.Module):
+class KimiLatentMoEProjection(_TTModule):
     """The latent entry/exit of Stable LatentMoE (report Eq. 11).
 
     ``down`` maps a token from full width ``d`` into the routed-expert latent
@@ -1468,32 +1614,58 @@ class KimiLatentMoEProjection(nn.Module):
     896-expert routing affordable (dispatch traffic is O(l), not O(d)).
     """
 
-    def __init__(
-        self,
+    @dataclass(kw_only=True, slots=True)
+    class Config(_TTModule.Config):
+        """Config-driven, with the norm optional the way the module is.
+
+        No declaration on ``norm``: it sits on the MoE's OUTPUT side, where the
+        value arrives plain (the MoE unwraps at its boundary), so a declared
+        DTensor weight would meet a plain input inside _fused_rms_norm. It keeps
+        its imperative NoParallel entry.
+        """
+
+        down: "Linear.Config"
+        up: "Linear.Config"
+        norm: "RMSNorm.Config | None" = None
+
+    @staticmethod
+    def make_config(
         hidden_size: int,
         latent_size: int,
         use_norm: bool = True,
         rms_norm_eps: float = 1e-5,
-    ) -> None:
-        super().__init__()
+    ) -> "KimiLatentMoEProjection.Config":
         # Replicated, NOT the column/row pair a SwiGLU would use. down's output
         # goes straight into the MoE, whose in_src_shardings expects Replicate --
         # the SP-island boundary that makes EP x TP work. Declaring Shard(0) here
         # gives the MoE a Shard(dim=2) activation and it refuses:
         # "MoE.x_BLD: input DTensor has placements (Shard(dim=2),), but
         # in_src_shardings expects (Replicate(),)". up is replicated to match.
-        self.down = Linear(
-            hidden_size, latent_size, bias=False, sharding_config=_tp_replicate()
+        return KimiLatentMoEProjection.Config(
+            down=Linear.Config(
+                in_features=hidden_size,
+                out_features=latent_size,
+                bias=False,
+                sharding_config=_tp_replicate(),
+            ),
+            up=Linear.Config(
+                in_features=latent_size,
+                out_features=hidden_size,
+                bias=False,
+                sharding_config=_tp_replicate(),
+            ),
+            norm=(
+                RMSNorm.Config(normalized_shape=latent_size, eps=rms_norm_eps)
+                if use_norm
+                else None
+            ),
         )
-        self.up = Linear(
-            latent_size, hidden_size, bias=False, sharding_config=_tp_replicate()
-        )
-        # No declaration on this norm. It sits on the MoE's OUTPUT side, where
-        # the value arrives plain (the MoE unwraps at its boundary), so a declared
-        # DTensor weight meets a plain input inside _fused_rms_norm. It keeps its
-        # imperative NoParallel entry, like the AttnRes norms did before the
-        # residual-stream flip reached them.
-        self.norm = RMSNorm(latent_size, eps=rms_norm_eps) if use_norm else None
+
+    def __init__(self, config: "KimiLatentMoEProjection.Config") -> None:
+        super().__init__()
+        self.down = config.down.build()
+        self.up = config.up.build()
+        self.norm = config.norm.build() if config.norm is not None else None
 
     def to_latent(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(x)
@@ -1557,12 +1729,12 @@ class KimiMoE(nn.Module):
             config.hidden_size if self.latent_size is None else self.latent_size
         )
         if self.latent_size is not None:
-            self.latent = KimiLatentMoEProjection(
+            self.latent = KimiLatentMoEProjection.make_config(
                 config.hidden_size,
                 self.latent_size,
                 use_norm=config.latent_moe_use_norm,
                 rms_norm_eps=config.rms_norm_eps,
-            )
+            ).build()
 
         router_cfg = TokenChoiceTopKRouter.Config(
             num_experts=config.num_experts,
@@ -1748,13 +1920,13 @@ class KimiMoE(nn.Module):
         self.shared_experts = None
         if config.num_shared_experts > 0 and self.latent_size is not None:
             shared_dim = config.moe_intermediate_size * config.num_shared_experts
-            self.shared_experts = KimiMLP(
+            self.shared_experts = KimiMLP.make_config(
                 config.hidden_size,
                 shared_dim,
                 hidden_act=config.hidden_act,
                 situ_beta=config.activation_situ_beta,
                 situ_linear_beta=config.activation_situ_linear_beta,
-            )
+            ).build()
 
     @property
     def routed_experts(self):
@@ -1844,10 +2016,12 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
         self.attention: nn.Module | None = None
         self.delta_attention: nn.Module | None = None
         if config.is_kda_layer(layer_idx):
-            self.delta_attention = KimiDeltaAttention(config, layer_idx)
+            self.delta_attention = KimiDeltaAttention.make_config(
+                config, layer_idx
+            ).build()
             self.is_linear_attn = True
         elif config.is_mla:
-            self.attention = KimiMLAAttention(config, layer_idx)
+            self.attention = KimiMLAAttention.make_config(config, layer_idx).build()
             self.is_linear_attn = False
         else:
             # Reachable: a config with none of the MLA dims set and
@@ -1873,11 +2047,11 @@ class KimiDecoderLayer(nn.Module, UpstreamFSDPNames):
             self.moe = KimiMoE(config)
             self.is_moe = True
         else:
-            self.feed_forward = KimiMLP(
+            self.feed_forward = KimiMLP.make_config(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-            )
+            ).build()
             self.is_moe = False
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate())

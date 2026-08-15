@@ -28,13 +28,13 @@ from torchtitan.models.kimi_k3.model import (
 
 class TestLatentProjection(unittest.TestCase):
     def test_official_widths(self):
-        proj = KimiLatentMoEProjection(7168, 3584)
+        proj = KimiLatentMoEProjection.make_config(7168, 3584).build()
         self.assertEqual(proj.down.weight.shape, (3584, 7168))
         self.assertEqual(proj.up.weight.shape, (7168, 3584))
         self.assertEqual(proj.norm.normalized_shape, (3584,))
 
     def test_round_trip_shapes(self):
-        proj = KimiLatentMoEProjection(64, 32)
+        proj = KimiLatentMoEProjection.make_config(64, 32).build()
         x = torch.randn(2, 5, 64)
         u = proj.to_latent(x)
         self.assertEqual(u.shape, (2, 5, 32))
@@ -42,21 +42,21 @@ class TestLatentProjection(unittest.TestCase):
 
     def test_norm_sits_before_up(self):
         torch.manual_seed(0)
-        proj = KimiLatentMoEProjection(64, 32)
+        proj = KimiLatentMoEProjection.make_config(64, 32).build()
         u = torch.randn(2, 5, 32) * 100  # scale the aggregate up
         torch.testing.assert_close(proj.from_latent(u), proj.up(proj.norm(u)))
 
     def test_norm_makes_exit_scale_insensitive(self):
         # the point of sec 2.3.1: u's scale varies with the selected experts
         torch.manual_seed(0)
-        proj = KimiLatentMoEProjection(64, 32)
+        proj = KimiLatentMoEProjection.make_config(64, 32).build()
         u = torch.randn(2, 5, 32)
         a = proj.from_latent(u)
         b = proj.from_latent(u * 50.0)
         torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)
 
     def test_norm_can_be_disabled(self):
-        proj = KimiLatentMoEProjection(64, 32, use_norm=False)
+        proj = KimiLatentMoEProjection.make_config(64, 32, use_norm=False).build()
         self.assertIsNone(proj.norm)
         u = torch.randn(2, 5, 32)
         torch.testing.assert_close(proj.from_latent(u), proj.up(u))
@@ -64,7 +64,7 @@ class TestLatentProjection(unittest.TestCase):
     def test_projections_are_shared_not_per_expert(self):
         # one down/up pair per layer -- applied once per token, which is what
         # keeps 896-expert dispatch affordable (traffic is O(l), not O(d))
-        proj = KimiLatentMoEProjection(64, 32)
+        proj = KimiLatentMoEProjection.make_config(64, 32).build()
         names = {n for n, _ in proj.named_parameters()}
         self.assertEqual(names, {"down.weight", "up.weight", "norm.weight"})
 
