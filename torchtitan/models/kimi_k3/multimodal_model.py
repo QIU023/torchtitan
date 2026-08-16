@@ -1417,6 +1417,21 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
             from torchtitan.models.kimi_k3.vit_prefetch import prefetch_depth
 
             pf.advance(mb, prefetch_depth())
+        # Cut the graph here when the bubble runtime is driving: what gets spliced is a
+        # detached stand-in, and the tower's backward is replayed at a planned slot
+        # instead of running inside this stage's backward. Placed before the CP-shard
+        # selection so the cut sees the tower's own output, not a sliced view of it --
+        # replaying a gradient into a slice would train the tower on part of its batch.
+        gq = getattr(self, "_vision_grad_queue", None)
+        if gq is not None and mb is not None:
+            from torchtitan.models.kimi_k3.dep_bubble_backward import (
+                cut_for_deferred_backward,
+            )
+
+            if isinstance(feats, torch.Tensor):
+                feats = cut_for_deferred_backward(feats, gq, mb)
+            else:
+                feats = [cut_for_deferred_backward(f, gq, mb) for f in feats]
         if isinstance(feats, torch.Tensor):
             feats = [feats]
         num_rows = sum(f.size(0) for f in feats)

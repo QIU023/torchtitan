@@ -103,6 +103,22 @@ class GradQueue:
             self.ran += 1
         return True
 
+    def run_next(self) -> bool:
+        """Run the earliest pending vision backward, if any.
+
+        The backward side is greedy rather than budget-planned, and that is a deliberate
+        difference from the forward. A placement plan needs to know when the work becomes
+        runnable, and on the forward side that is static -- the pixels are there from step
+        entry. A vision backward only becomes runnable once the text backward for its
+        micro-batch has produced the gradient, which is a schedule-dependent moment the
+        planner would have to model. Taking one pending item per idle interval after a
+        backward action is the same placement the plan would make in the common case and
+        needs no model of arrival time.
+        """
+        if not self._pending:
+            return False
+        return self.run_one(min(self._pending))
+
     def drain(self) -> int:
         """Run everything still pending. Called unconditionally at step end.
 
@@ -129,6 +145,9 @@ class GradQueue:
                 f"tower on incomplete gradients."
             )
 
+    def pending_count(self) -> int:
+        return sum(len(v) for v in self._pending.values())
+
     def report(self, placed: int) -> None:
         level = logger.info if self.drained == 0 else logger.warning
         level(
@@ -140,3 +159,49 @@ class GradQueue:
         )
         self.ran = 0
         self.drained = 0
+
+
+def install_backward_slots(pp_schedule, queue: GradQueue) -> int:
+    """Run one queued vision backward after each of this rank's backward actions.
+
+    Same shape as the forward's hook and for the same reason: the idle interval starts
+    when an action completes, so firing after ``backward_one_chunk`` returns puts the
+    work in the gap rather than in front of the next action's wait.
+
+    Also makes ``step`` drain whatever is left. That is not tidiness -- a deferred
+    backward that never runs leaves the tower without that micro-batch's gradient and
+    raises nothing.
+    """
+    wrapped = 0
+    for stage in getattr(pp_schedule, "_stages", []) or []:
+        if getattr(stage, "_kimi_bubble_bwd_wrapped", False):
+            continue
+        inner = getattr(stage, "backward_one_chunk", None)
+        if inner is None:
+            continue
+
+        def make(inner=inner):
+            def backward_one_chunk(*args, **kwargs):
+                out = inner(*args, **kwargs)
+                queue.run_next()
+                return out
+
+            return backward_one_chunk
+
+        stage.backward_one_chunk = make()  # type: ignore[method-assign]
+        stage._kimi_bubble_bwd_wrapped = True
+        wrapped += 1
+
+    if not getattr(pp_schedule, "_kimi_bubble_backward_step", False):
+        orig_step = pp_schedule.step
+
+        def patched_step(*args, **kwargs):
+            try:
+                return orig_step(*args, **kwargs)
+            finally:
+                left = queue.drain()
+                queue.report(placed=queue.ran + left)
+
+        pp_schedule.step = patched_step  # type: ignore[method-assign]
+        pp_schedule._kimi_bubble_backward_step = True
+    return wrapped

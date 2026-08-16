@@ -1291,6 +1291,18 @@ def _install_bubble_runtime_for(pp_schedule, prefetcher) -> None:
         upfront_encode=encode_now,
     )
 
+    # The backward half. The queue lives on the OWNER module, because the seam that
+    # cuts the graph is inside its forward and that is the only place the micro-batch
+    # index and the features meet.
+    from torchtitan.models.kimi_k3.dep_bubble_backward import (
+        GradQueue,
+        install_backward_slots,
+    )
+
+    queue = GradQueue()
+    prefetcher._owner._vision_grad_queue = queue
+    install_backward_slots(pp_schedule, queue)
+
 
 def dep_vision_stages() -> int:
     """How many stages the vision tower occupies.
