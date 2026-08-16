@@ -1260,6 +1260,12 @@ def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
                 "_moe; EP needs the standard torchtitan MoE wrapping."
             )
         moe.parallelize(parallel_dims)
+        # Tell the declarative driver to stay out of this subtree. It cannot infer it:
+        # _already_distributed asks for a module's OWN parameters, and the KimiMoE wrapper
+        # has none -- its parameters all live in children -- so the wrapper always looks
+        # undistributed and the driver descends into the core MoE this call just
+        # parallelized, which raises "MoE has already been parallelized".
+        ffn._kimi_ep_parallelized = True
         moe_layers_wrapped += 1
     if moe_layers_wrapped:
         logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
@@ -1393,6 +1399,8 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
     while queue:
         child = queue.pop()
         if isinstance(child, _TTModule) and not getattr(child, "_parallelized", False):
+            if getattr(child, "_kimi_ep_parallelized", False):
+                continue
             if not _already_distributed(child):
                 child.parallelize(parallel_dims)
                 entered.append(type(child).__name__)
