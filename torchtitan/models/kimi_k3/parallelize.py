@@ -258,7 +258,10 @@ def parallelize_kimi_k3(
         # Note that KCP on the KDA layers and Ulysses on the MLA layers run
         # TOGETHER, and that is the design: they apply to disjoint layers. The
         # per-layer modes are not a choice between two whole-model strategies.
-        kda_mode = kda_modules[0].cp_mode if kda_modules else "ulysses"
+        # None, not a default mode name: under PP a rank can hold no KDA layer at
+        # all (the vision-tower stage is the ordinary case), and naming a mode
+        # there would be the log inventing a configuration. Reported as "-".
+        kda_mode = kda_modules[0].cp_mode if kda_modules else None
         if kda_mode == "ulysses":
             for m in kda_modules:
                 # KDA is NoParallel under TP (replicated), so only cp
@@ -317,9 +320,16 @@ def parallelize_kimi_k3(
             cp_degree,
             n_mla,
             len(kda_modules),
-            kda_mode,
+            kda_mode or "-",
             n_attn,
         )
+    # None means "this rank has no MoE to plan for", which is a normal state rather
+    # than a missing value: under PP a rank can hold only the vision-tower stage, or
+    # only decoder layers that are dense. Kept explicit because the verify call below
+    # is guarded on ep_enabled, and ep_enabled is a property of the JOB while having
+    # MoE layers is a property of THIS RANK -- reading an unset local there is what
+    # took down every ep+pp cell on the multimodal arms.
+    ep_expected = None
     if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
         # Expert Parallel for Kimi MoE layers. The
         # KimiMoE module wraps torchtitan.models.common.moe.MoE as
@@ -341,8 +351,10 @@ def parallelize_kimi_k3(
     # already exist -- no plan is removed here, so the imperative plan and the
     # declarations are both in effect and their agreement is what the matrix checks.
     entered = _drive_declarative_sharding(model, parallel_dims)
-    if parallel_dims.ep_enabled:
-        # After the driver, because the driver is what carries the ep mesh down.
+    if parallel_dims.ep_enabled and ep_expected is not None:
+        # After the driver, because the driver is what carries the ep mesh down. Only
+        # where there was a plan: apply_ep_kimi_k3 already refuses a model that has MoE
+        # layers but yields none, so a None here means this rank has no MoE at all.
         verify_ep_applied(ep_expected)
     if parallel_dims.tp_enabled:
         _sweep_remaining_to_replicate(
@@ -350,6 +362,9 @@ def parallelize_kimi_k3(
             parallel_dims.get_mesh("tp"),
             skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
         )
+        # The sweep is the last thing that distributes parameters, so this is the
+        # point where "all of them" is a checkable statement.
+        verify_params_distributed(model)
     if entered:
         from collections import Counter
 
@@ -1359,6 +1374,39 @@ def verify_ep_applied(expected) -> None:
                 f"{[n for n, _ in experts.named_parameters(recurse=False)]} are all "
                 f"replicated or plain. The driver did not carry the ep mesh here."
             )
+
+
+def verify_params_distributed(model: nn.Module) -> None:
+    """Under TP, every parameter must be a DTensor before FSDP wraps the model.
+
+    Three mechanisms distribute parameters here -- the imperative TP plan, the
+    declarative driver, and the leftover sweep -- and each can believe another handled
+    a given one. When one slips through, nothing fails at wiring time: it fails much
+    later inside ``clip_grad_norm_``, as ``aten._foreach_mul_.Tensor got mixed``, which
+    names neither the parameter nor the mechanism. That has happened, with the A_log
+    and dt_bias of nine KDA layers -- eighteen plain gradients at clip time.
+
+    Only DTensor-ness is asserted, not the mesh. The parameters legitimately live on
+    more than one mesh (routed experts on the ep mesh, everything else on tp), so a
+    mesh whitelist here would encode the very layout the sweep exists to arrange and
+    would start rejecting valid ones. The mesh histogram is logged instead, where a
+    surprise is visible without being fatal.
+    """
+    plain = [n for n, p in model.named_parameters() if not isinstance(p, DTensor)]
+    if plain:
+        raise ValueError(
+            f"{len(plain)} parameter(s) are still plain Tensors after TP wiring, so "
+            f"clip_grad_norm_ will fail with a mixed-type _foreach error far from here: "
+            f"{plain[:8]}{' ...' if len(plain) > 8 else ''}. Every parameter must be a "
+            "DTensor by this point -- check whether the module declares a sharding that "
+            "was never applied, or whether the leftover sweep skipped it."
+        )
+    from collections import Counter
+
+    meshes = Counter(
+        str(p.device_mesh.mesh_dim_names) for _, p in model.named_parameters()
+    )
+    logger.info("Parameter meshes after TP wiring: %s", dict(meshes))
 
 
 def _sweep_remaining_to_replicate(

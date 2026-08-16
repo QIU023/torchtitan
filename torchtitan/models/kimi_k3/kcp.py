@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 
 def conv_with_halo(
@@ -61,14 +62,29 @@ def conv_with_halo(
     ``ShortConvolution`` carries. A plain ``nn.Conv1d`` does not -- the upstream
     K3 model applies its SiLU outside the conv -- so those call sites pass the
     name explicitly rather than getting a second copy of this function.
+
+    The weight and bias are unwrapped to local first. Under TP the KDA layers are
+    NoParallel, so these are DTensor(Replicate), and handing a DTensor to fla's
+    triton kernel does not raise anything legible -- it surfaces as
+    ``CUBLAS_STATUS_INTERNAL_ERROR`` or an illegal memory access from inside the
+    kernel. The Ulysses path unwraps them in its own ``conv_subset``; this one did
+    not, which is why KCP worked in every cell that had no TP and broke every cell
+    that had both.
     """
     from einops import rearrange
     from fla.modules.conv.cp.ops import causal_conv1d_cp
 
+    weight = conv.weight
+    if isinstance(weight, DTensor):
+        weight = weight.to_local()
+    bias = conv.bias
+    if bias is not None and isinstance(bias, DTensor):
+        bias = bias.to_local()
+
     return causal_conv1d_cp(
         x=x_local,
-        weight=rearrange(conv.weight, "d 1 w -> d w"),
-        bias=conv.bias,
+        weight=rearrange(weight, "d 1 w -> d w"),
+        bias=bias,
         activation=getattr(conv, "activation", None)
         if activation is None
         else activation,
