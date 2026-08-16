@@ -58,9 +58,50 @@ tests, training needs the triton path).
   detached-leaf cache + gradient bridge, so backward through cached
   tensors does not double-accumulate into the producer. Delta mode sends
   only newly committed blocks.
-- **CP is out of scope**: KDA needs Ulysses-style head sharding or
-  LASP-style cross-rank state passing, neither of which fla-core provides
-  today (same blank as `qwen3_5`).
+- **Context parallelism is per layer kind, and both kinds run together.**
+  The KDA layers use KCP (report sec 5.1.2): the sequence stays sharded end
+  to end via a prefix scan over state fragments, plus a fixed-size halo for
+  the short convolutions. fla-core >= 0.5.1 provides both
+  (`chunk_kda(cp_context=...)`, `causal_conv1d_cp`). The MLA layers use
+  Ulysses head sharding, which is unrelated -- KCP decomposes the delta-rule
+  recurrence and says nothing about softmax attention -- so a CP run is KCP
+  on the KDA layers *and* Ulysses on the MLA layers simultaneously.
+  `kda_cp_mode` selects the KDA side and defaults to `"kcp"`; `"ulysses"`
+  there is kept as an A/B, and is not what K3 does: it gives every rank the
+  whole sequence for its head subset, so activation memory does not fall
+  with `cp` and the context lengths K3 targets are out of reach.
+  KCP's varlen path takes no batch axis (fla asserts `[1, T, D]`), so the
+  batch is looped -- flattening it into one packed sequence would not match,
+  because fla cuts the *global* packed sequence into contiguous rank-ordered
+  pieces while a rank holds piece `r` of every sequence.
+- **TP and CP interact through the head count, and the KDA layers pay for
+  it.** KDA is `NoParallel` under TP (replicated), so its attention compute
+  is duplicated across the TP axis: at the report's 3:1 KDA:MLA ratio, three
+  quarters of the attention layers compute redundantly at `tp > 1`. TP is
+  there for MLA and the MoE; KDA scales on CP. On the MLA side both axes cut
+  the same heads, so `num_attention_heads % (tp * cp) == 0` is enforced, and
+  the quotient is also a performance floor -- 96 heads at `tp=8, cp=4` leaves
+  3 heads a rank, where the all-to-all payload and SDPA's own head
+  parallelism both get thin. Prefer spending the budget on `cp` over `tp`
+  once that quotient drops into the single digits.
+- **Expert parallelism is the standard all-to-all, not MoonEP.** Report sec
+  5.2.1 describes a balanced EP implementation that is not reproduced here;
+  what this folder has is torchtitan's `ExpertParallel` on the routed-expert
+  container, i.e. dispatch and combine all-to-alls with no load-balancing
+  transport of its own. See
+  [MoonshotAI/MoonEP](https://github.com/MoonshotAI/MoonEP). Note that at
+  896 experts with top-16 the report itself (sec 2.3) puts the sparsity
+  beyond where fixed-step auxiliary-loss-free bias updates are known to
+  behave, so this is not only a throughput gap. `quantile_balance.py`
+  addresses the *router* half of that (sec 2.3.3: it solves for the bias
+  instead of nudging it, removing the step size); it does not make the
+  transport balanced.
+- **`V=1` is a supported PP mode, not a degradation.** With one virtual
+  stage per rank the adapter runs the naive chain relay, and that is the
+  bandwidth lower bound rather than a fallback: with no second virtual stage
+  on the rank there is no cached prefix to diff against, so every hop must
+  carry the blocks the next stage reads. Delta mode needs `V >= 2` to have
+  anything to omit.
 
 ## Evidence
 
