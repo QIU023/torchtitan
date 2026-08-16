@@ -89,6 +89,11 @@ class TopologyKnobs:
     # A parameter and not a runtime measurement, because a plan derived from each
     # rank's own timing would stop being identical across ranks.
     vit_bubble_cost_ratio: float = 0.5
+    # How many deferred vision backwards may wait at once. Each one holds a
+    # micro-batch's tower forward graph alive, so this is the memory window of the
+    # backward half. 0 is unbounded, which is the measured-nothing default -- see
+    # GradQueue for why a guessed bound would be worse than none.
+    vit_bubble_max_pending: int = 0
     vit_tp_heads: bool = True
     attn_res_cache: bool = False
 
@@ -116,6 +121,10 @@ def register_topology(config) -> TopologyKnobs:
         vit_bubble_cost_ratio=float(
             _field(config, "vit_bubble_cost_ratio", "KIMI_VIT_BUBBLE_COST_RATIO")
             or 0.5
+        ),
+        vit_bubble_max_pending=int(
+            _field(config, "vit_bubble_max_pending", "KIMI_VIT_BUBBLE_MAX_PENDING")
+            or 0
         ),
         vit_tp_heads=bool(_field(config, "vit_tp_heads", "KIMI_VIT_TP_HEADS")),
         attn_res_cache=bool(
@@ -171,6 +180,9 @@ def topology() -> TopologyKnobs:
         vit_bubble=os.environ.get("KIMI_VIT_BUBBLE", "") not in ("", "0"),
         vit_bubble_cost_ratio=float(
             os.environ.get("KIMI_VIT_BUBBLE_COST_RATIO", "0.5")
+        ),
+        vit_bubble_max_pending=max(
+            0, int(os.environ.get("KIMI_VIT_BUBBLE_MAX_PENDING", "0"))
         ),
         vit_tp_heads=os.environ.get("KIMI_VIT_TP_HEADS", "1") != "0",
         attn_res_cache=os.environ.get("TORCHTITAN_ATTNRES_CACHE") == "1",

@@ -85,15 +85,42 @@ def cut_for_deferred_backward(
 
 
 class GradQueue:
-    """Vision backwards whose gradient has arrived but which have not run yet."""
+    """Vision backwards whose gradient has arrived but which have not run yet.
 
-    def __init__(self) -> None:
+    ``max_pending`` bounds how many may wait at once. Each waiting entry keeps one
+    micro-batch's tower forward graph alive from the encode until the replay, which
+    is a longer window than the forward prefetch's and is the real limit on how much
+    of the backward can be moved. Above the bound the earliest pending entry runs
+    immediately, turning the memory window into a configured quantity instead of
+    whatever the plan happened to imply.
+
+    Zero means unbounded, and that is the default deliberately. The window has not
+    been measured (it needs a box that can hold the configuration where hiding
+    exists), so a nonzero default would replace a known behaviour with a guessed
+    number. What the bound is for is the run that hits its memory ceiling: there it
+    is a knob rather than a rewrite.
+    """
+
+    def __init__(self, max_pending: int = 0) -> None:
         self._pending: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._max_pending = max(0, int(max_pending))
         self.ran = 0
         self.drained = 0
+        # Ran early because the bound was reached, not because a slot came up.
+        self.forced = 0
+        # Slots that came up with nothing pending. The backward side is greedy and
+        # its placement assumes the earliest micro-batch's gradient arrives first;
+        # a high count here says that assumption does not hold for this schedule
+        # and the greedy min() should become any-pending.
+        self.idle_slots = 0
 
     def stash(self, microbatch: int, output: torch.Tensor, grad: torch.Tensor) -> None:
         self._pending.setdefault(microbatch, []).append((output, grad))
+        while self._max_pending and self.pending_count() > self._max_pending:
+            before = self.ran
+            if not self.run_one(min(self._pending)):
+                break
+            self.forced += self.ran - before
 
     def has(self, microbatch: int) -> bool:
         return bool(self._pending.get(microbatch))
@@ -126,6 +153,7 @@ class GradQueue:
         needs no model of arrival time.
         """
         if not self._pending:
+            self.idle_slots += 1
             return False
         return self.run_one(min(self._pending))
 
@@ -160,15 +188,24 @@ class GradQueue:
 
     def report(self, placed: int) -> None:
         level = logger.info if self.drained == 0 else logger.warning
+        # forced and idle_slots are the two ways the placement can be working
+        # against the schedule while every gradient still runs: forced means the
+        # memory bound is what decided when, and idle_slots means slots came up
+        # with nothing to put in them. Both are silent in the loss.
         level(
-            "DEP bubble backward: %d ran at a planned slot, %d drained at step end "
+            "DEP bubble backward: %d ran at a planned slot, %d drained at step end, "
+            "%d forced by the pending bound, %d slot(s) found nothing pending "
             "(%d slots planned)",
-            self.ran,
+            self.ran - self.forced,
             self.drained,
+            self.forced,
+            self.idle_slots,
             placed,
         )
         self.ran = 0
         self.drained = 0
+        self.forced = 0
+        self.idle_slots = 0
 
 
 def install_backward_slots(pp_schedule, queue: GradQueue) -> int:

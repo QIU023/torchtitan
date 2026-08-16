@@ -284,3 +284,63 @@ class TestDeferredVisionGrad(unittest.TestCase):
         queue.run_one(1)
         queue.run_one(0)
         torch.testing.assert_close(model.weight.grad, expected, rtol=0, atol=0)
+
+
+class TestPendingBound(unittest.TestCase):
+    """The memory window of the backward half, as a configured quantity.
+
+    Each pending entry keeps one micro-batch's tower forward graph alive from the
+    encode until the replay. Unbounded, the plan decides how many that is; bounded,
+    the earliest runs early and the window is known. What must not change either way
+    is that every gradient runs exactly once.
+    """
+
+    def _tower(self):
+        torch.manual_seed(0)
+        return torch.nn.Linear(4, 4, bias=False)
+
+    def test_the_bound_runs_the_earliest_instead_of_growing(self):
+        xs = [torch.randn(2, 4) for _ in range(3)]
+        model = self._tower()
+        queue = GradQueue(max_pending=1)
+        for mb, x in enumerate(xs):
+            cut_for_deferred_backward(model(x), queue, mb).sum().backward()
+            self.assertLessEqual(queue.pending_count(), 1)
+        # Two were forced out by the bound; the third is still waiting for a slot.
+        self.assertEqual(queue.forced, 2)
+        self.assertEqual(queue.pending_count(), 1)
+
+    def test_the_bound_changes_when_not_whether_a_gradient_runs(self):
+        xs = [torch.randn(2, 4) for _ in range(3)]
+        expected_model = self._tower()
+        for x in xs:
+            expected_model(x).sum().backward()
+        expected = expected_model.weight.grad.clone()
+
+        model = self._tower()
+        queue = GradQueue(max_pending=1)
+        for mb, x in enumerate(xs):
+            cut_for_deferred_backward(model(x), queue, mb).sum().backward()
+        queue.drain()
+        torch.testing.assert_close(model.weight.grad, expected, rtol=0, atol=0)
+        queue.assert_empty("after drain under a pending bound")
+
+    def test_zero_means_unbounded(self):
+        xs = [torch.randn(2, 4) for _ in range(3)]
+        model = self._tower()
+        queue = GradQueue(max_pending=0)
+        for mb, x in enumerate(xs):
+            cut_for_deferred_backward(model(x), queue, mb).sum().backward()
+        self.assertEqual(queue.pending_count(), 3)
+        self.assertEqual(queue.forced, 0)
+
+    def test_a_slot_that_finds_nothing_is_counted(self):
+        """The greedy placement assumes the earliest micro-batch's grad arrives first.
+
+        A high idle count is how that assumption failing becomes visible, since the
+        step-end drain keeps it correct and therefore silent.
+        """
+        queue = GradQueue()
+        self.assertFalse(queue.run_next())
+        self.assertFalse(queue.run_next())
+        self.assertEqual(queue.idle_slots, 2)

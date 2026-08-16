@@ -1337,7 +1337,7 @@ def _install_bubble_runtime_for(pp_schedule, prefetcher) -> None:
         install_backward_slots,
     )
 
-    queue = GradQueue()
+    queue = GradQueue(max_pending=int(topology().vit_bubble_max_pending))
     prefetcher._owner._vision_grad_queue = queue
     install_backward_slots(pp_schedule, queue)
 
