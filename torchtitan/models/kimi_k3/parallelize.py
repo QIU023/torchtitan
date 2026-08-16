@@ -1303,7 +1303,7 @@ def verify_ep_applied(expected) -> None:
         sharded = [
             n
             for n, prm in experts.named_parameters(recurse=False)
-            if isinstance(prm, _DTensor)
+            if isinstance(prm, DTensor)
             and any(not pl.is_replicate() for pl in prm.placements)
         ]
         if not sharded:
