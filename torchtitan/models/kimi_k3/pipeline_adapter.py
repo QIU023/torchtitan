@@ -126,7 +126,7 @@ class RankLocalCache:
         # Parallel counter: how many Capture.backward calls have deposited
         # into each slot. The producer-side hook compares this against
         # ``layout.expected_same_rank_captures(...)`` to turn silent grad
-        # loss (a consumer's backward never fired) into an explicit warning.
+        # loss (a consumer's backward never fired) into a raised error.
         self._capture_counts: dict[tuple[int, int, int], int] = {}
 
     def append(
@@ -218,6 +218,17 @@ class RankLocalCache:
         count = self._capture_counts.pop(key, 0)
         return grad, count
 
+    def clear_capture_slots(self) -> int:
+        """Drop every captured-grad slot and counter. Returns how many there were.
+
+        For the step-end sweep: an aborted backward can leave a slot behind that
+        no mb-keyed ``drop`` reaches.
+        """
+        count = len(self._captured_grads)
+        self._captured_grads.clear()
+        self._capture_counts.clear()
+        return count
+
     def has_captured_for_mb(self, mb_index: int) -> bool:
         """True iff any captured-grad slot for ``mb_index`` survives.
         Called by the mb-end assertion as a lingering-bug canary.
@@ -289,9 +300,14 @@ def _install_augment_hook(
     later virtual stages that SHOULD deposit into this slot during the
     mb's backward window (from
     :meth:`BlockLayoutTables.expected_same_rank_captures`). The hook
-    warns when the observed count diverges -- the common failure that
-    this catches is a consumer's backward silently not firing, which
-    would drop its grad contribution into the bit bucket.
+    RAISES when the observed count diverges -- the failure this catches is
+    a consumer's backward not firing, which drops its grad contribution
+    into the bit bucket, and the step that follows would apply an
+    incomplete gradient with nothing anywhere saying so. There is no
+    configuration in which continuing is the right answer, so this is not
+    a warning: the count is derived from the static layout, delta mode is
+    gated on Interleaved1F1B, and under that schedule every same-rank
+    consumer's backward provably precedes the producer's own.
 
     Replaces the prior ``_LocalCacheAugment`` autograd.Function pattern:
     under real PP scheduling the Function's output-view trick did not
@@ -324,14 +340,17 @@ def _install_augment_hook(
             f"count={count} expected={expected_captures}"
         )
         if expected_captures is not None and count != expected_captures:
-            warnings.warn(
-                f"AttnRes adapter: capture-count mismatch at slot "
-                f"{slot_key}: observed {count} deposits, layout expected "
-                f"{expected_captures}. This indicates a same-rank "
-                "consumer's backward did not fire (silent grad loss) "
-                "or an unexpected consumer deposited an extra grad. "
-                "Escalate with -W error::UserWarning under CI.",
-                stacklevel=1,
+            mb_index, producer_stage, block_idx_in_producer = slot_key
+            raise RuntimeError(
+                f"AttnRes adapter: capture-count mismatch at slot {slot_key} "
+                f"(mb={mb_index}, producer stage={producer_stage}, commit "
+                f"{block_idx_in_producer} of that stage): observed {count} "
+                f"deposits, the layout expected {expected_captures}. Fewer "
+                "means a same-rank consumer's backward did not fire and its "
+                "grad contribution is lost; more means a consumer deposited "
+                "into the wrong slot. Either way this micro-batch's gradient "
+                "for that block is wrong, so the step is refused rather than "
+                "taken."
             )
         if captured is None:
             return grad
@@ -792,7 +811,9 @@ class CrossStageCacheAdapter(nn.Module):
         out_blocks_tensor = (
             torch.stack(send_pieces, dim=1)
             if send_pieces
-            else partial_out.new_zeros((partial_out.shape[0] * partial_out.shape[1], 0, partial_out.shape[-1]))
+            else partial_out.new_zeros(
+                (partial_out.shape[0] * partial_out.shape[1], 0, partial_out.shape[-1])
+            )
         )
         partial_out = self._keepalive_touch(partial_out, prev_recv_tensor)
         return partial_out, out_blocks_tensor
@@ -831,6 +852,23 @@ class CrossStageCacheAdapter(nn.Module):
         # Defensive: ensure the seen-set is clear even if drop() didn't
         # remove every entry.
         self._cache._seen_mbs.clear()
+        # The step-end patch calls this from a ``finally``, so it also runs when
+        # the step raised. On that path a micro-batch's backward can stop between
+        # a consumer's deposit and the producer's pop, and the mb-keyed drop above
+        # only reaches slots whose mb still had cached blocks -- so clear the slot
+        # tables outright. A grad tensor per slot is real memory, and a step that
+        # dies in the backward of one micro-batch (OOM being the ordinary cause)
+        # would otherwise accumulate them for as long as the process keeps
+        # retrying. Reported rather than silent: outside the exception path a
+        # residual slot means an on_microbatch_end assertion did not run.
+        leaked = self._cache.clear_capture_slots()
+        if leaked:
+            logger.warning(
+                "cross-stage cache: cleared %d captured-grad slot(s) at step end "
+                "on rank %s; expected zero unless the step raised mid-backward.",
+                leaked,
+                self.pp_rank,
+            )
 
     def on_microbatch_end(self, mb_index: int) -> None:
         """Mark ``mb_index`` as seen on this rank so the step-end sweep
@@ -1411,14 +1449,13 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     A no-op when the prefetch depth is 0, which is the default, so enabling DEP alone
     changes nothing here.
     """
+    from torchtitan.models.kimi_k3.knobs import topology
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
     from torchtitan.models.kimi_k3.vit_prefetch import (
         install_step_hook,
         prefetch_depth,
         VisionPrefetcher,
     )
-
-    from torchtitan.models.kimi_k3.knobs import topology
 
     bubble = bool(topology().vit_bubble)
     if prefetch_depth() <= 0 and not bubble:

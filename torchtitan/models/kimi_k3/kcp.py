@@ -30,12 +30,16 @@ A hand-rolled halo used to do this with ``dist.all_gather``, which is not
 autograd-aware, so the gradient owed to the left neighbour's tail was dropped while
 the forward stayed bit-exact -- hence using fla's autograd.Function instead.
 
-KCP vs the Ulysses path already in this repo: Ulysses all-to-alls the head axis
-and gives every rank the full sequence for its head subset, so activation memory
-per rank stays O(T/cp x D) only for the projections and the recurrence sees the
-whole sequence. KCP keeps the sequence sharded end to end, which is what makes
-it composable with a sharded-sequence pipeline and what the 1M-token context
-needs. Both are kept: Ulysses is the A/B.
+KCP vs the Ulysses path also in this repo: Ulysses all-to-alls the head axis and
+gives every rank the full sequence for its head subset, so activation memory per
+rank stays O(T/cp x D) only for the projections and the recurrence sees the whole
+sequence. KCP keeps the sequence sharded end to end, which is what makes it
+composable with a sharded-sequence pipeline and what the 1M-token context needs.
+
+KCP is therefore what ``kda_cp_mode`` defaults to, and Ulysses is the A/B. Which
+one runs is per-layer-kind and not a whole-model choice: a CP run is KCP on the
+KDA layers AND Ulysses on the MLA layers, together, because KCP decomposes the
+delta-rule recurrence and has nothing to say about softmax attention.
 """
 
 from __future__ import annotations
@@ -65,26 +69,47 @@ def conv_with_halo(
         x=x_local,
         weight=rearrange(conv.weight, "d 1 w -> d w"),
         bias=conv.bias,
-        activation=getattr(conv, "activation", None) if activation is None else activation,
+        activation=getattr(conv, "activation", None)
+        if activation is None
+        else activation,
         cp_context=cp_context,
     )
 
 
 def build_kcp_context(
-    seq_len_local: int, group, device, conv1d_kernel_size: int | None = None
+    seq_len_local: int,
+    group,
+    device,
+    conv1d_kernel_size: int | None = None,
+    cu_seqlens: "torch.Tensor | None" = None,
 ) -> object:
-    """fla CP context for a single evenly-split sequence.
+    """fla CP context for one evenly-split sequence.
 
     ``chunk_kda`` needs the GLOBAL cu_seqlens of the packed sequence plus the
     process group; ``build_cp_context`` derives each rank's slice from them.
     ``conv1d_kernel_size`` is required by ``causal_conv1d_cp`` and otherwise
     unused, so it is optional here.
+
+    ``cu_seqlens`` defaults to ``[0, seq_len_local * world]``, i.e. ONE document
+    spanning the whole sequence. Pass real boundaries to describe a packed
+    (multi-document) sequence -- they must be GLOBAL, since that is what fla
+    slices per rank.
+
+    Whether the default is right is a property of the caller, not of this
+    helper, and worth stating plainly: nothing in this repo hands KDA document
+    boundaries in ANY mode. Both non-CP call sites pass ``cu_seqlens=None`` to
+    ``chunk_kda``, so a packed SFT batch already carries the delta-rule state
+    across document boundaries with or without CP. The default here matches that
+    behaviour rather than introducing a hole of its own; fixing it means
+    threading the dataloader's boundaries through every KDA call site, not
+    changing this default.
     """
     from fla.ops.cp.context import build_cp_context
 
-    world = dist.get_world_size(group)
-    total = seq_len_local * world
-    cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=device)
+    if cu_seqlens is None:
+        world = dist.get_world_size(group)
+        total = seq_len_local * world
+        cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=device)
     return build_cp_context(
         cu_seqlens, group=group, conv1d_kernel_size=conv1d_kernel_size
     )

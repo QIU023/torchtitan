@@ -51,8 +51,8 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
-from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.embedding import Embedding
+from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
@@ -252,12 +252,19 @@ class KimiK3Config:
     # tile use dense Tensor Core matmuls. Official value: -5.0. None keeps
     # the Kimi Linear form. fla-core implements both (ops/kda/gate.py).
     kda_gate_lower_bound: float | None = None
-    # Which CP scheme KDA uses. "ulysses" all-to-alls the head axis so each
-    # rank sees the whole sequence for its heads; "kcp" keeps the sequence
-    # sharded end to end via the prefix scan of report sec 5.1.2 plus a conv
-    # halo (see kcp.py). KCP is what a 1M-token context needs; ulysses is the
-    # validated A/B.
-    kda_cp_mode: str = "ulysses"
+    # Which CP scheme the KDA layers use. "kcp" is report sec 5.1.2 and the
+    # default: the sequence stays sharded end to end via a prefix scan over
+    # state fragments plus a conv halo (see kcp.py). "ulysses" all-to-alls the
+    # head axis instead, so every rank materializes the WHOLE sequence for its
+    # head subset -- which means activation memory does not fall with cp, and a
+    # 1M-token context is out of reach. It is kept as the validated A/B, not as
+    # a production path, and it is not what K3 does.
+    #
+    # The MLA layers are Ulysses either way, and that is not an alternative to
+    # this field: KCP decomposes the delta-rule recurrence and has nothing to say
+    # about softmax attention. A CP run is KCP on the KDA layers AND Ulysses on
+    # the MLA layers, together.
+    kda_cp_mode: str = "kcp"
     # Eq. 6, output gate. Kimi Linear used a low-rank projection; K3 uses an
     # input-dependent FULL-RANK one: y = W_o[Sigmoid(W_g x) (.) RMSNorm(o~)].
     kda_use_full_rank_gate: bool = False
@@ -558,9 +565,7 @@ class KimiMLAAttention(_TTModule):
         )
 
     @staticmethod
-    def make_config(
-        config: KimiK3Config, layer_idx: int
-    ) -> "KimiMLAAttention.Config":
+    def make_config(config: KimiK3Config, layer_idx: int) -> "KimiMLAAttention.Config":
         """Turn the flat model config into this module's config tree.
 
         The one place that reads the flat config for MLA, so hoisting the tree
@@ -634,7 +639,8 @@ class KimiMLAAttention(_TTModule):
             # init makes sigmoid(gate) ~= 1 and the layer starts near identity.
             if config.attn_gate_param == "full_rank":
                 cfg.attn_gate_proj = _lin(
-                    config.hidden_size, heads * config.v_head_dim,
+                    config.hidden_size,
+                    heads * config.v_head_dim,
                     sharding=_tp_shard(0),
                 )
             else:
@@ -935,7 +941,9 @@ class KimiMLAAttention(_TTModule):
             # the contracted axis. Replicate here gives "a and b must have same
             # reduction dim" -- the local width is num_heads/tp * v_head_dim.
             attn_BLE = DTensor.from_local(
-                attn_BLE, x.device_mesh, (Shard(attn_BLE.dim() - 1),),
+                attn_BLE,
+                x.device_mesh,
+                (Shard(attn_BLE.dim() - 1),),
                 run_check=False,
             )
         out = self.o_proj(attn_BLE)
@@ -1091,7 +1099,9 @@ class KimiDeltaAttention(_TTModule):
         if config.kda_use_full_rank_gate:
             cfg.g_proj = _lin(config.hidden_size, projection_size)
         else:
-            cfg.g_a_proj = _lin(config.hidden_size, config.kda_head_dim, replicate=False)
+            cfg.g_a_proj = _lin(
+                config.hidden_size, config.kda_head_dim, replicate=False
+            )
             cfg.g_b_proj = _lin(config.kda_head_dim, projection_size, replicate=False)
         return cfg
 
@@ -1368,16 +1378,36 @@ class KimiDeltaAttention(_TTModule):
         unsupported under cp_context, which is fine for training (the final
         state is only needed for decoding), and the sequence must divide evenly
         across the CP ranks.
+
+        A batch axis is handled by looping, because fla's ``causal_conv1d_cp``
+        asserts ``[1, T, D]``: its CP path is built around a single packed
+        sequence. Flattening ``[B, L, D]`` into one packed sequence instead would
+        be cheaper in launches but wrong -- ``build_cp_context`` derives each
+        rank's slice by cutting the GLOBAL packed sequence into contiguous
+        rank-ordered pieces, while what this rank actually holds is piece ``r`` of
+        every sequence, so the two layouts only coincide at B = 1. The loop is
+        also what the recurrence wants: sequences in a batch are independent, and
+        the delta-rule state must not carry from one into the next.
+
+        The cost is B prefix-scan all-gathers instead of one. Each is fixed size
+        (state fragments, not activations) and independent of sequence length, and
+        B is identical on every rank, so the collective counts match and cannot
+        deadlock. K3's own regime is the cheap end of this: local batch 1 with a
+        long sequence, the batch coming from DP.
         """
+        B = x.shape[0]
+        if B > 1:
+            return torch.cat(
+                [self._forward_kcp_one(x[b : b + 1], cp_group) for b in range(B)],
+                dim=0,
+            )
+        return self._forward_kcp_one(x, cp_group)
+
+    def _forward_kcp_one(self, x: torch.Tensor, cp_group) -> torch.Tensor:
+        """One sequence's KCP forward. ``x`` is this rank's ``[1, L, D]`` shard."""
         from torchtitan.models.kimi_k3.kcp import build_kcp_context, conv_with_halo
 
-        B, t_loc, _ = x.shape
-        if B != 1:
-            raise ValueError(
-                "KCP uses fla's varlen cp_context, which packs a single "
-                f"sequence; got batch size {B}. Flatten the batch into the "
-                "packed layout or use kda_cp_mode='ulysses'."
-            )
+        t_loc = x.shape[1]
 
         # One context serves both the conv halo and the recurrence; the conv
         # needs the kernel width, the recurrence ignores it.
@@ -1691,9 +1721,7 @@ class KimiMoE(_TTModule):
         # takes a separate router_input.
         latent_cfg = None
         latent_size: int | None = config.routed_expert_hidden_size
-        expert_dim = (
-            config.hidden_size if latent_size is None else latent_size
-        )
+        expert_dim = config.hidden_size if latent_size is None else latent_size
         if latent_size is not None:
             latent_cfg = KimiLatentMoEProjection.make_config(
                 config.hidden_size,
@@ -1910,7 +1938,6 @@ class KimiMoE(_TTModule):
             config.shared_experts.build() if config.shared_experts is not None else None
         )
 
-
     @property
     def routed_experts(self):
         """The composed core MoE's routed experts.
@@ -2006,10 +2033,9 @@ class KimiDecoderLayer(_TTModule, UpstreamFSDPNames):
         feed_forward: "KimiMLP.Config | None" = None
 
     @staticmethod
-    def make_config(
-        config: KimiK3Config, layer_idx: int
-    ) -> "KimiDecoderLayer.Config":
+    def make_config(config: KimiK3Config, layer_idx: int) -> "KimiDecoderLayer.Config":
         """The one place this class reads the flat config."""
+
         def _norm() -> "RMSNorm.Config":
             return RMSNorm.Config(
                 normalized_shape=config.hidden_size,
@@ -2056,9 +2082,13 @@ class KimiDecoderLayer(_TTModule, UpstreamFSDPNames):
         super().__init__()
         self.layer_idx = config.layer_idx
         self.hidden_size = config.hidden_size
-        self.attention = config.attention.build() if config.attention is not None else None
+        self.attention = (
+            config.attention.build() if config.attention is not None else None
+        )
         self.delta_attention = (
-            config.delta_attention.build() if config.delta_attention is not None else None
+            config.delta_attention.build()
+            if config.delta_attention is not None
+            else None
         )
         self.is_linear_attn = self.delta_attention is not None
         self.moe = config.moe.build() if config.moe is not None else None
@@ -2068,7 +2098,6 @@ class KimiDecoderLayer(_TTModule, UpstreamFSDPNames):
         self.is_moe = self.moe is not None
         self.input_layernorm = config.input_layernorm.build()
         self.post_attention_layernorm = config.post_attention_layernorm.build()
-
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Attention block

@@ -12,10 +12,6 @@ stage commits, which blocks each rank's shared cache holds at every
 virtual-stage entry, and which subset a stage must ship on its outgoing
 P2P (the "delta"). The adapter reads these tables at runtime so no
 metadata ever travels over the wire.
-
-Also exposes :func:`_grad_tag_base`, the tag-numbering helper used by
-both the consumer-side send-back and the producer-side irecv paths in
-:mod:`pipeline_adapter`.
 """
 
 from __future__ import annotations
@@ -34,9 +30,15 @@ class BlockLayoutTables:
     * ``delta_to_send(S)``         -> list[int] of block indices stage ``S``
       ships on its P2P send to stage ``S+1`` (``[]`` for the last stage).
     * ``producer_stage_of_block(b)`` -> int, the stage that commits block ``b``.
-    * ``consumer_stages_of(S)``    -> list[int] of stages that pull any block
-      ``S`` committed out of THEIR rank-cache (not via the delta buffer).
-    * ``cache_consumers_of_block(b)`` -> per-block flavor of the above.
+    * ``cache_consumers_of_block(b)`` -> list[int] of stages that pull block ``b``
+      out of THEIR rank-cache (not via the delta buffer).
+
+    A stage may commit more than one block: that happens whenever its layer span
+    is wider than ``layers_per_block`` (e.g. 96 layers over P=2, V=2 with
+    ``attn_res_block_size=12`` puts two boundaries on every stage). Everything
+    here is keyed by the commit's index WITHIN its producer stage, and so is the
+    runtime -- the rank cache stores ``(rank, stage, block_idx_in_producer)`` and
+    the producer installs one augment hook per commit.
 
     Expected delta sizes for the canonical config
     ``(P=8, V=2, num_blocks=8, n_layers=16, layers_per_block=2)``:
@@ -92,7 +94,6 @@ class BlockLayoutTables:
         self._producer_stage_of_block: dict[int, int] = {}
         self._cache_at_entry: dict[tuple[int, int], frozenset[int]] = {}
         self._delta_to_send: dict[int, list[int]] = {}
-        self._consumer_stages_of: dict[int, list[int]] = {}
 
         self._build()
 
@@ -109,9 +110,6 @@ class BlockLayoutTables:
 
     def producer_stage_of_block(self, block_idx: int) -> int:
         return self._producer_stage_of_block[block_idx]
-
-    def consumer_stages_of(self, stage_id: int) -> list[int]:
-        return list(self._consumer_stages_of.get(stage_id, ()))
 
     def cache_consumers_of_block(self, block_idx: int) -> list[int]:
         """Stages that consume ``block_idx`` via their shared rank cache."""
@@ -196,9 +194,10 @@ class BlockLayoutTables:
             else:
                 self._delta_to_send[stage_id] = []
 
-        # 3) consumer_stages_of: later stages that read a block from their
-        # RANK CACHE (not from the delta buffer). Those are the stages
-        # whose send-back Function fires an isend to the producer.
+        # 3) cache_consumers_of_block: the later stages that read a block from
+        # their RANK CACHE rather than from the delta buffer. Each such read
+        # deposits one grad into the producer's slot, which is what
+        # expected_same_rank_captures counts.
         cache_consumers_of_block: dict[int, list[int]] = {
             b: [] for b in range(self.num_blocks)
         }
@@ -210,25 +209,6 @@ class BlockLayoutTables:
         self._cache_consumers_of_block = {
             b: list(stages) for b, stages in cache_consumers_of_block.items()
         }
-
-        for stage_id in range(self.num_stages):
-            commits = self._commits_at[stage_id]
-            if not commits:
-                self._consumer_stages_of[stage_id] = []
-                continue
-            if len(commits) > 1:
-                # Multi-commit producers would need per-block consumer
-                # lists inside _RecvBlockGradsFromConsumers; production
-                # launch configs (layers_per_stage <= layers_per_block)
-                # never hit this.
-                raise NotImplementedError(
-                    f"Stage {stage_id} commits {len(commits)} blocks; "
-                    "multi-commit producers require per-block consumer "
-                    "lists in _RecvBlockGradsFromConsumers (not yet wired)."
-                )
-            self._consumer_stages_of[stage_id] = list(
-                cache_consumers_of_block[commits[0]]
-            )
 
 
 def _infer_block_layout_tables_from_stages(
@@ -302,13 +282,3 @@ def _infer_block_layout_tables_from_stages(
         layers_per_block=layers_per_block,
         layer_to_stage=layer_to_stage,
     )
-
-
-def _grad_tag_base(mb_index: int, producer_stage_id: int) -> int:
-    """P2P tag base unique per ``(mb_index, producer_stage_id)``.
-
-    Block-within-producer is added by the caller. 1024 blocks of tag
-    space per (mb, producer) is wildly conservative for AttnRes'
-    ``num_blocks`` order-of-8.
-    """
-    return (mb_index * 1024 * 64) + (producer_stage_id * 1024)

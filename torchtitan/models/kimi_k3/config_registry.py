@@ -1326,12 +1326,13 @@ def kimi_k3_mini_kcp() -> Trainer.Config:
     """K3-faithful structure with KDA Context Parallelism (report sec 5.1.2).
 
     The sequence stays sharded across CP ranks end to end: a fixed-size halo for
-    the short convolutions plus fla's prefix scan for the delta-rule state. The
-    default kda_cp_mode is "ulysses", which all-to-alls the head axis instead
-    and is kept as the A/B; see kcp.py for why both exist.
+    the short convolutions plus fla's prefix scan for the delta-rule state.
 
-    Requires local_batch_size 1, because fla's cp_context packs a single varlen
-    sequence.
+    This is now what ``kda_cp_mode`` defaults to, so the flavor states the value
+    rather than changing it. It is kept because launch scripts and several logbook
+    documents name it, and because naming the mode in the flavor is worth
+    something on a run whose whole point is the mode. The A/B in the other
+    direction is ``kimi_k3_mini_kda_ulysses``.
     """
     import dataclasses as _dc
 
@@ -1340,6 +1341,32 @@ def kimi_k3_mini_kcp() -> Trainer.Config:
     cfg.model_spec.model = _dc.replace(
         cfg.model_spec.model,
         kimi_config=_dc.replace(cfg.model_spec.model.kimi_config, kda_cp_mode="kcp"),
+    )
+    return cfg
+
+
+def kimi_k3_mini_kda_ulysses() -> Trainer.Config:
+    """The KDA CP A/B: head-axis all-to-all instead of a sharded sequence.
+
+    Every rank materializes the whole sequence for its head subset. That is the
+    reason this is the A/B and not the default -- activation memory does not fall
+    with cp, so the context length K3 targets is out of reach -- but it is also
+    why it is worth keeping: it needs no CP support from fla, it was validated
+    bit-exact against a single-rank reference before KCP existed, and a
+    disagreement between the two modes localizes to the KDA CP path rather than
+    to the rest of the stack.
+
+    The MLA layers all-to-all in both flavors; only the KDA layers differ.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_kda_ulysses"
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            cfg.model_spec.model.kimi_config, kda_cp_mode="ulysses"
+        ),
     )
     return cfg
 

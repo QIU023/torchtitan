@@ -161,5 +161,143 @@ class TestStepEndSweep(unittest.TestCase):
         self.assertEqual(adapter._cache._seen_mbs, set())
 
 
+class TestMultiCommitProducers(unittest.TestCase):
+    """A stage whose layer span is wider than one AttnRes block.
+
+    ``layers_per_stage > layers_per_block`` puts several block boundaries on one
+    stage, so that stage commits several blocks. The layout used to refuse this
+    with a NotImplementedError naming ``_RecvBlockGradsFromConsumers``, a class
+    deleted when the custom grad P2P was replaced by the rank-local capture and
+    augment hooks; the table that restriction protected
+    (``consumer_stages_of``) had no readers left. Every remaining table is keyed
+    by the commit's index within its producer stage, which is what these tests
+    pin down -- the runtime keys its cache and its hooks the same way.
+    """
+
+    @staticmethod
+    def _tables(*, P, V, n_layers, layers_per_block):
+        from torchtitan.models.kimi_k3.layout import BlockLayoutTables
+
+        return BlockLayoutTables(
+            pp_size=P,
+            virtual_stages_per_rank=V,
+            num_blocks=-(-n_layers // layers_per_block),
+            n_layers=n_layers,
+            layers_per_block=layers_per_block,
+        )
+
+    def test_two_boundaries_on_one_stage_build_a_table(self):
+        # K3's 12-layer blocks over 96 layers at pp=2, V=2: 24 layers a stage,
+        # so two commits each.
+        tables = self._tables(P=2, V=2, n_layers=96, layers_per_block=12)
+        self.assertEqual(tables.commits_at(0), [0, 1])
+        self.assertEqual(tables.commits_at(3), [6, 7])
+
+    def test_every_block_has_exactly_one_producer(self):
+        tables = self._tables(P=2, V=2, n_layers=96, layers_per_block=12)
+        owned = [b for s in range(4) for b in tables.commits_at(s)]
+        self.assertEqual(sorted(owned), list(range(8)))
+        for b in range(8):
+            self.assertEqual(
+                tables.producer_stage_of_block(b),
+                next(s for s in range(4) if b in tables.commits_at(s)),
+            )
+
+    def test_captures_are_counted_per_commit_not_per_stage(self):
+        # Both of stage 0's commits are read by stage 2 (same rank, later
+        # virtual stage), so each commit expects its own single deposit. A
+        # per-stage count would say 2 for one slot and 0 for the other.
+        tables = self._tables(P=2, V=2, n_layers=96, layers_per_block=12)
+        self.assertEqual(tables.expected_same_rank_captures(0, 0), 1)
+        self.assertEqual(tables.expected_same_rank_captures(0, 1), 1)
+        # Out-of-range commit index stays 0 rather than raising.
+        self.assertEqual(tables.expected_same_rank_captures(0, 2), 0)
+
+    def test_a_cache_consumer_is_always_a_later_stage(self):
+        # The grad bridge assumes it: a consumer deposits during ITS backward,
+        # which under Interleaved1F1B precedes the producer's own.
+        for P, V, n, bs in ((2, 2, 96, 12), (2, 2, 16, 2), (1, 2, 16, 2)):
+            tables = self._tables(P=P, V=V, n_layers=n, layers_per_block=bs)
+            for b in range(tables.num_blocks):
+                producer = tables.producer_stage_of_block(b)
+                for consumer in tables.cache_consumers_of_block(b):
+                    self.assertGreater(consumer, producer, f"P={P} block={b}")
+
+
+class TestCaptureCountMismatchRaises(unittest.TestCase):
+    """A capture-count mismatch means a gradient was dropped, so it raises.
+
+    It used to warn, which left the run to take the step with an incomplete
+    gradient for that block and nothing but a log line to say so.
+    """
+
+    def test_a_missing_consumer_deposit_raises_during_backward(self):
+        import torch
+
+        from torchtitan.models.kimi_k3.pipeline_adapter import (
+            _install_augment_hook,
+            RankLocalCache,
+        )
+
+        cache = RankLocalCache()
+        block = torch.zeros(2, requires_grad=True)
+        # Layout says one same-rank consumer will deposit; none does.
+        _install_augment_hook(block, (0, 0, 0), cache, expected_captures=1)
+        with self.assertRaises(RuntimeError) as ctx:
+            (block * 2).sum().backward()
+        self.assertIn("capture-count mismatch", str(ctx.exception))
+
+    def test_the_expected_deposit_passes_and_is_summed_in(self):
+        import torch
+
+        from torchtitan.models.kimi_k3.pipeline_adapter import (
+            _install_augment_hook,
+            RankLocalCache,
+        )
+
+        cache = RankLocalCache()
+        block = torch.zeros(2, requires_grad=True)
+        _install_augment_hook(block, (0, 0, 0), cache, expected_captures=1)
+        cache.capture_grad((0, 0, 0), torch.ones(2) * 3.0)
+        (block * 2).sum().backward()
+        # 2 from the local graph plus the consumer's 3.
+        self.assertTrue(torch.equal(block.grad, torch.full((2,), 5.0)))
+
+
+class TestStepEndSlotSweep(unittest.TestCase):
+    """The step-end sweep clears captured-grad slots outright.
+
+    The mb-keyed drop only reaches slots whose micro-batch still had cached
+    blocks. A step that dies inside one micro-batch's backward -- OOM being the
+    ordinary cause -- leaves a slot holding a grad tensor that nothing else
+    frees, and the sweep runs from the step patch's ``finally``.
+    """
+
+    def test_a_slot_with_no_cached_blocks_is_still_cleared(self):
+        import torch
+        from torch import nn
+
+        from torchtitan.models.kimi_k3.pipeline_adapter import CrossStageCacheAdapter
+
+        adapter = CrossStageCacheAdapter(
+            nn.Identity(), stage_id=0, num_stages=1, pp_rank=91
+        )
+        adapter._cache.capture_grad((7, 0, 0), torch.ones(2))
+        self.assertEqual(adapter._cache.get_blocks(7), [])
+        adapter._drop_all_cached_and_clear()
+        self.assertEqual(adapter._cache.pop_grad((7, 0, 0)), (None, 0))
+
+    def test_the_sweep_reports_how_many_it_cleared(self):
+        import torch
+
+        from torchtitan.models.kimi_k3.pipeline_adapter import RankLocalCache
+
+        cache = RankLocalCache()
+        cache.capture_grad((0, 0, 0), torch.ones(2))
+        cache.capture_grad((1, 0, 0), torch.ones(2))
+        self.assertEqual(cache.clear_capture_slots(), 2)
+        self.assertEqual(cache.clear_capture_slots(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

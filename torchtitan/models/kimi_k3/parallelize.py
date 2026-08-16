@@ -231,11 +231,14 @@ def parallelize_kimi_k3(
         cp_group = parallel_dims.get_mesh("cp").get_group()
         cp_degree = parallel_dims.cp
         tp_degree = parallel_dims.tp
-        n_attn = 0
+        n_mla = 0
+        kda_modules = []
         for m in model.modules():
             if isinstance(m, KimiMLAAttention):
-                # Under TP the head axis is already tp-sharded; Ulysses
-                # further splits the local heads by cp.
+                # MLA is Ulysses in both modes -- KCP is a KDA recurrence
+                # decomposition and has nothing to say about softmax attention.
+                # Under TP the head axis is already tp-sharded; Ulysses further
+                # splits the local heads by cp.
                 if m.num_heads % (tp_degree * cp_degree) != 0:
                     raise ValueError(
                         f"MLA num_attention_heads={m.num_heads} must be "
@@ -243,8 +246,21 @@ def parallelize_kimi_k3(
                         "Ulysses CP head sharding"
                     )
                 m._cp_group = cp_group
-                n_attn += 1
+                n_mla += 1
             elif isinstance(m, KimiDeltaAttention):
+                kda_modules.append(m)
+        # Which CP path the KDA layers take is their ``kda_cp_mode``, and the
+        # wiring has to know it, because the two modes shard different axes and
+        # so have different preconditions: the Ulysses head-divisibility rule
+        # below is meaningless for KCP, which never splits heads, and enforcing
+        # it there rejects configurations that work.
+        #
+        # Note that KCP on the KDA layers and Ulysses on the MLA layers run
+        # TOGETHER, and that is the design: they apply to disjoint layers. The
+        # per-layer modes are not a choice between two whole-model strategies.
+        kda_mode = kda_modules[0].cp_mode if kda_modules else "ulysses"
+        if kda_mode == "ulysses":
+            for m in kda_modules:
                 # KDA is NoParallel under TP (replicated), so only cp
                 # splits its heads.
                 if m.num_heads % cp_degree != 0:
@@ -253,8 +269,32 @@ def parallelize_kimi_k3(
                         f"divisible by cp={cp_degree} for Ulysses CP "
                         "head sharding"
                     )
-                m._cp_group = cp_group
-                n_attn += 1
+        elif kda_modules:
+            # KCP needs fla's CP ops rather than a head count. Checked here so a
+            # missing dependency names the config field instead of surfacing as
+            # an ImportError from inside the first forward.
+            #
+            # The batch-size precondition is deliberately NOT checked here: what
+            # KCP's varlen path cannot take is a batch axis on the tensor the
+            # module sees, and that is the micro-batch, not
+            # training.local_batch_size -- under PP the two differ by the
+            # micro-batch count. KimiDeltaAttention._forward_kcp checks the real
+            # B and says what to do about it; a less accurate copy at wiring time
+            # would reject configurations that run.
+            try:
+                from fla.modules.conv.cp.ops import causal_conv1d_cp  # noqa: F401
+                from fla.ops.cp.context import build_cp_context  # noqa: F401
+            except ImportError as err:
+                raise ValueError(
+                    "kda_cp_mode='kcp' needs fla-core's CP ops "
+                    "(fla.ops.cp.context.build_cp_context and "
+                    "fla.modules.conv.cp.ops.causal_conv1d_cp), which ship in "
+                    f"fla-core >= 0.5.1; import failed with: {err}. Install a "
+                    "newer fla-core or use kda_cp_mode='ulysses'."
+                ) from err
+        for m in kda_modules:
+            m._cp_group = cp_group
+        n_attn = n_mla + len(kda_modules)
         # The multimodal wrapper needs it too. prepare_context_parallel_input
         # shards inputs/labels/positions but NOT pixel_values, so each CP rank
         # sees a slice of the vision sentinels while still being handed the
@@ -267,9 +307,17 @@ def parallelize_kimi_k3(
             if isinstance(m, KimiK3MultimodalModel):
                 m._cp_group = cp_group
                 m._cp_subgroups = subgroups
+        # Names the KDA mode, because the two are indistinguishable downstream:
+        # both leave the module boundary a seq-sharded plain tensor and neither
+        # changes the loss. A log line that says Ulysses on a KCP run is exactly
+        # the kind of stale report that hid the EP wiring bug.
         logger.info(
-            "Applied Ulysses CP cp_degree=%d (all-to-all at %d attn layers).",
+            "Applied CP cp_degree=%d: %d MLA layer(s) Ulysses, %d KDA layer(s) "
+            "kda_cp_mode=%s (%d attn layers total).",
             cp_degree,
+            n_mla,
+            len(kda_modules),
+            kda_mode,
             n_attn,
         )
     if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
@@ -300,9 +348,7 @@ def parallelize_kimi_k3(
         _sweep_remaining_to_replicate(
             model,
             parallel_dims.get_mesh("tp"),
-            skip_expert_params=(
-                parallel_dims.ep_enabled or _model_has_moe(model)
-            ),
+            skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
         )
     if entered:
         from collections import Counter
@@ -681,9 +727,7 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
     from torchtitan.models.kimi_k3.knobs import topology as _topology
 
     shard_heads = (
-        _topology().vit_tp_heads
-        and num_heads >= tp_size
-        and num_heads % tp_size == 0
+        _topology().vit_tp_heads and num_heads >= tp_size and num_heads % tp_size == 0
     )
     per_rank = num_heads // tp_size if shard_heads else 0
     if not shard_heads and num_heads:
@@ -1299,7 +1343,9 @@ def verify_ep_applied(expected) -> None:
     for layer_idx, moe in expected:
         experts = getattr(getattr(moe, "routed_experts", None), "inner_experts", None)
         if experts is None:
-            raise ValueError(f"layer {layer_idx}: MoE has no routed_experts.inner_experts")
+            raise ValueError(
+                f"layer {layer_idx}: MoE has no routed_experts.inner_experts"
+            )
         sharded = [
             n
             for n, prm in experts.named_parameters(recurse=False)
@@ -1387,7 +1433,6 @@ def _sweep_remaining_to_replicate(
                     distribute_tensor(p.data, tp_mesh, [Replicate()]),
                     requires_grad=p.requires_grad,
                 )
-
 
 
 def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -> int:
@@ -1527,7 +1572,6 @@ def apply_fsdp(
         edp_mesh_dims=edp_mesh_dims,
         enable_symm_mem=enable_symm_mem,
     )
-
 
 
 _fla_dynamo_carveout_done = False
