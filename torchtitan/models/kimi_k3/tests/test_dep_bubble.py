@@ -15,6 +15,12 @@ from __future__ import annotations
 
 import unittest
 
+import torch
+
+from torchtitan.models.kimi_k3.dep_bubble_backward import (
+    cut_for_deferred_backward,
+    GradQueue,
+)
 from torchtitan.models.kimi_k3.dep_bubble_plan import build_plans, plan_for_rank
 from torchtitan.models.kimi_k3.dep_bubble_runtime import install_bubble_runtime
 
@@ -204,3 +210,77 @@ class TestBubbleRuntime(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeferredVisionGrad(unittest.TestCase):
+    """The deferred backward must be exact, and must never lose a gradient."""
+
+    def _tower(self):
+        torch.manual_seed(0)
+        return torch.nn.Linear(4, 4, bias=False)
+
+    def test_deferred_backward_matches_the_inline_one_exactly(self):
+        """Cutting the graph and re-running it later is only sound if it is identical."""
+        x = torch.randn(3, 4)
+
+        inline = self._tower()
+        inline(x).sum().backward()
+        expected = inline.weight.grad.clone()
+
+        deferred = self._tower()
+        queue = GradQueue()
+        out = cut_for_deferred_backward(deferred(x), queue, 0)
+        out.sum().backward()
+        self.assertIsNone(deferred.weight.grad, "the text backward must not reach in")
+        self.assertTrue(queue.has(0))
+        self.assertTrue(queue.run_one(0))
+        torch.testing.assert_close(deferred.weight.grad, expected, rtol=0, atol=0)
+
+    def test_nothing_is_lost_when_no_slot_ever_comes(self):
+        """The drain is the correctness guarantee, not a tidiness measure.
+
+        A deferred backward that never runs leaves the tower without that
+        micro-batch's gradient and raises nothing, so the step-end drain has to be
+        unconditional.
+        """
+        x = torch.randn(3, 4)
+        expected_model = self._tower()
+        expected_model(x).sum().backward()
+        expected = expected_model.weight.grad.clone()
+
+        model = self._tower()
+        queue = GradQueue()
+        cut_for_deferred_backward(model(x), queue, 7).sum().backward()
+        self.assertEqual(queue.drain(), 1)
+        torch.testing.assert_close(model.weight.grad, expected, rtol=0, atol=0)
+        queue.assert_empty("after drain")
+
+    def test_a_slot_before_the_gradient_arrives_is_not_an_error(self):
+        queue = GradQueue()
+        self.assertFalse(queue.run_one(3))
+        queue.assert_empty("nothing was ever stashed")
+
+    def test_assert_empty_refuses_to_let_a_leak_through(self):
+        x = torch.randn(2, 4)
+        model = self._tower()
+        queue = GradQueue()
+        cut_for_deferred_backward(model(x), queue, 1).sum().backward()
+        with self.assertRaises(AssertionError):
+            queue.assert_empty("before the optimizer step")
+
+    def test_two_microbatches_accumulate_like_one_pass(self):
+        xs = [torch.randn(2, 4), torch.randn(2, 4)]
+        expected_model = self._tower()
+        for x in xs:
+            expected_model(x).sum().backward()
+        expected = expected_model.weight.grad.clone()
+
+        model = self._tower()
+        queue = GradQueue()
+        for mb, x in enumerate(xs):
+            cut_for_deferred_backward(model(x), queue, mb).sum().backward()
+        # Deliberately out of order: parameter gradients accumulate, so a deferred
+        # backward may run in any bubble after its gradient arrives.
+        queue.run_one(1)
+        queue.run_one(0)
+        torch.testing.assert_close(model.weight.grad, expected, rtol=0, atol=0)
