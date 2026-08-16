@@ -282,7 +282,7 @@ def parallelize_kimi_k3(
         # MoE only at the block boundary (after FFN residual add),
         # so EP routing within the FFN body is transparent to the
         # AttnRes block-commit logic.
-        apply_ep_kimi_k3(model, parallel_dims)
+        ep_expected = apply_ep_kimi_k3(model, parallel_dims)
         logger.info(
             "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
             parallel_dims.ep,
@@ -293,6 +293,9 @@ def parallelize_kimi_k3(
     # already exist -- no plan is removed here, so the imperative plan and the
     # declarations are both in effect and their agreement is what the matrix checks.
     entered = _drive_declarative_sharding(model, parallel_dims)
+    if parallel_dims.ep_enabled:
+        # After the driver, because the driver is what carries the ep mesh down.
+        verify_ep_applied(ep_expected)
     if parallel_dims.tp_enabled:
         _sweep_remaining_to_replicate(
             model,
@@ -1237,6 +1240,7 @@ def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
     have no experts to shard.
     """
     moe_layers_wrapped = 0
+    expected: list = []
     for layer in model.layers.values():
         if not bool(getattr(layer, "is_moe", False)):
             continue
@@ -1259,24 +1263,56 @@ def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
                 f"layer {layer.layer_idx} MoE ffn missing a parallelizable "
                 "_moe; EP needs the standard torchtitan MoE wrapping."
             )
-        moe.parallelize(parallel_dims)
-        # Tell the declarative driver to stay out of this subtree. It cannot infer it:
-        # _already_distributed asks for a module's OWN parameters, and the KimiMoE wrapper
-        # has none -- its parameters all live in children -- so the wrapper always looks
-        # undistributed and the driver descends into the core MoE this call just
-        # parallelized, which raises "MoE has already been parallelized".
-        ffn._kimi_ep_parallelized = True
+        # NOT parallelized here. The declarative driver reaches this MoE through the
+        # layer's own Module.parallelize, which recurses into every child and passes the
+        # same parallel_dims -- so EP is already wired by the time the driver returns, and
+        # a second call raises "MoE has already been parallelized". Verified by
+        # experiment: fixing the attribute name so this function found its layers turned a
+        # working run into that error, which is what showed who the real caller was.
+        #
+        # What was actually broken was the reporting: this function read layer.ffn after
+        # the attribute became layer.moe, found nothing, and logged "wrapped 0" through
+        # many green EP cells. EP worked; the line lied about who did it.
         moe_layers_wrapped += 1
-    if moe_layers_wrapped:
-        logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
-    else:
-        # EP was requested and nothing was wrapped. That is not a configuration to log
-        # calmly: the experts stay unsharded and the run looks healthy.
+        expected.append((layer.layer_idx, moe))
+
+    if not moe_layers_wrapped:
         raise ValueError(
-            "expert parallel is enabled but no MoE layer was wrapped. Every layer "
-            "reporting is_moe had no `moe` attribute, which means the block layout and "
-            "this plan disagree."
+            "expert parallel is enabled but no layer reporting is_moe has a `moe` "
+            "attribute, so nothing would carry the ep mesh. The block layout and this "
+            "plan disagree."
         )
+    logger.info(
+        "EP: %d MoE layer(s) to be wired by the declarative driver.", moe_layers_wrapped
+    )
+    return expected
+
+
+def verify_ep_applied(expected) -> None:
+    """Assert the routed experts actually landed on the ep mesh.
+
+    Called after the declarative driver, because that is what wires them. Without this
+    the only signal was a log line, and a log line is what hid the attribute-name bug for
+    as long as it did: EP not being applied looks exactly like EP being applied, from the
+    loss.
+    """
+    for layer_idx, moe in expected:
+        experts = getattr(getattr(moe, "routed_experts", None), "inner_experts", None)
+        if experts is None:
+            raise ValueError(f"layer {layer_idx}: MoE has no routed_experts.inner_experts")
+        sharded = [
+            n
+            for n, prm in experts.named_parameters(recurse=False)
+            if isinstance(prm, _DTensor)
+            and any(not pl.is_replicate() for pl in prm.placements)
+        ]
+        if not sharded:
+            raise ValueError(
+                f"layer {layer_idx}: expert parallel is enabled but no routed-expert "
+                f"parameter is sharded -- "
+                f"{[n for n, _ in experts.named_parameters(recurse=False)]} are all "
+                f"replicated or plain. The driver did not carry the ep mesh here."
+            )
 
 
 def _sweep_remaining_to_replicate(
