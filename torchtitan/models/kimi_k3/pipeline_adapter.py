@@ -1239,6 +1239,59 @@ def dep_enabled() -> bool:
     return topology().vit_dep
 
 
+def _install_bubble_runtime_for(pp_schedule, prefetcher) -> None:
+    """Wire the bubble planner and runtime to one vision stage's prefetcher.
+
+    The plan is rebuilt per step from the schedule's own shape rather than cached,
+    because the micro-batch count can change between steps (a short final batch) and a
+    stale plan would anchor on actions the schedule no longer runs. Rebuilding is pure
+    Python over a list of actions, so it is not worth caching against that risk.
+    """
+    from torchtitan.models.kimi_k3.dep_bubble_plan import build_plans
+    from torchtitan.models.kimi_k3.dep_bubble_runtime import install_bubble_runtime
+    from torchtitan.models.kimi_k3.knobs import topology
+
+    cost_ratio = float(topology().vit_bubble_cost_ratio)
+
+    def plan_for_step():
+        n_mb = int(getattr(pp_schedule, "_n_microbatches", 0) or 0)
+        pp_size = int(getattr(pp_schedule, "pp_group_size", 0) or 0)
+        n_stages = int(getattr(pp_schedule, "_num_stages", 0) or 0)
+        rank = int(getattr(pp_schedule, "rank", -1))
+        if not (n_mb and pp_size and n_stages) or rank < 0:
+            return None
+        vp, rem = divmod(n_stages, pp_size)
+        if rem or vp < 1:
+            # A non-looped schedule has no interleaved action list to plan against.
+            return None
+        try:
+            plans = build_plans(
+                pp_size=pp_size,
+                vp=vp,
+                n_microbatches=n_mb,
+                cost_ratio=cost_ratio,
+            )
+        except ValueError as err:
+            # e.g. a micro-batch count Interleaved1F1B rejects. Saying so beats
+            # silently running without the mechanism under test.
+            logger.warning("DEP bubble plan unavailable: %s", err)
+            return None
+        return plans.get(rank)
+
+    def encode_now(microbatches):
+        # Synchronous on the CURRENT stream: this is the bubble, so the point is to
+        # occupy it, not to overlap with it.
+        for mb in microbatches:
+            prefetcher.ensure_sync(mb)
+
+    install_bubble_runtime(
+        pp_schedule,
+        plan_for_step=plan_for_step,
+        encode_now=encode_now,
+        upfront_encode=encode_now,
+    )
+
+
 def dep_vision_stages() -> int:
     """How many stages the vision tower occupies.
 
@@ -1353,8 +1406,21 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         VisionPrefetcher,
     )
 
-    if prefetch_depth() <= 0:
+    from torchtitan.models.kimi_k3.knobs import topology
+
+    bubble = bool(topology().vit_bubble)
+    if prefetch_depth() <= 0 and not bubble:
         return
+    if prefetch_depth() > 0 and bubble:
+        # Alternatives, not layers: the prefetch issues ahead on a side stream, the
+        # bubble runtime places encodes in idle intervals on the main stream. Both at
+        # once would have the prefetch satisfy every micro-batch before the planned slot
+        # arrived, so the placements would report as fired while the side stream did the
+        # work -- a green occupancy number for the wrong mechanism.
+        raise ValueError(
+            "KIMI_VIT_PREFETCH and KIMI_VIT_BUBBLE are alternatives; set exactly one. "
+            f"Got prefetch={prefetch_depth()}, bubble={bubble}."
+        )
 
     if dep_vision_stages() > 1:
         # The run-ahead prefetches by calling encode_images, which assumes one stage
@@ -1397,6 +1463,8 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         prefetcher = VisionPrefetcher(module)
         module._vision_prefetcher = prefetcher
         install_step_hook(pp_schedule, prefetcher)
+        if bubble:
+            _install_bubble_runtime_for(pp_schedule, prefetcher)
 
     # The micro-batch index patch lives in _install_vision_stage_wiring, which runs
     # first and unconditionally under DEP -- patching it here too would wrap

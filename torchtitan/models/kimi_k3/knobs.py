@@ -8,6 +8,7 @@
 
 Finding 32. Five knobs decided the PIPELINE TOPOLOGY from environment variables:
 ``KIMI_VIT_DEP``, ``KIMI_VIT_DEP_STAGES``, ``KIMI_VIT_PREFETCH``,
+``KIMI_VIT_BUBBLE``, ``KIMI_VIT_BUBBLE_COST_RATIO``,
 ``KIMI_VIT_TP_HEADS`` and ``TORCHTITAN_ATTNRES_CACHE``. Two consequences, and the
 first one is the reason this file exists:
 
@@ -80,6 +81,14 @@ class TopologyKnobs:
     vit_dep: bool = False
     vit_dep_stages: int = 1
     vit_prefetch: int = 0
+    # Run the planned encodes in the schedule's idle intervals on the MAIN stream,
+    # rather than ahead of time on a side stream. The two are alternatives, not
+    # layers: vit_bubble takes over placement when it is on.
+    vit_bubble: bool = False
+    # One ViT forward in units of one text-stage forward, from dep_cost_ratio.py.
+    # A parameter and not a runtime measurement, because a plan derived from each
+    # rank's own timing would stop being identical across ranks.
+    vit_bubble_cost_ratio: float = 0.5
     vit_tp_heads: bool = True
     attn_res_cache: bool = False
 
@@ -103,6 +112,11 @@ def register_topology(config) -> TopologyKnobs:
         vit_dep=bool(_field(config, "vit_dep", "KIMI_VIT_DEP")),
         vit_dep_stages=int(_field(config, "vit_dep_stages", "KIMI_VIT_DEP_STAGES")),
         vit_prefetch=int(_field(config, "vit_prefetch", "KIMI_VIT_PREFETCH")),
+        vit_bubble=bool(_field(config, "vit_bubble", "KIMI_VIT_BUBBLE")),
+        vit_bubble_cost_ratio=float(
+            _field(config, "vit_bubble_cost_ratio", "KIMI_VIT_BUBBLE_COST_RATIO")
+            or 0.5
+        ),
         vit_tp_heads=bool(_field(config, "vit_tp_heads", "KIMI_VIT_TP_HEADS")),
         attn_res_cache=bool(
             _field(text_cfg, "attn_res_cache", "TORCHTITAN_ATTNRES_CACHE")
@@ -154,6 +168,10 @@ def topology() -> TopologyKnobs:
         vit_dep=os.environ.get("KIMI_VIT_DEP", "0") != "0",
         vit_dep_stages=max(1, int(os.environ.get("KIMI_VIT_DEP_STAGES", "1"))),
         vit_prefetch=max(0, int(os.environ.get("KIMI_VIT_PREFETCH", "0"))),
+        vit_bubble=os.environ.get("KIMI_VIT_BUBBLE", "") not in ("", "0"),
+        vit_bubble_cost_ratio=float(
+            os.environ.get("KIMI_VIT_BUBBLE_COST_RATIO", "0.5")
+        ),
         vit_tp_heads=os.environ.get("KIMI_VIT_TP_HEADS", "1") != "0",
         attn_res_cache=os.environ.get("TORCHTITAN_ATTNRES_CACHE") == "1",
     )

@@ -191,6 +191,30 @@ class VisionPrefetcher:
             if enc is not None:
                 self._encode_spans.append(enc)
 
+    def ensure_sync(self, mb: int) -> None:
+        """Encode ``mb`` on the CURRENT stream, completing before returning.
+
+        The bubble runtime's entry point. Where :meth:`ensure` issues on a side stream
+        so the encode overlaps with text compute, this one occupies the caller's stream
+        deliberately: the caller is standing in a pipeline bubble, so the whole point is
+        to spend that idle interval on the encode rather than to race with anything.
+
+        That also sidesteps what the side-stream path has to be careful about -- the
+        encode contains NCCL collectives, and cross-stream collective ordering is the
+        part that needs an argument. Here they are issued on the stream everything else
+        is issued on, in an order every rank derives identically from the plan.
+
+        Cached in the same place :meth:`ensure` fills, so :meth:`take` serves it and the
+        hit/miss counters keep counting the same thing.
+        """
+        if mb in self._features:
+            return
+        inputs = self._inputs_for(mb)
+        if inputs is None:
+            return
+        pixel_values, grid_thw = inputs
+        self._features[mb] = self._owner.encode_images(pixel_values, grid_thw)
+
     def take(self, mb: int):
         """Features for ``mb`` if prefetched, else None. Removes the entry.
 
