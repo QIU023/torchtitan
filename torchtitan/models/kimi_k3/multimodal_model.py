@@ -92,6 +92,17 @@ class KimiK3MultimodalConfig:
     dynamic_cp: bool = True
     cp_image_shard: bool = True
     vision_side_stream: bool = False
+    # Smallest image worth partitioning across a sub-CP group, in PRE-merge patches
+    # (``grid_thw.prod(-1)``, i.e. t*h*w). 256 of them is a 16x16 patch grid, which at
+    # patch_size 14 is a 224x224 image and 64 tokens after the 2x2 merge -- so the
+    # default reads as "at least one full standard-resolution image". Below it the
+    # image-level round robin balances better, since splitting buys one gather per
+    # layer.
+    #
+    # Not calibrated. That threshold is where the gather's cost crosses the imbalance
+    # it removes, which is a measurement (sweep it at fixed cp and image mix, compare
+    # step time against the round-robin path) and nobody has made it. Treated as a
+    # documented guess rather than a tuned value.
     dynamic_cp_min_patches: int = 256
 
     # --- vision PP / TP topology (finding 32) ------------------------------ #
