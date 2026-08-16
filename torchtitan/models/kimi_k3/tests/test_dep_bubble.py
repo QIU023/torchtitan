@@ -84,35 +84,63 @@ class TestBubblePlan(unittest.TestCase):
         self.assertEqual(plan.placed, ())
         self.assertEqual(sorted(plan.synchronous), [0, 1])
 
-    def test_trailing_bubbles_cannot_be_anchored(self):
-        """Idle time at the end has no following action, so it helps nothing."""
-        actions = [_FakeAction("FORWARD", 0, 0), None, None, None]
+    def test_a_bubble_after_the_consumer_is_not_used(self):
+        """Trailing idle time is usable in general, since the preceding action anchors
+        it, so what rules a bubble out is the consumption point rather than its
+        position. The earlier version of this test asserted trailing bubbles were
+        unusable, which held only while placements anchored on the FOLLOWING action.
+        """
+        actions = [
+            _FakeAction("FORWARD", 0, 0),
+            _FakeAction("FORWARD", 0, 1),
+            None,
+            None,
+        ]
         plan = plan_for_rank(
             actions, rank=0, vision_microbatches=2, cost_ratio=1.0, upfront=0
         )
-        self.assertEqual(plan.placed, ())
-        self.assertIn(1, plan.synchronous)
+        self.assertEqual([p.microbatch for p in plan.placed], [])
+        self.assertEqual(sorted(plan.synchronous), [0, 1])
+
+
+class _FakeStage:
+    """A stage whose forward records itself, so ordering can be asserted."""
+
+    def __init__(self, stage_index: int, trace: list[str]) -> None:
+        self.stage_index = stage_index
+        self._trace = trace
+
+    def forward_one_chunk(self, fwd_chunk_id, *args, **kwargs):
+        self._trace.append(f"fwd({self.stage_index},{fwd_chunk_id})")
+        return "out"
 
 
 class _FakeSchedule:
-    """Enough of _PipelineScheduleRuntime to test the ordering property."""
+    """Enough of _PipelineScheduleRuntime to test the ordering property.
+
+    The idle interval is what happens between two of this rank's actions, so the encode
+    has to land after the action it is anchored to and before the next one.
+    """
 
     def __init__(self, order: list) -> None:
-        self.fwd_recv_ops: dict = {}
-        self._order = order
         self.trace: list[str] = []
+        stages: dict[int, _FakeStage] = {}
+        for a in order:
+            if a is not None and a.stage_index not in stages:
+                stages[a.stage_index] = _FakeStage(a.stage_index, self.trace)
+        self._stages = list(stages.values())
+        self._by_index = stages
+        self._order = order
 
     def step(self, *args, **kwargs):
         for action in self._order:
             if action is None:
+                self.trace.append("idle")
                 continue
-            key = (action.stage_index, action.microbatch_index)
             if "FORWARD" in action.computation_type:
-                self.fwd_recv_ops[key] = ["work"]
-                # The runtime's own order: pop, then wait, then forward.
-                self.fwd_recv_ops.pop(key, None)
-                self.trace.append(f"wait{key}")
-                self.trace.append(f"fwd{key}")
+                self._by_index[action.stage_index].forward_one_chunk(
+                    action.microbatch_index
+                )
         return "stepped"
 
 
@@ -127,27 +155,30 @@ class TestBubbleRuntime(unittest.TestCase):
         )
         return sched
 
-    def test_the_encode_runs_before_the_wait_it_hides_behind(self):
+    def test_the_encode_lands_in_the_idle_interval(self):
         """The whole design in one assertion.
 
-        If the encode landed after the wait it would serialise with the forward instead
-        of occupying the idle interval, which is what hooking forward_one_chunk would
-        have done.
+        The encode must come after the action it is anchored to and before the next real
+        action, i.e. inside the gap. Anchoring on the FOLLOWING action instead put the
+        hook on a receive wait that never happens for pipeline stage 0 -- exactly the
+        rank that owns the tower.
         """
-        order = [_FakeAction("FORWARD", 0, 0), None, _FakeAction("FORWARD", 0, 1)]
+        order = [
+            _FakeAction("FORWARD", 0, 0),
+            None,
+            None,
+            _FakeAction("FORWARD", 1, 0),
+        ]
         plan = plan_for_rank(
             order, rank=0, vision_microbatches=2, cost_ratio=1.0, upfront=0
         )
         self.assertTrue(plan.placed, "fixture must place at least one encode")
         sched = self._install(order, plan)
         sched.step()
+        real = [i for i, t in enumerate(sched.trace) if t.startswith("fwd")]
         enc = next(i for i, t in enumerate(sched.trace) if t.startswith("encode"))
-        wait = next(
-            i
-            for i, t in enumerate(sched.trace)
-            if t.startswith("wait") and i > enc - 2
-        )
-        self.assertLess(enc, wait, f"trace={sched.trace}")
+        self.assertGreater(enc, real[0], f"trace={sched.trace}")
+        self.assertLess(enc, real[1], f"trace={sched.trace}")
 
     def test_no_plan_leaves_the_schedule_untouched(self):
         order = [_FakeAction("FORWARD", 0, 0)]

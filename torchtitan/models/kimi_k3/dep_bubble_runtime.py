@@ -9,27 +9,23 @@
 The companion to :mod:`dep_bubble_plan`, which decides WHERE each encode goes. This
 puts it there.
 
-## Why the hook is on ``fwd_recv_ops.pop`` and not on the forward
+## Why the hook is after a forward returns, and not before a receive wait
 
-A bubble is the rank waiting for a P2P receive. In
-``_PipelineScheduleRuntime._step_microbatches`` the FORWARD branch does::
+Two hook points look equally reasonable and only one of them can fire where it
+matters.
 
-    _wait_batch_p2p(self.fwd_recv_ops.pop((stage_idx, mb_index)))
-    output = stage.forward_one_chunk(...)
+``fwd_recv_ops.pop`` sits immediately before ``_wait_batch_p2p`` in the runtime's
+FORWARD branch, which is the moment the rank is about to block on a receive -- the
+start of an idle interval, and it carries the ``(stage, microbatch)`` an anchor needs.
+That was the first implementation. It fires for a FORWARD that RECEIVES activations,
+and the rank owning the tower owns pipeline stage 0, whose input comes from the
+dataloader: no receive, no pop, nothing fires. Measured on a real pp8xvp4 cell -- 8
+placements planned, 0 fired.
 
-so the wait -- the bubble -- is consumed BEFORE ``forward_one_chunk``. Hooking the
-forward would run the encode after the rank had already finished waiting, which
-serialises the two instead of overlapping them: the encode would delay the forward by
-its full duration and fill nothing. Checked in the source rather than assumed, because
-the difference between the two is the entire point of the design.
-
-``fwd_recv_ops.pop`` is called immediately before that wait and carries the
-``(stage_index, microbatch_index)`` the plan anchors on, so replacing that dict with
-one that fires on ``pop`` puts the encode exactly at the start of the idle interval.
-The receive is already in flight by then, so the GPU runs the encode while it lands.
-
-``fwd_recv_ops`` is assigned once in the runtime's ``__init__`` and never rebound, so
-replacing the instance attribute after construction holds for the whole run.
+So the anchor moved to the action BEFORE the interval, and the hook to after
+``forward_one_chunk`` returns. The interval starts exactly there: that action has
+completed and the next cannot begin until a dependency lands. No receive is involved,
+so it works on the stage that actually holds the tower.
 
 ## Main stream, not the side stream
 
@@ -55,16 +51,19 @@ from torchtitan.tools.logging import logger
 from torchtitan.models.kimi_k3.dep_bubble_plan import BubblePlan
 
 
-class _AnchoredRecvOps(dict):
-    """``fwd_recv_ops`` that runs planned encodes when a wait is about to happen.
+class _AnchorFirer:
+    """Runs the planned encodes after the action they are anchored to.
 
-    Subclasses ``dict`` rather than wrapping it because the runtime uses ``in``,
-    ``__setitem__`` and ``pop`` on the attribute directly; anything less transparent
-    than a dict subclass would have to reimplement those and would drift.
+    Anchored on the action BEFORE the idle interval and fired after it returns, so the
+    encode occupies the gap from its start. The first attempt anchored on the action
+    AFTER the interval and hooked ``fwd_recv_ops.pop`` -- the moment the runtime is
+    about to wait for a receive. Correct in principle and useless in practice: the rank
+    owning the tower owns pipeline stage 0, whose forward receives nothing, so no pop
+    ever happens for it. That version planned 8 placements on a real pp8xvp4 cell and
+    fired 0, which the fired-vs-placed warning reported rather than hiding.
     """
 
-    def __init__(self, on_anchor: Callable[[Sequence[int]], None]) -> None:
-        super().__init__()
+    def __init__(self, on_anchor) -> None:
         self._on_anchor = on_anchor
         self._by_anchor: dict[tuple[int, int], list[int]] = {}
         self.fired = 0
@@ -75,20 +74,46 @@ class _AnchoredRecvOps(dict):
         for placement in plan.placed:
             kind, stage_index, mb_index = placement.anchor
             if "FORWARD" not in kind:
-                # Backward anchors need bwd_recv_ops and the adapter's gradient path.
+                # Backward anchors need the adapter's gradient path; forward first.
                 continue
             self._by_anchor.setdefault((stage_index, mb_index), []).append(
                 placement.microbatch
             )
 
-    def pop(self, key, *default):  # type: ignore[override]
-        queued = self._by_anchor.pop(key, None)
-        if queued:
-            # In the bubble: the receive for `key` is in flight and has not been waited
-            # on yet, so this compute occupies time the rank would otherwise idle.
-            self._on_anchor(queued)
-            self.fired += len(queued)
-        return super().pop(key, *default)
+    def after_forward(self, stage_index: int, mb_index: int) -> None:
+        queued = self._by_anchor.pop((stage_index, mb_index), None)
+        if not queued:
+            return
+        self._on_anchor(queued)
+        self.fired += len(queued)
+
+
+def _wrap_stage_forwards(pp_schedule, firer: _AnchorFirer) -> int:
+    """Call ``firer.after_forward`` after each stage's ``forward_one_chunk`` returns.
+
+    Wrapped outermost and marked, so the adapter's own micro-batch-index patch on the
+    same method keeps working -- that one runs first and unconditionally under DEP, and
+    double-wrapping it was already a known way to break it.
+    """
+    wrapped = 0
+    for stage in getattr(pp_schedule, "_stages", []) or []:
+        if getattr(stage, "_kimi_bubble_wrapped", False):
+            continue
+        inner = stage.forward_one_chunk
+        stage_index = int(getattr(stage, "stage_index", -1))
+
+        def make(inner=inner, stage_index=stage_index):
+            def forward_one_chunk(fwd_chunk_id, *args, **kwargs):
+                out = inner(fwd_chunk_id, *args, **kwargs)
+                firer.after_forward(stage_index, int(fwd_chunk_id))
+                return out
+
+            return forward_one_chunk
+
+        stage.forward_one_chunk = make()  # type: ignore[method-assign]
+        stage._kimi_bubble_wrapped = True
+        wrapped += 1
+    return wrapped
 
 
 def install_bubble_runtime(
@@ -113,23 +138,21 @@ def install_bubble_runtime(
     """
     if getattr(pp_schedule, "_kimi_bubble_runtime", False):
         return
-    recv_ops = _AnchoredRecvOps(encode_now)
-    if not hasattr(pp_schedule, "fwd_recv_ops"):
+    firer = _AnchorFirer(encode_now)
+    if not _wrap_stage_forwards(pp_schedule, firer):
         raise AttributeError(
-            "pp_schedule has no fwd_recv_ops: the bubble runtime needs "
-            "_PipelineScheduleRuntime's action loop, so a schedule that does not use "
-            "it cannot host this. Disable KIMI_VIT_BUBBLE for that schedule."
+            "no pipeline stages on this schedule to wrap: the bubble runtime fires "
+            "after a stage's forward_one_chunk, so a schedule without _stages cannot "
+            "host it."
         )
-    recv_ops.update(pp_schedule.fwd_recv_ops)
-    pp_schedule.fwd_recv_ops = recv_ops
     orig_step = pp_schedule.step
 
     def patched_step(*args, **kwargs):
         plan = plan_for_step()
         if plan is None:
             return orig_step(*args, **kwargs)
-        recv_ops.arm(plan)
-        before = recv_ops.fired
+        firer.arm(plan)
+        before = firer.fired
         if plan.upfront:
             # The report's own design: the first micro-batches' encodes cannot be
             # placed, because nothing precedes them.
@@ -138,7 +161,7 @@ def install_bubble_runtime(
             return orig_step(*args, **kwargs)
         finally:
             placed = len(plan.placed)
-            fired = recv_ops.fired - before
+            fired = firer.fired - before
             # Placed-but-never-fired means the anchor action did not run on this rank
             # this step, i.e. the plan and the schedule disagree. Silence there would
             # let the encode fall back to its synchronous path and still look correct.

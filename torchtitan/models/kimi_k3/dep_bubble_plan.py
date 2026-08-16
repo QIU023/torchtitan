@@ -37,7 +37,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Placement:
-    """Encode ``microbatch`` immediately before the action named by ``anchor``.
+    """Encode ``microbatch`` immediately after the action named by ``anchor``.
 
     Anchored on the following action's IDENTITY rather than on a slot index,
     because the index does not survive lowering: the runtime iterates
@@ -46,7 +46,8 @@ class Placement:
     compute actions is the same in both representations, so the first real action
     after the bubble run is a stable name for the position.
 
-    ``anchor`` is ``(computation_type_name, stage_index, microbatch_index)``.
+    ``anchor`` names the action the runtime fires AFTER, as
+    ``(computation_type_name, stage_index, microbatch_index)``.
     ``slot`` is kept for reporting and for the occupancy check against the simulator.
     """
 
@@ -120,38 +121,40 @@ def plan_for_rank(
     placed: list[Placement] = []
     budget = 0.0
     idle = 0
-    armed: list[tuple[int, int]] = []  # (slot, microbatch) awaiting an anchor
+    # The action most recently completed. Placements anchor on THIS, and the runtime
+    # fires after it returns -- the start of the idle interval, reachable without any
+    # receive to hook.
+    #
+    # Anchoring on the action AFTER the bubble was the first attempt and it cannot work
+    # where it matters. The hook available there is fwd_recv_ops.pop, the moment the
+    # runtime is about to wait for a receive; but the rank owning the tower owns
+    # pipeline stage 0, whose forward receives nothing, so no pop ever happens for it.
+    # Measured on a real pp8xvp4 cell: 8 placements planned, 0 fired, which the
+    # fired-vs-placed warning reported instead of hiding.
+    prev: tuple[str, int, int] | None = None
     for slot, action in enumerate(actions):
         if action is None:
             budget += 1.0
             idle += 1
-            # Spend on the earliest pending micro-batch whose consumer is still ahead.
-            if budget >= cost_ratio:
+            if budget >= cost_ratio and prev is not None:
                 for k, mb in enumerate(pending):
                     if consume_slot.get(mb, 1 << 30) > slot:
                         budget -= cost_ratio
-                        armed.append((slot, pending.pop(k)))
+                        placed.append(
+                            Placement(slot=slot, microbatch=pending.pop(k), anchor=prev)
+                        )
                         break
             continue
-        # First real action after one or more paid-for bubbles: it names the position.
-        if armed:
-            anchor = (
-                str(getattr(action, "computation_type", "?")),
-                int(getattr(action, "stage_index", -1)),
-                int(
-                    action.microbatch_index
-                    if getattr(action, "microbatch_index", None) is not None
-                    else -1
-                ),
-            )
-            for slot_i, mb in armed:
-                placed.append(Placement(slot=slot_i, microbatch=mb, anchor=anchor))
-            armed = []
-    # Bubbles at the very end of the list have no following action, so nothing can be
-    # anchored to them: the encode would run after its own consumer. Those go back to
-    # the synchronous set rather than being placed somewhere they cannot help.
-    pending.extend(mb for _, mb in armed)
-    pending.sort()
+        prev = (
+            str(getattr(action, "computation_type", "?")),
+            int(getattr(action, "stage_index", -1)),
+            int(
+                action.microbatch_index
+                if getattr(action, "microbatch_index", None) is not None
+                else -1
+            ),
+        )
+        budget = 0.0  # an executed action ends the idle run
     return BubblePlan(
         rank=rank,
         upfront=tuple(range(min(upfront, vision_microbatches))),
