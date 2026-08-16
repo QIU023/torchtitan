@@ -481,6 +481,53 @@ def kimi_k3_mini_block_attn_res() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_mini_attnres_multicommit() -> Trainer.Config:
+    """k3mini shaped so ONE pipeline stage commits more than one AttnRes block.
+
+    The geometry, not the model, is the point. A stage commits a block whenever its
+    layer span crosses a block boundary, so multi-commit needs
+    ``layers_per_stage > layers_per_block`` -- and no other flavor can express it.
+    The parent has 21 layers over K3's block size 12, so a span wider than 12 layers
+    leaves fewer than two stages, and the multimodal pp8xvp4 flavor is not an AttnRes
+    model at all (``num_blocks`` is None, so the adapter passes through).
+
+    16 layers in 8 blocks of 2. At pp=2 with ``layers_per_stage=4`` that is four
+    stages of four layers, i.e. two commits each, and 16 is divisible by 4 -- which
+    ``BlockLayoutTables`` requires under the default layer map.
+
+    Two launch flags are not optional with it, and both were learned by hitting them:
+    ``pipeline_parallel_schedule Interleaved1F1B``, because delta mode is gated on that
+    class and otherwise the adapter silently runs naive passthrough; and
+    ``pipeline_parallel_first_stage_less_layers 0`` with its last-stage twin, because
+    the default weights make the split uneven and the adapter's contiguous-layout check
+    then refuses with "layer 24 sits on stage 2".
+
+    Everything structural is inherited. Only the layer count, the block partition and
+    the KDA/MLA pattern that follows from the count are changed.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_k3_mini_block_attn_res()
+    cfg.model_spec.flavor = "kimi_k3_mini_attnres_multicommit"
+    n = 16
+    full_attn = [4, 8, 12, 16]
+    kc = _dc.replace(
+        cfg.model_spec.model.kimi_config,
+        num_hidden_layers=n,
+        full_attn_layers=full_attn,
+        kda_layers=[i for i in range(1, n + 1) if i not in full_attn],
+    )
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=kc,
+        num_blocks=8,
+        # Stated as a block COUNT rather than a size, so layers_per_block is derived
+        # as 16/8 = 2. The parent's size of 12 cannot partition 16 layers.
+        attn_res_block_size=None,
+    )
+    return cfg
+
+
 def kimi_k3_mini_diag_dense_mla() -> Trainer.Config:
     """DIAGNOSTIC: k3mini with no KDA and no MoE -- dense MLA only.
 
