@@ -1240,7 +1240,12 @@ def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
     for layer in model.layers.values():
         if not bool(getattr(layer, "is_moe", False)):
             continue
-        ffn = getattr(layer, "ffn", None)
+        # `moe`, not `ffn`: the block's attribute was renamed when the FFN position
+        # split into moe XOR feed_forward, and this call site was missed. getattr then
+        # returned None for every layer and EP was silently never applied -- the log line
+        # below said "wrapped 0 MoE layer experts" through many green ep cells, because a
+        # model whose experts are simply not sharded still trains.
+        ffn = getattr(layer, "moe", None)
         if ffn is None:
             continue
         # KimiMoE wraps the torchtitan common MoE as self._moe. Upstream
@@ -1256,7 +1261,16 @@ def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
             )
         moe.parallelize(parallel_dims)
         moe_layers_wrapped += 1
-    logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
+    if moe_layers_wrapped:
+        logger.info("EP plan wrapped %d MoE layer experts.", moe_layers_wrapped)
+    else:
+        # EP was requested and nothing was wrapped. That is not a configuration to log
+        # calmly: the experts stay unsharded and the run looks healthy.
+        raise ValueError(
+            "expert parallel is enabled but no MoE layer was wrapped. Every layer "
+            "reporting is_moe had no `moe` attribute, which means the block layout and "
+            "this plan disagree."
+        )
 
 
 def _sweep_remaining_to_replicate(
