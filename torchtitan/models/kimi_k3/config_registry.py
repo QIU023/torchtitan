@@ -528,6 +528,26 @@ def kimi_k3_mini_attnres_multicommit() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_mini_attnres_multicommit_lora() -> Trainer.Config:
+    """The multi-commit flavor with LoRA rank 8, nothing else.
+
+    LoRA changes what the cross-stage grad bridge has to carry: only the adapters and the
+    AttnRes graft projections are trainable, so the skip-edge gradients the bridge routes
+    are the only gradients some stages produce. That is also where the producer side and
+    the consumer side of the bridge could disagree -- a consumer read forces
+    ``requires_grad`` on the cached block so it can wrap it, while the producer installs
+    its augment hook only when its own block already required grad. This flavor is what
+    makes that pairing observable at all.
+
+    ``lora_rank`` is the only field that differs from the flavor it derives from, which
+    keeps any per-cell difference attributable to the adapter path.
+    """
+    cfg = kimi_k3_mini_attnres_multicommit()
+    cfg.model_spec.flavor = "kimi_k3_mini_attnres_multicommit_lora"
+    cfg.model_spec.model.lora_rank = 8
+    return cfg
+
+
 def kimi_k3_mini_diag_dense_mla() -> Trainer.Config:
     """DIAGNOSTIC: k3mini with no KDA and no MoE -- dense MLA only.
 

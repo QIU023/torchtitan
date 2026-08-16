@@ -44,11 +44,12 @@ path involved. Forward first, with the occupancy criterion, then backward.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 
-from torchtitan.tools.logging import logger
-
 from torchtitan.models.kimi_k3.dep_bubble_plan import BubblePlan
+
+from torchtitan.tools.logging import logger
 
 
 class _AnchorFirer:
@@ -67,6 +68,15 @@ class _AnchorFirer:
         self._on_anchor = on_anchor
         self._by_anchor: dict[tuple[int, int], list[int]] = {}
         self.fired = 0
+        # Wall-clock actually spent inside the planned encodes, and the count of them.
+        # The plan is built from a STATIC cost ratio, and this session paid for the gap
+        # that leaves: a ratio measured at seq 4096 (0.493) was handed to a seq-256 cell
+        # where the true value is about 14, so each encode overran its interval roughly
+        # 28-fold. Every counter still read green, because "ran at the planned point" was
+        # true -- occupancy is not hiding. Measuring the encodes is what makes that
+        # visible as something other than a slower step.
+        self.encode_seconds = 0.0
+        self.encode_calls = 0
 
     def arm(self, plan: BubblePlan) -> None:
         """Load this step's placements. Called once per step, before the loop."""
@@ -84,7 +94,17 @@ class _AnchorFirer:
         queued = self._by_anchor.pop((stage_index, mb_index), None)
         if not queued:
             return
+        # perf_counter around a CUDA call measures launch, not execution, unless the
+        # stream is synchronized. The encodes run on the MAIN stream and the next
+        # pipeline action is issued to it immediately, so a sync here would serialize
+        # what the mechanism exists to overlap. Timing the launch window is still worth
+        # having: an encode whose kernels do not fit the interval shows up as the launch
+        # blocking on a full queue, and the step-time comparison remains the real
+        # measurement.
+        start = time.perf_counter()
         self._on_anchor(queued)
+        self.encode_seconds += time.perf_counter() - start
+        self.encode_calls += len(queued)
         self.fired += len(queued)
 
 
@@ -166,14 +186,25 @@ def install_bubble_runtime(
             # this step, i.e. the plan and the schedule disagree. Silence there would
             # let the encode fall back to its synchronous path and still look correct.
             level = logger.info if fired == placed else logger.warning
+            # Encode time per call alongside the counts, because the counts alone
+            # cannot distinguish "hidden in the bubble" from "ran at the planned point
+            # and overran it". The plan's budget comes from a static cost ratio, and a
+            # ratio measured at a different sequence length is how this session got 8/8
+            # placements that each overran roughly 28-fold while every number read green.
+            per = (
+                firer.encode_seconds / firer.encode_calls if firer.encode_calls else 0.0
+            )
             level(
                 "DEP bubble runtime: %d/%d planned encode(s) ran in a bubble, "
-                "%d upfront, %d left synchronous",
+                "%d upfront, %d left synchronous, %.1f ms per planned encode",
                 fired,
                 placed,
                 len(plan.upfront),
                 len(plan.synchronous),
+                per * 1e3,
             )
+            firer.encode_seconds = 0.0
+            firer.encode_calls = 0
 
     pp_schedule.step = patched_step  # type: ignore[method-assign]
     pp_schedule._kimi_bubble_runtime = True

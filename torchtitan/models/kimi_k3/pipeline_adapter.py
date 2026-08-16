@@ -128,6 +128,9 @@ class RankLocalCache:
         # ``layout.expected_same_rank_captures(...)`` to turn silent grad
         # loss (a consumer's backward never fired) into a raised error.
         self._capture_counts: dict[tuple[int, int, int], int] = {}
+        # Commits whose producer installed no augment hook (no gradient path through
+        # them). A consumer must not deposit into those slots; see mark_no_hook.
+        self._no_hook: set[tuple[int, int, int]] = set()
 
     def append(
         self,
@@ -168,6 +171,9 @@ class RankLocalCache:
         for key in list(self._capture_counts.keys()):
             if key[0] == mb_index:
                 self._capture_counts.pop(key, None)
+        for key in list(self._no_hook):
+            if key[0] == mb_index:
+                self._no_hook.discard(key)
 
     # ----- captured-grad slot helpers -------------------------------- #
 
@@ -217,6 +223,23 @@ class RankLocalCache:
         grad = self._captured_grads.pop(key, None)
         count = self._capture_counts.pop(key, 0)
         return grad, count
+
+    def mark_no_hook(self, key: tuple[int, int, int]) -> None:
+        """Record that this commit has NO producer-side augment hook.
+
+        A consumer must then leave the cached block alone. The cache always stores a
+        DETACHED copy, so ``blk.requires_grad`` is False for every entry and cannot tell
+        a consumer whether the producer's own tensor had a gradient path -- which is why
+        the consumer used to force ``requires_grad_(True)`` unconditionally. That made
+        the two sides asymmetric: a deposit with no hook to pop it is a lost gradient
+        caught only by the mb-end assertion. Measured as unreachable in training (the
+        AttnRes graft projections are trainable even under LoRA, so the block always
+        requires grad), so this records the invariant rather than fixing a live bug.
+        """
+        self._no_hook.add(key)
+
+    def has_augment_hook(self, key: tuple[int, int, int]) -> bool:
+        return key not in self._no_hook
 
     def clear_capture_slots(self) -> int:
         """Drop every captured-grad slot and counter. Returns how many there were.
@@ -290,7 +313,7 @@ def _install_augment_hook(
     rank_cache: "RankLocalCache",
     *,
     expected_captures: int | None = None,
-) -> None:
+) -> bool:
     """Register a tensor grad hook on ``block_tensor`` that, when the
     tensor receives its incoming grad during the producer stage's own
     backward, pops the matching captured-grad slot from ``rank_cache``
@@ -330,7 +353,7 @@ def _install_augment_hook(
     semantics are vacuous — silently skip hook installation.
     """
     if not block_tensor.requires_grad:
-        return
+        return False
 
     def _hook(grad: torch.Tensor) -> torch.Tensor:
         captured, count = rank_cache.pop_grad(slot_key)
@@ -357,6 +380,7 @@ def _install_augment_hook(
         return grad + captured
 
     block_tensor.register_hook(_hook)
+    return True
 
 
 class _LocalCacheCapture(torch.autograd.Function):
@@ -676,8 +700,12 @@ class CrossStageCacheAdapter(nn.Module):
         grad_active = torch.is_grad_enabled()
         for blk, meta in zip(earlier_blocks_raw, earlier_meta):
             producer_rank, producer_stage, block_idx_in_producer = meta
-            if producer_rank == self.pp_rank and grad_active:
-                slot_key = (mb, producer_stage, block_idx_in_producer)
+            slot_key = (mb, producer_stage, block_idx_in_producer)
+            if (
+                producer_rank == self.pp_rank
+                and grad_active
+                and self._cache.has_augment_hook(slot_key)
+            ):
                 if not blk.requires_grad:
                     blk.requires_grad_(True)
                 earlier_blocks.append(
@@ -764,12 +792,15 @@ class CrossStageCacheAdapter(nn.Module):
                 self.stage_id,
                 local_idx,
             )
-            _install_augment_hook(
+            if not _install_augment_hook(
                 blk,
                 slot_key,
                 self._cache,
                 expected_captures=expected_captures,
-            )
+            ):
+                # No gradient path through this commit, so no consumer may deposit into
+                # its slot either. Keeps the two sides of the bridge in agreement.
+                self._cache.mark_no_hook(slot_key)
             # Cache entry must be detached so same-rank consumers cannot
             # reach the producer's forward graph via autograd.
             self._cache.append(
@@ -822,6 +853,15 @@ class CrossStageCacheAdapter(nn.Module):
     def _keepalive_touch(payload, prev_recv_tensor: torch.Tensor | None):
         """Ensure ``prev_recv_tensor`` is on the autograd graph that
         produces ``payload``. Preserves tuple returns.
+
+        Profiled rather than left as a suspicion (matrix_scripts/pp_cp_overheads.py):
+        the touch costs 0.037 ms at 256x512, 4096x2048 and every shape between, rising
+        to 0.18 ms only at 16384x2048. It is launch-bound, not arithmetic-bound, so the
+        O(T*D) reduction it looks like is not what is being paid -- and a cheaper
+        formulation that reads one element instead of reducing would save nothing.
+        Against one projection it is 137% at 256x512 and 5.2% at 4096x2048; against a
+        whole stage's forward, which runs dozens of projections, it is well under a
+        percent at any production shape. Left as is.
         """
         if prev_recv_tensor is None:
             return payload

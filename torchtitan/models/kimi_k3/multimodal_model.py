@@ -31,7 +31,6 @@ from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
 from torchtitan.models.kimi_k3.model import KimiK3Config, KimiK3Model, KimiK3Spec
 from torchtitan.models.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
 
-
 from torchtitan.tools.logging import logger
 
 
@@ -40,8 +39,6 @@ def _knob(config, field: str, env: str):
     from torchtitan.models.kimi_k3.knobs import resolve_knob
 
     return resolve_knob(config, field, env)
-
-
 
 
 # ----- K3's own vision path ---------------------------------------------- #
@@ -99,10 +96,16 @@ class KimiK3MultimodalConfig:
     # image-level round robin balances better, since splitting buys one gather per
     # layer.
     #
-    # Not calibrated. That threshold is where the gather's cost crosses the imbalance
-    # it removes, which is a measurement (sweep it at fixed cp and image mix, compare
-    # step time against the round-robin path) and nobody has made it. Treated as a
-    # documented guess rather than a tuned value.
+    # Measured on this flavor's tower and NOT changed as a result, which is worth stating
+    # rather than leaving as an unexplained default. matrix_scripts/dynamic_cp_threshold.py
+    # times the tower on a whole image against one rank's share of a row-partitioned one,
+    # at cp=2: 64 patches 0.99x, 144 1.00x, 256 1.01x, 400 1.01x, 1024 1.06x. Fixed cost
+    # dominates at this scale -- every size sits near a 2.5 ms floor -- so partitioning
+    # buys at most 6% even at 16x the threshold, before charging the per-layer gather the
+    # probe does not charge for. The honest reading is that a debug-scale tower cannot
+    # locate this crossing, not that 256 is validated; K3's 447M tower on
+    # high-resolution input is where the number would come from. Left at 256 because a
+    # value tuned on a floor of launch overhead would be worse than a stated guess.
     dynamic_cp_min_patches: int = 256
 
     # --- vision PP / TP topology (finding 32) ------------------------------ #
@@ -301,6 +304,7 @@ class KimiK3MultimodalModel(nn.Module):
         # --debug.detect-anomaly named this line after six attempts spent on the
         # dynamic-CP path; the failing forward was its sibling, the replicated
         # path, which every batch also goes through.
+
         def _seal(f):
             if isinstance(f, DTensor):
                 f = f.to_local()
@@ -449,7 +453,9 @@ class KimiK3MultimodalModel(nn.Module):
         cfg = self.config.vision_config
         kh, kw = cfg.merge_kernel_size
         merge = kh * kw
-        min_patches = _knob(self.config, "dynamic_cp_min_patches", "KIMI_VIT_DYNAMIC_CP_MIN_PATCHES")
+        min_patches = _knob(
+            self.config, "dynamic_cp_min_patches", "KIMI_VIT_DYNAMIC_CP_MIN_PATCHES"
+        )
         large = classify(counts, cp_size, min_patches=min_patches)
         if not large:
             return None
@@ -569,9 +575,7 @@ class KimiK3MultimodalModel(nn.Module):
             # but its backward re-wraps the gradient, and the all_gather below
             # has a reduce_scatter transpose with no DTensor rule.
             feats = [
-                _PlainGradBoundary.apply(
-                    f.to_local() if isinstance(f, DTensor) else f
-                )
+                _PlainGradBoundary.apply(f.to_local() if isinstance(f, DTensor) else f)
                 for f in feats
             ]
             local_feat = torch.cat(feats, dim=0)
@@ -859,7 +863,9 @@ class KimiK3MultimodalModel(nn.Module):
             # stream's layout rather than unwrapping the stream. Both are
             # Replicate on the tp axis here, so this is metadata only.
             flat = DTensor.from_local(
-                flat.to(text.to_local().dtype), text.device_mesh, text.placements,
+                flat.to(text.to_local().dtype),
+                text.device_mesh,
+                text.placements,
                 run_check=False,
             )
             mask = DTensor.from_local(
@@ -874,7 +880,9 @@ class KimiK3MultimodalModel(nn.Module):
             out = local_text.reshape(-1, local_text.shape[-1]).clone()
             out[idx] = flat.to_local().to(out.dtype)
             return DTensor.from_local(
-                out.view_as(local_text), text.device_mesh, text.placements,
+                out.view_as(local_text),
+                text.device_mesh,
+                text.placements,
                 run_check=False,
             )
         return text.masked_scatter(mask, flat.to(text.dtype))
