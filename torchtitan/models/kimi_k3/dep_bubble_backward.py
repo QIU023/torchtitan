@@ -64,6 +64,16 @@ def cut_for_deferred_backward(
     computes its gradient and calls the hook there. Returning ``None`` from the hook
     leaves that gradient as it is; returning anything else would rewrite it.
     """
+    if not features.requires_grad:
+        # Nothing to defer: the tower has no gradient path this step, which is the normal
+        # case under LoRA when no adapter sits inside it. Cutting anyway would be worse
+        # than useless -- it introduces a grad-requiring leaf where the graph had none,
+        # so the splicing stage's output starts requiring grad and torch's stage_backward
+        # is dragged down a path it would not have taken. Measured: LoRA + bubble died in
+        # stage_backward with "grad can be implicitly created only for scalar outputs"
+        # while full-parameter passed.
+        return features
+
     detached = features.detach().requires_grad_(True)
 
     def _capture(grad: torch.Tensor):
