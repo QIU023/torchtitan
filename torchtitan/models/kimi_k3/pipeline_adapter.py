@@ -101,14 +101,17 @@ def adapter_enabled() -> bool:
     DETERMINISTIC -- a summation-order difference from the mid-stage block-stack rebuild
     and from ``grad + captured`` where autograd would have accumulated -- so comparing it
     against a reseed spread bounds detectability, not bias.
-    ``run_delta_sign_test.sh`` runs the pair at three seeds: delta finishes worse at all
-    three, by +0.14%, +0.24% and +0.20% on the tail mean. A consistent sign with the
-    magnitudes in that narrow a band is a BIAS of roughly +0.19%, sitting below the 0.56%
-    run-to-run spread and therefore invisible in any single run.
+    ``run_delta_sign_test.sh`` runs the pair across seeds and reads the sign of the tail
+    difference, which is what separates a coincidence from a bias. At six seeds: +0.14%,
+    +0.24%, +0.20%, -0.16%, +0.08%, +0.14% -- five positive, one negative, mean +0.107%.
+    Five of six same-signed has probability 0.219 under no bias, so this is NOT a
+    detectable systematic effect; the first three seeds all landing positive was the
+    coincidence that 3/3 at p = 0.25 always risked being.
 
-    So the trade is +0.19% loss for -11.4% peak memory at this shape, not a free
-    optimisation. Three seeds put the sign at p = 0.25 on its own; the clustering of the
-    magnitudes is the stronger part of the evidence, and more seeds would settle it.
+    The accurate statement is therefore narrow: the difference is DETERMINISTIC in
+    mechanism -- same seed, same digits -- and unbiased in aggregate, with a magnitude
+    (0.107% mean) well inside the 0.56% spread between two runs of one configuration. It
+    behaves like noise without being noise, and neither transport is favoured.
 
     Still False by default, because engaging it needs more than trust: Interleaved1F1B
     (otherwise this returns and the adapter passes through), n_layers divisible by the
