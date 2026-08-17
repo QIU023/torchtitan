@@ -301,3 +301,111 @@ class TestStepEndSlotSweep(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShapeInferencePlaceholder(unittest.TestCase):
+    """The delta placeholder must have the shape the runtime actually sends.
+
+    Pipelining sizes the next stage's recv buffer from what shape inference returns, so a
+    placeholder of the wrong rank is not a cosmetic mismatch -- the consumer then receives
+    a carrier it does not recognise. The runtime sends ``torch.stack(pieces, dim=1)`` over
+    ``[T, D]`` pieces, so the shape is ``[T, K, D]`` with T the flattened batch-sequence.
+
+    Two earlier forms were wrong and both needed ``expected_K != N`` to show it, which no
+    16-layer pp2 x vp2 run produces: an empty commit used ``partial_out.shape`` whole and
+    returned a four-dimensional ``[K, B, L, D]``; a non-empty one used
+    ``new_blocks_out.shape[1:]`` and put the block axis first. The four-dimensional case
+    is what broke 32 layers at pp8 x vp2, as "got multiple values for argument 'blocks'" --
+    the consumer's ``_has_blocks_signature`` tests ``dim() == 3``, so a rank-4 carrier fell
+    through to the positional slot that ``blocks`` occupies.
+    """
+
+    def _adapter(self, *, stage_id, num_stages, layout, pp_rank):
+        from torch import nn
+
+        from torchtitan.models.kimi_k3.pipeline_adapter import CrossStageCacheAdapter
+
+        wrapped = nn.Module()
+        wrapped._return_only_new_blocks = True
+        return CrossStageCacheAdapter(
+            wrapped,
+            stage_id=stage_id,
+            num_stages=num_stages,
+            layout_tables=layout,
+            pp_rank=pp_rank,
+        )
+
+    def _layout(self):
+        from torchtitan.models.kimi_k3.layout import BlockLayoutTables
+
+        # 16 stages over 32 layers with blocks of 4: stages alternate between committing
+        # one block and committing none, which is the empty-commit case.
+        return BlockLayoutTables(
+            pp_size=8,
+            virtual_stages_per_rank=2,
+            num_blocks=8,
+            n_layers=32,
+            layers_per_block=4,
+        )
+
+    def _placeholder(self, adapter, *, n_new):
+        import torch
+
+        partial = torch.zeros(1, 512, 1280, requires_grad=True)
+        blocks = torch.zeros(512, n_new, 1280)
+        adapter._call_wrapped_naive = lambda args, kwargs: (partial, blocks)
+        return adapter._forward_shape_inference(partial)
+
+    def test_an_empty_commit_still_yields_a_rank_three_carrier(self):
+        layout = self._layout()
+        # A stage whose delta differs from its commit count, so the placeholder path runs.
+        stage = next(
+            s
+            for s in range(16)
+            if len(layout.delta_to_send(s)) != len(layout.commits_at(s))
+        )
+        adapter = self._adapter(
+            stage_id=stage, num_stages=16, layout=layout, pp_rank=stage % 8
+        )
+        _, carrier = self._placeholder(adapter, n_new=0)
+        self.assertEqual(carrier.dim(), 3, f"rank must be 3, got {carrier.shape}")
+        self.assertEqual(carrier.shape[0], 512, "T comes first, as stack(dim=1) emits")
+        self.assertEqual(carrier.shape[1], len(layout.delta_to_send(stage)))
+        self.assertEqual(carrier.shape[2], 1280)
+
+    def test_the_carrier_keeps_requires_grad(self):
+        """A requires_grad=False placeholder makes the consumer drop the backward edge."""
+        layout = self._layout()
+        stage = next(
+            s
+            for s in range(16)
+            if len(layout.delta_to_send(s)) != len(layout.commits_at(s))
+        )
+        adapter = self._adapter(
+            stage_id=stage, num_stages=16, layout=layout, pp_rank=stage % 8
+        )
+        _, carrier = self._placeholder(adapter, n_new=0)
+        self.assertTrue(carrier.requires_grad)
+
+    def test_a_consumer_recognises_the_placeholder_as_a_block_carrier(self):
+        """The end-to-end property: dim() == 3 is what _has_blocks_signature tests."""
+        import torch
+
+        from torchtitan.models.kimi_k3.pipeline_adapter import CrossStageCacheAdapter
+
+        layout = self._layout()
+        stage = next(
+            s
+            for s in range(16)
+            if len(layout.delta_to_send(s)) != len(layout.commits_at(s))
+        )
+        adapter = self._adapter(
+            stage_id=stage, num_stages=16, layout=layout, pp_rank=stage % 8
+        )
+        _, carrier = self._placeholder(adapter, n_new=0)
+        self.assertTrue(
+            CrossStageCacheAdapter._has_blocks_signature(
+                (torch.zeros(1, 512, 1280), carrier)
+            ),
+            "the consumer would pass this positionally into 'blocks' instead",
+        )

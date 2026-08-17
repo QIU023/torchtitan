@@ -652,18 +652,30 @@ class CrossStageCacheAdapter(nn.Module):
         if expected_K == new_blocks_out.shape[1]:
             return partial_out, new_blocks_out
 
-        per_block_shape = (
-            new_blocks_out.shape[1:]
-            if new_blocks_out.shape[1] > 0
-            else partial_out.shape
-        )
+        # The placeholder must have the shape the RUNTIME emits, because the
+        # downstream recv buffer is sized from it. The runtime sends
+        # ``torch.stack(send_pieces, dim=1)`` over ``[T, D]`` pieces, i.e.
+        # ``[T, K, D]`` with T the flattened batch-sequence -- the carrier layout
+        # stack_blocks documents. Deriving it from partial_out is what makes that
+        # true for a stage that commits nothing, where new_blocks_out has no
+        # column to read a per-block shape from.
+        #
+        # Both previous forms were wrong and both needed expected_K != N to show
+        # it, which is why every delta run to date missed them: an empty commit
+        # took partial_out.shape whole and produced a FOUR-dimensional
+        # [K, B, L, D], and a non-empty one took new_blocks_out.shape[1:] and
+        # produced [K, N, D] with the block axis first. The four-dimensional case
+        # surfaced as a consumer failing _has_blocks_signature (which tests
+        # dim() == 3) and then passing the carrier positionally into ``blocks``:
+        # "got multiple values for argument 'blocks'", 32 layers at pp8 x vp2.
+        tokens_times_batch = partial_out.shape[0] * partial_out.shape[1]
         # requires_grad must mirror the runtime delta emission: torch >= 2.12
         # derives the downstream recv-buffer and grad-send metadata from the
         # shape-inference tensors, and a requires_grad=False placeholder makes
         # the consumer stage drop the delta's backward edge (None grads at
         # SEND_B -> PipeliningMetadataError).
         return partial_out, partial_out.new_zeros(
-            (expected_K, *per_block_shape),
+            (tokens_times_batch, expected_K, partial_out.shape[-1]),
             requires_grad=partial_out.requires_grad,
         )
 
