@@ -228,3 +228,70 @@ class TestEpVerifierOnAnEmptyPlan(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKcpBatchLoop(unittest.TestCase):
+    """The batch axis is handled by looping, and the loop's shape is the contract.
+
+    fla's ``causal_conv1d_cp`` asserts ``[1, T, D]``, so the CP path cannot take a batch
+    at all -- it raised for B > 1, which is most of the gate's cells, until the default
+    moved to KCP and the loop was added. A GPU parity probe measures that the numbers come
+    out right; what it cannot show is the STRUCTURE: that each row is handed over on its
+    own, in order, and reassembled in the same order. A loop that passed the whole batch
+    to one call, or that reused row 0's slice, could still produce plausible numbers.
+
+    Flattening into one packed sequence instead would be wrong rather than merely
+    awkward: ``build_cp_context`` cuts the GLOBAL packed sequence into contiguous
+    rank-ordered pieces, while a rank holds piece r of EVERY sequence, so the layouts
+    coincide only at B = 1.
+    """
+
+    def _kda(self):
+        from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiK3Config
+
+        flat = KimiK3Config(
+            hidden_size=32,
+            kda_num_heads=2,
+            kda_head_dim=16,
+            kda_short_conv_kernel_size=4,
+            kda_use_full_rank_gate=True,
+            kda_cp_mode="kcp",
+        )
+        return KimiDeltaAttention.make_config(flat, layer_idx=0).build()
+
+    def test_each_row_is_handed_over_alone_and_in_order(self):
+        kda = self._kda()
+        seen = []
+
+        def fake_one(x, cp_group):
+            seen.append(x)
+            # Return something row-identifiable so the concatenation order is checkable.
+            return x[..., :1] * 0 + len(seen)
+
+        kda._forward_kcp_one = fake_one
+        x = torch.arange(3 * 5 * 32, dtype=torch.float32).reshape(3, 5, 32)
+        out = kda._forward_kcp(x, cp_group=object())
+
+        self.assertEqual(len(seen), 3, "one call per batch row")
+        for b, got in enumerate(seen):
+            self.assertEqual(tuple(got.shape), (1, 5, 32), "each call gets [1, L, D]")
+            torch.testing.assert_close(got, x[b : b + 1], rtol=0, atol=0)
+        # Reassembled in call order, so row b of the output came from call b.
+        self.assertEqual(tuple(out.shape), (3, 5, 1))
+        torch.testing.assert_close(out[:, 0, 0], torch.tensor([1.0, 2.0, 3.0]))
+
+    def test_a_single_row_does_not_take_the_loop(self):
+        """B = 1 must reach the same call the loop would make, without a cat."""
+        kda = self._kda()
+        seen = []
+
+        def fake_one(x, cp_group):
+            seen.append(x)
+            return x
+
+        kda._forward_kcp_one = fake_one
+        x = torch.zeros(1, 4, 32)
+        out = kda._forward_kcp(x, cp_group=object())
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0], x, "the single-row path should not slice or copy")
+        self.assertIs(out, x)
