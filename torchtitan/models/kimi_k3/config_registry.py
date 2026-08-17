@@ -528,6 +528,42 @@ def kimi_k3_mini_attnres_multicommit() -> Trainer.Config:
     return cfg
 
 
+def kimi_k3_mini_attnres_multicommit_wide() -> Trainer.Config:
+    """32 layers in 16 blocks of 2, so more than one multi-commit geometry exists.
+
+    The 16-layer sibling can express exactly ONE. Interleaved1F1B needs
+    ``num_stages > pp_degree`` and multi-commit needs
+    ``layers_per_stage > layers_per_block``, and with 16 layers over blocks of 2 the only
+    ``pp * vp`` that satisfies both while dividing 16 is 4 -- pp2 x vp2, two commits a
+    stage. Every other shape is either vp=1 or single-commit.
+
+    Doubling the layers opens the ones that were unreachable:
+
+    * pp2 x vp2 (layers_per_stage 8)  -> 4 stages, FOUR commits a stage
+    * pp4 x vp2 (layers_per_stage 4)  -> 8 stages, two commits a stage, a different pp
+    * pp2 x vp4 (layers_per_stage 4)  -> 8 stages, two commits, two virtual stages a rank
+
+    Same k3mini extents otherwise, so it stays a two-GPU flavor.
+    """
+    import dataclasses as _dc
+
+    cfg = kimi_k3_mini_attnres_multicommit()
+    cfg.model_spec.flavor = "kimi_k3_mini_attnres_multicommit_wide"
+    n = 32
+    full_attn = sorted(set(range(4, n + 1, 4)) | {n})
+    cfg.model_spec.model = _dc.replace(
+        cfg.model_spec.model,
+        kimi_config=_dc.replace(
+            cfg.model_spec.model.kimi_config,
+            num_hidden_layers=n,
+            full_attn_layers=full_attn,
+            kda_layers=[i for i in range(1, n + 1) if i not in full_attn],
+        ),
+        num_blocks=16,
+    )
+    return cfg
+
+
 def kimi_k3_mini_attnres_multicommit_lora() -> Trainer.Config:
     """The multi-commit flavor with LoRA rank 8, nothing else.
 
