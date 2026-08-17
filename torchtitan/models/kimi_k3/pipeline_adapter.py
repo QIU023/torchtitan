@@ -89,7 +89,23 @@ from torchtitan.tools.logging import logger
 
 
 def adapter_enabled() -> bool:
-    """Config gate: the adapter is opt-in until we trust it."""
+    """Config gate for delta mode. Opt-in, and the trust now has a measurement.
+
+    3000 steps per arm at pp2 x vp2, two commits per stage
+    (matrix_scripts/run_delta_convergence.sh): naive 1.77437, delta 1.78017, and the
+    SAME configuration reseeded 1.76570. The delta-vs-naive mean relative gap runs
+    0.00245 over the first tenth to 0.00342 over the last; the reseed-vs-naive gap runs
+    0.00465 to 0.00555. So the transport's difference is about 60% of the run-to-run
+    spread of one configuration, and neither gap grows -- the 0.0198 that six steps
+    showed was noise being averaged, not a divergence.
+
+    Still False by default, because engaging it needs more than trust: Interleaved1F1B
+    (otherwise this returns and the adapter passes through), n_layers divisible by the
+    stage count, and an even split (first/last_stage_less_layers 0). Flipping the default
+    would leave most configurations on the passthrough they already take, while the ones
+    that do qualify would change transport without a gate cell able to see it -- the
+    58-cell gate never enters delta mode at all.
+    """
     from torchtitan.models.kimi_k3.knobs import topology
 
     return topology().attn_res_cache
