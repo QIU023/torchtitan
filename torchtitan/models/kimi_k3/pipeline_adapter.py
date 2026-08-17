@@ -95,9 +95,20 @@ def adapter_enabled() -> bool:
     (matrix_scripts/run_delta_convergence.sh): naive 1.77437, delta 1.78017, and the
     SAME configuration reseeded 1.76570. The delta-vs-naive mean relative gap runs
     0.00245 over the first tenth to 0.00342 over the last; the reseed-vs-naive gap runs
-    0.00465 to 0.00555. So the transport's difference is about 60% of the run-to-run
-    spread of one configuration, and neither gap grows -- the 0.0198 that six steps
-    showed was noise being averaged, not a divergence.
+    0.00465 to 0.00555. Neither grows, so it is not a divergence.
+
+    But it is not noise either, and the distinction is the point. Delta's difference is
+    DETERMINISTIC -- a summation-order difference from the mid-stage block-stack rebuild
+    and from ``grad + captured`` where autograd would have accumulated -- so comparing it
+    against a reseed spread bounds detectability, not bias.
+    ``run_delta_sign_test.sh`` runs the pair at three seeds: delta finishes worse at all
+    three, by +0.14%, +0.24% and +0.20% on the tail mean. A consistent sign with the
+    magnitudes in that narrow a band is a BIAS of roughly +0.19%, sitting below the 0.56%
+    run-to-run spread and therefore invisible in any single run.
+
+    So the trade is +0.19% loss for -11.4% peak memory at this shape, not a free
+    optimisation. Three seeds put the sign at p = 0.25 on its own; the clustering of the
+    magnitudes is the stronger part of the evidence, and more seeds would settle it.
 
     Still False by default, because engaging it needs more than trust: Interleaved1F1B
     (otherwise this returns and the adapter passes through), n_layers divisible by the
