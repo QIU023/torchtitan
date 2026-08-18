@@ -46,32 +46,32 @@ view and is equivalent.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate
 
-from dataclasses import dataclass
-
 from torchtitan.models.common.embedding import Embedding as _TTEmbedding
-from torchtitan.protocols.module import Module as _TTModule
 from torchtitan.models.kimi_k3.attn_res import (
-    block_attn_res_tensor,
     AttnResProjection,
     block_attn_res,
+    block_attn_res_tensor,
     stack_blocks,
     unstack_blocks,
 )
 from torchtitan.models.kimi_k3.model import (
-    RMSNorm,
     _tp_replicate,
     _tp_shard,
     KimiDecoderLayer,
     KimiK3Config,
     KimiK3Model,
     Linear,
+    RMSNorm,
     splice_vision_embeds,
     UpstreamFSDPNames,
 )
+from torchtitan.protocols.module import Module
 
 
 def _scalar_local(a: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
@@ -103,7 +103,7 @@ def _plain_stream(
 # ----- Per-layer AttnRes wrapper ------------------------------------------ #
 
 
-class KimiAttnResDecoderLayer(_TTModule, UpstreamFSDPNames):
+class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
     """Kimi decoder layer with AttnRes woven around attn and FFN.
 
     Structurally the same as :class:`KimiDecoderLayer` (per-layer KDA/MLA
@@ -124,7 +124,7 @@ class KimiAttnResDecoderLayer(_TTModule, UpstreamFSDPNames):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(_TTModule.Config):
+    class Config(Module.Config):
         """This block plus the four AttnRes reads.
 
         ``base`` is the plain block's own config, so the attention/FFN choice and
@@ -338,7 +338,9 @@ class KimiAttnResDecoderLayer(_TTModule, UpstreamFSDPNames):
 
         if block_residual_TND.shape[1] > 0:
             x_BLD = block_attn_res_tensor(
-                prefix_sum_BLD, block_residual_TND, self.attention_res_proj,
+                prefix_sum_BLD,
+                block_residual_TND,
+                self.attention_res_proj,
                 self.attention_res_norm,
             )
 
@@ -419,9 +421,15 @@ class KimiK3MTPLayer(nn.Module):
     def __init__(self, config, layer_idx: int, *, gated: bool) -> None:
         super().__init__()
         d = config.hidden_size
-        self.enorm = RMSNorm.Config(normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
-        self.hnorm = RMSNorm.Config(normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
-        self.eh_proj = Linear.Config(in_features=2 * d, out_features=d, bias=False, sharding_config=_tp_shard(0)).build()
+        self.enorm = RMSNorm.Config(
+            normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()
+        ).build()
+        self.hnorm = RMSNorm.Config(
+            normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()
+        ).build()
+        self.eh_proj = Linear.Config(
+            in_features=2 * d, out_features=d, bias=False, sharding_config=_tp_shard(0)
+        ).build()
         self.gated = gated
         self.block = KimiAttnResDecoderLayer.make_config(
             config, layer_idx, gated=gated
@@ -547,7 +555,11 @@ class KimiK3AttnResModel(KimiK3Model):
             if num_mtp
             else None
         )
-        self.norm = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
+        self.norm = RMSNorm.Config(
+            normalized_shape=config.hidden_size,
+            eps=config.rms_norm_eps,
+            sharding_config=_tp_replicate(),
+        ).build()
         self.lm_head = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.vocab_size,
@@ -717,9 +729,7 @@ class KimiK3AttnResModel(KimiK3Model):
                 # carrier plain there, so the carrier cat inside
                 # block_attn_res_tensor met one of each.
                 if not isinstance(x, DTensor):
-                    x = DTensor.from_local(
-                        x, _tpm, (Replicate(),), run_check=False
-                    )
+                    x = DTensor.from_local(x, _tpm, (Replicate(),), run_check=False)
                 if not isinstance(carrier, DTensor):
                     carrier = DTensor.from_local(
                         carrier, _tpm, (Replicate(),), run_check=False
@@ -743,7 +753,13 @@ class KimiK3AttnResModel(KimiK3Model):
                     # This stage span covers no block boundary — emit a
                     # zero-first-dim tensor so the adapter's P2P handoff
                     # preserves a static per-stage shape.
-                    empty = partial_block.new_zeros((partial_block.shape[0] * partial_block.shape[1], 0, partial_block.shape[-1]))
+                    empty = partial_block.new_zeros(
+                        (
+                            partial_block.shape[0] * partial_block.shape[1],
+                            0,
+                            partial_block.shape[-1],
+                        )
+                    )
                     return partial_block, empty
                 return partial_block, stack_blocks(new_blocks)
             if not block_list:
@@ -756,7 +772,13 @@ class KimiK3AttnResModel(KimiK3Model):
                 # and a zero-first-dim new_zeros is not guaranteed to satisfy
                 # that. VP4 is what surfaced it -- VP1 never sends an empty
                 # stack because every rank's single stage spans a boundary.
-                empty = partial_block.new_zeros((partial_block.shape[0] * partial_block.shape[1], 0, partial_block.shape[-1])).contiguous()
+                empty = partial_block.new_zeros(
+                    (
+                        partial_block.shape[0] * partial_block.shape[1],
+                        0,
+                        partial_block.shape[-1],
+                    )
+                ).contiguous()
                 return partial_block, empty
             return partial_block, stack_blocks(block_list)
 

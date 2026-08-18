@@ -56,7 +56,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.protocols.module import Module as _TTModule
+from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
 
@@ -510,7 +510,7 @@ def _cp_all_to_all_headseq(
     return out.permute(1, 2, 0, 3, 4).reshape(B, t_loc, cp * h_loc, K).contiguous()
 
 
-class KimiMLAAttention(_TTModule):
+class KimiMLAAttention(Module):
     """Multi-head Latent Attention, Kimi NoPE variant.
 
     Faithful port of ``reference:KimiMLAAttention``. Key differences
@@ -532,7 +532,7 @@ class KimiMLAAttention(_TTModule):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(_TTModule.Config):
+    class Config(Module.Config):
         """Config-driven Gated MLA.
 
         The Q path is either a single projection or the low-rank pair, so those
@@ -1016,7 +1016,7 @@ def _local_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     return F.linear(x, weight, bias)
 
 
-class KimiDeltaAttention(_TTModule):
+class KimiDeltaAttention(Module):
     """Kimi Delta Attention — linear-attention variant using
     fla-core's gated delta rule kernel.
 
@@ -1026,7 +1026,7 @@ class KimiDeltaAttention(_TTModule):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(_TTModule.Config):
+    class Config(Module.Config):
         """Config-driven KDA.
 
         The scalar fields deliberately carry the SAME names as the flat model
@@ -1575,7 +1575,7 @@ class KimiDeltaAttention(_TTModule):
 # ----- MoE (training-capable via torchtitan.models.common.moe) ------------ #
 
 
-class KimiLatentMoEProjection(_TTModule):
+class KimiLatentMoEProjection(Module):
     """The latent entry/exit of Stable LatentMoE (report Eq. 11).
 
     ``down`` maps a token from full width ``d`` into the routed-expert latent
@@ -1589,7 +1589,7 @@ class KimiLatentMoEProjection(_TTModule):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(_TTModule.Config):
+    class Config(Module.Config):
         """Config-driven, with the norm optional the way the module is.
 
         No declaration on ``norm``: it sits on the MoE's OUTPUT side, where the
@@ -1648,7 +1648,7 @@ class KimiLatentMoEProjection(_TTModule):
         return self.up(self.norm(u) if self.norm is not None else u)
 
 
-class KimiMoE(_TTModule):
+class KimiMoE(Module):
     """Kimi's sigmoid-gated grouped-topk MoE, implemented via
     torchtitan's training-capable MoE primitives.
 
@@ -1676,7 +1676,7 @@ class KimiMoE(_TTModule):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(_TTModule.Config):
+    class Config(Module.Config):
         """The latent MoE's config tree.
 
         ``moe`` is core's MoE.Config, because this class composes core's MoE
@@ -2007,7 +2007,7 @@ class UpstreamFSDPNames:
         return bool(getattr(self, "is_moe", False))
 
 
-class KimiDecoderLayer(_TTModule, UpstreamFSDPNames):
+class KimiDecoderLayer(Module, UpstreamFSDPNames):
     """One transformer block: pre-norm + attention + residual +
     pre-norm + MoE/MLP + residual.
 
@@ -2015,7 +2015,7 @@ class KimiDecoderLayer(_TTModule, UpstreamFSDPNames):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(_TTModule.Config):
+    class Config(Module.Config):
         """One hybrid block. Attention and FFN are each an XOR pair.
 
         The layer type is readable off the populated field rather than by asking
@@ -2125,7 +2125,7 @@ class KimiDecoderLayer(_TTModule, UpstreamFSDPNames):
 # ----- Top-level model ----------------------------------------------------- #
 
 
-class KimiK3Model(_TTModule):
+class KimiK3Model(Module):
     """Kimi Linear stack: embed -> decoder layers -> final RMSNorm -> LM head.
 
     No KV cache, no generation path. Training / loss is expected to be
@@ -2142,7 +2142,7 @@ class KimiK3Model(_TTModule):
     _skip_lm_head: bool = False
 
     @dataclass(kw_only=True, slots=True)
-    class Config(_TTModule.Config):
+    class Config(Module.Config):
         """The trunk's config tree.
 
         ``tok_embeddings``, ``norm`` and ``lm_head`` carry the names core's

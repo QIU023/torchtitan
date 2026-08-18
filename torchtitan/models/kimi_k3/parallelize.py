@@ -1521,7 +1521,7 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
     """
     from torch.distributed.tensor import DTensor as _DTensor
 
-    from torchtitan.protocols.module import Module as _TTModule
+    from torchtitan.protocols.module import Module
 
     def _already_distributed(m: nn.Module) -> bool:
         """Has the imperative plan (or an earlier pass) already distributed this subtree?
@@ -1544,7 +1544,7 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
     queue = list(model.children())
     while queue:
         child = queue.pop()
-        if isinstance(child, _TTModule) and not getattr(child, "_parallelized", False):
+        if isinstance(child, Module) and not getattr(child, "_parallelized", False):
             if getattr(child, "_kimi_ep_parallelized", False):
                 continue
             if not _already_distributed(child):
