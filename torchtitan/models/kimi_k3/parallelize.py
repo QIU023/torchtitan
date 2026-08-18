@@ -131,14 +131,8 @@ def parallelize_kimi_k3(
     FSDP/HSDP. AC is applied before compile so the compiled subgraph is
     the checkpointed unit (matches upstream llama3/qwen3 ordering).
 
-    CP is Ulysses-style (seq-local projections, all-to-all seq<->head,
-    full-seq attention on the local head subset) inside each KDA/MLA
-    module; the module boundary stays a seq-sharded plain tensor, which
-    is what keeps CP composable with FSDP/PP/EP. CP+TP composes too: the
-    CP collectives run on plain local tensors AFTER the TP-wrapped
-    projections (to_local at the same gap the TP plan already strips
-    DTensor), so under TP each rank computes num_heads/(tp*cp) MLA heads.
-    Requires context_parallel_load_balancer=None (validated below).
+    CP is applied by ``apply_cp_kimi_k3``; see its docstring for which
+    mechanism lands on which layer kind.
     """
 
     # Resolve the topology knobs from config ONCE, before anything reads them
@@ -197,132 +191,7 @@ def parallelize_kimi_k3(
             parallel_dims.tp,
         )
     if parallel_dims.cp_enabled:
-        # Fail loudly on configs the CP implementation cannot honor.
-        # Silent degradation here has already produced plausible-but-wrong
-        # runs (headtail-permuted sequences), so these are ValueErrors,
-        # not warnings.
-        cp_load_balancer = parallelism.context_parallel_load_balancer
-        if cp_load_balancer is not None:
-            raise ValueError(
-                "kimi_linear CP requires context_parallel_load_balancer="
-                f"None, got '{cp_load_balancer}'. The KDA/MLA CP path "
-                "reassembles the full sequence as contiguous rank-ordered "
-                "shards; a load balancer (e.g. headtail) permutes the "
-                "sequence before sharding, which silently breaks causal "
-                "order inside the attention kernels (future-token leakage). "
-                "Load balancing is also unnecessary here: every rank "
-                "computes the full sequence for its head subset, so "
-                "per-rank work is already symmetric."
-            )
-        # Ulysses CP for the hybrid KDA/MLA backbone: each attention
-        # module runs its projections seq-local, swaps seq<->head
-        # sharding with one fused differentiable all-to-all on the cp
-        # sub-mesh, and runs conv/scan/SDPA on its head subset over the
-        # full sequence (see KimiDeltaAttention/KimiMLAAttention
-        # ._forward_cp). chunk_kda is bit-exactly per-head independent
-        # (verified bit-exact against a single-rank reference), so
-        # head sharding is exact.
-        # KDA can't ring (fla-core scan) and the custom MLA
-        # inner_attention isn't the torchtitan SDPA type
-        # apply_cp_to_forward expects -- hence this module-internal CP
-        # rather than the upstream dispatcher.
-        from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiMLAAttention
-
-        cp_group = parallel_dims.get_mesh("cp").get_group()
-        cp_degree = parallel_dims.cp
-        tp_degree = parallel_dims.tp
-        n_mla = 0
-        kda_modules = []
-        for m in model.modules():
-            if isinstance(m, KimiMLAAttention):
-                # MLA is Ulysses in both modes -- KCP is a KDA recurrence
-                # decomposition and has nothing to say about softmax attention.
-                # Under TP the head axis is already tp-sharded; Ulysses further
-                # splits the local heads by cp.
-                if m.num_heads % (tp_degree * cp_degree) != 0:
-                    raise ValueError(
-                        f"MLA num_attention_heads={m.num_heads} must be "
-                        f"divisible by tp*cp={tp_degree * cp_degree} for "
-                        "Ulysses CP head sharding"
-                    )
-                m._cp_group = cp_group
-                n_mla += 1
-            elif isinstance(m, KimiDeltaAttention):
-                kda_modules.append(m)
-        # Which CP path the KDA layers take is their ``kda_cp_mode``, and the
-        # wiring has to know it, because the two modes shard different axes and
-        # so have different preconditions: the Ulysses head-divisibility rule
-        # below is meaningless for KCP, which never splits heads, and enforcing
-        # it there rejects configurations that work.
-        #
-        # Note that KCP on the KDA layers and Ulysses on the MLA layers run
-        # TOGETHER, and that is the design: they apply to disjoint layers. The
-        # per-layer modes are not a choice between two whole-model strategies.
-        # None, not a default mode name: under PP a rank can hold no KDA layer at
-        # all (the vision-tower stage is the ordinary case), and naming a mode
-        # there would be the log inventing a configuration. Reported as "-".
-        kda_mode = kda_modules[0].cp_mode if kda_modules else None
-        if kda_mode == "ulysses":
-            for m in kda_modules:
-                # KDA is NoParallel under TP (replicated), so only cp
-                # splits its heads.
-                if m.num_heads % cp_degree != 0:
-                    raise ValueError(
-                        f"KDA kda_num_heads={m.num_heads} must be "
-                        f"divisible by cp={cp_degree} for Ulysses CP "
-                        "head sharding"
-                    )
-        elif kda_modules:
-            # KCP needs fla's CP ops rather than a head count. Checked here so a
-            # missing dependency names the config field instead of surfacing as
-            # an ImportError from inside the first forward.
-            #
-            # The batch-size precondition is deliberately NOT checked here: what
-            # KCP's varlen path cannot take is a batch axis on the tensor the
-            # module sees, and that is the micro-batch, not
-            # training.local_batch_size -- under PP the two differ by the
-            # micro-batch count. KimiDeltaAttention._forward_kcp checks the real
-            # B and says what to do about it; a less accurate copy at wiring time
-            # would reject configurations that run.
-            try:
-                from fla.modules.conv.cp.ops import causal_conv1d_cp  # noqa: F401
-                from fla.ops.cp.context import build_cp_context  # noqa: F401
-            except ImportError as err:
-                raise ValueError(
-                    "kda_cp_mode='kcp' needs fla-core's CP ops "
-                    "(fla.ops.cp.context.build_cp_context and "
-                    "fla.modules.conv.cp.ops.causal_conv1d_cp), which ship in "
-                    f"fla-core >= 0.5.1; import failed with: {err}. Install a "
-                    "newer fla-core or use kda_cp_mode='ulysses'."
-                ) from err
-        for m in kda_modules:
-            m._cp_group = cp_group
-        n_attn = n_mla + len(kda_modules)
-        # The multimodal wrapper needs it too. prepare_context_parallel_input
-        # shards inputs/labels/positions but NOT pixel_values, so each CP rank
-        # sees a slice of the vision sentinels while still being handed the
-        # whole batch of images; the splice then finds a sentinel count that
-        # matches neither the image count nor the token count.
-        from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
-
-        subgroups = _build_cp_subgroups(cp_group)
-        for m in model.modules():
-            if isinstance(m, KimiK3MultimodalModel):
-                m._cp_group = cp_group
-                m._cp_subgroups = subgroups
-        # Names the KDA mode, because the two are indistinguishable downstream:
-        # both leave the module boundary a seq-sharded plain tensor and neither
-        # changes the loss. A log line that says Ulysses on a KCP run is exactly
-        # the kind of stale report that hid the EP wiring bug.
-        logger.info(
-            "Applied CP cp_degree=%d: %d MLA layer(s) Ulysses, %d KDA layer(s) "
-            "kda_cp_mode=%s (%d attn layers total).",
-            cp_degree,
-            n_mla,
-            len(kda_modules),
-            kda_mode or "-",
-            n_attn,
-        )
+        apply_cp_kimi_k3(model, parallel_dims=parallel_dims, parallelism=parallelism)
     # None means "this rank has no MoE to plan for", which is a normal state rather
     # than a missing value: under PP a rank can hold only the vision-tower stage, or
     # only decoder layers that are dense. Kept explicit because the verify call below
@@ -492,6 +361,154 @@ def parallelize_kimi_k3(
             parallel_dims.dp_replicate,
         )
     return model
+
+
+def apply_cp_kimi_k3(
+    model: nn.Module,
+    *,
+    parallel_dims: ParallelDims,
+    parallelism: ParallelismConfig,
+) -> None:
+    """Wire context parallelism: KCP on the KDA layers, Ulysses on the MLA layers.
+
+    Both at once, on disjoint layer kinds -- KCP decomposes the delta-rule recurrence
+    and says nothing about softmax attention, so it does not replace Ulysses. KCP keeps
+    the sequence sharded end to end (report sec 5.1.2); Ulysses gives each rank the whole
+    sequence for its head subset. ``kda_cp_mode="ulysses"`` runs the KDA layers the second
+    way and is kept only as an A/B.
+
+    Either way the module boundary stays a seq-sharded plain tensor, which is what keeps
+    CP composable with FSDP/PP/EP. CP+TP composes too: the CP collectives run on plain
+    local tensors AFTER the TP-wrapped projections (to_local at the same gap the TP plan
+    already strips DTensor), so under TP each rank computes num_heads/(tp*cp) MLA heads.
+    Requires context_parallel_load_balancer=None (validated below).
+    """
+    # Fail loudly on configs the CP implementation cannot honor.
+    # Silent degradation here has already produced plausible-but-wrong
+    # runs (headtail-permuted sequences), so these are ValueErrors,
+    # not warnings.
+    cp_load_balancer = parallelism.context_parallel_load_balancer
+    if cp_load_balancer is not None:
+        raise ValueError(
+            "kimi_linear CP requires context_parallel_load_balancer="
+            f"None, got '{cp_load_balancer}'. The KDA/MLA CP path "
+            "reassembles the full sequence as contiguous rank-ordered "
+            "shards; a load balancer (e.g. headtail) permutes the "
+            "sequence before sharding, which silently breaks causal "
+            "order inside the attention kernels (future-token leakage). "
+            "Load balancing is also unnecessary here: every rank "
+            "computes the full sequence for its head subset, so "
+            "per-rank work is already symmetric."
+        )
+    # Ulysses CP for the hybrid KDA/MLA backbone: each attention
+    # module runs its projections seq-local, swaps seq<->head
+    # sharding with one fused differentiable all-to-all on the cp
+    # sub-mesh, and runs conv/scan/SDPA on its head subset over the
+    # full sequence (see KimiDeltaAttention/KimiMLAAttention
+    # ._forward_cp). chunk_kda is bit-exactly per-head independent
+    # (verified bit-exact against a single-rank reference), so
+    # head sharding is exact.
+    # KDA can't ring (fla-core scan) and the custom MLA
+    # inner_attention isn't the torchtitan SDPA type
+    # apply_cp_to_forward expects -- hence this module-internal CP
+    # rather than the upstream dispatcher.
+    from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiMLAAttention
+
+    cp_group = parallel_dims.get_mesh("cp").get_group()
+    cp_degree = parallel_dims.cp
+    tp_degree = parallel_dims.tp
+    n_mla = 0
+    kda_modules = []
+    for m in model.modules():
+        if isinstance(m, KimiMLAAttention):
+            # MLA is Ulysses in both modes -- KCP is a KDA recurrence
+            # decomposition and has nothing to say about softmax attention.
+            # Under TP the head axis is already tp-sharded; Ulysses further
+            # splits the local heads by cp.
+            if m.num_heads % (tp_degree * cp_degree) != 0:
+                raise ValueError(
+                    f"MLA num_attention_heads={m.num_heads} must be "
+                    f"divisible by tp*cp={tp_degree * cp_degree} for "
+                    "Ulysses CP head sharding"
+                )
+            m._cp_group = cp_group
+            n_mla += 1
+        elif isinstance(m, KimiDeltaAttention):
+            kda_modules.append(m)
+    # Which CP path the KDA layers take is their ``kda_cp_mode``, and the
+    # wiring has to know it, because the two modes shard different axes and
+    # so have different preconditions: the Ulysses head-divisibility rule
+    # below is meaningless for KCP, which never splits heads, and enforcing
+    # it there rejects configurations that work.
+    #
+    # Note that KCP on the KDA layers and Ulysses on the MLA layers run
+    # TOGETHER, and that is the design: they apply to disjoint layers. The
+    # per-layer modes are not a choice between two whole-model strategies.
+    # None, not a default mode name: under PP a rank can hold no KDA layer at
+    # all (the vision-tower stage is the ordinary case), and naming a mode
+    # there would be the log inventing a configuration. Reported as "-".
+    kda_mode = kda_modules[0].cp_mode if kda_modules else None
+    if kda_mode == "ulysses":
+        for m in kda_modules:
+            # KDA is NoParallel under TP (replicated), so only cp
+            # splits its heads.
+            if m.num_heads % cp_degree != 0:
+                raise ValueError(
+                    f"KDA kda_num_heads={m.num_heads} must be "
+                    f"divisible by cp={cp_degree} for Ulysses CP "
+                    "head sharding"
+                )
+    elif kda_modules:
+        # KCP needs fla's CP ops rather than a head count. Checked here so a
+        # missing dependency names the config field instead of surfacing as
+        # an ImportError from inside the first forward.
+        #
+        # The batch-size precondition is deliberately NOT checked here: what
+        # KCP's varlen path cannot take is a batch axis on the tensor the
+        # module sees, and that is the micro-batch, not
+        # training.local_batch_size -- under PP the two differ by the
+        # micro-batch count. KimiDeltaAttention._forward_kcp checks the real
+        # B and says what to do about it; a less accurate copy at wiring time
+        # would reject configurations that run.
+        try:
+            from fla.modules.conv.cp.ops import causal_conv1d_cp  # noqa: F401
+            from fla.ops.cp.context import build_cp_context  # noqa: F401
+        except ImportError as err:
+            raise ValueError(
+                "kda_cp_mode='kcp' needs fla-core's CP ops "
+                "(fla.ops.cp.context.build_cp_context and "
+                "fla.modules.conv.cp.ops.causal_conv1d_cp), which ship in "
+                f"fla-core >= 0.5.1; import failed with: {err}. Install a "
+                "newer fla-core or use kda_cp_mode='ulysses'."
+            ) from err
+    for m in kda_modules:
+        m._cp_group = cp_group
+    n_attn = n_mla + len(kda_modules)
+    # The multimodal wrapper needs it too. prepare_context_parallel_input
+    # shards inputs/labels/positions but NOT pixel_values, so each CP rank
+    # sees a slice of the vision sentinels while still being handed the
+    # whole batch of images; the splice then finds a sentinel count that
+    # matches neither the image count nor the token count.
+    from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
+
+    subgroups = _build_cp_subgroups(cp_group)
+    for m in model.modules():
+        if isinstance(m, KimiK3MultimodalModel):
+            m._cp_group = cp_group
+            m._cp_subgroups = subgroups
+    # Names the KDA mode, because the two are indistinguishable downstream:
+    # both leave the module boundary a seq-sharded plain tensor and neither
+    # changes the loss. A log line that says Ulysses on a KCP run is exactly
+    # the kind of stale report that hid the EP wiring bug.
+    logger.info(
+        "Applied CP cp_degree=%d: %d MLA layer(s) Ulysses, %d KDA layer(s) "
+        "kda_cp_mode=%s (%d attn layers total).",
+        cp_degree,
+        n_mla,
+        len(kda_modules),
+        kda_mode or "-",
+        n_attn,
+    )
 
 
 def _build_cp_subgroups(cp_group) -> dict[int, object]:
