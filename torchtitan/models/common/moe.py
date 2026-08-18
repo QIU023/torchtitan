@@ -91,21 +91,41 @@ class GroupedExperts(Module):
                 # TODO(pianpwk): likely relax this in spmd_types.
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
-        h_RF = F.silu(
-            self._grouped_mm(
-                A=x_RD.bfloat16(),
-                B_t=w1_EFD.bfloat16().transpose(-2, -1),
-                offs=offsets_E,
-            )
+        gate_RF = self._grouped_mm(
+            A=x_RD.bfloat16(),
+            B_t=w1_EFD.bfloat16().transpose(-2, -1),
+            offs=offsets_E,
         )
-        h_RF = h_RF * self._grouped_mm(
+        up_RF = self._grouped_mm(
             A=x_RD.bfloat16(),
             B_t=w3_EFD.bfloat16().transpose(-2, -1),
             offs=offsets_E,
         )
+        h_RF = self.gate_up_combine(gate_RF, up_RF)
         return self._grouped_mm(
             A=h_RF, B_t=w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
         ).type_as(x_RD)
+
+    def gate_up_combine(
+        self, gate_RF: torch.Tensor, up_RF: torch.Tensor
+    ) -> torch.Tensor:
+        """Combine the gate and up projections. Override for a different GLU variant.
+
+        Default is SwiGLU, which is what this class has always computed, so existing
+        models are unaffected.
+
+        A hook rather than an activation parameter, because the variants that exist are
+        not single-argument activations: gpt_oss clamps BOTH branches at a configured
+        limit, and Kimi K3's SiTU-GLU is ``beta * tanh(g / beta) * sigmoid(g)`` with a
+        second clip on the linear branch, computed in fp32 because the product of two
+        saturating nonlinearities is sensitive to bf16 rounding near the caps. Neither
+        fits ``activation(gate) * up``, and both carry hyperparameters the subclass owns.
+
+        What this removes is the real duplication: a subclass changing this one step
+        previously had to copy the whole forward, grouped-mm calls and SPMD type mutation
+        included, to reach it.
+        """
+        return F.silu(gate_RF) * up_RF
 
     def _grouped_mm(
         self, *, A: torch.Tensor, B_t: torch.Tensor, offs: torch.Tensor
@@ -432,11 +452,7 @@ class MoE(Module):
         """
         # topk_scores_BLK and topk_expert_ids_BLK shape (B, L, K)
         # scores_BLE shape (B, L, E)
-        (
-            topk_scores_BLK,
-            topk_expert_ids_BLK,
-            scores_BLE,
-        ) = self.router(
+        (topk_scores_BLK, topk_expert_ids_BLK, scores_BLE,) = self.router(
             x_BLD if router_input_BLD is None else router_input_BLD,
             self.expert_bias_E,
         )

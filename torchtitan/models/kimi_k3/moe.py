@@ -21,13 +21,8 @@ rank, D model dim, F expert hidden dim, E experts.
 
 from dataclasses import dataclass
 
-import spmd_types as spmd
-
 import torch
-from torch.distributed.tensor import DTensor
 
-from torchtitan.distributed.spmd_types import spmd_mesh_size
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.moe import GroupedExperts
 
 from .model import situ_and_mul
@@ -51,42 +46,8 @@ class KimiSiTUGroupedExperts(GroupedExperts):
         self.situ_beta = config.situ_beta
         self.situ_linear_beta = config.situ_linear_beta
 
-    def forward(
-        self,
-        x_RD: torch.Tensor,
-        num_tokens_per_expert_E: torch.Tensor,
+    def gate_up_combine(
+        self, gate_RF: torch.Tensor, up_RF: torch.Tensor
     ) -> torch.Tensor:
-        if isinstance(self.w1_EFD, DTensor):
-            # Plain tensors for the dynamic-shape EP path, as the base does.
-            w1_EFD = self.w1_EFD.to_local()
-            w2_EDF = self.w2_EDF.to_local()
-            w3_EFD = self.w3_EFD.to_local()
-        else:
-            w1_EFD = self.w1_EFD
-            w2_EDF = self.w2_EDF
-            w3_EFD = self.w3_EFD
-
-        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if (
-            get_spmd_backend() == "spmd_types"
-            and spmd.is_type_checking()
-            and spmd_mesh_size("ep") == 1
-        ):
-            for axis in ("dp", "cp"):
-                spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
-
-        # Through the inherited seam, not torch._grouped_mm directly: the MXFP8
-        # converter installs its quantized GEMM by overriding _grouped_mm, so a
-        # direct call silently opts every routed expert out of it -- which is
-        # where the majority of the model's FLOPs live, and the opposite of what
-        # this class's docstring promises.
-        gate_RF = self._grouped_mm(
-            A=x_RD.bfloat16(), B_t=w1_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
-        )
-        up_RF = self._grouped_mm(
-            A=x_RD.bfloat16(), B_t=w3_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
-        )
-        h_RF = situ_and_mul(gate_RF, up_RF, self.situ_beta, self.situ_linear_beta)
-        return self._grouped_mm(
-            A=h_RF, B_t=w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
-        ).type_as(x_RD)
+        """SiTU-GLU instead of the base class's SwiGLU (report Eq. 12)."""
+        return situ_and_mul(gate_RF, up_RF, self.situ_beta, self.situ_linear_beta)
