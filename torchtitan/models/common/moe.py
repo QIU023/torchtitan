@@ -430,13 +430,14 @@ class MoE(Module):
         Args:
             x_BLD: Input ``(B, L, D)`` -- what the experts consume.
             router_input_BLD: Keyword-only. Optional ``(B, L, D_r)`` routed-on
-                tensor -- keyword-only because ``Module._redistribute_inputs``
-                enumerates the positional parameters. When
-                None (the default) the router reads ``x_BLD``, which is the
-                conventional MoE. Latent-expert designs route on the
-                full-width token while dispatching a projected, narrower
+                tensor. When None (the default) the router reads ``x_BLD``,
+                which is the conventional MoE. Latent-expert designs route on
+                the full-width token while dispatching a projected, narrower
                 tensor to the experts, so they need the two to differ; only
-                the leading ``(B, L)`` must match.
+                the leading ``(B, L)`` must match. Keyword-only so it stays out
+                of ``_cache_pos_arg_names``: a positional parameter would extend
+                the list that ``LocalMapConfig.in_grad_placements`` is ordered
+                by.
 
         Returns:
             Output ``(B, L, D)``.
