@@ -107,6 +107,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
@@ -294,10 +295,19 @@ def parallelize_kimi_k3(
                     axes.append("cp")
                 return parallel_dims.get_mesh(axes)
 
-        if parallel_dims.dp_replicate_enabled:
-            dp_mesh = _fsdp_axis(["dp_replicate"])
+        # Under full_dtensor / spmd_types, fully_shard() needs the named storage mesh
+        # AND DataParallelMeshDims -- torch's _resolve_spmd_types_for_storage raises
+        # without them, so _fsdp_axis alone is not enough on those backends. Upstream
+        # computes both in one helper; use it rather than re-deriving the axis names.
+        # It returns dp_mesh_dims=None for a size-1 storage mesh on purpose: assert_type
+        # filters inactive size-1 axes, so params would carry no annotations for FSDP to
+        # translate.
+        if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+            dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+        elif parallel_dims.dp_replicate_enabled:
+            dp_mesh, dp_mesh_dims = _fsdp_axis(["dp_replicate"]), None
         else:
-            dp_mesh = _fsdp_axis()
+            dp_mesh, dp_mesh_dims = _fsdp_axis(), None
         # Under EP, MoE expert parameters must shard via the *edp* mesh
         # (= dp_shard with the EP rank dim factored out) so FSDP's
         # mesh does not overlap EP's mesh on the same physical ranks.
@@ -342,6 +352,7 @@ def parallelize_kimi_k3(
                 reduce_dtype=reduce_dtype,
                 reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
                 pp_enabled=parallel_dims.pp_enabled,
+                dp_mesh_dims=dp_mesh_dims,
             )
 
         apply_fsdp(
@@ -354,6 +365,7 @@ def parallelize_kimi_k3(
             reshard_after_forward_policy=(parallelism.fsdp_reshard_after_forward),
             ep_degree=parallel_dims.ep,
             edp_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
         )
         logger.info(
             "Applied FSDP2 to Kimi Linear model (dp_shard=%d, dp_replicate=%d).",

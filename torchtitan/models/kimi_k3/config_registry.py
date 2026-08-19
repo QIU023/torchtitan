@@ -20,7 +20,7 @@ against earlier history (<= 666cf7ad6).
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.validate import Validator
