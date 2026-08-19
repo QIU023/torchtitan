@@ -12,6 +12,20 @@ Supported parallelism dimensions:
   ``torchtitan.models.llama3.parallelize.apply_fsdp``. Adapted to Kimi's
   module names (``embed_tokens``, ``norm``, ``lm_head``, ``layers`` as
   ``nn.ModuleList``).
+* **TP** -- DSv3-style plan in ``apply_tp_kimi_k3``, matched to
+  Kimi's MLA + KDA + MoE layout. All boundary tensors use_local_output
+  so PP send/recv, AttnRes stacking, and fla-core triton kernels see
+  plain tensors.
+* **CP** -- Ulysses-style (seq-local projections, one fused all-to-all
+  seq<->head, full-sequence attention on the local head subset) inside
+  each KDA/MLA module. The module boundary stays a seq-sharded plain
+  tensor, which is what keeps CP composable with FSDP/TP/PP/EP. Requires
+  ``context_parallel_load_balancer=None`` (enforced with a ValueError).
+* **EP** -- Expert Parallel for KimiMoE via ``apply_ep_kimi_k3``;
+  all-to-all dispatch/combine on the EP mesh.
+* **PP** -- via the cross-stage cache adapter in ``pipeline_adapter.py``;
+  PP rank assignment is in torchtitan core, scheduling in the
+  ``pipeline_kimi_k3_with_cache_adapter`` wrapper.
 * **torch.compile** -- per-decoder-layer compile via
   ``_apply_compile_kimi_k3``; MoE for-loop and fla-core triton ops
   are carved out.
@@ -21,11 +35,52 @@ Supported parallelism dimensions:
   pattern. Honors all upstream modes (``selective``, ``full``,
   ``memory_budget``, ``none``).
 
-TP, CP and EP each raise here. They arrive as one follow-up PR per axis, each
-deleting its own ValueError and adding its own ``apply_*`` -- the three do not
-call into each other, so the only thing they share is this entry. PP arrives
-the same way, through ``pipeline_adapter.py`` rather than through this file.
+Why KDA is ``NoParallel`` on the tp axis
+----------------------------------------
+The whole ``delta_attention`` is registered ``NoParallel``, so every child param
+(q/k/v/o projections, conv1d weights, ``A_log``, ``dt_bias``) becomes a
+``DTensor(Replicate)`` on ``tp_mesh``. Three consequences worth stating once:
 
+* **It is required for FSDP+TP composability.** ``clip_grad_norm_`` stacks
+  per-param grad norms across the parameter list, and the stack fails if some
+  norms live on ``(fsdp, tp)`` and others on ``(fsdp,)`` alone.
+* **The linears compose, the kernels do not.** Inside the KDA forward every
+  linear receives a DTensor input from ``input_layernorm`` and DTensor weights
+  from this wrap, so it produces DTensor. fla-core's triton kernels
+  (``causal_conv1d`` inside ``ShortConvolution``, ``fused_kda_gate``,
+  ``chunk_kda``, ``FusedRMSNormGated``) do not dispatch through DTensor, so
+  ``ShortConvolution.forward`` and ``FusedRMSNormGated.forward`` are shimmed to
+  ``to_local`` weight and input at the kernel boundary and ``from_local`` the
+  output. ``fused_kda_gate`` and ``chunk_kda`` are called explicitly, and their
+  to_local-and-call wrappers live in ``model.py``.
+* **The exit is plain.** ``local_output_grad_placements=Replicate`` ``to_local``s
+  the output at the module exit, matching MLA's ``o_proj`` and the dense MLP's
+  ``down_proj``, so ``attn_out`` is a plain tensor everywhere and both
+  partial-block accumulation and ``block_attn_res`` see one tensor kind.
+
+Why the MoE TP plan wraps LEAVES with ``NoParallel`` rather than the container
+--------------------------------------------------------------------------------
+Four facts, all load-bearing, kept here rather than inline at the call site:
+
+1. **The mechanism.** Registering each leaf with ``NoParallel`` puts its params on
+   ``tp_mesh`` as ``DTensor(Replicate)``. The shared MoE forward ``to_local``s its
+   DTensor input at entry, so gate/experts/shared_experts receive PLAIN x; each
+   leaf's ``prepare_input`` hook converts back to DTensor, runs on DTensor
+   (params are DTensor too, so the matmul composes), and returns plain via
+   ``local_output_grad_placements=Replicate``.
+2. **Why the experts need nothing extra.** ``GroupedExperts.forward`` and
+   ``KimiMLP``'s gate/up/down projections dispatch normally on DTensor because
+   their ops are standard ``F.linear``; ``GroupedExperts`` additionally
+   ``to_local``s its DTensor params before the grouped_mm kernel.
+3. **Why NOT the ``moe`` container.** The MoE forward strips x with ``to_local``
+   AFTER the parent's ``prepare_input``. Wrapping ``moe`` or ``moe._moe`` would make
+   the input a DTensor at MoE entry, ``to_local`` would make it plain, and the
+   gate would then receive plain x while holding DTensor weights -- which errors.
+   Wrapping the gate ITSELF keeps the boundary right.
+4. **Required for FSDP+TP composability.** ``clip_grad_norm_`` stacks per-param
+   grad norms across the whole parameter list, which fails if MoE params live on
+   ``(fsdp,)`` while MLA params live on ``(fsdp, tp)``. ``NoParallel`` promotes
+   the MoE params to ``(fsdp, tp)`` after the FSDP wrap.
 """
 
 from __future__ import annotations
@@ -34,6 +89,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor
 
 from torchtitan.config import (
     CompileConfig,
@@ -62,33 +118,43 @@ def parallelize_kimi_k3(
 ) -> nn.Module:
     """Apply the configured parallelism plan to a Kimi Linear model.
 
-    Wires (in order, before FSDP wrap): AC -> compile -> FSDP/HSDP. AC is
-    applied before compile so the compiled subgraph is the checkpointed unit
-    (matches upstream llama3/qwen3 ordering).
+    Wires (in order, before FSDP wrap): TP -> CP -> EP -> AC -> compile ->
+    FSDP/HSDP. AC is applied before compile so the compiled subgraph is
+    the checkpointed unit (matches upstream llama3/qwen3 ordering).
 
-    TP, CP and EP raise; each is added by its own follow-up PR, ahead of AC.
+    CP is applied by ``apply_cp_kimi_k3``; see its docstring for which
+    mechanism lands on which layer kind.
     """
-
-    # Resolve the topology knobs from config ONCE, before anything reads them
-    # (finding 32). Both this and the pipelining entry register; first call wins.
     from torchtitan.models.kimi_k3.knobs import register_topology
-
     if hasattr(model, "config"):
         register_topology(model.config)
-
-    # Enable TF32 tensor cores for fp32 matmuls (loss aggregation,
-    # optimizer master weight updates, fp32 RoPE etc.). bf16 path is
-    # unaffected. Speedup ~5-10% on fp32 ops, no measurable accuracy
-    # impact at our scale.
     torch.set_float32_matmul_precision("high")
-
     if parallel_dims.tp_enabled:
         raise ValueError("Tensor parallelism is not wired for Kimi K3 in this PR.")
     if parallel_dims.cp_enabled:
         raise ValueError("Context parallelism is not wired for Kimi K3 in this PR.")
-    if parallel_dims.ep_enabled:
-        raise ValueError("Expert parallelism is not wired for Kimi K3 in this PR.")
+    ep_expected = None
+    if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
+        # Expert Parallel for Kimi MoE layers. The
+        # KimiMoE module wraps torchtitan.models.common.moe.MoE as
+        # self._moe; the expert ModuleList is at self._moe.experts.
+        # Apply standard ExpertParallel() to that experts container,
+        # which fires all-to-all on the EP mesh for token dispatch +
+        # combine. Cache adapter delta accumulation interacts with
+        # MoE only at the block boundary (after FFN residual add),
+        # so EP routing within the FFN body is transparent to the
+        # AttnRes block-commit logic.
+        ep_expected = apply_ep_kimi_k3(model, parallel_dims)
+        logger.info(
+            "Applied EP plan (per-MoE-layer ExpertParallel) ep_degree=%d.",
+            parallel_dims.ep,
+        )
     entered = _drive_declarative_sharding(model, parallel_dims)
+    if parallel_dims.ep_enabled and ep_expected is not None:
+        # After the driver, because the driver is what carries the ep mesh down. Only
+        # where there was a plan: apply_ep_kimi_k3 already refuses a model that has MoE
+        # layers but yields none, so a None here means this rank has no MoE at all.
+        verify_ep_applied(ep_expected)
     if entered:
         from collections import Counter
 
@@ -97,7 +163,6 @@ def parallelize_kimi_k3(
             len(entered),
             dict(Counter(entered)),
         )
-
     if ac_config is not None:
         # Caveat for KDA layers: ``selective`` mode recomputes ops not
         # marked MUST_SAVE during backward; fla-core's chunk_kda kernel is
@@ -105,26 +170,12 @@ def parallelize_kimi_k3(
         # spare the recompute (see fla fused_norm_gate crash history).
         ac_config.build(dump_folder=dump_folder).apply(model)
         logger.info("Applied activation checkpointing to KimiDecoderLayer stack.")
-    # torch.compile applied per-decoder-layer BEFORE FSDP wrap (so each
-    # FSDP unit wraps a compiled subgraph). MoE for-loop expert path
-    # is NOT compiled (torchtitan upstream has the same carve-out: see
-    # apply_compile_sparse comment about unbacked symints in for-loop
-    # fallback). fla-core ops (chunk_kda, ShortConvolution,
-    # FusedRMSNormGated) are wrapped with torch.compiler.disable since
-    # they're triton kernels that dynamo can't trace through.
     if compile_config.enable:
         _apply_compile_kimi_k3(model, compile_config)
         logger.info(
             "Compiled each KimiDecoderLayer with torch.compile (backend=%s).",
             compile_config.backend,
         )
-
-    # NOTE cp_enabled belongs in this gate: torchtitan's "fsdp" mesh is
-    # dp_shard x cp and FSDP is the mechanism that reduces param grads
-    # over cp. Gating on dp alone silently skipped FSDP at dp_shard=1,
-    # cp>1 -- every cp rank then trained an UNSYNCED replica on its own
-    # seq shard (diverging, no error; per-rank grad_norm was the only
-    # visible symptom). Upstream llama3 applies FSDP unconditionally.
     if (
         parallel_dims.dp_shard_enabled
         or parallel_dims.dp_replicate_enabled
@@ -218,6 +269,118 @@ def parallelize_kimi_k3(
     return model
 
 
+
+
+
+
+
+
+
+
+def _model_has_moe(model: nn.Module) -> bool:
+    """True if any layer carries a KimiMoE (module-internal MoE
+    parallelization applies)."""
+    return any(bool(getattr(layer, "is_moe", False)) for layer in model.layers.values())
+
+
+
+
+
+
+def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
+    """Expert Parallel plan for kimi_linear MoE flavors.
+
+    Calls ``_moe.parallelize(parallel_dims)`` on every MoE layer: the
+    upstream common MoE distributes its GroupedExperts states over the
+    "ep" mesh (per-Module sharding_config) and wires the token
+    dispatcher's ep/tp meshes for all-to-all dispatch + combine.
+
+    Layers without MoE (``layer.is_moe == False``, i.e. dense MLP at
+    the first ``first_k_dense_replace`` indices) are skipped — they
+    have no experts to shard.
+    """
+    moe_layers_wrapped = 0
+    expected: list = []
+    for layer in model.layers.values():
+        if not bool(getattr(layer, "is_moe", False)):
+            continue
+        # `moe`, not `ffn`: the block's attribute was renamed when the FFN position
+        # split into moe XOR feed_forward, and this call site was missed. getattr then
+        # returned None for every layer and EP was silently never applied -- the log line
+        # below said "wrapped 0 MoE layer experts" through many green ep cells, because a
+        # model whose experts are simply not sharded still trains.
+        ffn = getattr(layer, "moe", None)
+        if ffn is None:
+            continue
+        # KimiMoE wraps the torchtitan common MoE as self._moe. Upstream
+        # removed the standalone ExpertParallel style: EP is now module-
+        # internal -- MoE.parallelize(parallel_dims) distributes the
+        # GroupedExperts states over the "ep" mesh via each Module's
+        # sharding_config and wires the token dispatcher's ep/tp meshes.
+        moe = getattr(ffn, "_moe", None)
+        if moe is None or not hasattr(moe, "parallelize"):
+            raise ValueError(
+                f"layer {layer.layer_idx} MoE ffn missing a parallelizable "
+                "_moe; EP needs the standard torchtitan MoE wrapping."
+            )
+        # NOT parallelized here. The declarative driver reaches this MoE through the
+        # layer's own Module.parallelize, which recurses into every child and passes the
+        # same parallel_dims -- so EP is already wired by the time the driver returns, and
+        # a second call raises "MoE has already been parallelized". Verified by
+        # experiment: fixing the attribute name so this function found its layers turned a
+        # working run into that error, which is what showed who the real caller was.
+        #
+        # What was actually broken was the reporting: this function read layer.ffn after
+        # the attribute became layer.moe, found nothing, and logged "wrapped 0" through
+        # many green EP cells. EP worked; the line lied about who did it.
+        moe_layers_wrapped += 1
+        expected.append((layer.layer_idx, moe))
+
+    if not moe_layers_wrapped:
+        raise ValueError(
+            "expert parallel is enabled but no layer reporting is_moe has a `moe` "
+            "attribute, so nothing would carry the ep mesh. The block layout and this "
+            "plan disagree."
+        )
+    logger.info(
+        "EP: %d MoE layer(s) to be wired by the declarative driver.", moe_layers_wrapped
+    )
+    return expected
+
+
+def verify_ep_applied(expected) -> None:
+    """Assert the routed experts actually landed on the ep mesh.
+
+    Called after the declarative driver, because that is what wires them. Without this
+    the only signal was a log line, and a log line is what hid the attribute-name bug for
+    as long as it did: EP not being applied looks exactly like EP being applied, from the
+    loss.
+    """
+    for layer_idx, moe in expected:
+        experts = getattr(getattr(moe, "routed_experts", None), "inner_experts", None)
+        if experts is None:
+            raise ValueError(
+                f"layer {layer_idx}: MoE has no routed_experts.inner_experts"
+            )
+        sharded = [
+            n
+            for n, prm in experts.named_parameters(recurse=False)
+            if isinstance(prm, DTensor)
+            and any(not pl.is_replicate() for pl in prm.placements)
+        ]
+        if not sharded:
+            raise ValueError(
+                f"layer {layer_idx}: expert parallel is enabled but no routed-expert "
+                f"parameter is sharded -- "
+                f"{[n for n, _ in experts.named_parameters(recurse=False)]} are all "
+                f"replicated or plain. The driver did not carry the ep mesh here."
+            )
+
+
+
+
+
+
 def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -> int:
     """Start upstream's declarative sharding from a plain-``nn.Module`` root.
 
@@ -229,12 +392,13 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
     driver they hold DTensors with exactly the declared placements
     (``gate_proj`` Shard(0), ``down_proj`` Shard(1), ``q_a_proj`` Replicate).
 
-    Already-parallelized subtrees are SKIPPED rather than re-entered, because
-    ``Module.parallelize`` raises on a second call. Nothing in this PR parallelizes
-    ahead of the driver, so the skip is inert here; it is load-bearing once the TP and
-    EP PRs land, since each of those calls ``parallelize`` on subtrees of its own.
+    Already-parallelized subtrees are SKIPPED rather than re-entered:
+    ``Module.parallelize`` raises on a second call, and ``apply_ep_kimi_k3`` calls it on
+    each MoE itself. Skipping the whole subtree is correct because that call already
+    recursed into it.
 
-    Returns the class names entered, so a small count can be READ rather than guessed.
+    Returns the class names entered, so a small count can be READ rather than guessed --
+    with TP on the imperative plan covers most modules and only a handful remain.
     """
     from torch.distributed.tensor import DTensor as _DTensor
 
@@ -244,11 +408,11 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
         """Has the imperative plan (or an earlier pass) already distributed this subtree?
 
         ``_distribute_states`` raises "already a DTensor with placements ..." on a second
-        distribution of the same weight. The TP and EP PRs each add an imperative plan
-        covering some of the same modules the declarations do, and skipping what is
-        already distributed makes this driver activate exactly the declarations those
-        plans do NOT cover -- so imperative pieces can be deleted one at a time and the
-        declarations take over as they go.
+        distribution of the same weight, and during the migration BOTH mechanisms are
+        live: ``apply_tp_kimi_k3`` covers some of the same modules the declarations do.
+        Skipping what is already distributed makes this driver activate exactly the
+        declarations the imperative plan does NOT cover, so imperative pieces can be
+        deleted one at a time and the declarations take over as they go.
         """
         # recurse=False: the question is whether THIS module's own parameters
         # are distributed. parallelize() only touches what the module declares,
