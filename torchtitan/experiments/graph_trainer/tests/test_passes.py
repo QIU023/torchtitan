@@ -133,7 +133,7 @@ class TestDefaultTransformerBlockBuckets(TestCase):
                 compile=GraphTrainerCompileConfig(inductor_compilation="full"),
                 loss=loss,
                 model_spec=SimpleNamespace(model=SimpleNamespace(layers=[0, 1])),
-                parallelism=SimpleNamespace(enable_async_tensor_parallel=False),
+                parallelism=SimpleNamespace(),
             )
 
         traced_result = SimpleNamespace(state_fqns=[])
@@ -253,6 +253,7 @@ class TestReassignCollectivePgsPass(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            spmd_backend="partial_dtensor",
         )
 
     def _make_fsdp_model(self, dim=16, n_layers=3):
@@ -1215,6 +1216,7 @@ class TestOverlapPgIsolationPass(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            spmd_backend="partial_dtensor",
         )
 
     def _get_fsdp_pg_name(self):
@@ -1811,6 +1813,7 @@ class TestBucketingPrefetchOrder(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            spmd_backend="partial_dtensor",
         )
 
         model_spec = llama3_model_registry("debugmodel")
@@ -3378,7 +3381,6 @@ class TestChunkPasses(TestCase):
         config = SimpleNamespace(
             model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
             parallelism=SimpleNamespace(
-                enable_async_tensor_parallel=False,
                 expert_parallel_degree=1,
                 fsdp_reshard_after_forward="default",
                 pipeline_parallel_degree=1,

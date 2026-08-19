@@ -53,22 +53,22 @@ def _supports_spmd_typechecking(test_name: str, variant: tuple[str, ...]) -> boo
     """List of tests/variants to test spmd_types backend, but without typechecking."""
     unsupported_tests = [
         # Compile is not compatible with SPMD typechecking yet.
-        "1d_compile_spmd_types",
-        "1d_compile_sac_op_spmd_types",
-        "2d_compile_spmd_types",
-        "2d_asynctp_compile_spmd_types",
-        "3d_compile_spmd_types",
-        "torchcomms_3d_dp+cp+pp+compile_spmd_types",
-        "torchcomms_3d_dp+tp+pp+compile_spmd_types",
+        "1d_compile",
+        "1d_compile_sac_op",
+        "2d_compile",
+        "2d_asynctp_compile",
+        "3d_compile",
+        "torchcomms_3d_dp+cp+pp+compile",
+        "torchcomms_3d_dp+tp+pp+compile",
         # PP is not compatible with SPMD typechecking yet.
-        "pp_dp_1f1b_spmd_types",
-        "pp_tp_gpipe_spmd_types",
-        "pp_dp_tp_spmd_types",
-        "validation_tp_cp_pp_spmd_types",
-        "float8_emulate_lora_spmd_types",
+        "pp_dp_1f1b",
+        "pp_tp_gpipe",
+        "pp_dp_tp",
+        "validation_tp_cp_pp",
+        "float8_emulate_lora",
         # non-chunked CE loss isn't happy yet.
         (
-            "2d_eager_spmd_types",
+            "2d_eager",
             [
                 "--module llama3 --config llama3_debugmodel_ce_loss",
                 "--parallelism.tensor_parallel_degree 2",
@@ -81,16 +81,10 @@ def _supports_spmd_typechecking(test_name: str, variant: tuple[str, ...]) -> boo
     )
 
 
-def _enable_spmd_backend(t: OverrideDefinitions, backend: str) -> OverrideDefinitions:
-    """Inject ``--parallelism.spmd_backend {backend}`` into every variant and
-    suffix the test name with ``backend``.
-
-    PP-only variants (see ``_is_pp_only``) and CP + compile variants (upstream
-    symint limitation) skip the backend override. For ``spmd_types``,
-    ``--debug.spmd_typechecking`` is enabled where supported. Plain (no-backend)
-    coverage lives in models.py.
-    """
-    test_name = f"{t.test_name}_{backend}"
+def _configure_spmd_backend_and_typechecking(
+    t: OverrideDefinitions,
+) -> OverrideDefinitions:
+    """Configure the spmd_types backend and enable typechecking where supported."""
     new_args = []
     for variant in t.override_args:
         prefix: list[str] = []
@@ -98,23 +92,18 @@ def _enable_spmd_backend(t: OverrideDefinitions, backend: str) -> OverrideDefini
         has_cp = any("context_parallel_degree" in arg for arg in variant)
         has_compile = any("compile.enable" in arg for arg in variant)
         has_ac_mode = any("activation-checkpoint:" in arg for arg in variant)
-        if not _is_pp_only(variant, t.ngpu) and not (has_cp and has_compile):
-            prefix.append(f"--parallelism.spmd_backend {backend}")
-            if (
-                backend == "spmd_types"
-                and not has_ac_mode
-                and _supports_spmd_typechecking(test_name, variant)
-            ):
-                prefix.append("--debug.spmd_typechecking")
-                suffix.append("activation-checkpoint:none")
-        variant = tuple(
-            arg.replace(f"{t.test_name}/", f"{test_name}/") for arg in variant
-        )
+        if (
+            not _is_pp_only(variant, t.ngpu)
+            and not (has_cp and has_compile)
+            and not has_ac_mode
+            and _supports_spmd_typechecking(t.test_name, variant)
+        ):
+            prefix.append("--debug.spmd_typechecking")
+            suffix.append("activation-checkpoint:none")
         new_args.append(tuple(prefix) + tuple(variant) + tuple(suffix))
     return dataclasses.replace(
         t,
         override_args=tuple(new_args),
-        test_name=test_name,
     )
 
 
@@ -206,7 +195,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                 [
                     "--compile.enable",
                     "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.enable_async_tensor_parallel",
+                    "--compile.enable_async_tensor_parallel",
                 ],
             ],
             "2D async TP compile",
@@ -258,6 +247,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule 1F1B",
                     "--parallelism.data_parallel_shard_degree 1",
@@ -270,11 +260,13 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule 1F1B",
                     "--parallelism.data_parallel_shard_degree 2",
                 ],
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule 1F1B",
                     "--parallelism.pipeline_parallel_layers_per_stage 4",
@@ -287,6 +279,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule GPipe",
                     "--parallelism.tensor_parallel_degree 2",
@@ -298,12 +291,14 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--checkpoint.enable",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
                 ],
                 [
+                    "--training.disable_cuda_graphs",
                     "--training.steps 20",
                     "--checkpoint.enable",
                     "--parallelism.pipeline_parallel_degree 2",
@@ -318,6 +313,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
@@ -331,10 +327,12 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 4",
                     "--parallelism.pipeline_parallel_schedule Interleaved1F1B",
                 ],
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 4",
                     "--parallelism.pipeline_parallel_schedule Interleaved1F1B",
                     "--parallelism.pipeline_parallel_layers_per_stage 1",
@@ -359,6 +357,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 4",
                     "--parallelism.pipeline_parallel_schedule InterleavedZeroBubble",
                     "activation-checkpoint:full",
@@ -372,6 +371,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule ZBVZeroBubble",
                     "activation-checkpoint:full",
@@ -389,6 +389,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--parallelism.pipeline_parallel_degree 2",
                     "--parallelism.pipeline_parallel_schedule PipelineScheduleMulti",
                     "--parallelism.pipeline_parallel_schedule_csv ./tests/assets/custom_schedule.csv",
@@ -457,8 +458,8 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
-                    "--parallelism.data_parallel_shard_degree=2",
-                    "--parallelism.context_parallel_degree=2",
+                    "--module torchtitan_recipes.tests "
+                    "--config llama3_debugmodel_fsdp2_cp2",
                 ]
             ],
             "FSDP+CP",
@@ -547,6 +548,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--validator.enable",
                     "--validator.dataloader.dataset c4_test",
                     "--parallelism.tensor_parallel_degree=2",
@@ -573,6 +575,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module deepseek_v3 --config deepseek_v3_debugmodel",
                     "--override.imports torchtitan.overrides.fused_swiglu.fused_swiglu,"
                     "torchtitan.overrides.fused_swiglu.fused_grouped_experts",
@@ -590,6 +593,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module llama3 --config llama3_debugmodel_varlen_attn",
                     "--parallelism.data_parallel_shard_degree=4",
                     "activation-checkpoint:selective",
@@ -603,6 +607,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module llama3 --config llama3_debugmodel_float8_emulate_lora",
                     "--parallelism.tensor_parallel_degree 2",
                     "--parallelism.pipeline_parallel_degree 2",
@@ -615,6 +620,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--comm.mode torchcomms",
                     "--parallelism.context_parallel_degree 2",
                     "--parallelism.pipeline_parallel_degree 2",
@@ -633,6 +639,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module llama3 --config llama3_debugmodel_ce_loss",
                     "--comm.mode torchcomms",
                     "--parallelism.tensor_parallel_degree 2",
@@ -661,6 +668,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--checkpoint.enable",
                     "--checkpoint.create_seed_checkpoint",
                 ],
@@ -673,5 +681,8 @@ def build_features_test_list() -> list[OverrideDefinitions]:
     ]
 
     return [
-        *[_enable_spmd_backend(t, "spmd_types") for t in integration_tests_flavors],
+        *[
+            _configure_spmd_backend_and_typechecking(t)
+            for t in integration_tests_flavors
+        ],
     ]
