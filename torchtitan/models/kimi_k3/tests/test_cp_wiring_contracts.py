@@ -20,13 +20,10 @@ What is covered, and why each one needed a check rather than an argument:
   ever run in a flavor without TP.
 * ``build_kcp_context`` must pass through real document boundaries. It used to hardcode
   a single document, which is right for the caller it has and wrong to bake in.
-* ``verify_params_distributed`` must name the parameter. Its absence let a plain
-  parameter reach ``clip_grad_norm_``, which reports
-  ``aten._foreach_mul_.Tensor got mixed`` and names neither the parameter nor the
-  mechanism that skipped it.
-* ``verify_ep_applied`` must accept an empty plan. Under PP a rank can hold only the
-  vision-tower stage and therefore no MoE at all; treating that as a failure is what
-  took down every ep+pp cell on the multimodal arms.
+
+Two more contracts used to live here, on ``verify_params_distributed`` and
+``verify_ep_applied``. Those verifiers belong to the TP and EP plans and travel with
+them, so their tests do too.
 """
 
 from __future__ import annotations
@@ -160,76 +157,6 @@ class TestKcpContextBoundaries(unittest.TestCase):
         self.assertEqual(seen["cu_seqlens"].tolist(), [0, 5, 11, 16])
 
 
-class TestParamDistributionVerifier(unittest.TestCase):
-    """A plain parameter must be named here, not inside clip_grad_norm_."""
-
-    def _mesh(self):
-        import os
-
-        import torch.distributed as dist
-        from torch.distributed.device_mesh import init_device_mesh
-
-        if not dist.is_initialized():
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29513")
-            dist.init_process_group("gloo", rank=0, world_size=1)
-        return init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
-
-    def test_a_plain_parameter_raises_and_is_named(self):
-        from torchtitan.models.kimi_k3.parallelize import verify_params_distributed
-
-        model = torch.nn.Sequential(torch.nn.Linear(4, 4))
-        with self.assertRaises(ValueError) as ctx:
-            verify_params_distributed(model)
-        # The point of the check is that the message points at the parameter.
-        self.assertIn("0.weight", str(ctx.exception))
-        self.assertIn("plain Tensor", str(ctx.exception))
-
-    def test_all_dtensor_parameters_pass(self):
-        from torch.distributed.tensor import distribute_tensor, Replicate
-
-        from torchtitan.models.kimi_k3.parallelize import verify_params_distributed
-
-        mesh = self._mesh()
-        model = torch.nn.Linear(4, 4, bias=False)
-        model.weight = torch.nn.Parameter(
-            distribute_tensor(model.weight.data, mesh, [Replicate()])
-        )
-        verify_params_distributed(model)  # must not raise
-
-    def test_a_model_with_no_parameters_is_not_a_failure(self):
-        from torchtitan.models.kimi_k3.parallelize import verify_params_distributed
-
-        verify_params_distributed(torch.nn.Identity())
-
-
-class TestEpVerifierOnAnEmptyPlan(unittest.TestCase):
-    """A rank holding no MoE is a normal state under PP, not a missing plan.
-
-    ``ep_expected`` is assigned only when this rank has MoE layers, while the verify call
-    is guarded on ``ep_enabled`` -- a property of the JOB. Under PP a rank can hold only
-    the vision-tower stage, and reading the unset local there took down every ep+pp cell
-    on the multimodal arms.
-    """
-
-    def test_an_empty_plan_verifies_vacuously(self):
-        from torchtitan.models.kimi_k3.parallelize import verify_ep_applied
-
-        verify_ep_applied([])  # must not raise
-
-    def test_a_layer_whose_experts_are_missing_is_reported(self):
-        from torchtitan.models.kimi_k3.parallelize import verify_ep_applied
-
-        moe = torch.nn.Module()  # no routed_experts at all
-        with self.assertRaises(ValueError) as ctx:
-            verify_ep_applied([(3, moe)])
-        self.assertIn("layer 3", str(ctx.exception))
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestKcpBatchLoop(unittest.TestCase):
     """The batch axis is handled by looping, and the loop's shape is the contract.
 
@@ -295,3 +222,7 @@ class TestKcpBatchLoop(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertIs(seen[0], x, "the single-row path should not slice or copy")
         self.assertIs(out, x)
+
+
+if __name__ == "__main__":
+    unittest.main()
