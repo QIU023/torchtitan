@@ -194,13 +194,23 @@ def install_bubble_runtime(
             per = (
                 firer.encode_seconds / firer.encode_calls if firer.encode_calls else 0.0
             )
+            # idle_slots is the one number that separates "the schedule has no bubbles"
+            # from "it has bubbles and the planner under-placed". The planner places at
+            # most ONE encode per idle slot, so placed can never exceed it however small
+            # the cost ratio gets -- which is exactly the case dynamic CP creates, since
+            # it divides the per-rank encoder cost before DEP ever sees it. Without this
+            # printed, a run showing 4 placements out of 64 looks the same either way.
             level(
                 "DEP bubble runtime: %d/%d planned encode(s) ran in a bubble, "
-                "%d upfront, %d left synchronous, %.1f ms per planned encode",
+                "%d upfront, %d left synchronous, %d idle slot(s) "
+                "(%d starved, %d exhausted), %.1f ms per planned encode",
                 fired,
                 placed,
                 len(plan.upfront),
                 len(plan.synchronous),
+                plan.idle_slots,
+                plan.slots_starved,
+                plan.slots_exhausted,
                 per * 1e3,
             )
             firer.encode_seconds = 0.0

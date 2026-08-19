@@ -73,6 +73,12 @@ class BubblePlan:
     synchronous: tuple[int, ...]
     idle_slots: int
     cost_ratio: float
+    # Why the idle slots that placed nothing placed nothing. Without these the two
+    # reasons are indistinguishable from the outside, and they call for opposite fixes:
+    # starved means the bubbles are too short for this cost ratio, exhausted means the
+    # bubbles come after every remaining micro-batch has already been consumed.
+    slots_starved: int = 0
+    slots_exhausted: int = 0
 
     @property
     def hidden_share(self) -> float:
@@ -121,6 +127,8 @@ def plan_for_rank(
     placed: list[Placement] = []
     budget = 0.0
     idle = 0
+    slots_starved = 0
+    slots_exhausted = 0
     # The action most recently completed. Placements anchor on THIS, and the runtime
     # fires after it returns -- the start of the idle interval, reachable without any
     # receive to hook.
@@ -136,14 +144,34 @@ def plan_for_rank(
         if action is None:
             budget += 1.0
             idle += 1
-            if budget >= cost_ratio and prev is not None:
-                for k, mb in enumerate(pending):
-                    if consume_slot.get(mb, 1 << 30) > slot:
-                        budget -= cost_ratio
-                        placed.append(
-                            Placement(slot=slot, microbatch=pending.pop(k), anchor=prev)
-                        )
+            # Keep placing while this bubble's accumulated budget can pay. The previous
+            # version placed at most ONE encode per idle slot, which made `placed` bounded
+            # by the idle-slot count no matter how small the cost ratio got -- and a small
+            # cost ratio is precisely what dynamic CP produces, since it divides the
+            # per-rank encoder cost before DEP sees it. Measured at pp4 x mb64: 14 idle
+            # slots, 4 placed, 56 left synchronous.
+            if prev is not None:
+                while budget >= cost_ratio:
+                    k = next(
+                        (
+                            i
+                            for i, mb in enumerate(pending)
+                            if consume_slot.get(mb, 1 << 30) > slot
+                        ),
+                        None,
+                    )
+                    if k is None:
+                        # Bubbles this late serve nobody: every micro-batch still pending
+                        # has already passed its consumption point.
+                        slots_exhausted += 1
                         break
+                    budget -= cost_ratio
+                    placed.append(
+                        Placement(slot=slot, microbatch=pending.pop(k), anchor=prev)
+                    )
+                else:
+                    if not placed or placed[-1].slot != slot:
+                        slots_starved += 1
             continue
         prev = (
             str(getattr(action, "computation_type", "?")),
@@ -162,6 +190,8 @@ def plan_for_rank(
         synchronous=tuple(pending),
         idle_slots=idle,
         cost_ratio=cost_ratio,
+        slots_starved=slots_starved,
+        slots_exhausted=slots_exhausted,
     )
 
 
