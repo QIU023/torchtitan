@@ -225,11 +225,8 @@ class Validator(BaseValidator):
 
         parallel_dims = self.parallel_dims
 
-        accumulated_loss: torch.Tensor | None = None
+        accumulated_losses = []
         device_type = utils.device_type
-        total_global_valid_tokens = torch.zeros(
-            (), dtype=torch.int64, device=device_type
-        )
         num_steps = 0
         num_microbatches = (
             self.local_batch_size // self.parallelism.pipeline_parallel_microbatch_size
@@ -330,23 +327,18 @@ class Validator(BaseValidator):
                     predictions = model_parts[0](inputs, **extra_kwargs)
                     loss_sum, _ = self.loss_fn(predictions, labels)
 
-            loss_sum = loss_sum.detach()
-            if accumulated_loss is None:
-                accumulated_loss = loss_sum.clone()
-            else:
-                accumulated_loss.add_(loss_sum)
-            total_global_valid_tokens.add_(global_valid_tokens)
+            accumulated_losses.append(loss_sum.detach() / global_valid_tokens)
             num_steps += 1
 
-        assert accumulated_loss is not None
-        num_global_valid_tokens = int(total_global_valid_tokens.item())
+        # Compute average loss
+        loss = torch.sum(torch.stack(accumulated_losses))
+        loss /= num_steps
         if parallel_dims.dp_cp_enabled:
-            global_loss_sum = dist_utils.dist_sum(
-                accumulated_loss, parallel_dims.get_optional_mesh("loss")
+            global_avg_loss = dist_utils.dist_sum(
+                loss, parallel_dims.get_optional_mesh("loss")
             )
         else:
-            global_loss_sum = float(accumulated_loss.item())
-        global_avg_loss = global_loss_sum / num_global_valid_tokens
+            global_avg_loss = float(loss.item())
 
         self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
 

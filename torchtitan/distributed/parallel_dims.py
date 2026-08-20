@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from typing import Any, Literal
 
 import spmd_types as spmd
@@ -26,6 +26,12 @@ __all__ = [
     "unfold_dp_axis",
     "unfold_dp_axes",
 ]
+
+
+class StrEnum(str, Enum):
+    """str + Enum for Python < 3.11 compatibility."""
+
+    pass
 
 
 class MeshAxisName(StrEnum):
@@ -139,9 +145,7 @@ class ParallelDims:
     pp: int
     ep: int
     world_size: int
-    spmd_backend: Literal[
-        "partial_dtensor", "full_dtensor", "spmd_types"
-    ] = "spmd_types"
+    spmd_backend: Literal["default", "full_dtensor", "spmd_types"] = "default"
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse
     # is required for ``mesh in spmd_meshes()`` checks.
     _single_axis_meshes: dict[str, DeviceMesh] = field(default_factory=dict)
@@ -530,14 +534,6 @@ class ParallelDims:
             self.build_mesh()
         return self._global_meshes.get("spmd_sparse_for_fwdbwd")
 
-    def get_dense_tp_mesh(self) -> DeviceMesh:
-        """Return the TP-axis mesh used by dense forward/backward computation."""
-        if self.spmd_backend == "spmd_types":
-            return self.spmd_dense_mesh()["tp"]
-        if self.spmd_backend == "full_dtensor":
-            return self.spmd_meshes()[0]["tp"]
-        return self.get_mesh("tp")
-
     def get_activated_mesh(self, axes: list[str]) -> DeviceMesh | None:
         """Submesh of ``axes`` filtered to those actually enabled in this run.
 
@@ -574,7 +570,7 @@ class ParallelDims:
         axes_list = [
             axis.value if isinstance(axis, MeshAxisName) else axis for axis in axes
         ]
-        if self.spmd_backend == "partial_dtensor":
+        if self.spmd_backend == "default":
             in_band = ("tp", "ep")
             axes_list = [axis for axis in axes_list if axis in in_band]
         elif self.spmd_backend == "full_dtensor":

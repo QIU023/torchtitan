@@ -146,9 +146,8 @@ class FluxValidator(Validator):
 
         parallel_dims = self.parallel_dims
 
-        accumulated_loss: torch.Tensor | None = None
+        accumulated_losses = []
         device_type = dist_utils.device_type
-        total_local_elements = torch.zeros((), dtype=torch.int64, device=device_type)
         num_steps = 0
 
         validation_dataloader = self.dl_config.build(
@@ -231,9 +230,6 @@ class FluxValidator(Validator):
             else:
                 stratified_timesteps = input_dict.pop("timestep")
 
-            # Count full latent elements before CP shards the sequence.
-            total_local_elements += labels.numel()
-
             # Note the tps may be inaccurate due to the generating image step not being counted
             self.metrics_processor.ntokens_since_last_log += labels.numel()
 
@@ -289,33 +285,19 @@ class FluxValidator(Validator):
 
             del noise, target, latent_noise_pred, latents
 
-            loss = loss.detach()
-            if accumulated_loss is None:
-                accumulated_loss = loss.clone()
-            else:
-                accumulated_loss.add_(loss)
+            accumulated_losses.append(loss.detach())
 
             num_steps += 1
 
-        assert accumulated_loss is not None
-
-        # CP ranks shard the same full latent tensor, so only DP contributes
-        # additional elements to the denominator.
-        if parallel_dims.dp_enabled:
-            total_global_elements = dist_utils.dist_sum_tensor(
-                total_local_elements, parallel_dims.get_mesh("batch")
-            )
-        else:
-            total_global_elements = total_local_elements
-
+        # Compute average loss
+        loss = torch.sum(torch.stack(accumulated_losses))
+        loss /= num_steps
         if parallel_dims.dp_cp_enabled:
-            global_loss_sum = dist_utils.dist_sum(
-                accumulated_loss, parallel_dims.get_optional_mesh("loss")
+            global_avg_loss = dist_utils.dist_mean(
+                loss, parallel_dims.get_optional_mesh("loss")
             )
         else:
-            global_loss_sum = float(accumulated_loss.item())
-
-        global_avg_loss = global_loss_sum / int(total_global_elements.item())
+            global_avg_loss = float(loss.item())
 
         self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
 

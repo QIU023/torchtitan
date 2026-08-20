@@ -19,18 +19,10 @@ import cloudpickle
 import torch
 import torch.distributed as dist
 import torchstore as ts
-from monarch.actor import (
-    Actor,
-    Channel,
-    concurrent_endpoint,
-    current_rank,
-    Port,
-    PortReceiver,
-)
+from monarch.actor import Actor, Channel, current_rank, endpoint, Port, PortReceiver
 from torch.distributed.tensor import DTensor
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.config import CompileConfig, Configurable, DebugConfig, OverrideConfig
-from torchtitan.distributed.parallel_dims import unfold_dp_axes
 from torchtitan.distributed.utils import get_spmd_backend, set_batch_invariance
 from torchtitan.experiments.rl.batch_invariance import (
     force_logprobs_fn_for_batch_invariance,
@@ -700,7 +692,7 @@ class VLLMGenerator(Actor, Configurable):
 
     A weight sync rides the same loop: `pull_model_state_dict` queues a `LoopDecision(LoopAction.PULL_MODEL_STATE_DICT)` applied
     between step bursts. The engine does NOT drain in-flight requests first ("hotswap"). This behavior can be changed
-    in the inter-generator router, by blocking new requests until the engine is drained.
+    on the controller side, by blocking new requests until the engine is drained.
 
     Args:
         config: Generator-specific configuration.
@@ -997,12 +989,12 @@ class VLLMGenerator(Actor, Configurable):
         """
         return self._engine.model_executor.driver_worker.get_model()
 
-    @concurrent_endpoint
+    @endpoint
     async def sync_log_step(self, step: int, relative_step: int | None = None) -> None:
         """Sync the structured-logger step counter from the controller."""
         sl.set_step(step, relative_step=relative_step)
 
-    @concurrent_endpoint
+    @endpoint
     async def start_engine_loop(self) -> None:
         """Start the background engine loop on every rank (one-time, idempotent)."""
         if self._engine_loop_task is None:
@@ -1017,7 +1009,7 @@ class VLLMGenerator(Actor, Configurable):
                 f"before {endpoint_name}"
             )
 
-    @concurrent_endpoint
+    @endpoint
     @sl.log_trace_span("generate")
     async def generate(
         self,
@@ -1249,7 +1241,7 @@ class VLLMGenerator(Actor, Configurable):
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
 
-    @concurrent_endpoint
+    @endpoint
     @sl.log_trace_span("pull_model_state_dict")
     async def pull_model_state_dict(self, version: int) -> None:
         """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
@@ -1396,11 +1388,17 @@ class VLLMGenerator(Actor, Configurable):
                         continue
                     raise KeyError(f"{name} is missing SPMD layout metadata")
 
-                if (
-                    mesh := model.parallel_dims.get_activated_mesh(
-                        unfold_dp_axes(layout.axes())
-                    )
-                ) is None:
+                mesh = model.parallel_dims.resolve_mesh(layout.axes())
+                if mesh is None:
+                    active_axes = [
+                        axis
+                        for axis in layout.axes()
+                        if model.parallel_dims.get_optional_mesh(axis) is not None
+                    ]
+                    if active_axes:
+                        raise RuntimeError(
+                            f"{name} has active SPMD layout axes but no resolved mesh"
+                        )
                     continue
 
                 dtensor_model_sd[name] = DTensor.from_local(
@@ -1422,7 +1420,7 @@ class VLLMGenerator(Actor, Configurable):
                 if isinstance(value, DTensor):
                     model_sd[name] = value.to_local()
 
-    @concurrent_endpoint
+    @endpoint
     async def close(self) -> None:
         """Stop the engine loop, then release the vLLM engine.
 

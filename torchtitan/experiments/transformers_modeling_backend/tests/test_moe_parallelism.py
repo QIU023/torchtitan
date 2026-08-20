@@ -173,7 +173,7 @@ class _FakeParallelDims:
     """Minimal ParallelDims stub for tests that don't use full distributed setup."""
 
     full_dtensor = False
-    spmd_backend = "partial_dtensor"
+    spmd_backend = "default"
     tp_enabled = False
     ep_enabled = False
     tp = 1

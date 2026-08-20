@@ -9,13 +9,10 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from typing import Any
-
-from monarch.actor import Actor, concurrent_endpoint, current_size
 
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.routing.strategies import (
@@ -35,7 +32,7 @@ class _GeneratorState(Enum):
 
 @dataclass(kw_only=True, slots=True)
 class _GeneratorHandle(RoutingCandidate):
-    """Router-side metadata for one generator mesh."""
+    """Controller-side metadata for one generator mesh."""
 
     actor: Any
     """Monarch actor handle for the full generator mesh. Used for fan-out calls
@@ -46,7 +43,7 @@ class _GeneratorHandle(RoutingCandidate):
     to run."""
 
     reserved_load: int = 0
-    """Router-side estimate of in-flight routed generation work."""
+    """Controller-side estimate of in-flight routed generation work."""
 
     state: _GeneratorState = _GeneratorState.SERVING
     """Current routing lifecycle state for this generator."""
@@ -55,32 +52,17 @@ class _GeneratorHandle(RoutingCandidate):
     """Set when this generator has no reserved routed calls."""
 
 
-class InterGeneratorRouter(Actor, Configurable):
+class InterGeneratorRouter(Configurable):
     """Routes generation calls across generator meshes and pulls model's state dict.
 
     This is layer 1 of the two-layer routing design: it routes each call across
     generator *meshes* (replicas). Within the chosen mesh, ``IntraGeneratorRouter``
     then routes the request across that mesh's data-parallel ranks.
 
-    Singleton:
-        Routing decisions read and write mutable states such as ``_serving``,
-        ``_GeneratorHandle.state``, and so on. These states are not backed by
-        shared storage, so if there are multiple router instances, they cannot
-        know each others' routing decisions. Instead of using shared storage,
-        we solve the problem by enforcing the singleton pattern:
-          * there should be only 1 router mesh in a training job;
-          * this mesh should consists of only 1 actor.
-
-        This pattern is simpler to implement, and should be good enough to handle
-        the RL job's scale because the router is just a proxy, and the number of
-        concurrent requests should be reasonable for a singleton to handle.
-
-    Monarch Actor:
-       The router singleton needs to be access from different processes or even
-       different hosts. If we instantiate the router as an instance of a normal
-       Python class, that instance's cannot be accessed from other processes or
-       hosts. To solve this problem, we model the router as Monarch Actor, and
-       pass the actor reference around.
+    Thread safety:
+        This class is not thread-safe. Its mutable state and ``asyncio.Event``
+        objects are intended to be accessed from one event loop. Do not call a
+        single router instance from multiple OS threads or event loops.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -97,7 +79,7 @@ class InterGeneratorRouter(Actor, Configurable):
         generation (no draining). When False, each generator is drained before
         its pull.
 
-        Draining only waits for a generator's in-flight ``_route`` call (one
+        Draining only waits for a generator's in-flight ``route`` call (one
         turn) to finish; between turns of a multi-turn rollout the generator is
         idle, so a weight sync may land mid-rollout and successive turns can run
         under different policy versions."""
@@ -108,11 +90,6 @@ class InterGeneratorRouter(Actor, Configurable):
         *,
         generators: Sequence[Any],
     ):
-        num_actors = math.prod(current_size().values())
-        assert (
-            num_actors == 1
-        ), f"InterGeneratorRouter must be a singleton, but its mesh holds {num_actors} actors"
-
         self._config = config
         self._generators = [
             _GeneratorHandle(
@@ -168,7 +145,7 @@ class InterGeneratorRouter(Actor, Configurable):
         if h.reserved_load == 0:
             h.idle.set()
 
-    async def _route(
+    async def route(
         self,
         method: str,
         *args,
@@ -188,7 +165,7 @@ class InterGeneratorRouter(Actor, Configurable):
         finally:
             self._release(h, routing_ctx.estimated_cost)
 
-    async def _fanout(
+    async def fanout(
         self,
         method: str,
         *args,
@@ -215,7 +192,7 @@ class InterGeneratorRouter(Actor, Configurable):
             return_exceptions=return_exceptions,
         )
 
-    async def _pull_model_state_dict(self, *, policy_version: int) -> None:
+    async def pull_model_state_dict(self, *, policy_version: int) -> None:
         """Pull the given policy version's state dict into every generator.
 
         Args:
@@ -246,53 +223,3 @@ class InterGeneratorRouter(Actor, Configurable):
         #   all read the trainer's CPU-staged weights at once -- bounds trainer host RAM. Matters for
         #   big models / many generators, not at small scale.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])
-
-    @concurrent_endpoint
-    async def generate(
-        self,
-        prompt_token_ids: list[int],
-        *,
-        request_id: str,
-        routing_session_id: str | None,
-        sampling_config: Any | None,
-        metrics_prefix: str,
-    ) -> Any:
-        """Route one generation call to a generator and return its completion."""
-        return await self._route(
-            "generate",
-            prompt_token_ids,
-            request_id=request_id,
-            # VLLMGenerator.generate also requires this field for its
-            # intra-mesh DP routing.
-            routing_session_id=routing_session_id,
-            sampling_config=sampling_config,
-            metrics_prefix=metrics_prefix,
-            # Load is measured as in-flight request count (one unit per call).
-            routing_ctx=RoutingContext(
-                estimated_cost=1,
-                session_id=routing_session_id,
-            ),
-        )
-
-    @concurrent_endpoint
-    async def start_engine_loop(self) -> None:
-        """Start the engine loop on every rank of every generator."""
-        await self._fanout("start_engine_loop")
-
-    @concurrent_endpoint
-    async def sync_log_step(self, step: int) -> None:
-        """Set the step counter in this process and in every generator rank."""
-        sl.set_step(step)
-        await self._fanout("sync_log_step", step)
-
-    @concurrent_endpoint
-    async def pull_model_state_dict(self, policy_version: int) -> None:
-        """Pull the given policy version's state dict into every generator."""
-        # Wrapper the logic in a private method so we can test it independently
-        # without the need to spawn the Monarch actor mesh.
-        await self._pull_model_state_dict(policy_version=policy_version)
-
-    @concurrent_endpoint
-    async def close_generators(self) -> list[Any | BaseException]:
-        """Close every generator, returning each one's result or exception."""
-        return await self._fanout("close", return_exceptions=True)

@@ -691,7 +691,6 @@ class TestSimpleFSDP(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
-            spmd_backend="partial_dtensor",
         )
 
     def get_input(self):

@@ -425,7 +425,6 @@ class _GraphPPDsv3FSDPTest(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
-            spmd_backend="partial_dtensor",
         )
 
 
