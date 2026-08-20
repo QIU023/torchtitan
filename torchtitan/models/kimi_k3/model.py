@@ -56,7 +56,12 @@ from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.kimi_k3.sharding import contract_for_mode
+from torchtitan.models.kimi_k3.sharding import (
+    contract_for_mode,
+    HEAD_DIM,
+    SEQ_DIM,
+    ULYSSES,
+)
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
@@ -464,13 +469,16 @@ class KimiMLP(FeedForward):
 
 
 def _cp_all_to_all_headseq(
-    x: torch.Tensor, cp_group, seq_to_head: bool
+    x: torch.Tensor, cp_group, *, src_dim: int, dst_dim: int
 ) -> torch.Tensor:
-    """Differentiable Ulysses all-to-all swapping which of (seq, head) is
-    sharded across the CP group.
+    """Differentiable Ulysses all-to-all moving the CP shard between tensor dims.
 
-    seq_to_head=True:  ``[B, T/cp, H, K]`` (seq-sharded) -> ``[B, T, H/cp, K]``.
-    seq_to_head=False: ``[B, T, H/cp, K]`` -> ``[B, T/cp, H, K]``.
+    ``(1, 2)``: ``[B, T/cp, H, K]`` (seq-sharded) -> ``[B, T, H/cp, K]``.
+    ``(2, 1)``: ``[B, T, H/cp, K]`` -> ``[B, T/cp, H, K]``.
+
+    The dims come from the CP contract's placement pair rather than a flag, so a
+    contract that names a pair with no implementation raises here instead of being
+    quietly ignored.
 
     Numerics (round-trip and per-head chunk_kda parity) validated
     bit-exact against a single-rank reference; backward is the
@@ -478,9 +486,14 @@ def _cp_all_to_all_headseq(
     """
     import torch.distributed.nn.functional as dist_nn
 
+    if (src_dim, dst_dim) not in ((SEQ_DIM, HEAD_DIM), (HEAD_DIM, SEQ_DIM)):
+        raise ValueError(
+            f"no Ulysses all-to-all for CP shard dims {src_dim} -> {dst_dim}; "
+            f"implemented pairs are {SEQ_DIM} <-> {HEAD_DIM}"
+        )
     cp = dist.get_world_size(cp_group)
     B, d1, d2, K = x.shape
-    if seq_to_head:
+    if (src_dim, dst_dim) == (SEQ_DIM, HEAD_DIM):
         t_loc, num_heads = d1, d2
         # [B, T/cp, H, K] -> [cp, B, T/cp, H/cp, K] (split heads by dest)
         x_split = (
@@ -884,7 +897,10 @@ class KimiMLAAttention(Module):
             ],
             dim=-1,
         )
-        qkv_BTGW = _cp_all_to_all_headseq(qkv_BLHW, cp_group, seq_to_head=True)
+        src_dim, dst_dim = ULYSSES.in_dims()
+        qkv_BTGW = _cp_all_to_all_headseq(
+            qkv_BLHW, cp_group, src_dim=src_dim, dst_dim=dst_dim
+        )
         q_BTGQ, k_pass_BTGN, v_BTGV = torch.split(
             qkv_BTGW,
             [self.q_head_dim, self.qk_nope_head_dim, self.v_head_dim],
@@ -915,8 +931,9 @@ class KimiMLAAttention(Module):
             v_BTGV,
             scale=self.scaling,
         )
+        out_src_dim, out_dst_dim = ULYSSES.out_dims()
         attn_BLHV = _cp_all_to_all_headseq(
-            attn_BTGV.contiguous(), cp_group, seq_to_head=False
+            attn_BTGV.contiguous(), cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
         )
         attn_BLE = attn_BLHV.reshape(B, t_loc, h_loc * self.v_head_dim)
         if self.mla_gated:
@@ -1499,7 +1516,10 @@ class KimiDeltaAttention(Module):
             [q_BLHK, k_BLHK, v_BLHK, g_raw_BLHK, g_out_BLHK, beta_BLH1],
             dim=-1,
         )
-        packed_BTGW = _cp_all_to_all_headseq(packed_BLHW, cp_group, seq_to_head=True)
+        src_dim, dst_dim = ULYSSES.in_dims()
+        packed_BTGW = _cp_all_to_all_headseq(
+            packed_BLHW, cp_group, src_dim=src_dim, dst_dim=dst_dim
+        )
         q_BTGK, k_BTGK, v_BTGK, g_raw_BTGK, g_out_BTGK, beta_BTG1 = torch.split(
             packed_BTGW,
             [head_dim, head_dim, head_dim, head_dim, head_dim, 1],
@@ -1562,7 +1582,10 @@ class KimiDeltaAttention(Module):
         o_BTGK = self.o_norm(o_BTGK, g_out_BTGK)
 
         # 6) All-to-all back to seq-shard full-head layout, then o_proj.
-        o_BLHK = _cp_all_to_all_headseq(o_BTGK, cp_group, seq_to_head=False)
+        out_src_dim, out_dst_dim = ULYSSES.out_dims()
+        o_BLHK = _cp_all_to_all_headseq(
+            o_BTGK, cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
+        )
         out = _local_linear(self.o_proj, o_BLHK.reshape(B, t_loc, num_heads * head_dim))
         return out
 

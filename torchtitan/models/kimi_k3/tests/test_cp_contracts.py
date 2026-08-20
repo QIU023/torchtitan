@@ -52,11 +52,15 @@ class TestCPContracts(unittest.TestCase):
         k3_model.dist.get_world_size = lambda group: cp
         dist_nn.all_to_all_single = lambda out, inp, group=None: inp
         try:
-            fwd = k3_model._cp_all_to_all_headseq(x, _Stub(), seq_to_head=True)
+            fwd = k3_model._cp_all_to_all_headseq(
+                x, _Stub(), src_dim=SEQ_DIM, dst_dim=HEAD_DIM
+            )
             # in_src S(1): sequence is the sharded axis, so t_loc is a shard.
             # in_dst S(2): heads become the sharded axis, sequence goes full.
             self.assertEqual(fwd.shape, (B, cp * t_loc, num_heads // cp, K))
-            back = k3_model._cp_all_to_all_headseq(fwd, _Stub(), seq_to_head=False)
+            back = k3_model._cp_all_to_all_headseq(
+                fwd, _Stub(), src_dim=HEAD_DIM, dst_dim=SEQ_DIM
+            )
             self.assertEqual(back.shape, x.shape)
         finally:
             k3_model.dist.get_world_size = real_ws
@@ -66,6 +70,24 @@ class TestCPContracts(unittest.TestCase):
         self.assertEqual(ULYSSES.in_dst.axis_types[CP], spmd.S(HEAD_DIM))
         # out pair is the same swap reversed, so a round trip lands where it started
         self.assertEqual(ULYSSES.out_dst.axis_types[CP], ULYSSES.in_src.axis_types[CP])
+
+    def test_the_contract_actually_drives_the_all_to_all(self):
+        """A contract naming an unimplemented pair must fail, not be ignored.
+
+        This is what makes the declaration load-bearing. Before the dims came from
+        the contract, ``_forward_cp`` hard-coded the direction, so editing ULYSSES
+        to name any other pair changed precisely nothing at runtime.
+        """
+        from torchtitan.models.kimi_k3 import model as k3_model
+
+        x = torch.randn(2, 8, 12, 6)
+        with self.assertRaises(ValueError) as cm:
+            k3_model._cp_all_to_all_headseq(x, object(), src_dim=SEQ_DIM, dst_dim=3)
+        self.assertIn("no Ulysses all-to-all", str(cm.exception))
+
+        # And the pair the contract actually names is one of the implemented ones.
+        self.assertIn(ULYSSES.in_dims(), ((SEQ_DIM, HEAD_DIM), (HEAD_DIM, SEQ_DIM)))
+        self.assertEqual(ULYSSES.out_dims(), tuple(reversed(ULYSSES.in_dims())))
 
     def test_kcp_is_an_identity_pair(self):
         # KCP keeps the sequence sharded end to end, so the boundary moves no data.

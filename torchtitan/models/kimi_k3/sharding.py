@@ -65,6 +65,21 @@ class CPContract:
         """False when in_dst == in_src, i.e. the boundary moves no data."""
         return self.in_src.axis_types != self.in_dst.axis_types
 
+    def in_dims(self) -> tuple[int, int]:
+        """(src, dst) tensor dims the CP axis shards on the way in."""
+        return _shard_dim(self.in_src), _shard_dim(self.in_dst)
+
+    def out_dims(self) -> tuple[int, int]:
+        """(src, dst) tensor dims the CP axis shards on the way out."""
+        return _shard_dim(self.out_src), _shard_dim(self.out_dst)
+
+
+def _shard_dim(layout: SpmdLayout) -> int:
+    axis_type = layout.axis_types[CP]
+    if not isinstance(axis_type, spmd.Shard):
+        raise ValueError(f"CP contract expects a Shard on the CP axis, got {axis_type!r}")
+    return axis_type.dim
+
 
 # Ulysses: projections run seq-local, then one all-to-all trades the sharded
 # axis -- sequence for heads -- so the body sees the full sequence for its head
