@@ -514,41 +514,14 @@ def _build_cp_subgroups(cp_group) -> dict[int, object]:
 
 
 def _patch_fla_for_dtensor() -> dict:
-    """Build DTensor-safe forwards for ShortConvolution + FusedRMSNormGated.
+    """Build DTensor-safe forwards for ShortConvolution and FusedRMSNormGated.
 
-    Returns ``{class: forward_fn}`` for :func:`_bind_fla_dtensor_shims` to bind
-    per instance. Nothing here mutates the fla classes.
+    Returns ``{class: forward_fn}`` for :func:`_bind_fla_dtensor_shims` to bind per
+    instance -- nothing here mutates the fla classes. Both wrap triton kernels that take
+    raw pointers and do not dispatch through DTensor, so the shims to_local on the way in
+    and from_local on the way out.
 
-    Both classes wrap fla-core triton kernels (``causal_conv1d``,
-    ``fused_norm_gated``) that take raw tensor pointers and don't
-    dispatch through DTensor. Under TP, KDA's delta_attention is
-    NoParallel-wrapped — child params are DTensor(Replicate) on tp_mesh
-    and inputs arrive as DTensor too. Calling the triton kernel with
-    DTensor crashes.
-
-    The patch wraps each class's ``forward`` to:
-    1. ``to_local`` the input ``x`` (preserving DTensor mesh+placements
-       for re-wrap at the output) and any positional / keyword args
-       that happen to be DTensors.
-    2. Run the original forward unchanged. The forward calls the
-       kernel with ``self.weight`` (still a DTensor on the module, but
-       autograd-traced via to_local under the hood — see below) — so
-       we additionally redirect ``self.weight`` access to its local
-       view via a transient property override on the instance during
-       the call.
-    3. Re-wrap the output as DTensor on the same mesh+placements so the
-       parent's (NoParallel) prepare_output hook receives a DTensor.
-
-    Critically we do NOT swap ``self._parameters`` to a fresh
-    ``nn.Parameter(local)`` — that would break autograd (the new
-    parameter has no link back to the DTensor original, so kernel
-    backward would write into a temporary local tensor and the
-    DTensor's grad would never see the contribution). Instead we mask
-    the attribute lookup so the kernel sees a plain ``self.weight`` for
-    the duration of forward, but autograd's saved-tensors reference the
-    local-view of the DTensor (which is differentiable through to_local).
-
-    Patch is idempotent: ``cls._fla_orig_forward`` is set on first patch.
+    See ``phase13_k3like_48b_posttrain/TP_DTENSOR_CONSTRAINTS.md``.
     """
     from fla.modules import FusedRMSNormGated, ShortConvolution
 

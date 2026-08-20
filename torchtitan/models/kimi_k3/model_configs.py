@@ -54,7 +54,7 @@ SCALING_LAW_TABLE: tuple[_SweepSize, ...] = (
     # extend kernels accept this layout on SM 12.0 (RTX 5090). d_ff
     # bumped 528 → 768 to keep activated-param count ~447M, roughly
     # matching the original 436M row's compute budget.
-    # Re-uses 436M's lr / batch_size / token_count from the same row.
+    # Reuses 436M's lr / batch_size / token_count from the same row.
     _SweepSize("447m_aligned", 447, 87.9, 16, 16, 1024, 768, 2.20e-3, 384),
     # Full Kimi Linear 48B-A3B target. From paper §"Training recipe":
     # "27 Transformer blocks (54 layers)" with Block AttnRes N=9

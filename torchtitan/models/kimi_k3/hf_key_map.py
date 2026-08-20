@@ -4,41 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Kimi K3 released-checkpoint key names <-> ours.
+"""Bidirectional HF <-> torchtitan key map for the released K3 checkpoint.
 
-``state_dict_adapter.py`` targets the Kimi-Linear-48B naming, which K3's release
-does not use. Rather than mutate a validated adapter, the K3 translation lives
-here and the adapter delegates to it when it sees the K3 layout.
+    The part that is not a string rewrite: one released key can map to a SLICE of one of
+    our stacked tensors (``...experts.3.w1.weight`` -> ``...w1_EFD[3]``), so the reverse
+    direction needs an expert index. ``g_proj`` also resolves by layer type, which is why
+    the map takes ``kda_layers``.
 
-Every pattern below is transcribed from ``model.safetensors.index.json`` of
-``moonshotai/Kimi-K3``, and ``test_hf_key_map.py`` asserts coverage in both
-directions against that file, so an unhandled key is a test failure rather than
-a silently dropped tensor.
-
-Naming differences worth knowing, in rough order of how easy they are to miss:
-
-* Everything text-side sits under ``language_model.model.`` -- the release is
-  the multimodal wrapper, so even a text-only load has to strip that.
-* Block Attention Residuals ARE in the release, as ``self_attention_res_proj`` /
-  ``self_attention_res_norm`` (93 each) plus ``mlp_res_proj`` / ``mlp_res_norm``,
-  with the final aggregation at ``model.output_attn_res_proj``. We call the
-  per-layer pair ``attention_res_proj`` / ``attention_res_norm`` and the final one
-  ``output_res_proj``.
-* The MoE layers' module is ``block_sparse_moe``; the single dense layer's is
-  ``mlp``. They map onto our ``moe`` and ``feed_forward``.
-* Routed experts use ``w1`` / ``w2`` / ``w3`` while the SHARED experts use
-  ``gate_proj`` / ``up_proj`` / ``down_proj`` -- the same block uses both
-  conventions, so a single global rename gets one of them wrong. w1 is the gate,
-  w3 the up, w2 the down (annotated as such in the reference).
-* The Gated-MLA output gate is ``g_proj``, the same name KDA uses for its own
-  output gate. We call the MLA one ``attn_gate_proj`` because our module also
-  supports a per-head graft parameterization the release does not have.
-* The router's load-balance bias is ``gate.e_score_correction_bias``, which is a
-  BUFFER on our side (``expert_bias_E``), not a parameter.
-* Routed-expert weights are MXFP4, stored as ``.weight_packed`` plus
-  ``.weight_scale`` rather than ``.weight``. Nothing else in the checkpoint is
-  quantized, which is the scope ``quant_scope.py`` encodes.
-"""
+    See ``phase13_k3like_48b_posttrain/HF_KEY_MAP.md``.
+    """
 
 from __future__ import annotations
 
