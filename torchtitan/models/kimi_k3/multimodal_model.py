@@ -334,6 +334,20 @@ class KimiK3MultimodalModel(nn.Module):
         """
         if not torch.cuda.is_available():
             return None
+        # Only when no autograd graph is being recorded. A graph recorded here has its
+        # backward run here too, and with prefetch several micro-batches then accumulate
+        # into the same tower parameters from two streams with nothing ordering them --
+        # which cost mm_full/tp2_pp2_cp2 its reproducibility: seven runs, seven distinct
+        # traces. Forcing the encode onto the current stream gives one trace over three
+        # runs, bit-identical to the DEP-without-prefetch numbers, so the stream was only
+        # ever changing reduction order, never the result.
+        #
+        # Nothing is lost today because both callers join immediately, so the stream
+        # overlaps nothing while grad is on. The machinery stays for the deferred design
+        # (report 5.2.3), which needs cross-stream collective ordering this does not yet
+        # establish -- and will need ordered accumulation before it can carry gradients.
+        if torch.is_grad_enabled():
+            return None
         s = getattr(self, "_vision_side_stream", None)
         if s is None:
             s = torch.cuda.Stream()

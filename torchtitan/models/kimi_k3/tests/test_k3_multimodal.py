@@ -145,5 +145,39 @@ class TestK3MultimodalForward(unittest.TestCase):
             m(ids, patches, grid)
 
 
+class TestVisionSideStreamGating(unittest.TestCase):
+    """The vision side stream must not carry an autograd graph.
+
+    A graph recorded on it has its backward run on it, and with prefetch several
+    micro-batches then accumulate into the same tower parameters from two streams
+    with no ordering between them. That cost mm_full/tp2_pp2_cp2 its
+    reproducibility -- seven runs, seven distinct 10-step traces -- while changing
+    nothing about the result: with the stream forced off, the numbers are
+    bit-identical to the DEP-without-prefetch ones. See
+    NONDETERMINISM_tp2_pp2_cp2_2026-08-20.md in the logbook.
+    """
+
+    def _stream(self, grad_enabled):
+        from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
+
+        obj = KimiK3MultimodalModel.__new__(KimiK3MultimodalModel)
+        with torch.set_grad_enabled(grad_enabled):
+            return KimiK3MultimodalModel._vision_stream(obj)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA for a real stream")
+    def test_no_side_stream_while_recording_a_graph(self):
+        self.assertIsNone(self._stream(True))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA for a real stream")
+    def test_side_stream_available_under_no_grad(self):
+        self.assertIsNotNone(self._stream(False))
+
+    def test_no_side_stream_without_cuda(self):
+        # Guarded first, so the grad check never has to reason about a CPU-only box.
+        if torch.cuda.is_available():
+            self.skipTest("CUDA present; this asserts the CPU-only path")
+        self.assertIsNone(self._stream(False))
+
+
 if __name__ == "__main__":
     unittest.main()
