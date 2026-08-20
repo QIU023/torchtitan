@@ -4,55 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Cross-stage caching adapter + custom ``pipelining_fn`` for AttnRes.
+"""Cross-stage caching adapter and ``pipelining_fn`` for AttnRes.
 
-:class:`CrossStageCacheAdapter` wraps a per-stage AttnRes decoder. In
-delta mode (Interleaved1F1B with :class:`BlockLayoutTables` from
-:mod:`.layout`) each hop ships only the blocks the receiver's shared
-rank cache doesn't already have; the receiver rebuilds the full stack
-by concatenating its cached prefix with the incoming delta.
+    :class:`CrossStageCacheAdapter` wraps a per-stage AttnRes decoder. In delta mode
+    each hop ships only the blocks the receiver does not already hold; the receiver
+    rebuilds the stack from its cached prefix plus the delta. The block stack is a
+    live autograd path, not a cache -- gradients cross stage boundaries through it.
 
-Per-block backward grads ride the normal autograd + PP SEND_B path:
-
-* Blocks this rank received from an earlier PP hop are slices of a
-  ``recv_delta_tensor``; their grad flows back through that tensor
-  and PP's built-in ``SEND_B`` ships it to the previous rank.
-* Blocks this rank committed in an earlier virtual stage are bridged
-  via a *rank-local* slot. At producer emission a tensor grad hook
-  (:func:`_install_augment_hook`) is registered on the new block, and
-  a DETACHED copy is written into the rank cache. At consumer read
-  the detached cache entry is wrapped in :class:`_LocalCacheCapture`,
-  whose backward deposits the grad in the slot and stops. When the
-  producer's own backward runs, the hook pops the slot and SUMS the
-  captured grad into the incoming grad before propagating into the
-  producer's wrapped model. Detach is what guarantees the consumer's
-  backward physically cannot traverse into the producer's forward
-  graph -- a tensor-grad hook + ``Function.backward returning None``
-  alone did NOT suffice under real PP + FSDP + AC rerun (PP8xVP4
-  pressure-test reports: https://github.com/QIU023/torchtitan_attention_residual).
-
-Both bridge mechanisms are pure local Python + a dict -- zero NCCL,
-zero cross-rank state. The grad walks backwards hop-by-hop along the
-same PP stage chain that forward uses (PP owns all NCCL, so no
-deadlock risk), and each stage's forward graph is traversed exactly
-once per mb so peak memory equals the naive-PP baseline.
-
-:func:`pipeline_kimi_k3_with_cache_adapter` is a ``pipelining_fn`` plugged
-into the experiment's ``ModelSpec``; it delegates to core
-``pipeline_llm`` and (when ``TORCHTITAN_ATTNRES_CACHE=1``) wraps each
-stage's submod. Schedule must be Interleaved1F1B; otherwise we warn.
-
-Microbatch keying: the adapter keys its per-microbatch cache by the
-schedule-owned integer chunk id. ``forward_one_chunk`` /
-``backward_one_chunk`` are monkey-patched to stash the index on a
-thread-local keyed per-adapter; forward and backward run synchronously
-on the same thread, so autograd hooks that fire during backward can
-read the mb index. The integer key is stable across P2P crossings
-(unlike ``id()`` of a tensor).
-
-See ``adapter_design.md`` at the project root for the full state
-machine and invariants.
-"""
+    See ``phase13_k3like_48b_posttrain/PP_ATTNRES_ADAPTER.md``.
+    """
 
 from __future__ import annotations
 
@@ -374,7 +334,7 @@ def _install_augment_hook(
     tensor's accumulated grad, strictly DURING the containing stage's
     own backward. No Function layer is interposed, so the consumer's
     backward can not reach ``block_tensor.grad_fn`` at all (the consumer
-    only ever sees the detached cache entry — see ``_append_own_commit``).
+    only ever sees the detached cache entry — see ``RankLocalCache.append``).
 
     Eval / no_grad path: when this is called inside a no_grad / eval
     context (e.g. ``pp_schedule.eval()`` in torchtitan's Validator),
@@ -417,7 +377,7 @@ class _LocalCacheCapture(torch.autograd.Function):
     """Identity forward; backward deposits grad in the slot and STOPS.
 
     The input tensor comes from the rank cache where it was stored in
-    DETACHED form (see ``_append_own_commit``), so even if autograd
+    DETACHED form (see ``RankLocalCache.append``), so even if autograd
     were to attempt to traverse upstream from Capture's input, there
     is no upstream graph to walk. ``None`` for the tensor-input grad
     is belt-and-suspenders; detach is the primary guarantee.

@@ -25,7 +25,9 @@ rank's action list and is spent in order -- the same walk ``dep_hiding_theory.py
 uses to estimate the hideable share, reused here to decide placement.
 
 The cost ratio ``r`` is in units of one text-stage forward, measured by
-``dep_cost_ratio.py``. It is a parameter rather than something inferred at runtime: a
+``dep_cost_ratio.py`` (logbook) -- which has not run since config-ization, so the value
+in use is hand-filled, not measured. It is a parameter rather than something inferred at
+runtime: a
 plan that depended on a measurement each rank took locally would stop being identical
 across ranks.
 """

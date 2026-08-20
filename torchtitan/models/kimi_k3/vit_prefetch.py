@@ -4,53 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Run the vision encode AHEAD of the text pipeline (report 5.2.3's DEP).
+"""Run the vision encode ahead of the text pipeline (report 5.2.3's DEP).
 
-The report: "The ViT forward passes of the first PP micro-batches are executed
-synchronously upfront, the remaining forward passes are scheduled into pipeline
-bubbles, and the backward passes are handled analogously."
+    Issues micro-batch m+1's encode on a side stream during m's text compute. This is
+    the run-ahead, and it is mutually exclusive with the bubble runtime -- both at once
+    would credit the bubble placements for work the side stream did.
 
-Measured earlier, three ways, that this cannot be done by making the ViT a pipeline
-STAGE: the bubble count is identical with and without that (2019 either way), every
-IR reorder is rejected by the lowering as unschedulable, and the reason both hold is
-that a stage sits in the dependency chain -- at one vision stage it IS the pipeline
-head, so the bubbles are downstream of the work that would fill them. Overlap
-therefore has to come from concurrency, not from placement.
-
-## Why the hook is on the STEP and not the stage
-
-PP hands the first stage one micro-batch's inputs at a time, so at micro-batch m the
-stage cannot see m+k's pixels. But ``kwarg_mbs`` -- the per-micro-batch kwargs list --
-is passed to ``schedule.step()`` whole. Capturing it at step entry makes every
-micro-batch's vision input available from the first action onward, with no change to
-core: the hook goes on the schedule instance from our own ``pipelining_fn``.
-
-## The two constraints that are not negotiable
-
-**Same Python thread.** The AttnRes adapter keys its per-micro-batch cache in a
-``threading.local``, and its ``forward`` reads a missing key as "this call is PP's
-shape inference" and diverts WITHOUT raising. Driving any model code from a worker
-thread would silently return shape-inference outputs. Concurrency comes from a CUDA
-stream; the prefetch is issued from the same thread that runs the schedule.
-
-**Collectives gated on the mesh, never on the data.** The vision encode issues
-collectives (dynamic CP's gather-KV, the feature all-gather, FSDP's tower
-all-gather). Every rank in those groups must reach every one of them in the same
-order, or two communicators deadlock on a cyclic wait without either one's ordering
-being violated. So the prefetch schedule is a function of the micro-batch COUNT --
-which every rank agrees on before the step -- and never of what a rank's own batch
-contains.
-
-## Memory is the bound on the lookahead
-
-Holding k micro-batches of vision features live is the cost, and it is what decides
-whether "most" of the encoder can be hidden or only some. ``depth`` defaults to 1 for
-that reason: one micro-batch of slack is enough to overlap an encode with a text
-forward, and every extra unit is paid for in resident activations.
-"""
+    See ``phase13_k3like_48b_posttrain/VIT_PREFETCH_DESIGN.md``.
+    """
 
 from __future__ import annotations
-
 
 import torch
 

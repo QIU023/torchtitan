@@ -353,10 +353,19 @@ def kimi_k3_mini_vl() -> Trainer.Config:
     """K3-faithful multimodal downscale: text k3mini plus a shrunk MoonViT-V2.
 
     K3 is natively multimodal, so a debug flavor that drops the vision tower
-    misrepresents the architecture. But the tower at its released size is 447.4M
-    parameters against k3mini's 80.9M text side -- 5.5x -- so a debug run would
-    be dominated by the encoder rather than exercising the K3 structure under
-    test.
+    misrepresents the architecture. But the RELEASED tower does not shrink with the
+    text side: MoonViT-V2 is 447.4M parameters with its projector (401M in the
+    report's Table 1, which counts encoder plus position embeddings and excludes the
+    46.1M projector), against k3mini's 80.9M text side -- so a debug run carrying
+    the real tower would be dominated by the encoder instead of exercising the K3
+    structure.
+
+    That ratio is an artefact of downscaling the TEXT side, not a property of K3. At
+    real size the tower is 401M against 104.2B activated parameters, i.e. 0.385%,
+    and 0.014% of the 2.78T total. Anything reasoning from "the tower is bigger than
+    the model it serves" is reasoning about this debug flavor only. What IS large at
+    real size is the tower's COMPUTE on big images and long video -- the problem
+    report 5.2.3 addresses -- and that is not a parameter count.
 
     The tower is therefore SHRUNK, not simplified: 4 layers and hidden 256
     instead of 27 and 1024, while every structural feature of MoonViT-V2 is
@@ -1252,7 +1261,12 @@ def kimi_k3_debugmodel_bubble_ratio() -> Trainer.Config:
 
     Report 5.2.3's bubble hiding is invisible on ``report_arch_pp8vp4`` and that is a
     property of the config, not of the implementation. Measured with
-    ``dep_cost_ratio.py``: one ViT forward there costs **r = 14.0 text-stage forwards**,
+    ``dep_cost_ratio.py`` (logbook, phase13): one ViT forward there costs **r = 14.0
+    text-stage forwards** -- a number that CANNOT be re-derived today, because that script
+    stopped running after config-ization (KimiK3Model now takes a wrapper carrying
+    .kimi_config). Treat r as unverified until it is fixed; the bubble planner's
+    KIMI_VIT_BUBBLE_COST_RATIO has been a hand-filled value ever since.
+    One ViT forward there costs r = 14.0 text-stage forwards,
     while the hideable share reaches the report's "most" only at **r <= 0.3**
     (``dep_hiding_theory.py --sweep``). At r = 14 the theoretical hideable share is
     ZERO, so a correct implementation must also measure zero -- which is what three

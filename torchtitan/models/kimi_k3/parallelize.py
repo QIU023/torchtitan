@@ -6,81 +6,12 @@
 
 """Parallelism application for Kimi Linear models.
 
-Supported parallelism dimensions:
+Wires FSDP2/HSDP, AC and compile; TP, CP and EP each have their own ``apply_*``.
 
-* **FSDP2 full-shard** -- primary path, modeled on
-  ``torchtitan.models.llama3.parallelize.apply_fsdp``. Adapted to Kimi's
-  module names (``embed_tokens``, ``norm``, ``lm_head``, ``layers`` as
-  ``nn.ModuleList``).
-* **TP** -- DSv3-style plan in ``apply_tp_kimi_k3``, matched to
-  Kimi's MLA + KDA + MoE layout. All boundary tensors use_local_output
-  so PP send/recv, AttnRes stacking, and fla-core triton kernels see
-  plain tensors.
-* **CP** -- Ulysses-style (seq-local projections, one fused all-to-all
-  seq<->head, full-sequence attention on the local head subset) inside
-  each KDA/MLA module. The module boundary stays a seq-sharded plain
-  tensor, which is what keeps CP composable with FSDP/TP/PP/EP. Requires
-  ``context_parallel_load_balancer=None`` (enforced with a ValueError).
-* **EP** -- Expert Parallel for KimiMoE via ``apply_ep_kimi_k3``;
-  all-to-all dispatch/combine on the EP mesh.
-* **PP** -- via the cross-stage cache adapter in ``pipeline_adapter.py``;
-  PP rank assignment is in torchtitan core, scheduling in the
-  ``pipeline_kimi_k3_with_cache_adapter`` wrapper.
-* **torch.compile** -- per-decoder-layer compile via
-  ``_apply_compile_kimi_k3``; MoE for-loop and fla-core triton ops
-  are carved out.
-* **Activation checkpointing** -- applied via the shared
-  ``ActivationCheckpointingConfig.build().apply()`` path since the Kimi
-  decoder layer registry matches the llama3 ``model.layers`` iteration
-  pattern. Honors all upstream modes (``selective``, ``full``,
-  ``memory_budget``, ``none``).
-
-Why KDA is ``NoParallel`` on the tp axis
-----------------------------------------
-The whole ``delta_attention`` is registered ``NoParallel``, so every child param
-(q/k/v/o projections, conv1d weights, ``A_log``, ``dt_bias``) becomes a
-``DTensor(Replicate)`` on ``tp_mesh``. Three consequences worth stating once:
-
-* **It is required for FSDP+TP composability.** ``clip_grad_norm_`` stacks
-  per-param grad norms across the parameter list, and the stack fails if some
-  norms live on ``(fsdp, tp)`` and others on ``(fsdp,)`` alone.
-* **The linears compose, the kernels do not.** Inside the KDA forward every
-  linear receives a DTensor input from ``input_layernorm`` and DTensor weights
-  from this wrap, so it produces DTensor. fla-core's triton kernels
-  (``causal_conv1d`` inside ``ShortConvolution``, ``fused_kda_gate``,
-  ``chunk_kda``, ``FusedRMSNormGated``) do not dispatch through DTensor, so
-  ``ShortConvolution.forward`` and ``FusedRMSNormGated.forward`` are shimmed to
-  ``to_local`` weight and input at the kernel boundary and ``from_local`` the
-  output. ``fused_kda_gate`` and ``chunk_kda`` are called explicitly, and their
-  to_local-and-call wrappers live in ``model.py``.
-* **The exit is plain.** ``local_output_grad_placements=Replicate`` ``to_local``s
-  the output at the module exit, matching MLA's ``o_proj`` and the dense MLP's
-  ``down_proj``, so ``attn_out`` is a plain tensor everywhere and both
-  partial-block accumulation and ``block_attn_res`` see one tensor kind.
-
-Why the MoE TP plan wraps LEAVES with ``NoParallel`` rather than the container
---------------------------------------------------------------------------------
-Four facts, all load-bearing, kept here rather than inline at the call site:
-
-1. **The mechanism.** Registering each leaf with ``NoParallel`` puts its params on
-   ``tp_mesh`` as ``DTensor(Replicate)``. The shared MoE forward ``to_local``s its
-   DTensor input at entry, so gate/experts/shared_experts receive PLAIN x; each
-   leaf's ``prepare_input`` hook converts back to DTensor, runs on DTensor
-   (params are DTensor too, so the matmul composes), and returns plain via
-   ``local_output_grad_placements=Replicate``.
-2. **Why the experts need nothing extra.** ``GroupedExperts.forward`` and
-   ``KimiMLP``'s gate/up/down projections dispatch normally on DTensor because
-   their ops are standard ``F.linear``; ``GroupedExperts`` additionally
-   ``to_local``s its DTensor params before the grouped_mm kernel.
-3. **Why NOT the ``moe`` container.** The MoE forward strips x with ``to_local``
-   AFTER the parent's ``prepare_input``. Wrapping ``moe`` or ``moe._moe`` would make
-   the input a DTensor at MoE entry, ``to_local`` would make it plain, and the
-   gate would then receive plain x while holding DTensor weights -- which errors.
-   Wrapping the gate ITSELF keeps the boundary right.
-4. **Required for FSDP+TP composability.** ``clip_grad_norm_`` stacks per-param
-   grad norms across the whole parameter list, which fails if MoE params live on
-   ``(fsdp,)`` while MLA params live on ``(fsdp, tp)``. ``NoParallel`` promotes
-   the MoE params to ``(fsdp, tp)`` after the FSDP wrap.
+Two constraints shape the whole file and are documented in
+``phase13_k3like_48b_posttrain/TP_DTENSOR_CONSTRAINTS.md``: KDA is ``NoParallel``
+on the tp axis because fla-core's triton kernels do not dispatch through DTensor,
+and the MoE TP plan wraps leaves rather than the container.
 """
 
 from __future__ import annotations
@@ -107,11 +38,11 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
 )
+from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.tools.logging import logger
 
@@ -338,11 +269,20 @@ def parallelize_kimi_k3(
             model.register_forward_pre_hook(_hoist_cpu_buffers)
 
         # Shard the tower before the decoder, as the core helper documents. A
-        # local apply_fsdp_vision used to live here and was never called, so
-        # the tower rode along inside the root wrap fully replicated. That is
-        # invisible at the debug tower's 4 layers / hidden 256, but MoonViT-V2
-        # ships at 447.4M against k3mini's 80.9M text side -- 5.5x the model it
-        # serves -- so replicating it is not an option at real size.
+        # local apply_fsdp_vision used to live here and was never called, so the
+        # tower rode along inside the root wrap fully replicated -- invisible at
+        # the debug tower's 4 layers / hidden 256, and still worth sharding at
+        # real size because a replicated 401M is 401M wasted per rank.
+        #
+        # An earlier version justified it with "447.4M against k3mini's 80.9M text
+        # side -- 5.5x the model it serves". The 447.4M is right (encoder 397.0M +
+        # pos_emb 4.2M = the report's 401M, plus a 46.1M projector it excludes; see
+        # SCALE_AUDIT_2p8t_2026-08-04). The COMPARISON was not: 80.9M is a debug
+        # flavor's text side, and against the real 104.2B activated parameters the
+        # tower is 0.385%. Reasoning from "the tower is bigger than the model it
+        # serves" is reasoning about k3mini only. The tower is small in parameters
+        # and can be large in COMPUTE on big images and long video -- that is what
+        # report 5.2.3 addresses, and the two must not be conflated.
         vision_tower = getattr(model, "vision_tower", None)
         if vision_tower is not None:
             apply_fsdp_to_vision_encoder(
@@ -829,79 +769,15 @@ def apply_tp_kimi_k3(
     skip_expert_params: bool = False,
     moe_module_parallel: bool = False,
 ) -> None:
-    """TP plan for kimi_linear, modeled on
-    ``deepseek_v3/parallelize.py``.
+    """TP plan for kimi_linear, modeled on ``deepseek_v3/parallelize.py``.
 
-    Design constraint: every module-boundary tensor in this model is a
-    plain ``torch.Tensor`` (not DTensor). The motivation is composability
-    with three subsystems that don't dispatch through DTensor:
-
-    * **fla-core triton kernels** in :class:`KimiDeltaAttention`
-      (``causal_conv1d`` inside ``ShortConvolution``, ``fused_kda_gate``,
-      ``chunk_kda``, ``FusedRMSNormGated``) — opaque to DTensor.
-    * **PP P2P send/recv** at AttnRes block boundaries — only plain
-      Tensors are sendable; DTensor wrappers don't survive P2P.
-    * **AttnRes ``torch.stack``** in :func:`block_attn_res` — stacking
-      mixed plain/DTensor inputs raises ``mixed Tensor and DTensor``.
-
-    To satisfy all three, every Colwise/Rowwise plan emits
-    ``use_local_output=False`` (or ``output_layouts=Replicate()`` plus
-    ``use_local_output=False``), and every NoParallel call passes
-    ``local_output_grad_placements=(Replicate(),)`` so the output is
-    converted back to a plain Tensor at the module boundary. The TP
-    collectives still fire (Colwise → DTensor(Shard) inside Linear's
-    forward, Rowwise → DTensor(Partial) → all-reduce → Replicate →
-    to_local).
-
-    Per-module wrapping (DSv3-aligned):
-
-    * **Top-level**:
-      - ``embed_tokens``: RowwiseParallel (vocab dim sharded; no SP).
-      - ``norm``: NoParallel.
-      - ``lm_head``: ColwiseParallel (vocab dim sharded; output local).
-      - ``output_res_proj`` / ``output_res_norm`` (AttnRes
-        only): NoParallel — output dim 1 / RMSNorm cannot be sharded.
-
-    * **MLA layer (KimiMLAAttention)**:
-      - ``q_proj``: ColwiseParallel (out = H * q_head_dim).
-      - ``kv_a_proj_with_mqa``: NoParallel (DSv3 pattern — the output
-        is split into two halves of different sizes, which is not
-        compatible with sharding on the concatenated last dim).
-      - ``kv_a_layernorm``: NoParallel (single-half normalization).
-      - ``kv_b_proj``: ColwiseParallel (out = H * (qk_nope + v_head_dim)).
-      - ``inner_attention``: prepare_module_input(use_local_output=False)
-        with sequence-axis placements — strips DTensor wrapping before
-        SDPA's mem-efficient cutlass kernel sees q/k/v.
-      - ``o_proj``: RowwiseParallel (in_features sharded, output
-        all-reduced + Replicate).
-
-    * **KDA layer (KimiDeltaAttention)**: NOT TP-wrapped. KDA's body is
-      almost entirely fla-core triton kernels; sharding heads requires
-      a ring-recurrence variant of ``chunk_kda`` that fla-core doesn't
-      provide. Leaving KDA delta_attention unwrapped means its parameters
-      remain plain Tensors (FSDP shards them on the FSDP axis,
-      replicated across TP ranks — accepting compute redundancy on the
-      TP axis for a clean kernel-safety story). The KDA forward
-      defensively strips any incoming DTensor (see
-      ``_to_local_if_dtensor`` in model.py).
-
-    * **dense MLP**: gate_proj / up_proj ColwiseParallel; down_proj
-      RowwiseParallel(output_layouts=Replicate(), use_local_output=False).
-
-    * **MoE FFN**: NoParallel on the ``moe`` container (EP handles the
-      real parallelization on a separate axis).
-
-    * **Per-layer norms** (``input_layernorm``, ``post_attention_layernorm``):
-      NoParallel.
-
-    * **AttnRes per-layer modules** (``attention_res_proj``, ``attention_res_norm``,
-      ``ffn_res_proj``, ``ffn_res_norm``): NoParallel each.
-
-    Collectives per forward pass (summed across layers):
-    - 1 all-reduce per dense-MLP layer (down_proj rowwise)
-    - 1 all-reduce per MLA layer (o_proj rowwise)
-    - KDA layers fire no TP collectives.
-    Plus the symmetric backward all-reduces.
+    Every module-boundary tensor stays a plain Tensor -- Colwise/Rowwise emit
+    ``use_local_output=False``, NoParallel passes
+    ``local_output_grad_placements=(Replicate(),)`` -- because fla-core's triton
+    kernels, PP send/recv and AttnRes ``torch.stack`` all fail on DTensor. The TP
+    collectives still fire inside each Linear. KDA is left unwrapped entirely; see
+    ``phase13_k3like_48b_posttrain/TP_DTENSOR_CONSTRAINTS.md`` for why, and read the
+    plan below for what each module gets.
     """
     # Plain-output NoParallel: ``output_layout=Replicate()`` (default) plus
     # ``use_local_output=False`` produces a plain torch.Tensor at the module

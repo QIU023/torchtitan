@@ -6,55 +6,12 @@
 
 """MoonViT-V2: Kimi K3's vision tower.
 
-Reconciled against the RELEASED reference implementation
-(``modeling_kimi_k3.py`` in the HF model repo) and against the shipped
-checkpoint's key list, not against the report's prose. That distinction
-matters here, because the two disagree.
+    Reconciled against the RELEASED reference implementation and the shipped
+    checkpoint's key list, not against the report's prose -- the two disagree, and
+    the checkpoint wins.
 
-Report sec 2.4 says "attention is factorized into intra-frame spatial and
-inter-frame temporal passes". The shipped tower does NOT do that: each block has
-exactly one ``wqkv`` and one ``wo`` (27 of each in
-``model.safetensors.index.json``), and ``MoonViTEncoderLayer.forward`` runs a
-single varlen attention whose ``cu_seqlens`` spans a sample's whole ``t*h*w``
-token set. So frames interact through one joint 3-D attention, not two passes.
-An earlier version of this file implemented the factorized reading and matched
-the reported 0.4B parameter count -- which proves only that parameter count
-cannot distinguish "one projection set used twice" from "one projection set used
-once".
-
-Layout, from the checkpoint keys::
-
-    vision_tower.patch_embed.proj.weight            Conv2d, no bias
-    vision_tower.patch_embed.pos_emb.weight         learned 2-D spatial table
-    vision_tower.encoder.blocks.{i}.norm0.weight    27x, RMSNorm
-    vision_tower.encoder.blocks.{i}.wqkv.weight     27x, no bias
-    vision_tower.encoder.blocks.{i}.wo.weight       27x, no bias
-    vision_tower.encoder.blocks.{i}.norm1.weight    27x
-    vision_tower.encoder.blocks.{i}.mlp.fc0.weight  27x
-    vision_tower.encoder.blocks.{i}.mlp.fc1.weight  27x
-    vision_tower.encoder.final_layernorm.weight
-    mm_projector.proj.{0,2}.weight                  2 Linears, no bias
-    mm_projector.post_norm.weight                   RMSNorm AFTER the projection
-
-Two details the key list settles that the config alone does not:
-
-* There is no ``pos_emb.time_weight`` key. The time component is a FIXED 1-D
-  sincos table registered as a non-persistent buffer -- that is what the
-  "fixed" in ``pos_emb_type: divided_fixed`` refers to. Only the 2-D spatial
-  table is learned, and it is interpolated to the input's patch grid.
-* ``mm_projector`` has ``post_norm`` and no pre-norm, matching
-  ``PatchMergerMLPV2`` rather than ``PatchMergerMLP``.
-
-Positional information is therefore carried twice: the absolute divided_fixed
-embedding added at the patch embed, AND 2-D RoPE applied to q/k inside every
-block.
-
-Shape suffixes: L packed tokens across the whole batch, D model dim
-(vt_hidden_size), Q qkv_hidden_size, A heads, K head_dim, C text_hidden_size.
-Inputs are NaViT-style packed -- a flat ``(L, ...)`` token stream plus a
-``grid_thws`` table of ``(t, h, w)`` per sample -- so one batch can mix
-resolutions and frame counts, which is what native-resolution training needs.
-"""
+    See ``phase13_k3like_48b_posttrain/MOONVIT_RECONCILIATION.md``.
+    """
 
 from __future__ import annotations
 
@@ -425,12 +382,20 @@ class MoonViTEncoderLayer(nn.Module):
         self._tp_head_slice: tuple[int, int] | None = None
         # Dynamic CP: set when this rank holds a patch shard of one large image.
         self._cp_patch_plan: CPPatchPlan | None = None
-        self.norm0 = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
+        self.norm0 = RMSNorm.Config(
+            normalized_shape=config.hidden_size,
+            eps=config.rms_norm_eps,
+            sharding_config=_tp_replicate(),
+        ).build()
         self.wqkv = nn.Linear(
             config.hidden_size, 3 * config.qkv_hidden_size, bias=False
         )
         self.wo = nn.Linear(config.qkv_hidden_size, config.hidden_size, bias=False)
-        self.norm1 = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
+        self.norm1 = RMSNorm.Config(
+            normalized_shape=config.hidden_size,
+            eps=config.rms_norm_eps,
+            sharding_config=_tp_replicate(),
+        ).build()
         self.mlp = MoonViTMLP(config)
 
     def _attend_gather_kv(
@@ -549,10 +514,7 @@ class MoonViTEncoderLayer(nn.Module):
             # a DTensor here -- it happens when the head count does not divide the TP
             # ranks (parallelize.py warns and leaves attention replicated), so it was
             # invisible on any tower whose heads divide.
-            from torch.distributed.tensor import (
-                DTensor as _DT,
-                Replicate as _R,
-            )
+            from torch.distributed.tensor import DTensor as _DT, Replicate as _R
 
             tp_mesh = None
             if isinstance(q, _DT):
@@ -695,7 +657,11 @@ class MoonViTEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             MoonViTEncoderLayer(config) for _ in range(config.num_hidden_layers)
         )
-        self.final_layernorm = RMSNorm.Config(normalized_shape=config.hidden_size, eps=config.rms_norm_eps, sharding_config=_tp_replicate()).build()
+        self.final_layernorm = RMSNorm.Config(
+            normalized_shape=config.hidden_size,
+            eps=config.rms_norm_eps,
+            sharding_config=_tp_replicate(),
+        ).build()
 
     def set_cp_patch_plan(self, plan: CPPatchPlan | None) -> None:
         """Apply (or clear) a dynamic-CP patch partition on every block.
