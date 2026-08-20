@@ -124,9 +124,6 @@ def splice_vision_embeds(
     return h.masked_scatter(scatter_mask.unsqueeze(-1).expand_as(h), source)
 
 
-# Our own Linear/RMSNorm adapters used to live here. They existed only to accept
-# nn-style positional args, which no construction site needs now that every
-# module builds its children from configs; core's classes are used directly.
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1762,11 +1759,9 @@ class KimiMoE(Module):
             experts_config_cls = GroupedExperts.Config
             experts_act_kwargs = {}
         # Declarative per-parameter init, the mechanism upstream models use
-        # (deepseek_v3/__init__.py::_depth_experts_init). This is not cosmetic:
-        # Module._init_param RAISES when a parameter name is absent from the
-        # map, whereas the hand-rolled walk in init_weights silently skipped
-        # anything it did not recognize -- which is how the routed experts ran
-        # on to_empty garbage after upstream renamed them.
+        # (deepseek_v3/__init__.py::_depth_experts_init). Module._init_param RAISES on a
+        # parameter name absent from the map, which is why the map is the mechanism: a
+        # rename then fails loudly instead of leaving that parameter uninitialised.
         expert_init = {
             name: partial(nn.init.trunc_normal_, std=config.initializer_range)
             for name in ("w1_EFD", "w2_EDF", "w3_EFD")

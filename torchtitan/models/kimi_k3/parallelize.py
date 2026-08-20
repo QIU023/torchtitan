@@ -111,10 +111,8 @@ def parallelize_kimi_k3(
         # plain tensors that need to be converted back into the TP
         # mesh's local view before aggregation).
         model._tp_mesh = tp_mesh
-        # Also on the language model. The AttnRes layer loop lives there and
-        # reads _tp_mesh to lift the stream at its entry; with the mesh only on
-        # the multimodal wrapper the getattr returned None, the lift never ran,
-        # and the plain carrier met a DTensor prefix_sum in the carrier cat.
+        # The AttnRes layer loop lives on the language model and reads _tp_mesh to lift
+        # the stream at its entry, so the mesh has to be on both.
         _lm = getattr(model, "language_model", None)
         if _lm is not None:
             _lm._tp_mesh = tp_mesh
@@ -124,12 +122,9 @@ def parallelize_kimi_k3(
         )
     if parallel_dims.cp_enabled:
         apply_cp_kimi_k3(model, parallel_dims=parallel_dims, parallelism=parallelism)
-    # None means "this rank has no MoE to plan for", which is a normal state rather
-    # than a missing value: under PP a rank can hold only the vision-tower stage, or
-    # only decoder layers that are dense. Kept explicit because the verify call below
-    # is guarded on ep_enabled, and ep_enabled is a property of the JOB while having
-    # MoE layers is a property of THIS RANK -- reading an unset local there is what
-    # took down every ep+pp cell on the multimodal arms.
+    # None means "this rank has no MoE to plan for" -- a normal state under PP, where a
+    # rank can hold only the vision stage or only dense layers. Explicit because the verify
+    # below is guarded on ep_enabled, which is a job property while holding MoE is a rank one.
     ep_expected = None
     if (parallel_dims.ep > 1 or parallel_dims.tp > 1) and _model_has_moe(model):
         # Expert Parallel for Kimi MoE layers. The
