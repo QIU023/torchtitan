@@ -1,0 +1,131 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""KCP: KDA Context Parallelism (report sec 5.1.2).
+
+KDA under context parallelism has two pieces, and only one of them was solved.
+
+The recurrence. K3 does NOT use Ulysses head-sharding for KDA, and does not use
+LASP-style state summation either -- plain summation is wrong because the delta
+rule applies a token-dependent transition to the incoming state. KCP instead
+decomposes each rank's segment into two locally computable fragments, a
+cumulative transition and a zero-started state, which compose associatively; a
+prefix scan over them recovers each rank's true incoming state in one
+fixed-size all-gather, independent of sequence length. fla-core 0.5.1 ships this
+(``chunk_kda(cp_context=...)``) and this repo validated it bit-exact, forward
+and backward, against a single-rank reference.
+
+The short convolution. KDA runs a causal depthwise conv of width
+``W = short_conv_kernel_size`` on q, k and v before the recurrence. Shard the
+sequence and each rank's first ``W - 1`` outputs get computed against zero
+padding instead of the previous rank's tail. fla ships this too:
+``causal_conv1d_cp`` is a real ``autograd.Function`` that exchanges the tail in
+the forward and the matching ``dx`` in the backward. Pass
+``conv1d_kernel_size`` to ``build_cp_context`` and it is wired for you.
+
+A hand-rolled halo used to do this with ``dist.all_gather``, which is not
+autograd-aware, so the gradient owed to the left neighbour's tail was dropped while
+the forward stayed bit-exact -- hence using fla's autograd.Function instead.
+
+KCP vs the Ulysses path also in this repo: Ulysses all-to-alls the head axis and
+gives every rank the full sequence for its head subset, so activation memory per
+rank stays O(T/cp x D) only for the projections and the recurrence sees the whole
+sequence. KCP keeps the sequence sharded end to end, which is what makes it
+composable with a sharded-sequence pipeline and what the 1M-token context needs.
+
+KCP is therefore what ``kda_cp_mode`` defaults to, and Ulysses is the A/B. Which
+one runs is per-layer-kind and not a whole-model choice: a CP run is KCP on the
+KDA layers AND Ulysses on the MLA layers, together, because KCP decomposes the
+delta-rule recurrence and has nothing to say about softmax attention.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+
+
+def conv_with_halo(
+    conv, x_local: torch.Tensor, cp_context, activation: str | None = None
+) -> torch.Tensor:
+    """Run a depthwise causal conv on a sequence-sharded input, exactly.
+
+    Thin adapter over fla's ``causal_conv1d_cp``: unpack the depthwise weight
+    the way ``ShortConvolution.forward`` does and hand over the CP context,
+    which must have been built with ``conv1d_kernel_size`` set.
+
+    ``activation`` defaults to reading ``conv.activation``, which fla's
+    ``ShortConvolution`` carries. A plain ``nn.Conv1d`` does not -- the upstream
+    K3 model applies its SiLU outside the conv -- so those call sites pass the
+    name explicitly rather than getting a second copy of this function.
+
+    The weight and bias are unwrapped to local first. Under TP the KDA layers are
+    NoParallel, so these are DTensor(Replicate), and handing a DTensor to fla's
+    triton kernel does not raise anything legible -- it surfaces as
+    ``CUBLAS_STATUS_INTERNAL_ERROR`` or an illegal memory access from inside the
+    kernel. The Ulysses path unwraps them in its own ``conv_subset``; this one did
+    not, which is why KCP worked in every cell that had no TP and broke every cell
+    that had both.
+    """
+    from einops import rearrange
+    from fla.modules.conv.cp.ops import causal_conv1d_cp
+
+    weight = conv.weight
+    if isinstance(weight, DTensor):
+        weight = weight.to_local()
+    bias = conv.bias
+    if bias is not None and isinstance(bias, DTensor):
+        bias = bias.to_local()
+
+    return causal_conv1d_cp(
+        x=x_local,
+        weight=rearrange(weight, "d 1 w -> d w"),
+        bias=bias,
+        activation=getattr(conv, "activation", None)
+        if activation is None
+        else activation,
+        cp_context=cp_context,
+    )
+
+
+def build_kcp_context(
+    seq_len_local: int,
+    group,
+    device,
+    conv1d_kernel_size: int | None = None,
+    cu_seqlens: "torch.Tensor | None" = None,
+) -> object:
+    """fla CP context for one evenly-split sequence.
+
+    ``chunk_kda`` needs the GLOBAL cu_seqlens of the packed sequence plus the
+    process group; ``build_cp_context`` derives each rank's slice from them.
+    ``conv1d_kernel_size`` is required by ``causal_conv1d_cp`` and otherwise
+    unused, so it is optional here.
+
+    ``cu_seqlens`` defaults to ``[0, seq_len_local * world]``, i.e. ONE document
+    spanning the whole sequence. Pass real boundaries to describe a packed
+    (multi-document) sequence -- they must be GLOBAL, since that is what fla
+    slices per rank.
+
+    Whether the default is right is a property of the caller, not of this
+    helper, and worth stating plainly: nothing in this repo hands KDA document
+    boundaries in ANY mode. Both non-CP call sites pass ``cu_seqlens=None`` to
+    ``chunk_kda``, so a packed SFT batch already carries the delta-rule state
+    across document boundaries with or without CP. The default here matches that
+    behaviour rather than introducing a hole of its own; fixing it means
+    threading the dataloader's boundaries through every KDA call site, not
+    changing this default.
+    """
+    from fla.ops.cp.context import build_cp_context
+
+    if cu_seqlens is None:
+        world = dist.get_world_size(group)
+        total = seq_len_local * world
+        cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=device)
+    return build_cp_context(
+        cu_seqlens, group=group, conv1d_kernel_size=conv1d_kernel_size
+    )
