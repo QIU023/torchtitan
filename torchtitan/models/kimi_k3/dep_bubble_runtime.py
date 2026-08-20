@@ -188,9 +188,8 @@ def install_bubble_runtime(
             level = logger.info if fired == placed else logger.warning
             # Encode time per call alongside the counts, because the counts alone
             # cannot distinguish "hidden in the bubble" from "ran at the planned point
-            # and overran it". The plan's budget comes from a static cost ratio, and a
-            # ratio measured at a different sequence length is how this session got 8/8
-            # placements that each overran roughly 28-fold while every number read green.
+            # and overran it". The budget comes from a static cost ratio, so a ratio taken
+            # at another sequence length makes every placement look green while overrunning.
             per = (
                 firer.encode_seconds / firer.encode_calls if firer.encode_calls else 0.0
             )
