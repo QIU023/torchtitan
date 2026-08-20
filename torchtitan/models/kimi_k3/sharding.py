@@ -77,7 +77,9 @@ class CPContract:
 def _shard_dim(layout: SpmdLayout) -> int:
     axis_type = layout.axis_types[CP]
     if not isinstance(axis_type, spmd.Shard):
-        raise ValueError(f"CP contract expects a Shard on the CP axis, got {axis_type!r}")
+        raise ValueError(
+            f"CP contract expects a Shard on the CP axis, got {axis_type!r}"
+        )
     return axis_type.dim
 
 
@@ -113,3 +115,80 @@ def contract_for_mode(mode: str) -> CPContract:
     if mode not in _BY_MODE:
         raise ValueError(f"kda_cp_mode must be one of {sorted(_BY_MODE)}, got {mode!r}")
     return _BY_MODE[mode]
+
+
+# ---------------------------------------------------------------------------
+# Parameter declarations for the spmd_types backend.
+#
+# spmd_types needs every parameter to already be a DTensor on the full SPMD mesh
+# before fully_shard. This model declares none today -- 537 parameter-owning
+# modules, zero sharding_config -- so the backend cannot start at all. See
+# SPMD_TYPES_GAP_2026-08-20.md in the logbook for the inventory.
+#
+# Filled in slices, norms first, because they are the placement-simplest 117 of
+# the 590 and prove the mechanism end to end before the colwise/rowwise mapping
+# for the 280 Linears has to be got right.
+# ---------------------------------------------------------------------------
+
+
+def set_kimi_k3_norm_sharding(config, *, enable_sp: bool) -> int:
+    """Declare parameter placements for every RMSNorm in the trunk.
+
+    Returns how many configs were filled, so a caller can assert the declaration
+    reached the tree rather than infer it from a parameter count that would also
+    look right if nothing had been declared.
+
+    Only the norms this model owns as ``RMSNorm.Config``. FusedRMSNormGated is
+    fla's and carries no Config to declare on; it needs its own answer.
+    """
+    from torchtitan.models.common.decoder_sharding import norm_config
+
+    filled = 0
+
+    def declare(norm_cfg) -> None:
+        nonlocal filled
+        if norm_cfg is None:
+            return
+        norm_cfg.sharding_config = norm_config(enable_sp=enable_sp)
+        filled += 1
+
+    declare(getattr(config, "norm", None))
+    for layer in getattr(config, "layers", []) or []:
+        declare(getattr(layer, "input_layernorm", None))
+        declare(getattr(layer, "post_attention_layernorm", None))
+        attn = getattr(layer, "attention", None)
+        if attn is not None:
+            declare(getattr(attn, "kv_a_layernorm", None))
+            declare(getattr(attn, "q_a_layernorm", None))
+    return filled
+
+
+def parallelize_declared(model, parallel_dims) -> int:
+    """Distribute states for modules that declare a sharding_config and are not done.
+
+    Returns how many modules were parallelized, so a caller can assert engagement.
+
+    Not ``model.parallelize(parallel_dims)`` at the root, which is what upstream
+    models do: the MoE layers here already parallelize themselves during EP wiring,
+    and Module.parallelize raises rather than skipping when a module has been done
+    once. Walking and filtering keeps this additive while the conversion is partial
+    -- whatever is already declarative stays as it is.
+    """
+    from torchtitan.protocols.module import Module
+
+    count = 0
+    for module in model.modules():
+        if not isinstance(module, Module):
+            continue
+        if getattr(module, "_parallelized", False):
+            continue
+        # Module.Config.build() copies the declaration onto the instance as
+        # _sharding_config; the module's own .config attribute is not it. Reading
+        # the wrong one counted zero declared modules while the declarations were
+        # in fact filled -- which the returned count caught, and a parameter table
+        # alone would not have.
+        if getattr(module, "_sharding_config", None) is None:
+            continue
+        module.parallelize(parallel_dims)
+        count += 1
+    return count

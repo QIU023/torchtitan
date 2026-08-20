@@ -276,6 +276,22 @@ def parallelize_kimi_k3(
         # serves" is reasoning about k3mini only. The tower is small in parameters
         # and can be large in COMPUTE on big images and long video -- that is what
         # report 5.2.3 addresses, and the two must not be conflated.
+        # Distribute declared parameters before FSDP sees them. spmd_types requires
+        # every parameter to be a DTensor on the full SPMD mesh by then, and this model
+        # declared none until 2026-08-20 -- see SPMD_TYPES_GAP_2026-08-20.md.
+        #
+        # spmd_types ONLY, deliberately narrower than upstream's
+        # "spmd_types or tp_enabled": TP here is still the imperative plan, and running
+        # both would distribute the same parameters twice. That also makes this
+        # structurally unable to regress the 58-cell gate, which runs partial_dtensor.
+        if parallelism.spmd_backend == "spmd_types":
+            from torchtitan.models.kimi_k3.sharding import parallelize_declared
+
+            n_declared = parallelize_declared(model, parallel_dims)
+            logger.info(
+                "spmd_types: distributed states for %d declared module(s).", n_declared
+            )
+
         vision_tower = getattr(model, "vision_tower", None)
         if vision_tower is not None:
             apply_fsdp_to_vision_encoder(

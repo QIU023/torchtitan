@@ -2208,6 +2208,17 @@ class KimiK3Model(Module):
         super().__init__()
         self.config = config.kimi_config
 
+        # Declarations go on the configs, so they have to be filled before build().
+        # Only the spmd_types backend consumes them (parallelize_kimi_k3 decides);
+        # filling them unconditionally keeps that decision in one place.
+        from torchtitan.models.kimi_k3.sharding import set_kimi_k3_norm_sharding
+
+        parallelism = getattr(config, "parallelism", None)
+        set_kimi_k3_norm_sharding(
+            config,
+            enable_sp=bool(getattr(parallelism, "enable_sequence_parallel", False)),
+        )
+
         self.embed_tokens = config.tok_embeddings.build()
         # ModuleDict (not ModuleList) so pipeline_module_split preserves
         # layer-id string keys and the adapter's layer_to_stage discovery
