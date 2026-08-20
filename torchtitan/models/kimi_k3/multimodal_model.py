@@ -1301,6 +1301,20 @@ class KimiK3ViTStage(KimiK3MultimodalModel):
         feats = self.vision_tower(x, grid, part="tail", from_block=lo)
         if isinstance(feats, torch.Tensor):
             feats = [feats]
+        # Cut the graph here so the tower's backward can be replayed in a bubble, the
+        # same seam _forward_single_stage uses. It was missing on this path, so a split
+        # tower silently lost the whole backward half: the queue stayed empty and the
+        # runtime reported "0 ran at a planned slot, 0 slots planned" while every
+        # gradient still ran inline. The tail is the right share to cut on -- it is where
+        # the encode finishes, and a cut on head or body would replay only a prefix.
+        gq = getattr(self, "_vision_grad_queue", None)
+        mb = getattr(self, "_dep_current_mb", None)
+        if gq is not None and mb is not None:
+            from torchtitan.models.kimi_k3.dep_bubble_backward import (
+                cut_for_deferred_backward,
+            )
+
+            feats = [cut_for_deferred_backward(f, gq, mb) for f in feats]
         flat = torch.cat(list(feats), dim=0)
         num_sentinels = int(sentinel_mask.sum().item())
         if num_sentinels == 0:

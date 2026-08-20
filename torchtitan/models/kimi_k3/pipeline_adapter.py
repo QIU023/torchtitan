@@ -1553,16 +1553,22 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
             f"Got prefetch={prefetch_depth()}, bubble={bubble}."
         )
 
-    if dep_vision_stages() > 1:
+    if dep_vision_stages() > 1 and prefetch_depth() > 0:
         # The run-ahead prefetches by calling encode_images, which assumes one stage
         # performs the whole encode. With the tower split that would run every block
         # on share 0 and defeat the split. Refuse rather than silently negate it.
+        #
+        # This return used to be unconditional, which took the BUBBLE runtime down with
+        # it: only DEP_STAGES=1 ever installed it, and that is the configuration where
+        # the tower is NOT split. So the report's own shape -- tower balanced across PP
+        # stages with bubble placement -- had never run.
         warnings.warn(
             f"KIMI_VIT_PREFETCH={prefetch_depth()} ignored: the run-ahead has no "
             f"cross-stage form yet, and KIMI_VIT_DEP_STAGES="
             f"{dep_vision_stages()} splits the tower. Running without the run-ahead."
         )
-        return
+        if not bool(topology().vit_bubble):
+            return
 
     vision_stage_modules = [m for m in model_parts if isinstance(m, KimiK3ViTStage)]
     if not vision_stage_modules:
