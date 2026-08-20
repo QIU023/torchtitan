@@ -308,6 +308,19 @@ def parallelize_kimi_k3(
     return model
 
 
+def _check_head_divisibility(
+    contract, num_heads: int, divisor: int, divisor_expr: str, kind: str, field: str
+) -> None:
+    """Enforce the head split a contract asks for, if it asks for one."""
+    if not contract.head_sharded:
+        return
+    if num_heads % divisor != 0:
+        raise ValueError(
+            f"{kind} {field}={num_heads} must be divisible by "
+            f"{divisor_expr}={divisor} for {contract.name} CP head sharding"
+        )
+
+
 def apply_cp_kimi_k3(
     model: nn.Module,
     *,
@@ -327,6 +340,11 @@ def apply_cp_kimi_k3(
     local tensors AFTER the TP-wrapped projections (to_local at the same gap the TP plan
     already strips DTensor), so under TP each rank computes num_heads/(tp*cp) MLA heads.
     Requires context_parallel_load_balancer=None (validated below).
+
+    What each mode does to the activations is declared in ``sharding.py`` as a
+    placement pair on the CP axis; this function resolves the contract per module
+    and enforces the preconditions it implies. The collectives themselves are still
+    emitted inside the attention modules, not by the boundary -- see CP_DECLARATIVE.md.
     """
     # Fail loudly on configs the CP implementation cannot honor.
     # Silent degradation here has already produced plausible-but-wrong
@@ -358,6 +376,11 @@ def apply_cp_kimi_k3(
     # apply_cp_to_forward expects -- hence this module-internal CP
     # rather than the upstream dispatcher.
     from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiMLAAttention
+    from torchtitan.models.kimi_k3.sharding import (
+        contract_for_mode,
+        KCP as KCP_CONTRACT,
+        ULYSSES,
+    )
 
     cp_group = parallel_dims.get_mesh("cp").get_group()
     cp_degree = parallel_dims.cp
@@ -366,44 +389,41 @@ def apply_cp_kimi_k3(
     kda_modules = []
     for m in model.modules():
         if isinstance(m, KimiMLAAttention):
-            # MLA is Ulysses in both modes -- KCP is a KDA recurrence
+            # MLA is Ulysses under either kda_cp_mode -- KCP is a KDA recurrence
             # decomposition and has nothing to say about softmax attention.
-            # Under TP the head axis is already tp-sharded; Ulysses further
-            # splits the local heads by cp.
-            if m.num_heads % (tp_degree * cp_degree) != 0:
-                raise ValueError(
-                    f"MLA num_attention_heads={m.num_heads} must be "
-                    f"divisible by tp*cp={tp_degree * cp_degree} for "
-                    "Ulysses CP head sharding"
-                )
+            # Under TP the head axis is already tp-sharded, so Ulysses splits
+            # what TP left: heads must divide by tp*cp, not by cp.
+            _check_head_divisibility(
+                ULYSSES,
+                m.num_heads,
+                tp_degree * cp_degree,
+                "tp*cp",
+                "MLA",
+                "num_attention_heads",
+            )
             m._cp_group = cp_group
             n_mla += 1
         elif isinstance(m, KimiDeltaAttention):
             kda_modules.append(m)
-    # Which CP path the KDA layers take is their ``kda_cp_mode``, and the
-    # wiring has to know it, because the two modes shard different axes and
-    # so have different preconditions: the Ulysses head-divisibility rule
-    # below is meaningless for KCP, which never splits heads, and enforcing
-    # it there rejects configurations that work.
+    # KCP on the KDA layers and Ulysses on the MLA layers run TOGETHER, on
+    # disjoint layer kinds -- the per-layer modes are not a choice between two
+    # whole-model strategies.
     #
-    # Note that KCP on the KDA layers and Ulysses on the MLA layers run
-    # TOGETHER, and that is the design: they apply to disjoint layers. The
-    # per-layer modes are not a choice between two whole-model strategies.
     # None, not a default mode name: under PP a rank can hold no KDA layer at
     # all (the vision-tower stage is the ordinary case), and naming a mode
     # there would be the log inventing a configuration. Reported as "-".
     kda_mode = kda_modules[0].cp_mode if kda_modules else None
-    if kda_mode == "ulysses":
+    kda_contract = contract_for_mode(kda_mode) if kda_mode else None
+    if kda_contract is not None:
         for m in kda_modules:
-            # KDA is NoParallel under TP (replicated), so only cp
-            # splits its heads.
-            if m.num_heads % cp_degree != 0:
-                raise ValueError(
-                    f"KDA kda_num_heads={m.num_heads} must be "
-                    f"divisible by cp={cp_degree} for Ulysses CP "
-                    "head sharding"
-                )
-    elif kda_modules:
+            # KDA is NoParallel under TP (replicated), so only cp splits its
+            # heads. The contract decides whether the rule applies at all:
+            # KCP never splits heads, and enforcing it there rejects
+            # configurations that work.
+            _check_head_divisibility(
+                kda_contract, m.num_heads, cp_degree, "cp", "KDA", "kda_num_heads"
+            )
+    if kda_contract is KCP_CONTRACT:
         # KCP needs fla's CP ops rather than a head count. Checked here so a
         # missing dependency names the config field instead of surfacing as
         # an ImportError from inside the first forward.
@@ -451,7 +471,7 @@ def apply_cp_kimi_k3(
         cp_degree,
         n_mla,
         len(kda_modules),
-        kda_mode or "-",
+        kda_contract.name if kda_contract else "-",
         n_attn,
     )
 

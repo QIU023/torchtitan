@@ -56,6 +56,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.kimi_k3.sharding import contract_for_mode
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
@@ -122,8 +123,6 @@ def splice_vision_embeds(
     keep = torch.clamp(n_per_row, max=n_vis_max)
     scatter_mask = image_mask & (pos_rank < keep.unsqueeze(1))
     return h.masked_scatter(scatter_mask.unsqueeze(-1).expand_as(h), source)
-
-
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1196,10 +1195,9 @@ class KimiDeltaAttention(Module):
             self.g_b_proj = config.g_b_proj.build()
         self.gate_lower_bound = config.kda_gate_lower_bound
         self.cp_mode = config.kda_cp_mode
-        if self.cp_mode not in ("ulysses", "kcp"):
-            raise ValueError(
-                f"kda_cp_mode must be 'ulysses' or 'kcp', got {self.cp_mode!r}"
-            )
+        # Validate against the CP contracts so the accepted modes are declared
+        # in one place rather than restated here.
+        contract_for_mode(self.cp_mode)
 
         # Beta: per-head, per-token scalar (delta-rule learning rate)
         self.b_proj = config.b_proj.build()
