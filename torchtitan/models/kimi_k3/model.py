@@ -2610,10 +2610,9 @@ class KimiK3Spec:
                 nparams_dense += p.numel()
             # These must match the real module names, which are ``_moe`` with a
             # leading underscore and ``routed_experts`` rather than ``experts``.
-            # Every one of these buckets used to get zero hits, which sent all
-            # MoE parameters into `dense` -- i.e. counted every expert as
-            # activated. Keep the trailing dot: it stops the router pattern from
-            # also claiming a dense FFN's ``gate_proj``.
+            # A bucket that matches nothing sends every MoE parameter into `dense`, which
+            # counts all experts as activated. Keep the trailing dot: it stops the router
+            # pattern from also claiming a dense FFN's ``gate_proj``.
             elif "._moe.shared_experts." in name:
                 nparams_shared += p.numel()
             elif "._moe.router." in name:

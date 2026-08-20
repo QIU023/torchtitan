@@ -263,11 +263,9 @@ def parallelize_kimi_k3(
 
             model.register_forward_pre_hook(_hoist_cpu_buffers)
 
-        # Shard the tower before the decoder, as the core helper documents. A
-        # local apply_fsdp_vision used to live here and was never called, so the
-        # tower rode along inside the root wrap fully replicated -- invisible at
-        # the debug tower's 4 layers / hidden 256, and still worth sharding at
-        # real size because a replicated 401M is 401M wasted per rank.
+        # Shard the tower before the decoder, as the core helper documents. Worth doing
+        # even though the tower is small next to the text side: a replicated 401M is
+        # 401M wasted on every rank.
         #
         # An earlier version justified it with "447.4M against k3mini's 80.9M text
         # side -- 5.5x the model it serves". The 447.4M is right (encoder 397.0M +
@@ -637,10 +635,9 @@ def _patch_fla_for_dtensor() -> dict:
 def _bind_fla_dtensor_shims(model: nn.Module) -> int:
     """Bind the DTensor-safe forwards PER INSTANCE, not on the fla classes.
 
-    The previous form assigned ``cls.forward`` on ShortConvolution and
-    FusedRMSNormGated, which is a global, irreversible mutation of a third-party
-    library: it changes behaviour for every model in the process, including ones
-    that never enabled TP, and cannot be undone. torchtitan's own convention
+    Assigning ``cls.forward`` on ShortConvolution or FusedRMSNormGated would mutate a
+    third-party library process-wide and irreversibly, reaching models that never
+    enabled TP. torchtitan's own convention
     (qwen3_5) keeps kernel dispatch stateless and does the DTensor conversion at
     the call site.
 

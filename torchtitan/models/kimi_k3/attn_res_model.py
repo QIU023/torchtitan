@@ -810,11 +810,9 @@ class KimiK3AttnResModel(KimiK3Model):
             from torchtitan.models.kimi_k3.mtp_loss import put_mtp_logits
 
             if self._skip_lm_head:
-                # finding 44. This branch used to sit ahead of the _skip_lm_head return,
-                # so a chunked-loss run still materialised a full [B, L, V] logits tensor
-                # PER MTP DEPTH -- exactly the allocation chunking exists to avoid (OOM at
-                # seq 8192), retaining ~1.3 GiB per depth across steps, and handing the
-                # loss chunk-misaligned labels.
+                # Must stay BELOW the _skip_lm_head return: above it, a chunked-loss run
+                # materialises a full [B, L, V] logits tensor per MTP depth, which is the
+                # allocation chunking exists to avoid.
                 #
                 # Raised rather than skipped. Skipping would leave take_mtp_logits()
                 # returning None, the MTP loss component contributing nothing, and a run
