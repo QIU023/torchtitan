@@ -248,3 +248,63 @@ def drop_declarations_on_distributed(model) -> int:
             module._sharding_config = None
             dropped += 1
     return dropped
+
+
+def declare_tp_sharding(model, *, enable_sp: bool) -> tuple[int, int]:
+    """Declare TP placements on the MLA projections.
+
+    Returns ``(newly declared, already declared)``.
+
+    The imperative plan cannot run under spmd_types: it makes DTensors on the tp mesh
+    while FSDP there wants the full SPMD storage mesh ("Expected param's DTensor mesh to
+    be the same mesh passed to fully_shard"). Declaring instead leaves local tensors
+    sliced on the tp group and annotated.
+
+    Structured as a walk over layers rather than a match on module names, because the
+    names do not separate the two attention kinds: a KDA layer's projection is
+    ``delta_attention.q_proj``, which ENDS WITH ``attention.q_proj``. KDA layers take no
+    TP at all in the imperative plan -- they stay replicated -- so name matching would
+    shard them and be wrong in a way nothing else would catch.
+
+    Only the projections the imperative plan actually shards are declared. The rest of
+    that plan is NoParallel, i.e. replicated, which is what annotate_untyped_params
+    already provides.
+    """
+    from torchtitan.models.common.decoder_sharding import colwise_config, rowwise_config
+
+    # Counted apart because they mean opposite things. "Declared 0" reads as "no TP
+    # was set up", but it also happens when every projection ALREADY carried a
+    # declaration -- a correct state. Conflating them turned a working model into a
+    # hard failure once.
+    declared = 0
+    already = 0
+
+    def declare(parent, attr, config) -> None:
+        nonlocal declared, already
+        module = getattr(parent, attr, None)
+        if module is None:
+            return
+        # LoRA wraps the projection; the placements belong on the nn.Linear inside,
+        # the same redirect the imperative plan performs.
+        target = getattr(module, "base", module)
+        if getattr(target, "_sharding_config", None) is not None:
+            already += 1
+            return
+        target._sharding_config = config
+        declared += 1
+
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return 0, 0
+    for layer in layers.values() if hasattr(layers, "values") else layers:
+        if bool(getattr(layer, "is_linear_attn", False)):
+            continue
+        attn = getattr(layer, "attention", None)
+        if attn is None:
+            continue
+        for attr in ("q_proj", "q_b_proj", "kv_b_proj", "attn_gate_proj"):
+            declare(attn, attr, colwise_config())
+        declare(attn, "o_proj", rowwise_config(output_sp=enable_sp))
+
+    declare(model, "lm_head", colwise_config())
+    return declared, already

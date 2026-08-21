@@ -42,7 +42,10 @@ from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
 )
-from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
+from torchtitan.distributed.full_dtensor import (
+    resolve_fsdp_mesh,
+    resolve_sparse_fsdp_mesh,
+)
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.tools.logging import logger
 
@@ -99,12 +102,37 @@ def parallelize_kimi_k3(
         # boundary types plain so PP send/recv, AttnRes block stacking,
         # and triton kernels never see a mixed-mesh tensor.
         tp_mesh = parallel_dims.get_mesh("tp")
-        apply_tp_kimi_k3(
-            model,
-            tp_mesh,
-            skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
-            moe_module_parallel=_model_has_moe(model),
-        )
+        if parallelism.spmd_backend == "spmd_types":
+            # Mutually exclusive with the imperative plan, not additive: that plan puts
+            # parameters on the tp mesh and FSDP under spmd_types wants the full SPMD
+            # storage mesh. Declaring gives local tp-sliced tensors instead.
+            from torchtitan.models.kimi_k3.sharding import declare_tp_sharding
+
+            n_tp, n_had = declare_tp_sharding(
+                model, enable_sp=parallelism.enable_sequence_parallel
+            )
+            if n_tp + n_had == 0:
+                # Silence here would mean no tensor parallelism at all while the config
+                # asked for it -- worse than the error it replaces, because the run
+                # would train and converge slightly differently with no signal.
+                raise ValueError(
+                    "spmd_types: tensor_parallel_degree > 1 but no MLA projection was "
+                    "found at all. Nothing would be tensor-parallel. Check that the "
+                    "model exposes layers with .attention, and that KDA layers are the "
+                    "only ones marked is_linear_attn."
+                )
+            logger.info(
+                "spmd_types: declared TP sharding on %d module(s); %d already had one.",
+                n_tp,
+                n_had,
+            )
+        else:
+            apply_tp_kimi_k3(
+                model,
+                tp_mesh,
+                skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
+                moe_module_parallel=_model_has_moe(model),
+            )
         # Stash the TP mesh on the model so AttnRes top-level forward
         # can DTensor-ify PP-received block tensors when they arrive
         # plain (PP P2P uses raw send/recv, so mid-stage receives
@@ -269,13 +297,22 @@ def parallelize_kimi_k3(
         # See ``apply_fsdp`` docstring for the rationale; mirrors the
         # llama4 / deepseek_v3 path.
         edp_mesh = None
+        edp_mesh_dims = None
         if parallel_dims.ep_enabled:
-            edp_mesh_names = (
-                ["dp_replicate", "efsdp"]
-                if parallel_dims.dp_replicate_enabled
-                else ["efsdp"]
-            )
-            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+            if parallelism.spmd_backend == "spmd_types":
+                # Same reason the dense path calls resolve_fsdp_mesh: fully_shard needs
+                # the named storage mesh AND DataParallelMeshDims, and the hand-built
+                # mesh below supplies only the first, so the expert units failed with
+                # "requires both a named full DeviceMesh ... and dp_mesh_dims".
+                # The sparse helper already existed; it was simply never called here.
+                edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+            else:
+                edp_mesh_names = (
+                    ["dp_replicate", "efsdp"]
+                    if parallel_dims.dp_replicate_enabled
+                    else ["efsdp"]
+                )
+                edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
         param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
         reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
         if training.enable_cpu_offload:
@@ -327,6 +364,7 @@ def parallelize_kimi_k3(
             reshard_after_forward_policy=(parallelism.fsdp_reshard_after_forward),
             ep_degree=parallel_dims.ep,
             edp_mesh=edp_mesh,
+            edp_mesh_dims=edp_mesh_dims,
             dp_mesh_dims=dp_mesh_dims,
         )
         logger.info(
