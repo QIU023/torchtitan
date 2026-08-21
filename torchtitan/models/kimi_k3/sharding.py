@@ -172,3 +172,45 @@ def declare_norm_sharding(model, *, enable_sp: bool) -> int:
             count,
         )
     return count
+
+
+def annotate_untyped_params(model, parallel_dims) -> int:
+    """Give every parameter still lacking an spmd type a replicated one. Returns the count.
+
+    Under spmd_types FSDP needs each parameter to carry a type annotation, and
+    ``Module.parallelize`` only annotates modules that declare a sharding_config. Three
+    kinds of parameter are left over here and none can be reached by declaring on a
+    Module:
+
+    * fla's ``ShortConvolution`` and ``FusedRMSNormGated`` are not torchtitan Modules at
+      all, so ``parallelize()`` never visits them;
+    * the grouped-expert weights are distributed by the EP path, which predates this;
+    * a handful of Linears and the embedding sit outside any declared subtree.
+
+    Replicated is the right default and not a placeholder: an unsharded parameter IS
+    replicated on every axis, so the annotation states what is already true. Anything
+    genuinely sharded is skipped -- a DTensor carries its own layout, and a parameter
+    that already has a type was annotated by whoever distributed it.
+    """
+    from spmd_types.runtime import has_local_type
+    from torch.distributed.tensor import DTensor
+
+    from torchtitan.distributed.spmd_types import set_current_spmd_mesh
+    from torchtitan.models.common.decoder_sharding import dense_param_placement
+
+    layout = dense_param_placement(tp=spmd.R)
+    mesh = parallel_dims.get_optional_mesh(
+        [axis.value for axis in layout.axes()], include_singleton_axes=True
+    )
+    if mesh is None:
+        return 0
+
+    count = 0
+    with set_current_spmd_mesh(mesh):
+        for module in model.modules():
+            for name, param in module.named_parameters(recurse=False):
+                if isinstance(param, DTensor) or has_local_type(param):
+                    continue
+                spmd.assert_type(param, layout.axis_types, layout.partition_spec)
+                count += 1
+    return count

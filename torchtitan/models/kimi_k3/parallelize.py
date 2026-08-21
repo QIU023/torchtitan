@@ -160,6 +160,13 @@ def parallelize_kimi_k3(
         )
         logger.info("spmd_types: declared sharding for %d norm(s).", n_norm)
     entered = _drive_declarative_sharding(model, parallel_dims)
+    if parallelism.spmd_backend == "spmd_types":
+        # Whatever the driver could not reach. See annotate_untyped_params: fla's
+        # modules are not torchtitan Modules, so no declaration can reach them.
+        from torchtitan.models.kimi_k3.sharding import annotate_untyped_params
+
+        n_annotated = annotate_untyped_params(model, parallel_dims)
+        logger.info("spmd_types: annotated %d leftover parameter(s).", n_annotated)
     if parallel_dims.ep_enabled and ep_expected is not None:
         # After the driver, because the driver is what carries the ep mesh down. Only
         # where there was a plan: apply_ep_kimi_k3 already refuses a model that has MoE
