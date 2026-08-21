@@ -146,6 +146,19 @@ def parallelize_kimi_k3(
     # migration to upstream's declarative path: this only ACTIVATES declarations that
     # already exist -- no plan is removed here, so the imperative plan and the
     # declarations are both in effect and their agreement is what the matrix checks.
+    # Fill norm declarations first. The driver below only ACTIVATES declarations that
+    # exist, and this model had none on its norms -- 537 parameter-owning modules with
+    # zero sharding_config, which is why spmd_types cannot start (see
+    # SPMD_TYPES_GAP_2026-08-20.md). Declaring here rather than on Module.Config
+    # because KimiK3AttnResModel builds its layers straight from the flat KimiK3Config
+    # and never constructs the config tree upstream declares on.
+    if parallelism.spmd_backend == "spmd_types":
+        from torchtitan.models.kimi_k3.sharding import declare_norm_sharding
+
+        n_norm = declare_norm_sharding(
+            model, enable_sp=parallelism.enable_sequence_parallel
+        )
+        logger.info("spmd_types: declared sharding for %d norm(s).", n_norm)
     entered = _drive_declarative_sharding(model, parallel_dims)
     if parallel_dims.ep_enabled and ep_expected is not None:
         # After the driver, because the driver is what carries the ep mesh down. Only
@@ -276,22 +289,6 @@ def parallelize_kimi_k3(
         # serves" is reasoning about k3mini only. The tower is small in parameters
         # and can be large in COMPUTE on big images and long video -- that is what
         # report 5.2.3 addresses, and the two must not be conflated.
-        # Distribute declared parameters before FSDP sees them. spmd_types requires
-        # every parameter to be a DTensor on the full SPMD mesh by then, and this model
-        # declared none until 2026-08-20 -- see SPMD_TYPES_GAP_2026-08-20.md.
-        #
-        # spmd_types ONLY, deliberately narrower than upstream's
-        # "spmd_types or tp_enabled": TP here is still the imperative plan, and running
-        # both would distribute the same parameters twice. That also makes this
-        # structurally unable to regress the 58-cell gate, which runs partial_dtensor.
-        if parallelism.spmd_backend == "spmd_types":
-            from torchtitan.models.kimi_k3.sharding import parallelize_declared
-
-            n_declared = parallelize_declared(model, parallel_dims)
-            logger.info(
-                "spmd_types: distributed states for %d declared module(s).", n_declared
-            )
-
         vision_tower = getattr(model, "vision_tower", None)
         if vision_tower is not None:
             apply_fsdp_to_vision_encoder(

@@ -131,64 +131,28 @@ def contract_for_mode(mode: str) -> CPContract:
 # ---------------------------------------------------------------------------
 
 
-def set_kimi_k3_norm_sharding(config, *, enable_sp: bool) -> int:
-    """Declare parameter placements for every RMSNorm in the trunk.
+def declare_norm_sharding(model, *, enable_sp: bool) -> int:
+    """Attach norm parameter placements to BUILT RMSNorm modules. Returns the count.
 
-    Returns how many configs were filled, so a caller can assert the declaration
-    reached the tree rather than infer it from a parameter count that would also
-    look right if nothing had been declared.
+    Upstream models declare on ``Module.Config`` before ``build()``. That route does
+    not reach this model: KimiK3AttnResModel -- what the flavors actually construct --
+    calls ``nn.Module.__init__`` and builds its layers straight from the flat
+    KimiK3Config, so there is no config tree carrying ``.norm`` or
+    ``.layers[i].input_layernorm`` to declare on. Declaring on the instances is the
+    same contract applied one step later.
 
-    Only the norms this model owns as ``RMSNorm.Config``. FusedRMSNormGated is
-    fla's and carries no Config to declare on; it needs its own answer.
+    Only RMSNorm, which this model owns via torchtitan's class. FusedRMSNormGated is
+    fla's and ShortConvolution likewise; those need their own answer.
     """
     from torchtitan.models.common.decoder_sharding import norm_config
-
-    filled = 0
-
-    def declare(norm_cfg) -> None:
-        nonlocal filled
-        if norm_cfg is None:
-            return
-        norm_cfg.sharding_config = norm_config(enable_sp=enable_sp)
-        filled += 1
-
-    declare(getattr(config, "norm", None))
-    for layer in getattr(config, "layers", []) or []:
-        declare(getattr(layer, "input_layernorm", None))
-        declare(getattr(layer, "post_attention_layernorm", None))
-        attn = getattr(layer, "attention", None)
-        if attn is not None:
-            declare(getattr(attn, "kv_a_layernorm", None))
-            declare(getattr(attn, "q_a_layernorm", None))
-    return filled
-
-
-def parallelize_declared(model, parallel_dims) -> int:
-    """Distribute states for modules that declare a sharding_config and are not done.
-
-    Returns how many modules were parallelized, so a caller can assert engagement.
-
-    Not ``model.parallelize(parallel_dims)`` at the root, which is what upstream
-    models do: the MoE layers here already parallelize themselves during EP wiring,
-    and Module.parallelize raises rather than skipping when a module has been done
-    once. Walking and filtering keeps this additive while the conversion is partial
-    -- whatever is already declarative stays as it is.
-    """
-    from torchtitan.protocols.module import Module
+    from torchtitan.models.common.nn_modules import RMSNorm
 
     count = 0
     for module in model.modules():
-        if not isinstance(module, Module):
+        if not isinstance(module, RMSNorm):
             continue
-        if getattr(module, "_parallelized", False):
+        if getattr(module, "_sharding_config", None) is not None:
             continue
-        # Module.Config.build() copies the declaration onto the instance as
-        # _sharding_config; the module's own .config attribute is not it. Reading
-        # the wrong one counted zero declared modules while the declarations were
-        # in fact filled -- which the returned count caught, and a parameter table
-        # alone would not have.
-        if getattr(module, "_sharding_config", None) is None:
-            continue
-        module.parallelize(parallel_dims)
+        module._sharding_config = norm_config(enable_sp=enable_sp)
         count += 1
     return count
