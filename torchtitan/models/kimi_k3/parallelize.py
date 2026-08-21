@@ -138,12 +138,18 @@ def parallelize_kimi_k3(
         # plain (PP P2P uses raw send/recv, so mid-stage receives
         # plain tensors that need to be converted back into the TP
         # mesh's local view before aggregation).
-        model._tp_mesh = tp_mesh
-        # The AttnRes layer loop lives on the language model and reads _tp_mesh to lift
-        # the stream at its entry, so the mesh has to be on both.
-        _lm = getattr(model, "language_model", None)
-        if _lm is not None:
-            _lm._tp_mesh = tp_mesh
+        # Only for the imperative plan. _tp_mesh makes the AttnRes forward lift its
+        # stream into a DTensor on the tp mesh, which is right when the weights are
+        # DTensors there and wrong under spmd_types, where they are local tensors --
+        # the lift then meets a local weight and raises "_fused_rms_norm got mixed
+        # torch.Tensor and DTensor".
+        if parallelism.spmd_backend != "spmd_types":
+            model._tp_mesh = tp_mesh
+            # The AttnRes layer loop lives on the language model and reads _tp_mesh to
+            # lift the stream at its entry, so the mesh has to be on both.
+            _lm = getattr(model, "language_model", None)
+            if _lm is not None:
+                _lm._tp_mesh = tp_mesh
         logger.info(
             "Applied DSv3-style TP plan tp_degree=%d.",
             parallel_dims.tp,
@@ -210,11 +216,18 @@ def parallelize_kimi_k3(
         # layers but yields none, so a None here means this rank has no MoE at all.
         verify_ep_applied(ep_expected, parallelism.spmd_backend, parallel_dims.ep)
     if parallel_dims.tp_enabled:
-        _sweep_remaining_to_replicate(
-            model,
-            parallel_dims.get_mesh("tp"),
-            skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
-        )
+        # Under spmd_types annotate_untyped_params above IS this sweep -- same purpose,
+        # the leftovers -- and the two disagree on what a distributed parameter looks
+        # like. Running this one there re-promotes those leftovers to DTensor on the
+        # bare tp mesh, and fully_shard then rejects them: it compares mesh IDENTITY
+        # against the full storage mesh, so a ('tp',) mesh fails even though the
+        # placement is right.
+        if parallelism.spmd_backend != "spmd_types":
+            _sweep_remaining_to_replicate(
+                model,
+                parallel_dims.get_mesh("tp"),
+                skip_expert_params=(parallel_dims.ep_enabled or _model_has_moe(model)),
+            )
         # The sweep is the last thing that distributes parameters, so this is the
         # point where "all of them" is a checkable statement.
         verify_params_distributed(model, parallelism.spmd_backend)
