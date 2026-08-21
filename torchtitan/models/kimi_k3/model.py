@@ -980,6 +980,13 @@ class KimiMLAAttention(Module):
             v_BTGV,
             scale=self.scaling,
         )
+        # inner_attention's declaration wraps its output back into a DTensor
+        # (out_src_shardings on the heads axis). The CP collectives below run on
+        # plain local tensors -- alltoall_base_ has no DTensor sharding strategy --
+        # so strip it here the same way this forward already strips its inputs.
+        # Before the declarative migration the kernel returned a local tensor and
+        # there was nothing to strip.
+        attn_BTGV = _to_local_if_dtensor(attn_BTGV)
         out_src_dim, out_dst_dim = ULYSSES.out_dims()
         attn_BLHV = _cp_all_to_all_headseq(
             attn_BTGV.contiguous(), cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
