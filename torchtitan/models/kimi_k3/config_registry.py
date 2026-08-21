@@ -91,6 +91,11 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
         ),
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+            # GrainDataLoader shuffles by default and the loader it replaced did
+            # not. Leaving the default in reorders samples run to run, which moved
+            # every text cell in the gate -- loss in the fourth digit, grad_norm
+            # from 3.25 to 3.40 -- and would have read as a merge regression.
+            shuffle=False,
         ),
         checkpoint=CheckpointManager.Config(
             enable=True,
@@ -363,6 +368,11 @@ def _kimi_mm_dataloader(
     )
     return GrainDataLoader.Config(
         dataset=_replace(base, processor=processor),
+        # Off, unlike upstream's multimodal flavors. The gate compares numbers
+        # across runs, so sample order has to be fixed; the loader it replaced did
+        # not shuffle either. Upstream's own flavors leave the default on because
+        # their criterion is convergence, not bit-identity.
+        shuffle=False,
         collator=MultiModalCollator.Config(
             patch_size=patch_size,
             temporal_patch_size=1,
@@ -1691,6 +1701,7 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+            shuffle=False,
         ),
         checkpoint=CheckpointManager.Config(interval=100),
         activation_checkpoint=None,
