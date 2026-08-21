@@ -180,7 +180,7 @@ def parallelize_kimi_k3(
         # After the driver, because the driver is what carries the ep mesh down. Only
         # where there was a plan: apply_ep_kimi_k3 already refuses a model that has MoE
         # layers but yields none, so a None here means this rank has no MoE at all.
-        verify_ep_applied(ep_expected)
+        verify_ep_applied(ep_expected, parallelism.spmd_backend, parallel_dims.ep)
     if parallel_dims.tp_enabled:
         _sweep_remaining_to_replicate(
             model,
@@ -1266,13 +1266,24 @@ def apply_ep_kimi_k3(model: nn.Module, parallel_dims) -> None:
     return expected
 
 
-def verify_ep_applied(expected) -> None:
+def verify_ep_applied(expected, spmd_backend: str, ep_degree: int) -> None:
     """Assert the routed experts actually landed on the ep mesh.
 
     Called after the declarative driver, because that is what wires them. Without this
     the only signal was a log line, and a log line is what hid the attribute-name bug for
     as long as it did: EP not being applied looks exactly like EP being applied, from the
     loss.
+
+    The evidence differs by backend but the question does not. Under partial_dtensor a
+    sharded expert weight is a DTensor with a non-replicate placement. Under spmd_types
+    it stays a LOCAL tensor -- so that test reports "no routed-expert parameter is
+    sharded" on a correctly wired model. There the equivalent evidence is the local
+    shape: EP splits the expert dimension, so dim 0 must have shrunk by ep_degree.
+
+    Args:
+        expected: (layer_idx, moe) pairs that should have been wired.
+        spmd_backend: selects which evidence counts as sharded.
+        ep_degree: expected divisor of the expert dimension under spmd_types.
     """
     for layer_idx, moe in expected:
         experts = getattr(getattr(moe, "routed_experts", None), "inner_experts", None)
@@ -1280,11 +1291,18 @@ def verify_ep_applied(expected) -> None:
             raise ValueError(
                 f"layer {layer_idx}: MoE has no routed_experts.inner_experts"
             )
+        num_experts = getattr(experts, "num_experts", None)
+
+        def _is_sharded(prm) -> bool:
+            if isinstance(prm, DTensor):
+                return any(not pl.is_replicate() for pl in prm.placements)
+            if spmd_backend != "spmd_types" or ep_degree <= 1:
+                return False
+            # Local shard: the expert dim was split, so it is no longer num_experts.
+            return num_experts is not None and prm.shape[0] == num_experts // ep_degree
+
         sharded = [
-            n
-            for n, prm in experts.named_parameters(recurse=False)
-            if isinstance(prm, DTensor)
-            and any(not pl.is_replicate() for pl in prm.placements)
+            n for n, prm in experts.named_parameters(recurse=False) if _is_sharded(prm)
         ]
         if not sharded:
             raise ValueError(

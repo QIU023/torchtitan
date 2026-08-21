@@ -197,6 +197,35 @@ class TestParamDistributionVerifier(unittest.TestCase):
         )
         verify_params_distributed(model, "partial_dtensor")  # must not raise
 
+    def test_ep_verifier_accepts_a_local_shard_under_spmd_types(self):
+        """The evidence differs by backend; the question it answers must not.
+
+        Under partial_dtensor a sharded expert weight is a DTensor with a
+        non-replicate placement. Under spmd_types it stays local, so that test
+        reports "no routed-expert parameter is sharded" on a correctly wired
+        model. The local shape is the equivalent evidence: EP splits the expert
+        dimension, so dim 0 shrinks by ep_degree.
+        """
+        from torchtitan.models.kimi_k3.parallelize import verify_ep_applied
+
+        class _Experts(torch.nn.Module):
+            def __init__(self, dim0):
+                super().__init__()
+                self.num_experts = 8
+                self.w1_EFD = torch.nn.Parameter(torch.zeros(dim0, 2, 2))
+
+        class _MoE(torch.nn.Module):
+            def __init__(self, dim0):
+                super().__init__()
+                self.routed_experts = torch.nn.Module()
+                self.routed_experts.inner_experts = _Experts(dim0)
+
+        # 8 experts split by ep=2 -> local dim 0 is 4: wired.
+        verify_ep_applied([(0, _MoE(4))], "spmd_types", 2)
+        # Still 8 locally: EP did not happen, and that must still be caught.
+        with self.assertRaises(ValueError):
+            verify_ep_applied([(0, _MoE(8))], "spmd_types", 2)
+
     def test_spmd_types_still_rejects_an_untyped_local_parameter(self):
         """The criterion changes with the backend; the protection must not.
 
@@ -230,14 +259,14 @@ class TestEpVerifierOnAnEmptyPlan(unittest.TestCase):
     def test_an_empty_plan_verifies_vacuously(self):
         from torchtitan.models.kimi_k3.parallelize import verify_ep_applied
 
-        verify_ep_applied([])  # must not raise
+        verify_ep_applied([], "partial_dtensor", 1)  # must not raise
 
     def test_a_layer_whose_experts_are_missing_is_reported(self):
         from torchtitan.models.kimi_k3.parallelize import verify_ep_applied
 
         moe = torch.nn.Module()  # no routed_experts at all
         with self.assertRaises(ValueError) as ctx:
-            verify_ep_applied([(3, moe)])
+            verify_ep_applied([(3, moe)], "partial_dtensor", 1)
         self.assertIn("layer 3", str(ctx.exception))
 
 
