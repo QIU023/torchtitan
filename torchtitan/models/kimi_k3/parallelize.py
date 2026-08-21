@@ -903,39 +903,8 @@ def apply_tp_kimi_k3(
 
     model = getattr(model, "language_model", model)
 
-    parallelize_module(
-        model,
-        tp_mesh,
-        {
-            # embed_tokens has NO entry: torchtitan's Embedding runs
-            # vocab-parallel in its own forward once parallelize() sets
-            # tp_group, and produces an ordinary tensor. RowwiseParallel made
-            # DTensor do the split instead, whose MaskPartial cannot be
-            # redistributed against the P(sum) the declared AttnRes projections
-            # produce. Every upstream model relies on the module, not the style.
-            "norm": no_par_local,
-            # Shard(-1), not Replicate: core's cross-entropy has a
-            # vocab-parallel path for exactly this placement
-            # (_LossParallelCrossEntropy), and gathering back to Replicate meant
-            # the loss saw a DTensor it had no branch for once the residual
-            # stream stopped being unwrapped. This is also what upstream's models
-            # do -- their lm_head output is vocab-parallel.
-            "lm_head": ColwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Shard(-1),
-                use_local_output=False,
-            ),
-        },
-    )
-
-    # Only the NORM stays imperative. Declaring both fails with
-    # "aten.mul.Tensor got mixed" -- the norm is CALLED as a module, so a declared
-    # weight meets the plain residual stream inside rms_norm, and the declarative
-    # vocabulary has no output-side to_local. The proj's weight is read directly at
-    # the use site in block_attn_res, which already unwraps a DTensor, so it does
-    # not need the plan.
-    if getattr(model, "output_res_norm", None) is not None:
-        parallelize_module(model, tp_mesh, {"output_res_norm": no_par_local})
+    # The three root-level modules -- embed_tokens, norm, lm_head -- are declared
+    # on their configs, matching upstream's set_decoder_sharding_config.
 
     # MLA inner_attention: the ONE place use_local_output=True survives the
     # residual-stream flip. q/k/v arrive head-sharded and SDPA has no DTensor
@@ -1085,14 +1054,19 @@ def apply_tp_kimi_k3(
 
         # AttnRes per-layer modules: each layer has TWO pseudo-queries
         # + TWO RMSNorms, all NoParallel.
-        # The two per-layer pseudo-queries move to their declarations; the two
-        # NORMS stay imperative. Measured, twice: proj.weight is read directly
-        # inside block_attn_res, which already unwraps a DTensor, so a declared
-        # Replicate is fine there. A norm is CALLED as a module, so a declared
-        # weight meets the plain residual stream inside rms_norm and every tp>1
-        # cell dies with "aten.mul.Tensor got mixed". The declarative vocabulary
-        # has no output-side to_local, which is what use_local_output=False does
-        # here, so the norms cannot move until the whole stream is DTensor.
+        # The two pseudo-queries are declared; the two NORMS stay imperative,
+        # and the reason is not the one an earlier comment here gave (it said
+        # the declarative vocabulary had no output-side to_local). What it
+        # actually is, measured on dp2/tp2/cp2 by printing the placements at
+        # the block_attn_res_tensor call site: the block stream reaching these
+        # norms is Partial(sum) on the tp axis in 20 of the 21 layers and
+        # Replicate in the remaining one. NoParallel redistributes whatever it
+        # gets to Replicate, and that all-reduce is load-bearing -- softmax of
+        # a partial sum is not the partial sum of the softmaxes. A
+        # ShardingConfig names ONE out_src, so it can serve either group but
+        # not both. Making the stream uniform is a model change, not a
+        # declaration change. output_res_norm is uniformly Partial, so it did
+        # move (see _attn_res_norm_sharding).
         for name in ("attention_res_norm", "ffn_res_norm"):
             if hasattr(layer, name) and getattr(layer, name) is not None:
                 plan[name] = no_par_local

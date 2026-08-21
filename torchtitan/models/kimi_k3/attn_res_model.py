@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate
 
+from torchtitan.models.common.decoder_sharding import pre_lm_head_norm_config
+
 from torchtitan.models.common.embedding import Embedding as _TTEmbedding
 from torchtitan.models.kimi_k3.attn_res import (
     AttnResProjection,
@@ -30,6 +32,8 @@ from torchtitan.models.kimi_k3.attn_res import (
     unstack_blocks,
 )
 from torchtitan.models.kimi_k3.model import (
+    _attn_res_norm_sharding,
+    _lm_head_sharding,
     _tp_replicate,
     _tp_shard,
     _vocab_parallel_embedding,
@@ -117,6 +121,8 @@ class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
         d = config.hidden_size
 
         def _norm() -> "RMSNorm.Config":
+            # State only. The activation boundary these need stays in the
+            # imperative plan -- see the NoParallel entry in apply_tp_kimi_k3.
             return RMSNorm.Config(
                 normalized_shape=d,
                 eps=config.rms_norm_eps,
@@ -539,19 +545,18 @@ class KimiK3AttnResModel(KimiK3Model):
         self.norm = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
-            sharding_config=_tp_replicate(),
+            sharding_config=pre_lm_head_norm_config(enable_sp=False),
         ).build()
-        # _tp_shard(0), not the embedding's config: they shard the same axis but
-        # lm_head is an ordinary Linear, and the embedding's declaration carries a
-        # local_map plus input/output placements that exist for the vocab-parallel
-        # forward. Applying them here wraps Linear.forward in local_map, which hands
-        # it a local input against a DTensor weight -- "aten.mm.default got mixed",
-        # on every multimodal TP cell.
+        # Not the embedding's config: they shard the same axis, but the embedding
+        # declaration carries a local_map that exists for the vocab-parallel forward,
+        # and wrapping Linear.forward in it hands a local input to a DTensor weight
+        # ("aten.mm.default got mixed", on every multimodal TP cell). _lm_head_sharding
+        # declares the placements without the local_map.
         self.lm_head = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.vocab_size,
             bias=False,
-            sharding_config=_tp_shard(0),
+            sharding_config=_lm_head_sharding(),
         ).build()
 
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm
@@ -567,7 +572,7 @@ class KimiK3AttnResModel(KimiK3Model):
         self.output_res_norm = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
-            sharding_config=_tp_replicate(),
+            sharding_config=_attn_res_norm_sharding(),
         ).build()
         if gated:
             self.output_res_alpha = nn.Parameter(torch.zeros(1))

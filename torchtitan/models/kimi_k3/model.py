@@ -55,6 +55,7 @@ from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
     norm_config,
+    pre_lm_head_norm_config,
     rowwise_config,
     set_gqa_inner_attention_local_map,
 )
@@ -93,6 +94,44 @@ def _vocab_parallel_embedding() -> ShardingConfig:
         out_src_shardings=dense_activation_placement(tp=spmd.P),
         out_dst_shardings=dense_activation_placement(tp=spmd.R),
         local_map=LocalMapConfig(in_grad_placements=None),
+    )
+
+
+def _lm_head_sharding() -> ShardingConfig:
+    """Vocab-parallel lm_head: weight S(0), input replicated, output S(-1).
+
+    Shard(-1) rather than Replicate on the output because core's cross-entropy has
+    a vocab-parallel path for exactly that placement (``_LossParallelCrossEntropy``).
+    This is upstream's ``set_decoder_sharding_config`` entry verbatim, and it is what
+    the ``ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1))`` plan
+    entry it replaces already did.
+    """
+    replicated = dense_activation_placement(tp=spmd.R)
+    vocab_sharded = dense_activation_placement(tp=spmd.S(-1))
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
+        in_src_shardings={"input": replicated},
+        in_dst_shardings={"input": replicated},
+        out_src_shardings=vocab_sharded,
+        out_dst_shardings=vocab_sharded,
+    )
+
+
+def _attn_res_norm_sharding() -> ShardingConfig:
+    """The AttnRes key norms: weight replicated, output summed across tp.
+
+    These are not pre-lm_head norms despite two of them being named for the tail.
+    block_attn_res calls them on the block stream to build the aggregation keys,
+    and that stream arrives Partial(sum) on the tp axis because the rowwise
+    projections feeding it declare P. The sum has to happen before the keys are
+    used, which is precisely what the NoParallel plan entry this replaces did on
+    its output side (input_layout == desired_input_layout, so its input half was
+    always a no-op).
+    """
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.R)},
+        out_src_shardings=dense_activation_placement(tp=spmd.P),
+        out_dst_shardings=dense_activation_placement(tp=spmd.R),
     )
 
 
@@ -2247,6 +2286,7 @@ class KimiK3Model(Module):
             tok_embeddings=Embedding.Config(
                 num_embeddings=config.vocab_size,
                 embedding_dim=config.hidden_size,
+                sharding_config=_vocab_parallel_embedding(),
             ),
             layers=[
                 KimiDecoderLayer.make_config(config, i)
@@ -2255,13 +2295,13 @@ class KimiK3Model(Module):
             norm=RMSNorm.Config(
                 normalized_shape=config.hidden_size,
                 eps=config.rms_norm_eps,
-                sharding_config=_tp_replicate(),
+                sharding_config=pre_lm_head_norm_config(enable_sp=False),
             ),
             lm_head=Linear.Config(
                 in_features=config.hidden_size,
                 out_features=config.vocab_size,
                 bias=False,
-                sharding_config=_tp_shard(0),
+                sharding_config=_lm_head_sharding(),
             ),
         )
 
