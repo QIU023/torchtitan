@@ -51,8 +51,12 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.models.common.decoder_sharding import (
+    colwise_config,
     dense_activation_placement,
     dense_param_placement,
+    norm_config,
+    rowwise_config,
+    set_gqa_inner_attention_local_map,
 )
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
@@ -642,17 +646,19 @@ class KimiMLAAttention(Module):
             kv_b_proj=_lin(
                 config.kv_lora_rank,
                 heads * (config.qk_nope_head_dim + config.v_head_dim),
-                sharding=_tp_shard(0),
+                sharding=colwise_config(),
             ),
             o_proj=_lin(
                 heads * config.v_head_dim,
                 config.hidden_size,
-                sharding=_tp_shard(1),
+                sharding=rowwise_config(),
             ),
         )
         if config.q_lora_rank is None:
             # 48B-A3B path: Q straight to H * q_head_dim.
-            cfg.q_proj = _lin(config.hidden_size, heads * q_head_dim)
+            cfg.q_proj = _lin(
+                config.hidden_size, heads * q_head_dim, sharding=colwise_config()
+            )
         else:
             # K3 path (official config: q_lora_rank=1536). Same shape as DSv3's
             # wq_a/wq_b pair: the compression stays replicated because its output
@@ -666,7 +672,7 @@ class KimiMLAAttention(Module):
                 sharding_config=_tp_replicate(),
             )
             cfg.q_b_proj = _lin(
-                config.q_lora_rank, heads * q_head_dim, sharding=_tp_shard(0)
+                config.q_lora_rank, heads * q_head_dim, sharding=colwise_config()
             )
         if config.mla_gated:
             # Gated MLA, report Eq. 7. full_rank gates per (head, v_head_dim);
@@ -676,12 +682,22 @@ class KimiMLAAttention(Module):
                 cfg.attn_gate_proj = _lin(
                     config.hidden_size,
                     heads * config.v_head_dim,
-                    sharding=_tp_shard(0),
+                    sharding=colwise_config(),
                 )
             else:
                 cfg.attn_gate_proj = _lin(
-                    config.hidden_size, heads, bias=True, sharding=_tp_shard(0)
+                    config.hidden_size, heads, bias=True, sharding=colwise_config()
                 )
+        # The attention boundary and the SDPA local_map, following
+        # deepseek_v3/sharding.py -- its MLA has the same shape as ours, down to the
+        # q_lora_rank branch, and it declares all of this rather than carrying a
+        # plan. x is gathered to Replicate on entry; q/k/v reach the kernel as local
+        # tensors through the local_map, which is what PrepareModuleInput used to do.
+        cfg.sharding_config = ShardingConfig(
+            in_src_shardings={"x": dense_activation_placement(tp=spmd.R)},
+            in_dst_shardings={"x": dense_activation_placement(tp=spmd.R)},
+        )
+        set_gqa_inner_attention_local_map(cfg.inner_attention)
         return cfg
 
     def __init__(self, config: "KimiMLAAttention.Config") -> None:
@@ -2086,10 +2102,15 @@ class KimiDecoderLayer(Module, UpstreamFSDPNames):
         """The one place this class reads the flat config."""
 
         def _norm() -> "RMSNorm.Config":
+            # norm_config, not _tp_replicate: the layer norms sit on the activation
+            # path, so they need the boundary as well as the weight. deepseek_v3
+            # declares attention_norm and ffn_norm this way. The low-rank projections
+            # inside MLA keep the weight-only form, which is what dsv3 calls
+            # replicate_weight -- they are not on a TP boundary.
             return RMSNorm.Config(
                 normalized_shape=config.hidden_size,
                 eps=config.rms_norm_eps,
-                sharding_config=_tp_replicate(),
+                sharding_config=norm_config(enable_sp=False),
             )
 
         cfg = KimiDecoderLayer.Config(

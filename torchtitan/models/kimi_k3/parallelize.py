@@ -960,10 +960,9 @@ def apply_tp_kimi_k3(
         # naturally; downstream KDA strips DTensor at entry via
         # _to_local_if_dtensor; downstream dense MLP's prepare_input
         # accepts both. Plain NoParallel is the most natural choice.
-        plan: dict[str, object] = {
-            "input_layernorm": NoParallel(),
-            "post_attention_layernorm": NoParallel(),
-        }
+        # The two layer norms are declarative now (norm_config in
+        # KimiDecoderLayer.make_config), so they are not in the plan.
+        plan: dict[str, object] = {}
 
         if is_kda:
             # KDA takes its own declaration now. It used to fail with
@@ -992,54 +991,11 @@ def apply_tp_kimi_k3(
             # The pair registers exactly like the KV pair below -- the
             # compression stays replicated (its output is q_lora_rank, not a
             # head-sharded axis) and only the expansion is Colwise.
-            if getattr(layer.attention, "q_lora_rank", None) is None:
-                q_plan = {
-                    "attention.q_proj": ColwiseParallel(
-                        use_local_output=False,
-                    ),
-                }
-            else:
-                q_plan = {
-                    "attention.q_a_proj": NoParallel(),
-                    "attention.q_a_layernorm": NoParallel(),
-                    "attention.q_b_proj": ColwiseParallel(
-                        use_local_output=False,
-                    ),
-                }
-            plan.update(
-                {
-                    **q_plan,
-                    # NoParallel (no local_output_grad_placements): output
-                    # stays as a DTensor(Replicate) so the downstream
-                    # split into [kv_lora, qk_rope] halves and the
-                    # subsequent kv_a_layernorm + cat with k_pass_expanded
-                    # all run consistently in DTensor space (mirrors DSv3's
-                    # ``wkv_a`` registration).
-                    "attention.kv_a_proj_with_mqa": NoParallel(),
-                    "attention.kv_a_layernorm": NoParallel(),
-                    "attention.kv_b_proj": ColwiseParallel(
-                        use_local_output=False,
-                    ),
-                    "attention.inner_attention": inner_attn_plan,
-                    "attention.o_proj": RowwiseParallel(
-                        output_layouts=Replicate(),
-                        use_local_output=False,
-                    ),
-                }
-            )
-            # Gated MLA (k3faithful flavors): per-head gate projection,
-            # out_features = num_heads -> shard on the head axis like
-            # q_proj so the local gate matches the local attn heads in
-            # both the TP-only and the CP+TP forward. Without this the
-            # plain-tensor gate param meets DTensor x (mixed-op crash).
-            # Both gate parameterizations shard on the head axis: the
-            # per-head variant is [num_heads] and K3's full-rank variant is
-            # [num_heads * v_head_dim], so Colwise keeps the local gate width
-            # matched to the local attention output in both cases.
-            if getattr(layer.attention, "attn_gate_proj", None) is not None:
-                plan["attention.attn_gate_proj"] = ColwiseParallel(
-                    use_local_output=False,
-                )
+            # MLA is declarative now -- every projection, the attention boundary and
+            # the inner_attention local_map are declared in KimiMLAAttention.make_config,
+            # following deepseek_v3/sharding.py. Keeping plan entries here as well would
+            # apply each boundary twice.
+            pass
 
         # FFN path.
         if not is_moe:
