@@ -66,7 +66,7 @@ from torchtitan.models.kimi_k3.sharding import (
     ULYSSES,
 )
 from torchtitan.protocols.module import Module
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 
 def _vocab_parallel_embedding() -> ShardingConfig:
@@ -81,10 +81,14 @@ def _vocab_parallel_embedding() -> ShardingConfig:
     Upstream declares tok_embeddings exactly this way. Declaring only the weight leaves
     every rank holding its own slice's contribution with nothing summing them.
     """
+    embed_input = dense_activation_placement(tp=spmd.R)
     return ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
+        in_src_shardings={"input": embed_input},
+        in_dst_shardings={"input": embed_input},
         out_src_shardings=dense_activation_placement(tp=spmd.P),
         out_dst_shardings=dense_activation_placement(tp=spmd.R),
+        local_map=LocalMapConfig(in_grad_placements=None),
     )
 
 
