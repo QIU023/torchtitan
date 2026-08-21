@@ -32,6 +32,7 @@ from torchtitan.models.kimi_k3.attn_res import (
 from torchtitan.models.kimi_k3.model import (
     _tp_replicate,
     _tp_shard,
+    _vocab_parallel_embedding,
     KimiDecoderLayer,
     KimiK3Config,
     KimiK3Model,
@@ -497,8 +498,19 @@ class KimiK3AttnResModel(KimiK3Model):
         # now-declared AttnRes projections inside block_attn_res_tensor, and
         # DTensor has no conversion between two partial types. Every upstream
         # model uses this class for exactly this reason.
+        # Vocab-sharded on tp, which is a correctness requirement rather than a
+        # throughput choice: Embedding.forward takes its vocab-parallel branch
+        # whenever a tp group exists, and that branch indexes the weight with
+        # ``input - rank * ceil(vocab / tp)`` assuming the rows it holds ARE that
+        # chunk. Without this declaration the weight stayed whole (2016 rows for a
+        # chunk size of 1008), so rank 1 subtracted an offset and read the wrong
+        # rows -- gradients landed on the wrong entries and summed, inflating this
+        # parameter's grad-norm contribution 195x and the model's 5.6x. Upstream
+        # declares tok_embeddings with tp=S(0) for the same reason.
         self.embed_tokens = _TTEmbedding.Config(
-            num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            sharding_config=_vocab_parallel_embedding(),
         ).build()
         # ModuleDict for pipeline_module_split compatibility — see
         # KimiK3Model.__init__ for the same pattern.
@@ -533,7 +545,7 @@ class KimiK3AttnResModel(KimiK3Model):
             in_features=config.hidden_size,
             out_features=config.vocab_size,
             bias=False,
-            sharding_config=_tp_shard(0),
+            sharding_config=_vocab_parallel_embedding(),
         ).build()
 
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm

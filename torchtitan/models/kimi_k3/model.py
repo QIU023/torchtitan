@@ -50,7 +50,10 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from torchtitan.models.common.attention import ScaledDotProductAttention
-from torchtitan.models.common.decoder_sharding import dense_param_placement
+from torchtitan.models.common.decoder_sharding import (
+    dense_activation_placement,
+    dense_param_placement,
+)
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
 
@@ -64,6 +67,25 @@ from torchtitan.models.kimi_k3.sharding import (
 )
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
+
+
+def _vocab_parallel_embedding() -> ShardingConfig:
+    """Vocab-sharded embedding: weight S(0) on tp, output Partial on tp.
+
+    Both halves are required and neither is optional. Embedding.forward takes its
+    vocab-parallel branch whenever a tp group exists; that branch indexes the weight
+    with ``input - rank * ceil(vocab / tp)``, so the rows it holds must BE that chunk
+    (the S(0) half), and it zeroes ids outside its range, so the per-rank results are
+    partial sums that something has to add up (the P half).
+
+    Upstream declares tok_embeddings exactly this way. Declaring only the weight leaves
+    every rank holding its own slice's contribution with nothing summing them.
+    """
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
+        out_src_shardings=dense_activation_placement(tp=spmd.P),
+        out_dst_shardings=dense_activation_placement(tp=spmd.R),
+    )
 
 
 def _tp_shard(dim: int) -> ShardingConfig:
