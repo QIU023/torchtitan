@@ -788,11 +788,18 @@ class KimiMLAAttention(Module):
         B, T, _ = x.shape
 
         # Q path: direct projection -> (B, T, H, q_head_dim) -> (B, H, T, q_head_dim)
-        q = (
-            self._project_q(x)
-            .view(B, T, self.num_heads, self.q_head_dim)
-            .transpose(1, 2)
-        )
+        #
+        # H is DERIVED from the projection, not read off self.num_heads, because the
+        # two differ under TP: the projection is column-parallel, so each rank
+        # produces num_heads/tp of them. Under partial_dtensor its output is a
+        # DTensor whose view() sees the global shape and the distinction never
+        # surfaced; under spmd_types the output is a local tensor and the global
+        # count fails with "shape [1, 4096, 4, 192] is invalid for input of size
+        # 1572864" -- exactly half. Deriving works either way and needs no branch
+        # on the backend.
+        q_proj_out = self._project_q(x)
+        h_local = q_proj_out.shape[-1] // self.q_head_dim
+        q = q_proj_out.view(B, T, h_local, self.q_head_dim).transpose(1, 2)
         q_pass, q_rot = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
@@ -807,7 +814,7 @@ class KimiMLAAttention(Module):
         #   kv_b_proj: (kv_lora_rank) -> (num_heads * (qk_nope_head_dim + v_head_dim))
         kv_expanded = self.kv_b_proj(self.kv_a_layernorm(k_pass))
         kv_expanded = kv_expanded.view(
-            B, T, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            B, T, h_local, self.qk_nope_head_dim + self.v_head_dim
         ).transpose(1, 2)
         k_pass_expanded, v = torch.split(
             kv_expanded, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -815,7 +822,7 @@ class KimiMLAAttention(Module):
 
         # k_rot is broadcast across heads: (B, T, qk_rope_head_dim) -> (B, H, T, qk_rope)
         k_rot = k_rot.view(B, 1, T, self.qk_rope_head_dim).expand(
-            B, self.num_heads, T, self.qk_rope_head_dim
+            B, h_local, T, self.qk_rope_head_dim
         )
 
         # Concat nope + rot halves (NO RoPE application under mla_use_nope)
