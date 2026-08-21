@@ -148,11 +148,27 @@ def declare_norm_sharding(model, *, enable_sp: bool) -> int:
     from torchtitan.models.common.nn_modules import RMSNorm
 
     count = 0
+    already = 0
     for module in model.modules():
         if not isinstance(module, RMSNorm):
             continue
         if getattr(module, "_sharding_config", None) is not None:
             continue
+        # A module already marked parallelized will never be revisited, so a
+        # declaration attached now can only be dead weight. Counted rather than
+        # assumed: "declared N" and "N of them will be acted on" are different
+        # numbers, and the parameter table cannot tell them apart.
+        if getattr(module, "_parallelized", False):
+            already += 1
         module._sharding_config = norm_config(enable_sp=enable_sp)
         count += 1
+    if already:
+        from torchtitan.tools.logging import logger
+
+        logger.warning(
+            "declare_norm_sharding: %d of %d norms were already parallelized; "
+            "their declarations will not be applied.",
+            already,
+            count,
+        )
     return count
