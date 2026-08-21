@@ -180,7 +180,7 @@ class TestParamDistributionVerifier(unittest.TestCase):
 
         model = torch.nn.Sequential(torch.nn.Linear(4, 4))
         with self.assertRaises(ValueError) as ctx:
-            verify_params_distributed(model)
+            verify_params_distributed(model, "partial_dtensor")
         # The point of the check is that the message points at the parameter.
         self.assertIn("0.weight", str(ctx.exception))
         self.assertIn("plain Tensor", str(ctx.exception))
@@ -195,12 +195,27 @@ class TestParamDistributionVerifier(unittest.TestCase):
         model.weight = torch.nn.Parameter(
             distribute_tensor(model.weight.data, mesh, [Replicate()])
         )
-        verify_params_distributed(model)  # must not raise
+        verify_params_distributed(model, "partial_dtensor")  # must not raise
+
+    def test_spmd_types_still_rejects_an_untyped_local_parameter(self):
+        """The criterion changes with the backend; the protection must not.
+
+        Under spmd_types a parameter is meant to stay a local tensor carrying an spmd
+        type, so demanding DTensor there rejects the intended state. What must still
+        fail is a local tensor with NO annotation -- that reaches clip_grad_norm_ as a
+        plain one exactly as before.
+        """
+        from torchtitan.models.kimi_k3.parallelize import verify_params_distributed
+
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        with self.assertRaises(ValueError) as ctx:
+            verify_params_distributed(model, "spmd_types")
+        self.assertIn("0.weight", str(ctx.exception))
 
     def test_a_model_with_no_parameters_is_not_a_failure(self):
         from torchtitan.models.kimi_k3.parallelize import verify_params_distributed
 
-        verify_params_distributed(torch.nn.Identity())
+        verify_params_distributed(torch.nn.Identity(), "partial_dtensor")
 
 
 class TestEpVerifierOnAnEmptyPlan(unittest.TestCase):

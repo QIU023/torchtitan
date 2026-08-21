@@ -214,3 +214,37 @@ def annotate_untyped_params(model, parallel_dims) -> int:
                 spmd.assert_type(param, layout.axis_types, layout.partition_spec)
                 count += 1
     return count
+
+
+def drop_declarations_on_distributed(model) -> int:
+    """Remove declarations from modules the imperative plan already distributed.
+
+    Returns how many were dropped.
+
+    ``_drive_declarative_sharding`` already refuses to enter a subtree whose root the
+    imperative plan covered, so that the driver activates exactly the declarations the
+    plan does NOT. But that guard only holds at the subtree root: once
+    ``Module.parallelize()`` is called it recurses through everything below without it,
+    and under spmd_types the first TP-distributed weight it reaches raises
+    ``assert_type() does not support DTensor``. Under partial_dtensor the same recursion
+    is harmless, because ``_distribute_states`` has a branch that merely verifies an
+    existing DTensor's placements.
+
+    So the policy the driver implements per subtree is applied here per module. Dropping
+    the declaration costs those parameters nothing: they are DTensors, and FSDP accepts a
+    DTensor directly -- it is the LOCAL tensors that need an spmd type annotation.
+
+    Temporary in the same sense as the driver's guard: both exist because the imperative
+    TP plan and the declarations are live at once, and both go away when TP becomes
+    declarative.
+    """
+    from torch.distributed.tensor import DTensor
+
+    dropped = 0
+    for module in model.modules():
+        if getattr(module, "_sharding_config", None) is None:
+            continue
+        if any(isinstance(p, DTensor) for p in module.parameters(recurse=False)):
+            module._sharding_config = None
+            dropped += 1
+    return dropped

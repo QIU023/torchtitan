@@ -159,6 +159,15 @@ def parallelize_kimi_k3(
             model, enable_sp=parallelism.enable_sequence_parallel
         )
         logger.info("spmd_types: declared sharding for %d norm(s).", n_norm)
+    if parallelism.spmd_backend == "spmd_types":
+        from torchtitan.models.kimi_k3.sharding import drop_declarations_on_distributed
+
+        n_dropped = drop_declarations_on_distributed(model)
+        if n_dropped:
+            logger.info(
+                "spmd_types: dropped %d declaration(s) on TP-distributed modules.",
+                n_dropped,
+            )
     entered = _drive_declarative_sharding(model, parallel_dims)
     if parallelism.spmd_backend == "spmd_types":
         # Whatever the driver could not reach. See annotate_untyped_params: fla's
@@ -180,7 +189,7 @@ def parallelize_kimi_k3(
         )
         # The sweep is the last thing that distributes parameters, so this is the
         # point where "all of them" is a checkable statement.
-        verify_params_distributed(model)
+        verify_params_distributed(model, parallelism.spmd_backend)
     if entered:
         from collections import Counter
 
@@ -1286,8 +1295,8 @@ def verify_ep_applied(expected) -> None:
             )
 
 
-def verify_params_distributed(model: nn.Module) -> None:
-    """Under TP, every parameter must be a DTensor before FSDP wraps the model.
+def verify_params_distributed(model: nn.Module, spmd_backend: str) -> None:
+    """Under TP, every parameter must be distributed before FSDP wraps the model.
 
     Three mechanisms distribute parameters here -- the imperative TP plan, the
     declarative driver, and the leftover sweep -- and each can believe another handled
@@ -1296,13 +1305,35 @@ def verify_params_distributed(model: nn.Module) -> None:
     names neither the parameter nor the mechanism. That has happened, with the A_log
     and dt_bias of nine KDA layers -- eighteen plain gradients at clip time.
 
-    Only DTensor-ness is asserted, not the mesh. The parameters legitimately live on
-    more than one mesh (routed experts on the ep mesh, everything else on tp), so a
-    mesh whitelist here would encode the very layout the sweep exists to arrange and
-    would start rejecting valid ones. The mesh histogram is logged instead, where a
-    surprise is visible without being fatal.
+    What counts as distributed depends on the backend, and getting this wrong in either
+    direction is bad: under partial_dtensor it is DTensor-ness, but under spmd_types a
+    parameter is meant to stay a LOCAL tensor carrying an spmd type annotation, and
+    demanding DTensor there rejects the intended state (it did -- 80 parameters, all
+    correctly annotated). Asserting the annotation instead keeps the protection: an
+    untyped local tensor still reaches clip_grad_norm_ as a plain one.
+
+    Neither branch asserts the mesh. The parameters legitimately live on more than one
+    mesh (routed experts on the ep mesh, everything else on tp), so a mesh whitelist here
+    would encode the very layout the sweep exists to arrange and would start rejecting
+    valid ones. The mesh histogram is logged instead, where a surprise is visible without
+    being fatal.
+
+    Args:
+        model: the model after TP wiring, before FSDP.
+        spmd_backend: ``parallelism.spmd_backend``, which selects the criterion.
     """
-    plain = [n for n, p in model.named_parameters() if not isinstance(p, DTensor)]
+    if spmd_backend == "spmd_types":
+        from spmd_types.runtime import has_local_type
+
+        def _distributed(p) -> bool:
+            return isinstance(p, DTensor) or has_local_type(p)
+
+    else:
+
+        def _distributed(p) -> bool:
+            return isinstance(p, DTensor)
+
+    plain = [n for n, p in model.named_parameters() if not _distributed(p)]
     if plain:
         raise ValueError(
             f"{len(plain)} parameter(s) are still plain Tensors after TP wiring, so "
@@ -1314,7 +1345,10 @@ def verify_params_distributed(model: nn.Module) -> None:
     from collections import Counter
 
     meshes = Counter(
-        str(p.device_mesh.mesh_dim_names) for _, p in model.named_parameters()
+        str(p.device_mesh.mesh_dim_names)
+        if isinstance(p, DTensor)
+        else "local+spmd_type"
+        for _, p in model.named_parameters()
     )
     logger.info("Parameter meshes after TP wiring: %s", dict(meshes))
 
