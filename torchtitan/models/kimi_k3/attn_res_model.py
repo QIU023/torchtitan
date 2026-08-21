@@ -541,11 +541,17 @@ class KimiK3AttnResModel(KimiK3Model):
             eps=config.rms_norm_eps,
             sharding_config=_tp_replicate(),
         ).build()
+        # _tp_shard(0), not the embedding's config: they shard the same axis but
+        # lm_head is an ordinary Linear, and the embedding's declaration carries a
+        # local_map plus input/output placements that exist for the vocab-parallel
+        # forward. Applying them here wraps Linear.forward in local_map, which hands
+        # it a local input against a DTensor weight -- "aten.mm.default got mixed",
+        # on every multimodal TP cell.
         self.lm_head = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.vocab_size,
             bias=False,
-            sharding_config=_vocab_parallel_embedding(),
+            sharding_config=_tp_shard(0),
         ).build()
 
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm
