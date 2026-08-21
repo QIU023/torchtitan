@@ -28,11 +28,14 @@ import torch.distributed as dist
 
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.config import ConfigManager, TORCH_DTYPE_MAP
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.graph_trainer.common_utils import (
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.configs import trace_input_preparer_keys
+from torchtitan.experiments.graph_trainer.memory_policy import (
+    validate_memory_policy_config,
+)
 from torchtitan.experiments.graph_trainer.precompile import _FX_TRACE_ARTIFACT_KEY
 from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
@@ -51,6 +54,7 @@ def _common_setup(config):
         )
 
     parallelism = config.parallelism
+    dist_utils.set_spmd_backend(parallelism.spmd_backend)
     dp_replicate = parallelism.data_parallel_replicate_degree
     dp_shard = parallelism.data_parallel_shard_degree
     cp = parallelism.context_parallel_degree
@@ -230,16 +234,20 @@ def _precompile_aot_fx_trace(
         attn_config = model_config.layers[0].attention
         inner_attention = attn_config.inner_attention
 
+        # Match Trainer.post_dataloading_process: dataloader positions are
+        # torch.long contiguous [B, L], and full precompile bakes dtype/stride.
         positions = torch.arange(
-            0, dummy_inputs.shape[1], dtype=torch.int32, device=dummy_inputs.device
-        ).expand(dummy_inputs.shape)
+            0, dummy_inputs.shape[1], dtype=torch.long, device=dummy_inputs.device
+        ).repeat(local_batch_size, 1)
+
+        # Match Trainer.post_dataloading_process insertion order:
+        # dataloader kwargs first, then attention_masks added below.
+        extra_kwargs["positions"] = positions
 
         if isinstance(inner_attention, (FlexAttention.Config, VarlenAttention.Config)):
             extra_kwargs["attention_masks"] = cast(Decoder, model).get_attention_masks(
                 positions=positions,
             )
-
-        extra_kwargs["positions"] = positions
 
     # TODO: Add CP support — call prepare_context_parallel_input here
     # to shard dummy_inputs/dummy_labels/extra_kwargs along the sequence
@@ -350,6 +358,7 @@ def main():
         device,
         tokenizer,
     ) = _common_setup(config)
+    validate_memory_policy_config(compile_config)
 
     _precompile_aot_fx_trace(
         config,

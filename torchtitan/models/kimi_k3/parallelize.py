@@ -41,8 +41,6 @@ from torchtitan.distributed.activation_checkpoint import ActivationCheckpointing
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
-)
-from torchtitan.distributed.full_dtensor import (
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
@@ -291,14 +289,14 @@ def parallelize_kimi_k3(
                     axes.append("cp")
                 return parallel_dims.get_mesh(axes)
 
-        # Under full_dtensor / spmd_types, fully_shard() needs the named storage mesh
+        # Under spmd_types, fully_shard() needs the named storage mesh
         # AND DataParallelMeshDims -- torch's _resolve_spmd_types_for_storage raises
         # without them, so _fsdp_axis alone is not enough on those backends. Upstream
         # computes both in one helper; use it rather than re-deriving the axis names.
         # It returns dp_mesh_dims=None for a size-1 storage mesh on purpose: assert_type
         # filters inactive size-1 axes, so params would carry no annotations for FSDP to
         # translate.
-        if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+        if parallelism.spmd_backend == "spmd_types":
             dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
         elif parallel_dims.dp_replicate_enabled:
             dp_mesh, dp_mesh_dims = _fsdp_axis(["dp_replicate"]), None
@@ -1570,7 +1568,7 @@ def apply_fsdp(
 
     This was a 182-line copy of ``distributed.fsdp.apply_fsdp_to_decoder`` and had
     fallen behind it in five ways -- no ``enable_symm_mem``, no ``dp_mesh_dims``
-    flattening under full_dtensor, no ``edp_mesh_dims``, no ``Shard(1)`` refinement when
+    flattening under spmd_types, no ``edp_mesh_dims``, no ``Shard(1)`` refinement when
     the FSDP degree exceeds the expert count, and no EP prefetch wiring. It also
     nested-wrapped routed experts on ``edp_mesh`` to work around per-param meshes not
     being expressible in ``shard_placement_fn``; the helper now does that properly via

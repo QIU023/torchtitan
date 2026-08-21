@@ -127,14 +127,11 @@ class MoEStateDictAdapter(StateDictAdapter):
         # pyrefly: ignore [bad-argument-type]
         for i, name in enumerate(device_mesh.mesh_dim_names):
             placement = dtensor_placements[i]
-            # Only Shard carries a dim. A mesh axis the tensor is replicated
-            # over (or Partial on) contributes no sharding of dim-i, so it is
-            # skipped rather than probed -- reading .dim off Replicate raises.
-            # This is reachable whenever an expert weight is replicated on some
-            # axis, e.g. the cp axis under context parallelism.
-            if not placement.is_shard():
-                continue
-            if placement.dim == dim:
+            # Only Shard carries a dim: a mesh axis the tensor is replicated over
+            # (or Partial on) shards no dim, and reading .dim off Replicate raises.
+            # Reachable whenever an expert weight is replicated on some axis, e.g.
+            # cp under context parallelism.
+            if isinstance(placement, (Shard, _StridedShard)) and placement.dim == dim:
                 mesh_names.append(name)
                 dim_i_placements.append(placement)
 

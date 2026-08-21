@@ -18,14 +18,15 @@ against earlier history (<= 666cf7ad6).
 """
 
 
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.kimi_k3.model_configs import (  # noqa: F401
     _alternating_kda_mla_layers,
     _BY_NAME,
@@ -88,7 +89,9 @@ def _base_trainer_config(size_name: str) -> Trainer.Config:
             seq_len=8192,  # paper uses 8192 context
             steps=20000,  # placeholder; caller overrides via --training.steps
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+        ),
         checkpoint=CheckpointManager.Config(
             enable=True,
             interval=1000,
@@ -315,6 +318,61 @@ def kimi_linear_447m_aligned_block_attn_res_n4_fp8() -> Trainer.Config:
     return cfg
 
 
+def _kimi_mm_dataloader(
+    *,
+    patch_size: int,
+    spatial_merge_size: int,
+    max_patches: int,
+    max_patches_per_side: int,
+    min_pixels: int,
+    max_pixels: int,
+) -> "GrainDataLoader.Config":
+    """The multimodal loader, with this flavor's vision preprocessing preserved.
+
+    Upstream split MMDataLoader into GrainDataLoader plus a dataset whose processor
+    holds the pixel and patch settings, with patch_order and max_images_per_batch
+    moving to the collator. Every parameter the flavors passed before is still
+    passed -- they land on two objects now, and none was dropped. Dropping one
+    would change the patch count silently, which is the thing these flavors exist
+    to pin.
+
+    Every extent is an argument rather than a default: the two callers do NOT
+    agree (1024 patches at patch_size 14 from the model config, against 256 at a
+    hardcoded 14), and a shared default would have quietly rewritten one of them.
+    """
+    from dataclasses import replace as _replace
+
+    from torchtitan.components.data import GrainDataLoader
+    from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
+    from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS
+    from torchtitan.hf_datasets.multimodal.utils.image import resize_to_patch_budget
+
+    base = MM_DATASETS["cc12m-test"]
+    processor = _replace(
+        base.processor,
+        patch_size=patch_size,
+        temporal_patch_size=1,
+        spatial_merge_size=spatial_merge_size,
+        resize_fn=resize_to_patch_budget,
+        max_patches=max_patches,
+        max_patches_per_side=max_patches_per_side,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+    )
+    return GrainDataLoader.Config(
+        dataset=_replace(base, processor=processor),
+        collator=MultiModalCollator.Config(
+            patch_size=patch_size,
+            temporal_patch_size=1,
+            spatial_merge_size=spatial_merge_size,
+            patch_order="raster",
+            max_images_per_batch=8,
+        ),
+    )
+
+
 def kimi_k3_debugmodel_k3faithful() -> Trainer.Config:
     """Debug flavor with the K3-faithful architecture deltas ON:
     Gated MLA + alpha-graft Block AttnRes. CI-scale proof that the K3
@@ -377,8 +435,6 @@ def kimi_k3_mini_vl() -> Trainer.Config:
     Head count drops to 4 to keep head_dim at 64, matching the released tower.
     """
     from torchtitan.components.tokenizer import MultiModalTokenizer
-    from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
-    from torchtitan.hf_datasets.multimodal.utils.image import resize_to_patch_budget
     from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
 
@@ -428,20 +484,13 @@ def kimi_k3_mini_vl() -> Trainer.Config:
         vision_end_token="<|media_end|>",
         pad_token="[PAD]",
     )
-    cfg.dataloader = MMDataLoader.Config(
-        dataset="cc12m-test",
-        max_images_per_batch=8,
+    cfg.dataloader = _kimi_mm_dataloader(
         patch_size=vision.patch_size,
-        temporal_patch_size=1,
         spatial_merge_size=vision.merge_kernel_size[0],
-        patch_order="raster",
-        resize_fn=resize_to_patch_budget,
         max_patches=1024,
         max_patches_per_side=64,
         min_pixels=65536,
         max_pixels=1048576,
-        image_mean=(0.5, 0.5, 0.5),
-        image_std=(0.5, 0.5, 0.5),
     )
     return cfg
 
@@ -1021,8 +1070,6 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
     import dataclasses as _dc
 
     from torchtitan.components.tokenizer import MultiModalTokenizer
-    from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
-    from torchtitan.hf_datasets.multimodal.utils.image import resize_to_patch_budget
     from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
 
@@ -1071,20 +1118,13 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
     # image budget instead (max_patches 1024 at 64 per side) made the twin
     # architectural only: one image then fills most of the sequence, which is a
     # different data distribution and not the config that PR runs.
-    cfg.dataloader = MMDataLoader.Config(
-        dataset="cc12m-test",
-        max_images_per_batch=8,
+    cfg.dataloader = _kimi_mm_dataloader(
         patch_size=14,
-        temporal_patch_size=1,
         spatial_merge_size=2,
-        patch_order="raster",
-        resize_fn=resize_to_patch_budget,
         max_patches=256,
         max_patches_per_side=16,
         min_pixels=56 * 56,
         max_pixels=224 * 224,
-        image_mean=(0.5, 0.5, 0.5),
-        image_std=(0.5, 0.5, 0.5),
     )
     cfg.optimizer = default_adamw(lr=8e-4)
     cfg.lr_scheduler = LRSchedulersContainer.Config(
@@ -1649,7 +1689,9 @@ def kimi_k3_debugmodel() -> Trainer.Config:
             seq_len=512,
             steps=10,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+        ),
         checkpoint=CheckpointManager.Config(interval=100),
         activation_checkpoint=None,
         # See _base_trainer_config: kimi CP requires contiguous seq shards.
