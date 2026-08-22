@@ -455,14 +455,97 @@ class KimiK3AttnResModel(KimiK3Model):
     layers receive the full accumulated block list every layer.
     """
 
-    def __init__(
-        self,
+    @dataclass(kw_only=True, slots=True)
+    class Config(KimiK3Model.Config):
+        """The AttnRes trunk's config tree.
+
+        Same three root entries as the plain trunk plus what AttnRes adds: the
+        per-layer configs are KimiAttnResDecoderLayer's, and the tail carries the
+        final aggregation. Having a root Config at all is the point -- upstream's
+        converters walk ``model_config.traverse(Module.Config)``, and this class
+        used to be built straight from the flat KimiK3Config, so nothing could
+        walk it. ``num_committed_blocks`` and ``output_res_alpha`` stay derived
+        in __init__: one is arithmetic on the fields below, the other is a
+        parameter rather than a config.
+        """
+
+        layers: list["KimiAttnResDecoderLayer.Config"]
+        output_res_proj: "AttnResProjection.Config"
+        output_res_norm: "RMSNorm.Config"
+        num_blocks: int
+        layers_per_block: int | None = None
+        attn_res_gated: bool = False
+
+    @staticmethod
+    def make_config(
         config: KimiK3Config,
         *,
         num_blocks: int,
         layers_per_block: int | None = None,
         gated: bool = False,
+    ) -> "KimiK3AttnResModel.Config":
+        """The one place this class reads the flat config."""
+        n_layers = config.num_hidden_layers
+        return KimiK3AttnResModel.Config(
+            kimi_config=config,
+            tok_embeddings=_TTEmbedding.Config(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                sharding_config=_vocab_parallel_embedding(),
+            ),
+            layers=[
+                KimiAttnResDecoderLayer.make_config(config, i, gated=gated)
+                for i in range(n_layers)
+            ],
+            norm=RMSNorm.Config(
+                normalized_shape=config.hidden_size,
+                eps=config.rms_norm_eps,
+                sharding_config=pre_lm_head_norm_config(enable_sp=False),
+            ),
+            lm_head=Linear.Config(
+                in_features=config.hidden_size,
+                out_features=config.vocab_size,
+                bias=False,
+                sharding_config=_lm_head_sharding(),
+            ),
+            output_res_proj=AttnResProjection.Config(
+                dim=config.hidden_size, sharding_config=_tp_replicate()
+            ),
+            output_res_norm=RMSNorm.Config(
+                normalized_shape=config.hidden_size,
+                eps=config.rms_norm_eps,
+                sharding_config=_tp_replicate(),
+            ),
+            num_blocks=num_blocks,
+            layers_per_block=layers_per_block,
+            attn_res_gated=gated,
+        )
+
+    def __init__(
+        self,
+        config: "KimiK3Config | KimiK3AttnResModel.Config",
+        *,
+        num_blocks: int | None = None,
+        layers_per_block: int | None = None,
+        gated: bool = False,
     ) -> None:
+        # Accepts either the built config tree or the flat config plus keywords.
+        # The second form is what every existing caller passes and what the tests
+        # construct with; it just builds the tree first.
+        if not isinstance(config, KimiK3AttnResModel.Config):
+            assert num_blocks is not None
+            config = KimiK3AttnResModel.make_config(
+                config,
+                num_blocks=num_blocks,
+                layers_per_block=layers_per_block,
+                gated=gated,
+            )
+        cfg = config
+        num_blocks = cfg.num_blocks
+        layers_per_block = cfg.layers_per_block
+        gated = cfg.attn_res_gated
+        config = cfg.kimi_config
+
         # Skip KimiK3Model.__init__'s layer build (it builds
         # KimiDecoderLayer); we need KimiAttnResDecoderLayer instead.
         # Call nn.Module's init, then build what we need ourselves.
@@ -518,21 +601,12 @@ class KimiK3AttnResModel(KimiK3Model):
         # rows -- gradients landed on the wrong entries and summed, inflating this
         # parameter's grad-norm contribution 195x and the model's 5.6x. Upstream
         # declares tok_embeddings with tp=S(0) for the same reason.
-        self.embed_tokens = _TTEmbedding.Config(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            sharding_config=_vocab_parallel_embedding(),
-        ).build()
+        self.embed_tokens = cfg.tok_embeddings.build()
         # ModuleDict for pipeline_module_split compatibility — see
         # KimiK3Model.__init__ for the same pattern.
         self.attn_res_gated = gated
         self.layers = nn.ModuleDict(
-            {
-                str(i): KimiAttnResDecoderLayer.make_config(
-                    config, i, gated=gated
-                ).build()
-                for i in range(n_layers)
-            }
+            {str(i): layer_cfg.build() for i, layer_cfg in enumerate(cfg.layers)}
         )
         # Off unless the config asks for it; see KimiK3MTPLayer for why the
         # released artifact has none.
@@ -547,22 +621,13 @@ class KimiK3AttnResModel(KimiK3Model):
             if num_mtp
             else None
         )
-        self.norm = RMSNorm.Config(
-            normalized_shape=config.hidden_size,
-            eps=config.rms_norm_eps,
-            sharding_config=pre_lm_head_norm_config(enable_sp=False),
-        ).build()
+        self.norm = cfg.norm.build()
         # Not the embedding's config: they shard the same axis, but the embedding
         # declaration carries a local_map that exists for the vocab-parallel forward,
         # and wrapping Linear.forward in it hands a local input to a DTensor weight
         # ("aten.mm.default got mixed", on every multimodal TP cell). _lm_head_sharding
         # declares the placements without the local_map.
-        self.lm_head = Linear.Config(
-            in_features=config.hidden_size,
-            out_features=config.vocab_size,
-            bias=False,
-            sharding_config=_lm_head_sharding(),
-        ).build()
+        self.lm_head = cfg.lm_head.build()
 
         # Final AttnRes aggregation (one extra pseudo-query + RMSNorm
         # before lm_head). Same ``AttnResProjection`` shared with the
@@ -571,19 +636,8 @@ class KimiK3AttnResModel(KimiK3Model):
         # assigned inside Config.build, so constructing the class directly drops
         # the declaration silently -- the module then looks declared in the source
         # and is invisible to the declarative driver.
-        self.output_res_proj = AttnResProjection.Config(
-            dim=config.hidden_size, sharding_config=_tp_replicate()
-        ).build()
-        self.output_res_norm = RMSNorm.Config(
-            normalized_shape=config.hidden_size,
-            eps=config.rms_norm_eps,
-            # State only. A static out_src cannot serve this: the block stream
-            # reaching it is Partial(sum) in the latent-MoE flavours and
-            # Replicate in the non-latent ones, and declaring either breaks the
-            # other. Same reason the two per-layer AttnRes norms stay imperative;
-            # an earlier measurement on one flavour made this one look uniform.
-            sharding_config=_tp_replicate(),
-        ).build()
+        self.output_res_proj = cfg.output_res_proj.build()
+        self.output_res_norm = cfg.output_res_norm.build()
         if gated:
             self.output_res_alpha = nn.Parameter(torch.zeros(1))
 
