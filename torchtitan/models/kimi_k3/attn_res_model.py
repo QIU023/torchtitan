@@ -58,7 +58,13 @@ def _scalar_local(a: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     alpha as an fp32 master while the stream is bf16; without the cast
     the elementwise mix silently promotes the residual stream to fp32
     (matches FSDP mixed-precision compute when the cast is a no-op)."""
-    a = a.to_local() if isinstance(a, DTensor) else a
+    # Only unwrap when the stream it multiplies is plain. Once the stream is a
+    # DTensor the mul is DTensor x DTensor and needs no unwrap, and unwrapping
+    # anyway makes the alpha's gradient arrive at to_local's backward as a
+    # DTensor, which from_local rejects -- every gated flavour died there in the
+    # backward once the MoE stopped handing back a plain tensor.
+    if isinstance(a, DTensor) and not isinstance(like, DTensor):
+        a = a.to_local()
     return a.to(like.dtype) if a.dtype != like.dtype else a
 
 
@@ -204,25 +210,9 @@ class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
         other is None -- upstream's layout.
         """
         if self.moe is not None:
-            out = self.moe(h)
-        else:
-            assert self.feed_forward is not None
-            out = self.feed_forward(h)
-        if isinstance(h, DTensor) and not isinstance(out, DTensor):
-            # KimiMoE unwraps its own output on purpose -- its boundary
-            # convention is plain tensors, for PP P2P and the fla kernels. The
-            # DTensor the carrier needs back came from whatever ran after that
-            # unwrap, and with no latent path and no shared experts nothing
-            # does: measured on gated_lora at dp2/tp2, latent_size=None and
-            # shared=False give a plain MoE output against a DTensor carrier,
-            # and every such cell dies at partial_block + ffn_out. The unwrap
-            # already redistributed to Replicate, so wrapping it back that way
-            # is its inverse. Flavors whose MoE returns a DTensor are untouched.
-            mesh = h.device_mesh
-            out = DTensor.from_local(
-                out, mesh, [Replicate()] * mesh.ndim, run_check=False
-            )
-        return out
+            return self.moe(h)
+        assert self.feed_forward is not None
+        return self.feed_forward(h)
 
     def forward(
         self,

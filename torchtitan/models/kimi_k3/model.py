@@ -2076,6 +2076,17 @@ class KimiMoE(Module):
             # y = sum_j E_j^shared(x) + W_up RMSNorm( sum_i p_i E_i(W_down x) )
             # Router reads x; experts consume W_down x.
             out = self._moe(self.latent.to_latent(x), router_input_BLD=x)
+        # Whether to hand back a plain tensor at all. The unwrap below exists for
+        # the plain-boundary consumers (PP P2P, AttnRes stacking, fla kernels), and
+        # what puts a DTensor back is whatever runs after it: from_latent, then the
+        # shared-expert add. With no latent path nothing does, so a DTensor caller
+        # got a plain tensor and the AttnRes carrier died at partial_block +
+        # ffn_out. Re-wrapping afterwards is not the fix -- from_local's backward
+        # hands back a local gradient, which the to_local below then receives as a
+        # DTensor and rejects. Not unwrapping in the first place keeps the pair
+        # balanced. Latent flavours are untouched: they still unwrap and still get
+        # a DTensor back from the ops that follow.
+        _keep_dtensor = self.latent_size is None and isinstance(x, DTensor)
         if isinstance(out, DTensor):
             # Module-internal MoE parallelization (EP/TP) emits DTensor.
             # This model's boundary convention is plain tensors (PP P2P,
@@ -2088,7 +2099,11 @@ class KimiMoE(Module):
             # placement is correct.
             if any(not p.is_replicate() for p in out.placements):
                 out = out.redistribute(placements=[Replicate()] * len(out.placements))
-            out = out.to_local()
+            # The redistribute always runs; only the unwrap is conditional. Skipping
+            # both left a Partial output reaching the AttnRes softmax, where a partial
+            # sum is not what the aggregation expects.
+            if not _keep_dtensor:
+                out = out.to_local()
         if self.latent_size is not None:
             out = self.latent.from_latent(out)
             if self.shared_experts is not None:

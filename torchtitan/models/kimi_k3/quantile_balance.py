@@ -327,6 +327,12 @@ class QuantileBalancer:
             # same shape (num_bins is one attribute, not per layer) and the same
             # dtype, so they stack. Integer SUM is exact, so this cannot move the
             # numbers -- only the number of round trips.
+            # The loss mesh is dp_replicate x dp_shard x cp and deliberately excludes
+            # tp: under TP the router's scores are Replicate, so every tp rank holds
+            # the same tokens and summing over that axis would multiply the histogram
+            # by tp. Measured by all-gathering the pre-reduce counts -- across the loss
+            # group they differ (34765 of 81920 bins at dp2, 32928 at dp4), so this
+            # reduction aggregates distinct data rather than duplicating one rank's.
             keys = list(self._counts)
             stacked = torch.stack([self._counts[k] for k in keys])
             dist.all_reduce(stacked, group=self.loss_group, op=dist.ReduceOp.SUM)
