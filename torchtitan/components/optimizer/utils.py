@@ -34,21 +34,46 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     and before load (to load into them). This runs a step with zero gradients
     and ``lr=0`` so parameters are untouched, then restores ``lr``.
 
-    No-op if state already exists or any gradient is set, so it is safe to call
-    repeatedly and never disturbs an in-progress training step.
+    No-op if every parameter already has state, or if any gradient is set, so it
+    is safe to call repeatedly and never disturbs an in-progress training step.
+
+    Checking EVERY parameter rather than ``optim.state`` being non-empty matters
+    for models that carry a parameter no gradient ever reaches. Adam creates
+    state on a parameter's first step, so such a parameter has none while the
+    rest do; returning early on "some state exists" left it that way, and save
+    then wrote a checkpoint missing it while load -- running in a fresh process
+    where nothing has stepped -- materialized it and asked for it. DCP's load
+    planner is strict, so resume failed on a checkpoint the same code had just
+    written. Only the parameters that lack state get a gradient here, so the
+    step cannot disturb the state of the ones that have it: an optimizer skips
+    parameters whose grad is None.
     """
-    if optim.state:
+    missing = [
+        param
+        for param_group in optim.param_groups
+        for param in param_group["params"]
+        if param.requires_grad and param not in optim.state
+    ]
+    if not missing:
         return
 
-    for param_group in optim.param_groups:
-        for param in param_group["params"]:
-            if param.grad is not None:
-                return
+    # Stash whatever gradients are live and hand them back afterwards. Save runs
+    # after the training step, so gradients are still set then; returning early
+    # on that (as this did) meant the parameters missing state stayed missing in
+    # exactly the case that matters. An optimizer skips parameters whose grad is
+    # None, so clearing the others is what keeps this step from folding a zero
+    # gradient into state they already hold.
+    stashed = [
+        (param, param.grad)
+        for param_group in optim.param_groups
+        for param in param_group["params"]
+        if param.grad is not None
+    ]
+    for param, _ in stashed:
+        param.grad = None
 
-    for param_group in optim.param_groups:
-        for param in param_group["params"]:
-            if param.requires_grad:
-                param.grad = torch.zeros_like(param)
+    for param in missing:
+        param.grad = torch.zeros_like(param)
 
     # Some optimizers update parameters regardless of gradients due to lr, so set
     # lr to zero before stepping to keep parameters unchanged.
@@ -66,6 +91,8 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
         if "lr" in param_group:
             param_group["lr"] = saved_lrs.pop(0)
     optim.zero_grad(set_to_none=True)
+    for param, grad in stashed:
+        param.grad = grad
 
 
 def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:
