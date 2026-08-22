@@ -6,9 +6,11 @@
 
 """Grain-backed TorchTitan dataloader."""
 
+import pickle
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+
 from typing import Annotated, Any
 
 import grain.python as grain
@@ -145,16 +147,28 @@ class GrainDataLoader(BaseDataLoader):
         return self._iterator
 
     def state_dict(self) -> dict[str, Any]:
+        """Iterator state as one opaque value, not as a nested dict.
+
+        DCP flattens nested dicts into dotted keys and matches them exactly, so a
+        state whose SHAPE changes as the iterator advances cannot be loaded back.
+        The HF iterable does exactly that: ``examples_iterable.previous_state`` is
+        None on a fresh iterator and a dict once it has moved, which flattens to
+        one leaf key in the first case and three in the second. Save after a few
+        steps then wrote the three, load built the one from a fresh iterator, and
+        DCP's strict planner refused the checkpoint it had just written.
+
+        Pickling keeps it a single key whatever the iterator has been through.
+        """
         return {
-            "version": 1,
+            "version": 2,
             "dp_world_size": self._dp_world_size,
-            self._rank_id: self._iterator.get_state(),
+            self._rank_id: pickle.dumps(self._iterator.get_state()),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if not state_dict:
             return
-        if state_dict["version"] != 1:
+        if state_dict["version"] != 2:
             raise ValueError(
                 f"unsupported GrainDataLoader state version {state_dict['version']}"
             )
@@ -167,7 +181,7 @@ class GrainDataLoader(BaseDataLoader):
                 f"checkpoint is missing dataloader state for {self._rank_id}"
             )
         try:
-            self._iterator.set_state(state_dict[self._rank_id])
+            self._iterator.set_state(pickle.loads(state_dict[self._rank_id]))
         except Exception:
             self.close()
             raise

@@ -1648,7 +1648,7 @@ def test_mix_rejects_non_finite_or_nonpositive_weight(weight):
 
 def test_loader_rejects_unknown_checkpoint_version(finite_rows_loader):
     state = finite_rows_loader.state_dict()
-    state["version"] = 2
+    state["version"] = 99
 
     with pytest.raises(ValueError, match="version"):
         finite_rows_loader.load_state_dict(state)
@@ -1679,6 +1679,10 @@ def mock_grain_loader():
     loader._dp_world_size = 1
     loader._rank_id = "dp_rank_0"
     loader._iterator = mock.Mock()
+    # A plain value, not the Mock's auto-created child: state_dict pickles the
+    # iterator state so it survives DCP's flat-key matching, and a Mock is not
+    # picklable.
+    loader._iterator.get_state.return_value = {"shard_idx": 0}
     return loader
 
 
