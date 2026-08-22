@@ -909,6 +909,14 @@ class KimiMLAAttention(Module):
             scale=self.scaling,
         )  # (B, T, H, v_head_dim)
 
+        # inner_attention's local_map now wraps its output back into a DTensor, so
+        # the re-wrap below would no longer fire. Strip it first and keep firing:
+        # that block all-gathers to Replicate, o_proj immediately re-shards for the
+        # rowwise matmul, and dropping that round trip -- however redundant a pair
+        # of collectives it is -- changes the summation order and so changes the
+        # numbers. Removing it is a behaviour change and belongs in its own commit,
+        # not inside a migration whose whole claim is that it is behaviour-free.
+        attn_out = _to_local_if_dtensor(attn_out)
         attn_out = attn_out.reshape(B, T, -1)  # (B, T, H*Dv)
         # SDPA has no DTensor rule, so inner_attention hands back a plain local
         # tensor. Re-wrap it on the way out, the same shape as the fla kernels'
