@@ -356,6 +356,17 @@ class KimiLoRALinear(nn.Module):
         tp_mesh = self._tp_mesh
 
         if isinstance(x, DTensor):
+            if not colwise and all(p.is_replicate() for p in x.placements):
+                # The docstring below assumes a rowwise input arrives already
+                # sharded on the feature axis. MLA's o_proj gets a replicated one
+                # -- the attention output is all-gathered before it -- and the
+                # unquantized path never noticed because self.base(x) redistributes
+                # for itself. Here the weight is dequantized into a local tensor,
+                # so the shapes have to be made to agree first: measured as
+                # (1024x256) against (128x160) on the mxfp4 QLoRA flavour at tp2.
+                from torch.distributed.tensor import Shard as _Shard
+
+                x = x.redistribute(tp_mesh, [_Shard(x.dim() - 1)])
             grad_pl = (Partial(),) if colwise else None
             x_loc = x.to_local(grad_placements=grad_pl)
         else:

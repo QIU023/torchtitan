@@ -117,24 +117,6 @@ def _lm_head_sharding() -> ShardingConfig:
     )
 
 
-def _attn_res_norm_sharding() -> ShardingConfig:
-    """The AttnRes key norms: weight replicated, output summed across tp.
-
-    These are not pre-lm_head norms despite two of them being named for the tail.
-    block_attn_res calls them on the block stream to build the aggregation keys,
-    and that stream arrives Partial(sum) on the tp axis because the rowwise
-    projections feeding it declare P. The sum has to happen before the keys are
-    used, which is precisely what the NoParallel plan entry this replaces did on
-    its output side (input_layout == desired_input_layout, so its input half was
-    always a no-op).
-    """
-    return ShardingConfig(
-        state_shardings={"weight": dense_param_placement(tp=spmd.R)},
-        out_src_shardings=dense_activation_placement(tp=spmd.P),
-        out_dst_shardings=dense_activation_placement(tp=spmd.R),
-    )
-
-
 def _tp_shard(dim: int) -> ShardingConfig:
     """Weight sharded on ``dim`` of the tp axis; colwise is 0, rowwise is 1."""
     return ShardingConfig(

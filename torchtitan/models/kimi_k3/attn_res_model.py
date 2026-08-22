@@ -32,7 +32,6 @@ from torchtitan.models.kimi_k3.attn_res import (
     unstack_blocks,
 )
 from torchtitan.models.kimi_k3.model import (
-    _attn_res_norm_sharding,
     _lm_head_sharding,
     _tp_replicate,
     _tp_shard,
@@ -578,7 +577,12 @@ class KimiK3AttnResModel(KimiK3Model):
         self.output_res_norm = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
-            sharding_config=_attn_res_norm_sharding(),
+            # State only. A static out_src cannot serve this: the block stream
+            # reaching it is Partial(sum) in the latent-MoE flavours and
+            # Replicate in the non-latent ones, and declaring either breaks the
+            # other. Same reason the two per-layer AttnRes norms stay imperative;
+            # an earlier measurement on one flavour made this one look uniform.
+            sharding_config=_tp_replicate(),
         ).build()
         if gated:
             self.output_res_alpha = nn.Parameter(torch.zeros(1))

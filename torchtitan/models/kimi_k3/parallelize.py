@@ -911,6 +911,8 @@ def apply_tp_kimi_k3(
 
     # The three root-level modules -- embed_tokens, norm, lm_head -- are declared
     # on their configs, matching upstream's set_decoder_sharding_config.
+    if getattr(model, "output_res_norm", None) is not None:
+        parallelize_module(model, tp_mesh, {"output_res_norm": no_par_local})
 
     # MLA inner_attention: the ONE place use_local_output=True survives the
     # residual-stream flip. q/k/v arrive head-sharded and SDPA has no DTensor
@@ -1119,16 +1121,17 @@ def apply_tp_kimi_k3(
             if a_cfg is None:
                 continue
             lora_declared.append((target, a_cfg, b_cfg))
-            if target._quantize_base == "mxfp4":
+            base_pl = target.base._sharding_config.state_shardings["weight"]
+            colwise = base_pl == dense_param_placement(tp=spmd.S(0))
+            rowwise = base_pl == dense_param_placement(tp=spmd.S(1))
+            if target._quantize_base == "mxfp4" and (colwise or rowwise):
                 # A packed base has no base.weight to shard; its packed qdata and
                 # scale are handled by the module's own TP entry point instead.
-                packed_tp.append(
-                    (
-                        target,
-                        b_cfg.state_shardings["weight"]
-                        == dense_param_placement(tp=spmd.S(0)),
-                    )
-                )
+                # Only genuinely split bases go there: a replicated base has
+                # nothing to shard, and registering it anyway set _tp_style
+                # "rowwise", which made the forward take the packed-TP branch and
+                # slice a weight that should stay whole.
+                packed_tp.append((target, colwise))
 
         parallelize_module(
             module=layer,
