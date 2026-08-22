@@ -282,6 +282,15 @@ class QuantileBalancer:
             scores_BLE = output[2]
             bias_E = self._moes[key].expert_bias_E
             with torch.no_grad():
+                # The router's gate is declared, so under TP its output is a
+                # DTensor while expert_bias_E is unwrapped just below -- the two
+                # met in topk_with_cutoff's add and every tp cell died. Measured
+                # at dp2/tp2: scores are DTensor(Replicate), so every rank holds
+                # every token and to_local is exact here. That stops being true
+                # once EP shards the tokens, and the histogram would then have to
+                # reduce over the axis they are sharded on.
+                if hasattr(scores_BLE, "to_local"):
+                    scores_BLE = scores_BLE.to_local()
                 scores_TE = scores_BLE.detach().reshape(-1, scores_BLE.size(-1))
                 bias = bias_E.to_local() if hasattr(bias_E, "to_local") else bias_E
                 _, cutoff_T = topk_with_cutoff(

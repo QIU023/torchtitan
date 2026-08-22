@@ -401,12 +401,21 @@ class KimiLoRALinear(nn.Module):
                 out_loc, tp_mesh, [Shard(out_loc.dim() - 1)], run_check=False
             )
         # Rowwise: local outputs are partial sums over the in/tp shards.
+        # Stays a DTensor. The to_local that used to end this branch matched
+        # RowwiseParallel(output_layouts=Replicate, use_local_output=True), which
+        # is what the plan asked for before the residual stream became DTensor
+        # end to end. After that flip a plain return meets the DTensor carrier at
+        # partial_block + ffn_out, and every packed-base tp cell died there.
         out = DTensor.from_local(out_loc, tp_mesh, [Partial()], run_check=False)
-        out = out.redistribute(tp_mesh, [Replicate()]).to_local()
+        out = out.redistribute(tp_mesh, [Replicate()])
         # Rowwise does NOT shard the output, so the bias must be added AFTER the partial
         # sums are reduced -- adding it to out_loc would apply it once per TP rank.
         if bias is not None:
-            b = bias.full_tensor() if isinstance(bias, DTensor) else bias
+            b = (
+                bias
+                if isinstance(bias, DTensor)
+                else DTensor.from_local(bias, tp_mesh, [Replicate()], run_check=False)
+            )
             out = out + b.to(out.dtype)
         return out
 

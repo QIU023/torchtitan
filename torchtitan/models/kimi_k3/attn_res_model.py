@@ -204,9 +204,25 @@ class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
         other is None -- upstream's layout.
         """
         if self.moe is not None:
-            return self.moe(h)
-        assert self.feed_forward is not None
-        return self.feed_forward(h)
+            out = self.moe(h)
+        else:
+            assert self.feed_forward is not None
+            out = self.feed_forward(h)
+        if isinstance(h, DTensor) and not isinstance(out, DTensor):
+            # KimiMoE unwraps its own output on purpose -- its boundary
+            # convention is plain tensors, for PP P2P and the fla kernels. The
+            # DTensor the carrier needs back came from whatever ran after that
+            # unwrap, and with no latent path and no shared experts nothing
+            # does: measured on gated_lora at dp2/tp2, latent_size=None and
+            # shared=False give a plain MoE output against a DTensor carrier,
+            # and every such cell dies at partial_block + ffn_out. The unwrap
+            # already redistributed to Replicate, so wrapping it back that way
+            # is its inverse. Flavors whose MoE returns a DTensor are untouched.
+            mesh = h.device_mesh
+            out = DTensor.from_local(
+                out, mesh, [Replicate()] * mesh.ndim, run_check=False
+            )
+        return out
 
     def forward(
         self,
