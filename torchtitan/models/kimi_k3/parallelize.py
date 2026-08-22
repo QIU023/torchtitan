@@ -32,6 +32,8 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from torchtitan.components.lora import _lora_adapter_sharding
+
 from torchtitan.config import (
     CompileConfig,
     ParallelismConfig,
@@ -48,6 +50,7 @@ from torchtitan.distributed.fsdp import (
 )
 from torchtitan.distributed.tensor_parallel import NoParallel
 from torchtitan.models.common.decoder_sharding import dense_param_placement
+from torchtitan.protocols.sharding import resolve_placements, ShardingConfig
 from torchtitan.tools.logging import logger
 
 
@@ -1085,6 +1088,7 @@ def apply_tp_kimi_k3(
 
         lora_tp: list[tuple[nn.Module, bool]] = []
         seen_lora: set[nn.Module] = set()
+        lora_declared: list[tuple[nn.Module, object, object]] = []
         packed_tp: list[tuple[KimiLoRALinear, bool]] = []
         for key in list(plan.keys()):
             style = plan[key]
@@ -1109,19 +1113,22 @@ def apply_tp_kimi_k3(
         for name, target in layer.named_modules():
             if not isinstance(target, KimiLoRALinear) or target in seen_lora:
                 continue
-            base_cfg = getattr(target.base, "_sharding_config", None)
-            weight_pl = (
-                base_cfg.state_shardings.get("weight") if base_cfg is not None else None
+            a_cfg, b_cfg = _adapter_sharding(
+                getattr(target.base, "_sharding_config", None)
             )
-            if weight_pl is None:
+            if a_cfg is None:
                 continue
-            if weight_pl == dense_param_placement(tp=spmd.S(0)):
-                is_colwise = True
-            elif weight_pl == dense_param_placement(tp=spmd.S(1)):
-                is_colwise = False
-            else:
-                continue
-            _register_lora_tp(target, is_colwise, packed_tp, lora_tp, plan, name)
+            lora_declared.append((target, a_cfg, b_cfg))
+            if target._quantize_base == "mxfp4":
+                # A packed base has no base.weight to shard; its packed qdata and
+                # scale are handled by the module's own TP entry point instead.
+                packed_tp.append(
+                    (
+                        target,
+                        b_cfg.state_shardings["weight"]
+                        == dense_param_placement(tp=spmd.S(0)),
+                    )
+                )
 
         parallelize_module(
             module=layer,
@@ -1135,13 +1142,18 @@ def apply_tp_kimi_k3(
         for mod, is_colwise in lora_tp:
             a_pl = [Replicate()] if is_colwise else [Shard(1)]
             b_pl = [Shard(0)] if is_colwise else [Replicate()]
-            mod.lora_a = nn.Parameter(
-                distribute_tensor(mod.lora_a, tp_mesh, a_pl),
-                requires_grad=mod.lora_a.requires_grad,
-            )
-            mod.lora_b = nn.Parameter(
-                distribute_tensor(mod.lora_b, tp_mesh, b_pl),
-                requires_grad=mod.lora_b.requires_grad,
+            _distribute_adapters(mod, tp_mesh, a_pl, b_pl)
+
+        # Declared bases take their placements from upstream's
+        # _lora_adapter_sharding rather than from a second copy of the rule here.
+        # Writing it twice is how the four MLA adapters drifted: the plan-driven
+        # copy stopped covering them and nothing else knew the rule.
+        for mod, a_cfg, b_cfg in lora_declared:
+            _distribute_adapters(
+                mod,
+                tp_mesh,
+                list(resolve_placements(a_cfg.state_shardings["weight"], tp_mesh)),
+                list(resolve_placements(b_cfg.state_shardings["weight"], tp_mesh)),
             )
 
         # Any remaining LoRA adapters (e.g. NoParallel MoE shared experts,
@@ -1367,6 +1379,38 @@ def verify_params_distributed(model: nn.Module, spmd_backend: str) -> None:
         for _, p in model.named_parameters()
     )
     logger.info("Parameter meshes after TP wiring: %s", dict(meshes))
+
+
+def _adapter_sharding(base_cfg):
+    """Adapter sharding for one LoRA base, upstream's rule plus the replicated case.
+
+    ``_lora_adapter_sharding`` covers colwise and rowwise bases and asserts on
+    anything else. This model has replicated bases that upstream's do not --
+    MLA's low-rank compressions (q_a_proj, kv_a_proj_with_mqa) and the latent
+    MoE's shared down/up -- and a replicated base wants replicated adapters.
+    Returns ``(None, None)`` when the base carries no declaration.
+    """
+    weight = base_cfg.state_shardings.get("weight") if base_cfg is not None else None
+    if weight is None:
+        return None, None
+    if weight == dense_param_placement(tp=spmd.R):
+        replicated = ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.R)}
+        )
+        return replicated, replicated
+    return _lora_adapter_sharding(base_cfg)
+
+
+def _distribute_adapters(mod, tp_mesh, a_placements, b_placements) -> None:
+    """Put one module's LoRA adapters on ``tp_mesh`` with the given placements."""
+    mod.lora_a = nn.Parameter(
+        distribute_tensor(mod.lora_a, tp_mesh, a_placements),
+        requires_grad=mod.lora_a.requires_grad,
+    )
+    mod.lora_b = nn.Parameter(
+        distribute_tensor(mod.lora_b, tp_mesh, b_placements),
+        requires_grad=mod.lora_b.requires_grad,
+    )
 
 
 def _register_lora_tp(target, is_colwise, packed_tp, lora_tp, plan, key) -> None:
