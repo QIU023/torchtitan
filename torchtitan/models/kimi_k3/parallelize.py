@@ -16,6 +16,8 @@ and the MoE TP plan wraps leaves rather than the container.
 
 from __future__ import annotations
 
+import spmd_types as spmd
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -45,6 +47,7 @@ from torchtitan.distributed.fsdp import (
     resolve_sparse_fsdp_mesh,
 )
 from torchtitan.distributed.tensor_parallel import NoParallel
+from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.tools.logging import logger
 
 
@@ -1081,6 +1084,7 @@ def apply_tp_kimi_k3(
         from torchtitan.models.kimi_k3.lora import KimiLoRALinear
 
         lora_tp: list[tuple[nn.Module, bool]] = []
+        seen_lora: set[nn.Module] = set()
         packed_tp: list[tuple[KimiLoRALinear, bool]] = []
         for key in list(plan.keys()):
             style = plan[key]
@@ -1091,18 +1095,33 @@ def apply_tp_kimi_k3(
             except AttributeError:
                 continue
             if isinstance(target, KimiLoRALinear):
-                del plan[key]
                 is_colwise = isinstance(style, ColwiseParallel)
-                if target._quantize_base == "mxfp4":
-                    # Packed base has no base.weight for a Colwise/Rowwise
-                    # style to target; shard the packed qdata/scale
-                    # directly (row/whole-block-column sharding is exact
-                    # for MX block-32) and let the module's packed-TP
-                    # forward do local dequant + matmul + collective.
-                    packed_tp.append((target, is_colwise))
-                else:
-                    plan[f"{key}.base"] = style
-                lora_tp.append((target, is_colwise))
+                _register_lora_tp(target, is_colwise, packed_tp, lora_tp, plan, key)
+                seen_lora.add(target)
+
+        # Declared bases reach this the same way, without a plan entry. The loop
+        # above walks plan.keys(), so a LoRA-wrapped Linear whose TP split moved
+        # to its config became invisible to it: measured on the report_arch_lora
+        # flavor at tp2, all four MLA adapters (o_proj.lora_a, and lora_b on
+        # q_b_proj / kv_b_proj / attn_gate_proj) came out Replicate where they
+        # had been Shard(1) / Shard(0). lora_b is zero-initialized, so step 1
+        # looks clean and the error only shows from step 2.
+        for name, target in layer.named_modules():
+            if not isinstance(target, KimiLoRALinear) or target in seen_lora:
+                continue
+            base_cfg = getattr(target.base, "_sharding_config", None)
+            weight_pl = (
+                base_cfg.state_shardings.get("weight") if base_cfg is not None else None
+            )
+            if weight_pl is None:
+                continue
+            if weight_pl == dense_param_placement(tp=spmd.S(0)):
+                is_colwise = True
+            elif weight_pl == dense_param_placement(tp=spmd.S(1)):
+                is_colwise = False
+            else:
+                continue
+            _register_lora_tp(target, is_colwise, packed_tp, lora_tp, plan, name)
 
         parallelize_module(
             module=layer,
@@ -1348,6 +1367,21 @@ def verify_params_distributed(model: nn.Module, spmd_backend: str) -> None:
         for _, p in model.named_parameters()
     )
     logger.info("Parameter meshes after TP wiring: %s", dict(meshes))
+
+
+def _register_lora_tp(target, is_colwise, packed_tp, lora_tp, plan, key) -> None:
+    """Queue one LoRA-wrapped Linear for TP, from either a plan entry or a declaration.
+
+    A packed-mxfp4 base has no ``base.weight`` for a style to target, so its
+    packed qdata/scale are sharded directly instead (row / whole-block-column
+    sharding is exact for MX block-32) and the module's packed-TP forward does
+    the local dequant, matmul and collective.
+    """
+    if target._quantize_base == "mxfp4":
+        packed_tp.append((target, is_colwise))
+    elif key in plan:
+        plan[f"{key}.base"] = plan.pop(key)
+    lora_tp.append((target, is_colwise))
 
 
 def _sweep_remaining_to_replicate(
