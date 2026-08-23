@@ -29,7 +29,7 @@ class TestMXFP4QAT(unittest.TestCase):
         return lin
 
     def test_wrap_forward_and_ste_grad(self):
-        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+        from torchtitan.components.mx_qat import MXFP4QATLinear
 
         lin = self._linear()
         wrapped = MXFP4QATLinear(lin, quantize_act=True)
@@ -43,7 +43,7 @@ class TestMXFP4QAT(unittest.TestCase):
         self.assertTrue(torch.isfinite(wrapped.base.weight.grad).all())
 
     def test_quantization_actually_perturbs(self):
-        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+        from torchtitan.components.mx_qat import MXFP4QATLinear
 
         lin = self._linear()
         x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -55,9 +55,9 @@ class TestMXFP4QAT(unittest.TestCase):
         self.assertGreater((ref - q).abs().max().item(), 1e-3)
 
     def test_apply_wraps_model_targets(self):
+        from torchtitan.components.mx_qat import apply_mxfp4_qat
         from torchtitan.models.kimi_k3 import config_registry
         from torchtitan.models.kimi_k3.model import KimiK3Spec
-        from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
 
         kc = config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config
         spec = KimiK3Spec(kimi_config=kc, num_blocks=None)
@@ -72,7 +72,7 @@ class TestWrapperLooksLikeLinear(unittest.TestCase):
     def test_weight_and_bias_are_the_base_parameters(self):
         from torch import nn
 
-        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+        from torchtitan.components.mx_qat import MXFP4QATLinear
 
         lin = nn.Linear(8, 16, bias=True)
         wrapped = MXFP4QATLinear(lin, quantize_act=True)
@@ -86,7 +86,7 @@ class TestWrapperLooksLikeLinear(unittest.TestCase):
         # local copy, so .weight deliberately does not reflect what forward uses.
         from torch import nn
 
-        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+        from torchtitan.components.mx_qat import MXFP4QATLinear
 
         lin = nn.Linear(64, 64, bias=False)
         wrapped = MXFP4QATLinear(lin, quantize_act=False)
@@ -97,9 +97,9 @@ class TestWrapperLooksLikeLinear(unittest.TestCase):
         )
 
     def test_per_head_muon_still_tags_wrapped_projections(self):
+        from torchtitan.components.mx_qat import apply_mxfp4_qat
         from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
         from torchtitan.models.kimi_k3.muon import tag_per_head_muon
-        from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
         from torchtitan.models.kimi_k3.tests.test_kimi_attn_res_model import (
             _dense_mla_only_config,
         )

@@ -274,7 +274,7 @@ class KimiLoRALinear(nn.Module):
         """
         if not self._quantize_act or self._quantize_base != "mxfp4":
             return x
-        from torchtitan.models.kimi_k3.mxfp4_qat import (
+        from torchtitan.components.mx_qat import (
             _ACT_ELEM,
             _BLOCK,
             _fake_quant_mx,

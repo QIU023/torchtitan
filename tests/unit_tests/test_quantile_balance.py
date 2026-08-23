@@ -16,7 +16,7 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.quantile_balance import (
+from torchtitan.components.quantile_balance import (
     expert_loads,
     margin_histogram,
     quantile_balance_bias,
@@ -164,7 +164,7 @@ class TestQuantileBalancerRuntime(unittest.TestCase):
         return moe
 
     def test_installed_bias_moves_loads_toward_the_target(self):
-        from torchtitan.models.kimi_k3.quantile_balance import (
+        from torchtitan.components.quantile_balance import (
             expert_loads,
             QuantileBalancer,
         )
@@ -217,7 +217,7 @@ class TestQuantileBalancerRuntime(unittest.TestCase):
         balancer.remove()
 
     def test_bias_is_overwritten_not_accumulated(self):
-        from torchtitan.models.kimi_k3.quantile_balance import QuantileBalancer
+        from torchtitan.components.quantile_balance import QuantileBalancer
 
         torch.manual_seed(0)
         moe = self._fake_moe()
@@ -243,7 +243,7 @@ class TestQuantileBalancerRuntime(unittest.TestCase):
         balancer.remove()
 
     def test_step_without_a_forward_is_a_noop(self):
-        from torchtitan.models.kimi_k3.quantile_balance import QuantileBalancer
+        from torchtitan.components.quantile_balance import QuantileBalancer
 
         moe = self._fake_moe()
 
@@ -259,7 +259,7 @@ class TestQuantileBalancerRuntime(unittest.TestCase):
         balancer.remove()
 
     def test_missing_expert_bias_buffer_is_rejected(self):
-        from torchtitan.models.kimi_k3.quantile_balance import QuantileBalancer
+        from torchtitan.components.quantile_balance import QuantileBalancer
 
         moe = self._fake_moe()
         moe.expert_bias_E = None

@@ -23,7 +23,7 @@ class TestDeltasCompose(unittest.TestCase):
         from torchtitan.models.kimi_k3 import config_registry
         from torchtitan.models.kimi_k3.model import KimiK3Spec
         from torchtitan.models.kimi_k3.muon import Muon
-        from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
+        from torchtitan.components.mx_qat import apply_mxfp4_qat
 
         torch.manual_seed(0)
         kc = config_registry.kimi_k3_debugmodel().model_spec.model.kimi_config

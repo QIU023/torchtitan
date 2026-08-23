@@ -2626,7 +2626,7 @@ class KimiK3Spec:
             tagged = tag_per_head_muon(model)
             logger.info("Per-Head Muon: tagged %d Q/K/V projections.", tagged)
         if self.mxfp4_qat:
-            from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
+            from torchtitan.components.mx_qat import apply_mxfp4_qat
 
             # Disjoint from LoRA: QAT attaches to GroupedExperts (3-D params),
             # LoRA wraps nn.Linear, and K3's scope contains no Linear at all.

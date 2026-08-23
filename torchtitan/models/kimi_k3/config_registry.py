@@ -996,7 +996,7 @@ def kimi_k3_mini_k3recipe() -> Trainer.Config:
     import dataclasses as _dc
 
     from torchtitan.models.kimi_k3.muon import default_muon
-    from torchtitan.models.kimi_k3.quantile_balance import register_quantile_balancing
+    from torchtitan.components.quantile_balance import register_quantile_balancing
 
     cfg = kimi_k3_mini_block_attn_res()
     cfg.model_spec.flavor = "kimi_k3_mini_k3recipe"
@@ -1450,7 +1450,7 @@ def kimi_k3_mini_quantile_balance() -> Trainer.Config:
     hook; core's sign-rule hook stays registered because it is what keeps the
     expert_bias_E buffer allocated, and QB overwrites the bias afterwards.
     """
-    from torchtitan.models.kimi_k3.quantile_balance import register_quantile_balancing
+    from torchtitan.components.quantile_balance import register_quantile_balancing
 
     cfg = kimi_k3_mini_block_attn_res()
     cfg.model_spec.flavor = "kimi_k3_mini_quantile_balance"

@@ -25,7 +25,7 @@ import torch
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
 from torchtitan.models.kimi_k3.moe import KimiSiTUGroupedExperts
-from torchtitan.models.kimi_k3.mxfp4_qat import apply_mxfp4_qat
+from torchtitan.components.mx_qat import apply_mxfp4_qat
 from torchtitan.models.kimi_k3.quant_scope import (
     is_ignored,
     is_quantizable,
@@ -116,7 +116,7 @@ class TestQuantScope(unittest.TestCase):
             {"w1_EFD", "w2_EDF", "w3_EFD"},
         )
         # no Linear got wrapped
-        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+        from torchtitan.components.mx_qat import MXFP4QATLinear
 
         self.assertEqual(
             [fqn for fqn, m in model.named_modules() if isinstance(m, MXFP4QATLinear)],
@@ -128,7 +128,7 @@ class TestQuantScope(unittest.TestCase):
             apply_mxfp4_qat(_k3mini_model(), scope="everything")
 
     def test_all_linear_scope_still_available_as_ablation(self):
-        from torchtitan.models.kimi_k3.mxfp4_qat import MXFP4QATLinear
+        from torchtitan.components.mx_qat import MXFP4QATLinear
 
         model = _k3mini_model()
         n = apply_mxfp4_qat(model, scope="all_linear")
