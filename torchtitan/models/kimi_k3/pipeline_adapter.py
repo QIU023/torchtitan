@@ -1100,15 +1100,9 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     tower = getattr(model, "vision_encoder", None)
     inner = getattr(model, "language_model", None)
     if tower is None or inner is None:
-        if tower is not None and dep_enabled():
-            raise NotImplementedError(
-                "vision DEP expects the tower to be a sibling of the language "
-                "model, so it can own a pipeline stage of its own. On this "
-                "model the tower is a child of the decoder, and giving it a "
-                "stage means re-expressing the split rather than re-wrapping. "
-                "Unset KIMI_VIT_DEP; plain pipeline parallel keeps the tower "
-                "on the stage that owns the embedding."
-            )
+        # A model whose tower is its own child needs no re-wrapping: core's
+        # _split_module sees the tower directly, so DEP is expressed by the FQN
+        # split alone (see _inject_kimi_k3_fqns).
         return model
 
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
@@ -1461,7 +1455,25 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     # some stage to None, so leaving it out gives every stage a None tower and
     # the first multimodal batch reports "pixel_values were provided without a
     # vision encoder". DEP is the exception and gets its own stage below.
-    if not dep_enabled() and hasattr(model, "vision_encoder"):
+    if dep_enabled() and hasattr(model, "vision_encoder"):
+        # DEP (report sec 5.2.3): the tower gets a stage of its own, ahead of
+        # the text stages and carrying no decoder layers, so its compute can be
+        # hidden in the pipeline's bubbles instead of sitting on the critical
+        # path of the stage that owns the embedding.
+        #
+        # This model needs no separate stage class for that. Its forward already
+        # treats a missing tok_embeddings as "the input IS the hidden state",
+        # and a stage holding only the embedding and the tower runs the splice
+        # and returns (hidden, block_residual) like any other non-head stage.
+        # The tower has to travel with the embedding, not alone: the splice
+        # needs the token ids, and pipelining hands positional args to the
+        # first stage only.
+        embed = "tok_embeddings" if hasattr(model, "tok_embeddings") else "embed_tokens"
+        for stage in fqns:
+            if embed in stage:
+                stage.remove(embed)
+        fqns = [[embed, "vision_encoder"]] + fqns
+    elif hasattr(model, "vision_encoder"):
         embed_stage = next(
             (
                 stage
@@ -1472,7 +1484,12 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         )
         embed_stage.append("vision_encoder")
 
-    if dep_enabled():
+    if dep_enabled() and not hasattr(model, "vision_encoder"):
+        # The marker-based split below is for the wrapper layout, where the
+        # tower is a sibling of the language model and the split has to be told
+        # which share each empty chunk is. A model that carries the tower as its
+        # own child took the simpler branch above instead.
+        #
         # DEP: one stage ahead of the text ones that owns the vision tower. The
         # FQN deliberately matches NOTHING in the text model, so core's
         # _split_module -- which sets every non-matching child to None -- yields a
