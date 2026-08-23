@@ -463,7 +463,7 @@ class KimiK3Model(Decoder):
         vision_encoder: KimiK3VisionEncoder.Config | None = None
         # KDA runs on fla triton kernels, which do not dispatch through
         # DTensor, so no ShardingConfig can drive its context parallel -- the
-        # layer implements both CP modes itself. The preconditions that
+        # layer implements both CP modes itself, and the preconditions that
         # replaces the backend check with are enforced below.
         cp_via_sharding_config: bool = False
 
