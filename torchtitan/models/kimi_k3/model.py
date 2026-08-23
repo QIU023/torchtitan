@@ -25,6 +25,7 @@ import spmd_types as spmd
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     scatter_vision_embeds,
@@ -404,6 +405,21 @@ class KimiK3Model(Decoder):
             set_decoder_sharding_config(self, enable_sp=False)
             for layer in self.layers:
                 if layer.moe is not None:
+                    if enable_ep:
+                        # LocalTokenDispatcher only reorders tokens within a
+                        # rank, so it hands the experts the GLOBAL per-expert
+                        # counts. With the expert weights sharded on E, the
+                        # grouped GEMM then sees 32 offsets against 16 local
+                        # experts and reports "matrix batch sizes have to
+                        # match" -- which reads as a shape bug in the model.
+                        # The two configs carry the same fields.
+                        dispatcher = layer.moe.routed_experts.token_dispatcher
+                        layer.moe.routed_experts.token_dispatcher = (
+                            AllToAllTokenDispatcher.Config(
+                                num_experts=dispatcher.num_experts,
+                                top_k=dispatcher.top_k,
+                            )
+                        )
                     set_moe_sharding_config(
                         layer.moe,
                         enable_ep=enable_ep,

@@ -40,11 +40,6 @@ def parallelize_kimi_k3(
         name
         for name, enabled in (
             ("tensor parallel", parallel_dims.tp_enabled),
-            # Expert parallel: the declarations now land and the dispatcher
-            # runs, but the grouped GEMM fails with "matrix batch sizes have to
-            # match" -- the local expert count and the offsets disagree
-            # somewhere between dispatch and inner_experts. Not diagnosed.
-            ("expert parallel", parallel_dims.ep_enabled),
         )
         if enabled
     ]
