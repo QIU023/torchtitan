@@ -15,7 +15,7 @@ from torchtitan.models.common import Conv1d, Embedding, Linear
 from torchtitan.models.common.config_utils import get_attention_config
 from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.nn_modules import GELU, RMSNorm
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
+from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.vision_encoder import (
     VisionAttention,
     VisionMLP,
@@ -246,9 +246,15 @@ def _latent_moe_config(
                     "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
                 },
             ),
-            token_dispatcher=LocalTokenDispatcher.Config(
+            # core's factory, and "standard" unconditionally: it returns the
+            # all-to-all dispatcher and falls back to local dispatch when the
+            # ep mesh is None, so EP=1 is unchanged. Selecting the dispatcher
+            # by whether EP happens to be on splits one decision across two
+            # places and leaves the model's config depending on the topology.
+            token_dispatcher=make_token_dispatcher_config(
                 num_experts=num_experts,
                 top_k=top_k,
+                comm_backend="standard",
             ),
         ),
         routed_norm=_norm(latent_dim),
