@@ -40,6 +40,11 @@ def parallelize_kimi_k3(
         name
         for name, enabled in (
             ("tensor parallel", parallel_dims.tp_enabled),
+            # Expert parallel needs the model to declare its sharding: with no
+            # ShardingConfig anywhere, model.parallelize leaves every one of
+            # the 680 parameters a plain tensor (measured), so the experts
+            # never reach an ep mesh and clip_grad_norm_ then stacks norms
+            # from two different meshes. Blocked on the declarative pass.
             ("expert parallel", parallel_dims.ep_enabled),
         )
         if enabled
@@ -61,8 +66,20 @@ def parallelize_kimi_k3(
         ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
     )
     dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+    # The routed experts shard on their own data-parallel mesh, which excludes
+    # the expert axis; the same shape deepseek_v3 resolves.
+    edp_mesh = None
+    if parallel_dims.ep_enabled:
+        edp_mesh = parallel_dims.get_optional_mesh(
+            ["dp_replicate", "efsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp"]
+        )
 
     assert isinstance(model, KimiK3Model)
+    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
+        model.parallelize(parallel_dims)
+
     if parallel_dims.cp_enabled:
         apply_cp_kimi_k3(model, parallel_dims)
 
@@ -94,7 +111,8 @@ def parallelize_kimi_k3(
         pp_enabled=parallel_dims.pp_enabled,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=1,
+        ep_degree=parallel_dims.ep,
+        edp_mesh=edp_mesh,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
 
