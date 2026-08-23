@@ -7,6 +7,7 @@
 from dataclasses import dataclass, field
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
@@ -14,6 +15,8 @@ from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
+    create_attention_mask,
+    get_causal_mask_mod,
     BaseAttention,
     FlexAttention,
 )
@@ -27,6 +30,7 @@ from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
 from .kda import KimiDeltaAttention
+from .sharding import cp_all_to_all_headseq, ULYSSES
 from .moe import KimiFeedForward, KimiLatentMoE
 from .vision_encoder import KimiK3VisionEncoder
 
@@ -61,6 +65,12 @@ class KimiMLAAttention(BaseAttention):
         gate: Linear.Config
         wo: Linear.Config
         inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
+
+    # Set by apply_cp_kimi_k3; None means the layer runs without CP. MLA is
+    # Ulysses under either KDA CP mode -- KCP describes a recurrence that MLA
+    # does not have.
+    _cp_group = None
+    _cp_mask = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -116,16 +126,89 @@ class KimiMLAAttention(BaseAttention):
         )
         k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
 
-        out_THV = self.inner_attention(
-            q_THK,
-            k_THK,
-            v_THV,
-            attention_masks=attention_masks,
-            scale=self.scale,
-        )
+        cp_group = self._cp_group
+        if cp_group is not None and dist.get_world_size(cp_group) > 1:
+            out_THV = self._ulysses_attention(q_THK, k_THK, v_THV, cp_group)
+        else:
+            out_THV = self.inner_attention(
+                q_THK,
+                k_THK,
+                v_THV,
+                attention_masks=attention_masks,
+                scale=self.scale,
+            )
         out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
+
+
+    def _full_sequence_causal_mask(self, num_tokens: int, device):
+        """Causal mask for the sequence Ulysses reassembles.
+
+        The mask the layer is handed has been sharded for context parallel by
+        ``cp_shard``, which cuts it the way ring attention wants: local queries
+        against global keys. Ulysses reassembles the whole sequence on every
+        rank instead, so it needs the whole causal mask. Rebuilding it is
+        correct here only because this model rejects sample packing, so the
+        sequence is one document and the mask carries no boundaries; a packed
+        sequence would need the global boundaries threaded down instead.
+
+        Cached per (length, device) because the shape is constant across layers
+        and steps, and create_block_mask is compiled.
+        """
+        key = (num_tokens, device)
+        if self._cp_mask is None or self._cp_mask[0] != key:
+            mask = create_attention_mask(
+                get_causal_mask_mod(), None, None, num_tokens, num_tokens, device=device
+            )
+            self._cp_mask = (key, mask)
+        return self._cp_mask[1]
+
+    def _ulysses_attention(
+        self,
+        q_LHK: torch.Tensor,
+        k_LHK: torch.Tensor,
+        v_LHV: torch.Tensor,
+        cp_group,
+    ) -> torch.Tensor:
+        """Attention over the full sequence for this rank's head subset.
+
+        One fused all-to-all trades the sharded axis, sequence for heads; the
+        backend then runs unchanged; a second all-to-all trades back. The gate
+        and the output projection stay sequence-local, so they are outside this.
+
+        Shape suffixes beyond the file legend: L local sequence (T/cp), G this
+        rank's head count (H/cp), W the packed per-head channel width.
+        """
+        cp_size = dist.get_world_size(cp_group)
+        if self.n_heads % cp_size != 0:
+            raise ValueError(
+                f"MLA Ulysses CP: n_heads {self.n_heads} is not divisible by "
+                f"cp={cp_size}"
+            )
+        packed_LHW = torch.cat([q_LHK, k_LHK, v_LHV], dim=-1)
+        src_dim, dst_dim = ULYSSES.in_dims()
+        packed_TGW = cp_all_to_all_headseq(
+            packed_LHW, cp_group, src_dim=src_dim, dst_dim=dst_dim
+        )
+        q_TGK, k_TGK, v_TGV = torch.split(
+            packed_TGW,
+            [self.q_head_dim, self.q_head_dim, self.v_head_dim],
+            dim=-1,
+        )
+        out_TGV = self.inner_attention(
+            q_TGK,
+            k_TGK,
+            v_TGV,
+            attention_masks=self._full_sequence_causal_mask(
+                q_TGK.shape[0], q_TGK.device
+            ),
+            scale=self.scale,
+        )
+        out_src_dim, out_dst_dim = ULYSSES.out_dims()
+        return cp_all_to_all_headseq(
+            out_TGV, cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
+        )
 
 
 def _apply_attention_residual(
@@ -266,6 +349,11 @@ class KimiK3Model(Decoder):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        # KDA runs on fla triton kernels, which do not dispatch through
+        # DTensor, so no ShardingConfig can drive its context parallel -- the
+        # layer implements both CP modes itself. The preconditions that
+        # replaces the backend check with are enforced below.
+        cp_via_sharding_config: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
@@ -273,6 +361,21 @@ class KimiK3Model(Decoder):
             # and KDA recurrent states at document boundaries.
             if isinstance(dataset, MMSamplePackingConfig):
                 raise ValueError("Kimi K3 does not yet support sample packing.")
+            parallelism = config.parallelism
+            if (
+                parallelism.context_parallel_degree > 1
+                and parallelism.context_parallel_load_balancer is not None
+            ):
+                # Both CP algorithms here read the sequence as rank-ordered
+                # contiguous chunks: the Ulysses all-to-all reassembles it in
+                # rank order, and KDA's recurrence passes state from rank r to
+                # rank r+1. A load balancer permutes tokens across ranks, which
+                # silently breaks both -- the shapes still line up.
+                raise ValueError(
+                    "Kimi K3 context parallel requires "
+                    "parallelism.context_parallel_load_balancer=None; "
+                    f"got {parallelism.context_parallel_load_balancer!r}."
+                )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
