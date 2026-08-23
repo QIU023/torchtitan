@@ -42,12 +42,18 @@ def parallelize_kimi_k3(
             # Tensor parallel: the declarations are in place and measurably
             # take effect -- wq_b Shard(0), wo Shard(1), w1 Shard(0), lm_head
             # Shard(0), KDA replicated -- but the forward does not run through
-            # yet. Each fix so far uncovered the next surface: norms, then the
-            # KDA convolutions and its own A_log/dt_bias, then the fla kernel
-            # needing its inputs unwrapped, then the latent MoE pair that
-            # core's set_moe_sharding_config does not know about. It now stops
-            # inside dynamo with "RuntimeError when making fake tensor call".
+            # yet. Each fix so far uncovered the next surface: the per-layer
+            # norms, then the KDA convolutions and its own A_log/dt_bias, then
+            # the fla kernel needing its inputs unwrapped, then the latent MoE
+            # pair that core's set_moe_sharding_config does not know about.
+            # It now stops inside the compiled FlexAttention region -- model
+            # compile is off, so this is flex's own torch.compile -- on
+            #   getitem(int32[256], DTensor(scalar int32, Replicate on tp))
+            #   -> aten.index.Tensor got mixed torch.Tensor and DTensor
+            # i.e. a DTensor index against a plain tensor. Not AC: the same
+            # error appears with activation-checkpoint:none. Not diagnosed.
             ("tensor parallel", parallel_dims.tp_enabled),
+
         )
         if enabled
     ]
