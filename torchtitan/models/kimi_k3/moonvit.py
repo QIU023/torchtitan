@@ -18,15 +18,20 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import spmd_types as spmd
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 
+from torchtitan.models.common.linear import Linear
+
 # The wrapper and the placement helper live in model.py; model.py does not
 # import this file, so there is no cycle.
 from torchtitan.models.kimi_k3.model import _tp_replicate, RMSNorm
+from torchtitan.protocols.module import Module
 
 
 @dataclass
@@ -359,13 +364,74 @@ class MoonViTRope2D(nn.Module):
         return torch.view_as_real(rotated).reshape(L, A, K).to(x_LAK.dtype)
 
 
-class MoonViTMLP(nn.Module):
-    """``mlp2``. Named fc0/fc1 to match the checkpoint."""
+def _vit_colwise() -> "ShardingConfig":
+    """Colwise MLP linear on the TP axis.
 
-    def __init__(self, config: MoonViTConfig) -> None:
+    No in_src/in_dst, matching core's colwise_config. Declaring them makes the
+    framework lift the input into a DTensor, and torchtitan's Linear.forward
+    unwraps its own weight with to_local before F.linear -- so a lifted input
+    meets a local weight and the matmul reports mixed Tensor and DTensor. The
+    input arrives already correct; only the weight split and the output layout
+    need declaring.
+    """
+    from torchtitan.distributed.parallel_dims import MeshAxisName
+    from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+
+    tp = MeshAxisName.TP
+    return ShardingConfig(
+        state_shardings={"weight": SpmdLayout({tp: spmd.S(0)})},
+        out_src_shardings=SpmdLayout({tp: spmd.S(-1)}),
+    )
+
+
+def _vit_rowwise() -> "ShardingConfig":
+    """Rowwise MLP linear on the TP axis: partial output reduced on the way out."""
+    from torchtitan.distributed.parallel_dims import MeshAxisName
+    from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+
+    tp = MeshAxisName.TP
+    return ShardingConfig(
+        state_shardings={"weight": SpmdLayout({tp: spmd.S(1)})},
+        out_src_shardings=SpmdLayout({tp: spmd.P}),
+        out_dst_shardings=SpmdLayout({tp: spmd.R}),
+    )
+
+
+class MoonViTMLP(Module):
+    """``mlp2``. Named fc0/fc1 to match the checkpoint.
+
+    A Module with declared linears so the declarative driver can reach them; a
+    raw nn.Linear carries no sharding_config and nothing walks it.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        fc0: "Linear.Config"
+        fc1: "Linear.Config"
+
+    @staticmethod
+    def make_config(config: MoonViTConfig) -> "MoonViTMLP.Config":
+        return MoonViTMLP.Config(
+            fc0=Linear.Config(
+                in_features=config.hidden_size,
+                out_features=config.intermediate_size,
+                bias=False,
+                sharding_config=_vit_colwise(),
+            ),
+            fc1=Linear.Config(
+                in_features=config.intermediate_size,
+                out_features=config.hidden_size,
+                bias=False,
+                sharding_config=_vit_rowwise(),
+            ),
+        )
+
+    def __init__(self, config: "MoonViTConfig | MoonViTMLP.Config") -> None:
         super().__init__()
-        self.fc0 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.fc1 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        if not isinstance(config, MoonViTMLP.Config):
+            config = MoonViTMLP.make_config(config)
+        self.fc0 = config.fc0.build()
+        self.fc1 = config.fc1.build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc1(_gelu_tanh(self.fc0(x)))

@@ -131,6 +131,12 @@ def parallelize_kimi_k3(
                 n_had,
             )
         else:
+            _tower = getattr(model, "vision_tower", None)
+            if _tower is not None:
+                # Before apply_tp's distribute_module claims every vision
+                # parameter as Replicate; the later full-model driver skips
+                # whatever is already distributed.
+                _drive_declarative_sharding(_tower, parallel_dims)
             apply_tp_kimi_k3(
                 model,
                 tp_mesh,
@@ -797,16 +803,8 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
         # tower activations into DTensors at the boundary, so the block
         # residual is a DTensor and fc1 must hand back a DTensor too --
         # use_local_output=False here fails the add on mixed Tensor/DTensor.
-        plan[f"encoder.blocks.{i}.mlp.fc0"] = ColwiseParallel(
-            input_layouts=Replicate(),
-            output_layouts=Shard(-1),
-            use_local_output=False,
-        )
-        plan[f"encoder.blocks.{i}.mlp.fc1"] = RowwiseParallel(
-            input_layouts=Shard(-1),
-            output_layouts=Replicate(),
-            use_local_output=False,
-        )
+        pass  # the MLP is declared on MoonViTMLP.Config
+
     if shard_heads:
         for i in range(len(blocks)):
             # wo receives [L, A_local * K], exactly a Shard(-1) of [L, A * K].
