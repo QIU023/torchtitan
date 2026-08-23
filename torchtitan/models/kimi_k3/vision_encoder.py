@@ -395,6 +395,44 @@ class KimiK3VisionCPAttention(VisionAttention):
         return self.proj(out_THDh.reshape(num_tokens, -1))
 
 
+
+def make_cp_patch_plan(
+    grid: tuple[int, int, int],
+    *,
+    group,
+    rank: int,
+    merge_kernel_h: int,
+) -> tuple["CPPatchPlan", tuple[int, int]]:
+    """Build this rank's plan for one image, and the flat range it owns.
+
+    Bands are multiples of the merge kernel height: the projector merges each
+    (kh, kw) block, so a cut inside kh rows would ask two ranks to merge halves
+    of one block. Every rank keeps every frame -- the temporal pool is a mean
+    over all of them, so splitting by frame would give each rank the mean of its
+    own frames instead.
+
+    The ceiling split leaves any deficit on the trailing ranks, which is what
+    makes the padding land at the end of each frame's band rather than inside
+    it; ``_padded_key_keep`` relies on exactly that arithmetic.
+    """
+    from torchtitan.models.kimi_k3.vit_cp_plan import row_partition
+
+    t, h, w = grid
+    group_size = dist.get_world_size(group)
+    shards = row_partition(t, h, w, kh=merge_kernel_h, group_size=group_size)
+    band = max(s.row_end - s.row_start for s in shards)
+    mine = shards[rank]
+    plan = CPPatchPlan(
+        group=group,
+        valid_total=t * h * w,
+        full_grid=(t, h, w),
+        row_start=mine.row_start,
+        band=band,
+        real_rows=mine.row_end - mine.row_start,
+    )
+    return plan, mine.ranges
+
+
 class KimiK3VisionBlock(Module):
     """MoonViT pre-norm attention and MLP block."""
 
