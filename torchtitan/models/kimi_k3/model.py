@@ -144,7 +144,9 @@ class KimiMLAAttention(BaseAttention):
 
         cp_group = self._cp_group
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            out_THV = self._ulysses_attention(q_THK, k_THK, v_THV, cp_group)
+            out_THV = self._ulysses_attention(
+                q_THK, kv_THC, k_rope_TK, cp_group
+            )
         else:
             out_THV = self.inner_attention(
                 q_THK,
@@ -182,51 +184,77 @@ class KimiMLAAttention(BaseAttention):
 
     def _ulysses_attention(
         self,
-        q_LHK: torch.Tensor,
-        k_LHK: torch.Tensor,
-        v_LHV: torch.Tensor,
+        q_LHQ: torch.Tensor,
+        kv_LHC: torch.Tensor,
+        k_rope_LR: torch.Tensor,
         cp_group,
     ) -> torch.Tensor:
         """Attention over the full sequence for this rank's head subset.
 
-        One fused all-to-all trades the sharded axis, sequence for heads; the
-        backend then runs unchanged; a second all-to-all trades back. The gate
-        and the output projection stay sequence-local, so they are outside this.
+        One fused all-to-all trades the sharded axis, sequence for heads, then
+        the backend runs unchanged, then a second trades back. The gate and the
+        output projection stay sequence-local, so they are outside this.
+
+        The rotary slice is deliberately not in the all-to-all. It is headless
+        -- one vector per token, shared by every head -- so it is all-gathered
+        along the sequence and expanded onto this rank's heads afterwards.
+        Packing the already-expanded key instead sends the same values once per
+        head and reassembles them against the wrong head subset, which shows up
+        as a forward that diverges from the same layer run without CP.
 
         Shape suffixes beyond the file legend: L local sequence (T/cp), G this
-        rank's head count (H/cp), W the packed per-head channel width.
+        rank's head count (H/cp), W the packed per-head channel width, R the
+        rotary width.
         """
+        import torch.distributed.nn.functional as dist_nn
+
         cp_size = dist.get_world_size(cp_group)
         if self.n_heads % cp_size != 0:
             raise ValueError(
                 f"MLA Ulysses CP: n_heads {self.n_heads} is not divisible by "
                 f"cp={cp_size}"
             )
-        packed_LHW = torch.cat([q_LHK, k_LHK, v_LHV], dim=-1)
+        t_loc = q_LHQ.shape[0]
+        t_full = t_loc * cp_size
+        h_cp = self.n_heads // cp_size
+
+        packed_LHW = torch.cat([q_LHQ, kv_LHC], dim=-1)
         src_dim, dst_dim = ULYSSES.in_dims()
         packed_TGW = cp_all_to_all_headseq(
             packed_LHW, cp_group, src_dim=src_dim, dst_dim=dst_dim
         )
-        q_TGK, k_TGK, v_TGV = torch.split(
+        q_TGQ, k_nope_TGN, v_TGV = torch.split(
             packed_TGW,
-            [self.q_head_dim, self.q_head_dim, self.v_head_dim],
+            [self.q_head_dim, self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
+
+        # Differentiable all-gather: the backward is a reduce-scatter, which is
+        # what a value every rank consumed needs.
+        k_rope_TR = torch.cat(
+            dist_nn.all_gather(k_rope_LR.contiguous(), group=cp_group), dim=0
+        )
+        k_TGQ = torch.cat(
+            [
+                k_nope_TGN,
+                k_rope_TR.view(t_full, 1, self.qk_rope_head_dim).expand(
+                    t_full, h_cp, self.qk_rope_head_dim
+                ),
+            ],
+            dim=-1,
+        )
+
         out_TGV = self.inner_attention(
-            q_TGK,
-            k_TGK,
+            q_TGQ,
+            k_TGQ,
             v_TGV,
-            attention_masks=self._full_sequence_causal_mask(
-                q_TGK.shape[0], q_TGK.device
-            ),
+            attention_masks=self._full_sequence_causal_mask(t_full, q_TGQ.device),
             scale=self.scale,
         )
         out_src_dim, out_dst_dim = ULYSSES.out_dims()
         return cp_all_to_all_headseq(
-            out_TGV, cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
+            out_TGV.contiguous(), cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
         )
-
-
 
 
 def _tp_replicate_config() -> ShardingConfig:
