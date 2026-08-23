@@ -209,12 +209,9 @@ class KimiMLAAttention(BaseAttention):
         """
         import torch.distributed.nn.functional as dist_nn
 
+        # Head divisibility is checked at wiring time, against tp*cp rather
+        # than cp; see apply_cp_kimi_k3.
         cp_size = dist.get_world_size(cp_group)
-        if self.n_heads % cp_size != 0:
-            raise ValueError(
-                f"MLA Ulysses CP: n_heads {self.n_heads} is not divisible by "
-                f"cp={cp_size}"
-            )
         t_loc = q_LHQ.shape[0]
         t_full = t_loc * cp_size
         h_cp = self.n_heads // cp_size
