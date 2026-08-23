@@ -8,10 +8,12 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 from torch import nn
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 
+from torchtitan.distributed.fsdp import add_zero_valued_dependency
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -608,6 +610,38 @@ class KimiK3Model(Decoder):
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
 
+
+    def _tower_needs_collectives(self) -> bool:
+        """Is the tower wrapped in something that issues per-forward collectives?
+
+        True once FSDP has sharded it, which is when skipping it desynchronizes
+        the process group. Before that, running a placeholder buys nothing.
+        """
+        return any(
+            isinstance(p, DTensor) for p in self.vision_encoder.parameters()
+        )
+
+    def _tower_placeholder(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The smallest input the tower accepts, for a rank with no images."""
+        kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
+        grid = torch.tensor(
+            [[1, kernel_h, kernel_w]], dtype=torch.int32, device=self._device()
+        )
+        weight = self.vision_encoder.patch_embed.weight
+        # A plain tensor, not weight.new_zeros: once FSDP has sharded the
+        # tower the weight is a DTensor, and a placeholder inheriting that
+        # meets the tower's own plain tensors as "aten.mm got mixed".
+        patches = torch.zeros(
+            kernel_h * kernel_w,
+            weight.shape[-1],
+            dtype=weight.dtype,
+            device=self._device(),
+        )
+        return patches, grid
+
+    def _device(self) -> torch.device:
+        return next(self.parameters()).device
+
     def _prepare_multimodal_embeds(
         self,
         tokens: torch.Tensor,
@@ -623,6 +657,18 @@ class KimiK3Model(Decoder):
                 "both be omitted."
             )
         if pixel_values is None:
+            # An image-free batch is normal, and skipping the tower on it is
+            # what the vision TODO in parallelize.py describes: FSDP2 issues
+            # the tower's all-gather from its pre-forward hook, so a rank that
+            # does not run it leaves its peers waiting in that collective until
+            # the watchdog fires. Run it on a placeholder and keep the graph
+            # edge with a zero-valued dependency, so every rank issues the same
+            # collectives and the tower's contribution to the data-parallel
+            # average is a correct zero.
+            if self.vision_encoder is not None and self._tower_needs_collectives():
+                placeholder, placeholder_grid = self._tower_placeholder()
+                unused = self.vision_encoder(placeholder, grid_thw=placeholder_grid)
+                return add_zero_valued_dependency(embeddings_TD, unused)
             return embeddings_TD
         assert grid_thw is not None
         if self.vision_encoder is None:
@@ -714,9 +760,8 @@ class KimiK3Model(Decoder):
         # no gradient there, FSDP would skip that rank's reduce_scatter, and
         # the ranks would deadlock on mismatched collectives -- observed as a
         # 300s watchdog timeout with one rank still in reduce_scatter while
-        # the other had moved two collectives ahead. Adding an exact zero
-        # leaves the embeddings unchanged.
-        return embeddings_TD + vision_embeds.sum() * 0.0
+        # the other had moved two collectives ahead.
+        return add_zero_valued_dependency(embeddings_TD, vision_embeds)
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
