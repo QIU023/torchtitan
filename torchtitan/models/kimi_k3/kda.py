@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from fla.ops.kda import chunk_kda
 from torch import nn
 
@@ -191,15 +192,24 @@ class KimiDeltaAttention(Module):
         )
         beta_TH = self.beta(x_TD).float()
 
+        # The kernel is fla triton and does not dispatch through DTensor.
+        # Under TP these arrive wrapped, and handing a DTensor to it produces
+        # an illegal memory access rather than anything legible, so the unwrap
+        # happens at the call site and the result is re-wrapped for the
+        # module's declared output layout.
         out_THV = self.kernel(
-            q_THK.unsqueeze(0),
-            k_THK.unsqueeze(0),
-            v_THV.unsqueeze(0),
-            forget_THK.unsqueeze(0),
-            beta_TH.unsqueeze(0),
-            self.A_log,
-            self.dt_bias,
+            to_local_if_dtensor(q_THK).unsqueeze(0),
+            to_local_if_dtensor(k_THK).unsqueeze(0),
+            to_local_if_dtensor(v_THV).unsqueeze(0),
+            to_local_if_dtensor(forget_THK).unsqueeze(0),
+            to_local_if_dtensor(beta_TH).unsqueeze(0),
+            to_local_if_dtensor(self.A_log),
+            to_local_if_dtensor(self.dt_bias),
         ).squeeze(0)
+        if isinstance(q_THK, DTensor):
+            out_THV = DTensor.from_local(
+                out_THV, q_THK.device_mesh, q_THK.placements, run_check=False
+            )
         output_gate_THV = self.output_gate(x_TD).view(
             num_tokens, self.num_heads, self.head_dim
         )
