@@ -37,6 +37,12 @@ class _Model(nn.Module):
         self.output_res_proj = nn.Linear(4, 4)
 
 
+class _MultimodalModel(_Model):
+    def __init__(self):
+        super().__init__()
+        self.vision_encoder = nn.Linear(4, 4)
+
+
 def _kwargs(num_layers: int):
     parallelism = SimpleNamespace(
         module_fqns_per_model_part=None,
@@ -80,6 +86,19 @@ class TestFQNInjection(unittest.TestCase):
             for fqn in stage:
                 root = fqn.split(".", 1)[0]
                 self.assertIn(root, children, f"{fqn} matches no child")
+
+
+    def test_the_vision_tower_gets_a_stage(self):
+        """Vision features are spliced into the embeddings, so the tower rides
+        with whichever stage kept the embedding. Left unnamed it is None on
+        every stage, and the first multimodal batch reports "pixel_values were
+        provided without a vision encoder"."""
+        kwargs = _kwargs(8)
+        _inject_kimi_k3_fqns(_MultimodalModel(), kwargs)
+        fqns = kwargs["parallelism"].module_fqns_per_model_part
+        owner = [s for s in fqns if "vision_encoder" in s]
+        self.assertEqual(len(owner), 1, "the tower must land on exactly one stage")
+        self.assertIn("tok_embeddings", owner[0])
 
 
 if __name__ == "__main__":
