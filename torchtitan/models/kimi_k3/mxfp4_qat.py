@@ -25,6 +25,8 @@ dequant(quant(w)) so the loss sees quantized weights, while the bf16
 master trains (STE via detach trick).
 """
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -204,12 +206,14 @@ ALL_LINEAR_QAT_TARGETS: tuple[str, ...] = (
 )
 
 
-def apply_mxfp4_qat(
+def apply_mx_qat(
     model: nn.Module,
     *,
     scope: str = "k3_official",
     targets: tuple[str, ...] = ALL_LINEAR_QAT_TARGETS,
     quantize_act: bool = True,
+    select_modules: "Callable[[nn.Module], list] | None" = None,
+    skip_subtrees: "tuple[type, ...] | None" = None,
 ) -> int:
     """Attach MXFP4-weight / MXFP8-activation fake-quant QAT. Returns count.
 
@@ -224,9 +228,15 @@ def apply_mxfp4_qat(
     wrapper there would be silently dead.
     """
     if scope == "k3_official":
-        from torchtitan.models.kimi_k3.quant_scope import quantizable_modules
+        # The scope is the caller's, not this module's. K3's is the released
+        # quantization_config's -- routed experts only -- and passing it in is
+        # what keeps the primitive model-independent: everything above this line
+        # is fake-quant arithmetic that any model can use.
+        if select_modules is None:
+            from torchtitan.models.kimi_k3.quant_scope import quantizable_modules
 
-        candidates = quantizable_modules(model)
+            select_modules = quantizable_modules
+        candidates = select_modules(model)
         if not candidates:
             raise ValueError(
                 "apply_mxfp4_qat(scope='k3_official') found no routed experts "
@@ -253,11 +263,18 @@ def apply_mxfp4_qat(
             f"Unknown scope {scope!r}; expected 'k3_official' or 'all_linear'"
         )
 
-    from torchtitan.models.kimi_k3.model import KimiDeltaAttention
+    if skip_subtrees is None:
+        # KDA's projections must never be wrapped: fla reads .weight directly and
+        # bypasses module forward, so a wrapper there is silently dead. That is a
+        # property of the model, so the model names it -- the default keeps the
+        # existing callers working.
+        from torchtitan.models.kimi_k3.model import KimiDeltaAttention
+
+        skip_subtrees = (KimiDeltaAttention,)
 
     n = 0
     for module in model.modules():
-        if isinstance(module, KimiDeltaAttention):
+        if isinstance(module, skip_subtrees):
             continue
         for name, child in list(module.named_children()):
             if name in targets and isinstance(child, nn.Linear):
@@ -266,3 +283,9 @@ def apply_mxfp4_qat(
     if n == 0:
         raise ValueError("apply_mxfp4_qat matched no target Linears")
     return n
+
+
+# Kept so existing callers and docs keep working; the name only mentioned the
+# weight format while the wrapper has always done MXFP4 weights AND MXFP8
+# activations.
+apply_mxfp4_qat = apply_mx_qat
