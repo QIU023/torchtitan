@@ -1638,7 +1638,13 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
     # Every kimi_k3 flavor registers THIS pipelining_fn, so the DEP wiring has to be
     # installed here; having it only in pipeline_llm_with_cache_adapter left it dead
     # code, and its absence read as "the prefetch changes nothing".
-    if dep_enabled():
+    if dep_enabled() and step_inputs is not None:
+        # step_inputs is created only on the wrapper layout, where the tower is
+        # split into shares that each need the micro-batch index to find
+        # grid_thw. On a model that carries the tower as its own child, DEP
+        # gives it one whole stage, so there are no later shares to wire and
+        # nothing here applies.
+        #
         # Wiring first, and unconditionally: a split tower's later shares need the
         # micro-batch index to find grid_thw, and without it they pass activations
         # through with no error at all.
