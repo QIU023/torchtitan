@@ -18,7 +18,10 @@ from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
 )
-from .model import KimiK3Model
+from torchtitan.tools.logging import logger
+
+from .kda import KimiDeltaAttention
+from .model import KimiK3Model, KimiMLAAttention
 
 
 def parallelize_kimi_k3(
@@ -38,7 +41,6 @@ def parallelize_kimi_k3(
         for name, enabled in (
             ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
-            ("context parallel", parallel_dims.cp_enabled),
             ("expert parallel", parallel_dims.ep_enabled),
         )
         if enabled
@@ -62,6 +64,9 @@ def parallelize_kimi_k3(
     dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
 
     assert isinstance(model, KimiK3Model)
+    if parallel_dims.cp_enabled:
+        apply_cp_kimi_k3(model, parallel_dims)
+
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
         ac_policy.apply(model)
@@ -95,3 +100,34 @@ def parallelize_kimi_k3(
     )
 
     return model
+
+
+def apply_cp_kimi_k3(model: nn.Module, parallel_dims: ParallelDims) -> None:
+    """Hand every attention layer the CP process group.
+
+    Both attention kinds shard the sequence, so both need the group, but they
+    do different things with it. MLA trades the sharded axis for heads
+    (Ulysses). KDA keeps the sequence sharded and passes recurrent state along
+    the ranks, or trades axes too, depending on its ``cp_mode``.
+
+    This is imperative rather than declared because KDA's kernels are fla
+    triton and never see a DTensor; see ``cp_via_sharding_config`` on the model
+    config for why the declarative path cannot serve them.
+    """
+    cp_group = parallel_dims.get_mesh("cp").get_group()
+    num_mla = num_kda = 0
+    for module in model.modules():
+        if isinstance(module, KimiMLAAttention):
+            module._cp_group = cp_group
+            num_mla += 1
+        elif isinstance(module, KimiDeltaAttention):
+            module._cp_group = cp_group
+            num_kda += 1
+    if num_mla + num_kda == 0:
+        raise ValueError(
+            "context parallel is enabled but no attention layer was found to "
+            "wire it onto."
+        )
+    logger.info(
+        "Applied context parallel to %d MLA and %d KDA layers.", num_mla, num_kda
+    )
