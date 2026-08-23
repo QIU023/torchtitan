@@ -1100,6 +1100,15 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     tower = getattr(model, "vision_encoder", None)
     inner = getattr(model, "language_model", None)
     if tower is None or inner is None:
+        if tower is not None and dep_enabled():
+            raise NotImplementedError(
+                "vision DEP expects the tower to be a sibling of the language "
+                "model, so it can own a pipeline stage of its own. On this "
+                "model the tower is a child of the decoder, and giving it a "
+                "stage means re-expressing the split rather than re-wrapping. "
+                "Unset KIMI_VIT_DEP; plain pipeline parallel keeps the tower "
+                "on the stage that owns the embedding."
+            )
         return model
 
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
