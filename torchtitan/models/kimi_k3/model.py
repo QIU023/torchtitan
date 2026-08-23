@@ -671,7 +671,11 @@ class KimiK3Model(Decoder):
         cp_size = dist.get_world_size(group) if group is not None else 1
         grids = grid_thw.tolist()
         counts = [t * h * w for t, h, w in grids]
+        kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
         big = set(classify(counts, cp_size, min_patches=self.dynamic_cp_min_patches))
+        # Only images whose height divides the merge kernel: a band boundary
+        # inside a (kh, kw) block would ask two ranks to merge halves of one.
+        big = {i for i in big if grids[i][1] % kernel_h == 0}
         if not big:
             return self.vision_encoder(pixel_values, grid_thw=grid_thw)
         if not self._dyncp_logged:
@@ -687,7 +691,6 @@ class KimiK3Model(Decoder):
             )
 
         rank = dist.get_rank(group)
-        kernel_h, _ = self.vision_encoder.merge_kernel_size
         outputs = []
         offset = 0
         for i, (grid, count) in enumerate(zip(grids, counts, strict=True)):
@@ -713,8 +716,14 @@ class KimiK3Model(Decoder):
                 rows = item[lo:hi]
                 pad = plan.band * grid_w - rows.shape[0]
                 if pad > 0:
-                    src = rows[-1:] if rows.shape[0] else item[:1]
-                    rows = torch.cat([rows, src.expand(pad, *item.shape[1:])], dim=0)
+                    # Zeros, matching the implementation this was ported from.
+                    # The padded rows form whole merge blocks -- bands and real
+                    # row counts are both multiples of the kernel height -- so
+                    # nothing real is averaged with them, and the padded queries
+                    # are discarded while the padded keys are masked.
+                    rows = torch.cat(
+                        [rows, rows.new_zeros(pad, *item.shape[1:])], dim=0
+                    )
                 per_frame.append(rows)
             shard = torch.cat(per_frame, dim=0)
             mine = self.vision_encoder(shard, grid_thw=item_grid, cp_plan=plan)
