@@ -140,6 +140,19 @@ def kimi_k3_debugmodel_text() -> Trainer.Config:
 
 
 
+def kimi_k3_debugmodel_dyncp() -> Trainer.Config:
+    """The multimodal debug model with the dynamic-CP threshold lowered.
+
+    The debug dataloader caps images at 256 patches, which is the production
+    threshold, so with the default no image is ever large enough to partition
+    and the path is wired but never executed. This flavor lowers the threshold
+    so the matrix actually runs it.
+    """
+    config = kimi_k3_debugmodel()
+    config.model_spec.model.dynamic_cp_min_patches = 64
+    return config
+
+
 def kimi_k3_debugmodel_lora() -> Trainer.Config:
     """The multimodal debug model with LoRA adapters on the attention output.
 

@@ -45,6 +45,7 @@ from torchtitan.models.common.multimodal import (
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
+from torchtitan.tools.logging import logger
 
 from .kda import KimiDeltaAttention
 from .sharding import cp_all_to_all_headseq, ULYSSES
@@ -610,6 +611,7 @@ class KimiK3Model(Decoder):
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
         self.dynamic_cp_min_patches = config.dynamic_cp_min_patches
+        self._dyncp_logged = False
 
 
     def _tower_needs_collectives(self) -> bool:
@@ -672,6 +674,17 @@ class KimiK3Model(Decoder):
         big = set(classify(counts, cp_size, min_patches=self.dynamic_cp_min_patches))
         if not big:
             return self.vision_encoder(pixel_values, grid_thw=grid_thw)
+        if not self._dyncp_logged:
+            # Said once, because "dynamic CP is on" and "dynamic CP fired" are
+            # different claims: with the debug data every image sits under the
+            # threshold, so the path is wired and inert, and only a count tells
+            # the two apart.
+            self._dyncp_logged = True
+            logger.info(
+                "Dynamic CP partitioning %d of %d image(s) across %d rank(s); "
+                "patch counts %s, threshold %d.",
+                len(big), len(grids), cp_size, counts, self.dynamic_cp_min_patches,
+            )
 
         rank = dist.get_rank(group)
         kernel_h, _ = self.vision_encoder.merge_kernel_size
@@ -687,14 +700,42 @@ class KimiK3Model(Decoder):
             plan, ranges = make_cp_patch_plan(
                 tuple(grid), group=group, rank=rank, merge_kernel_h=kernel_h
             )
-            shard = torch.cat([item[lo:hi] for lo, hi in ranges], dim=0)
+            # Padded to the band, per frame, because _slice_for_shard pads the
+            # position tables the same way and the two are added together. A
+            # rank short of rows otherwise meets a table longer than its pixels
+            # -- which is what "mirroring how the caller lays out the pixels"
+            # in that helper means. The padding repeats the last real row
+            # rather than being zeroed, so nothing out of range reaches a norm;
+            # the padded queries are discarded and the padded keys are masked.
+            _, _, grid_w = grid
+            per_frame = []
+            for lo, hi in ranges:
+                rows = item[lo:hi]
+                pad = plan.band * grid_w - rows.shape[0]
+                if pad > 0:
+                    src = rows[-1:] if rows.shape[0] else item[:1]
+                    rows = torch.cat([rows, src.expand(pad, *item.shape[1:])], dim=0)
+                per_frame.append(rows)
+            shard = torch.cat(per_frame, dim=0)
             mine = self.vision_encoder(shard, grid_thw=item_grid, cp_plan=plan)
             # Every rank needs the whole image's tokens: the text side splices
             # them at positions this rank may or may not hold, and the CP
             # sentinel selection downstream cuts to what it does hold.
             parts = [torch.empty_like(mine) for _ in range(cp_size)]
             dist.all_gather(parts, mine.contiguous())
-            outputs.append(torch.cat(parts, dim=0))
+            # Each rank emitted band-worth of rows, padded; only its real rows
+            # carry tokens the text side expects. The counts follow the same
+            # ceiling split row_partition performs, so trimming needs no extra
+            # collective -- and it cannot be a single trailing trim, because
+            # every rank's padding sits at the end of ITS chunk.
+            _, full_h, full_w = plan.full_grid
+            kernel_w = self.vision_encoder.merge_kernel_size[1]
+            per_row = full_w // kernel_w
+            trimmed = []
+            for r_i, part in enumerate(parts):
+                real_rows = min(plan.band, max(0, full_h - r_i * plan.band))
+                trimmed.append(part[: (real_rows // kernel_h) * per_row])
+            outputs.append(torch.cat(trimmed, dim=0))
         return torch.cat(outputs, dim=0)
 
 
