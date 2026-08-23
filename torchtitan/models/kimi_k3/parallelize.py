@@ -52,14 +52,16 @@ def parallelize_kimi_k3(
             #   getitem(int32[256], DTensor(scalar int32, Replicate on tp))
             #   -> aten.index.Tensor got mixed torch.Tensor and DTensor
             # Not AC: the same error appears with activation-checkpoint:none.
-            # Cause, measured: KimiLatentMoE overrides MoE.forward, so the
-            # router bookkeeping (routing_map, per-expert counts) is computed
-            # at module level where the activations are DTensor, and the
-            # dispatcher then indexes plain tensors with a DTensor. The
-            # implementation this was ported from does not override
-            # MoE.forward at all -- it composes core's MoE and handles DTensor
-            # only at the module boundary -- which is why it never has a
-            # DTensor count to hand down. Paused on maintainer request.
+            # Cause, corrected: it is NOT that KimiLatentMoE overrides
+            # MoE.forward. Core's MoE.forward computes the same DTensor
+            # bookkeeping and says so -- "MoE.forward() operates on DTensors;
+            # the DTensor->local conversion happens at the GroupedExperts
+            # boundary". The difference is what reaches that boundary: core
+            # passes x_TD to routed_experts, this one passes routed_down(x_TD),
+            # and routed_experts carries the local_map that set_moe_sharding_config
+            # declared for x_TD's layout. The latent entry point is a second
+            # input path the declaration does not name.
+            # Paused on maintainer request.
             ("tensor parallel", parallel_dims.tp_enabled),
 
 
