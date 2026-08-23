@@ -136,7 +136,7 @@ def _qat_grouped_experts_subclass(parent_cls: type) -> type:
     """Subclass of a ``GroupedExperts`` variant with MXFP4/MXFP8 fake-quant.
 
     Works for any GroupedExperts subclass, which matters because K3's routed
-    experts are ``KimiSiTUGroupedExperts``, not the core class.
+    experts are ``KimiGroupedExperts``, not the core class.
 
     The fake-quantized weights are installed into ``self.__dict__`` for the
     duration of forward, which shadows ``_parameters`` for normal attribute

@@ -11,7 +11,7 @@ init_weights is the ONLY thing that gives the routed experts real values.
 It used to dispatch on ``type(m).__name__ == "GroupedExperts"`` and init
 parameters named ``("w1", "w2", "w3")``. Both went stale -- upstream renamed
 the parameters to w1_EFD / w2_EDF / w3_EFD, and K3's experts are a
-KimiSiTUGroupedExperts subclass -- so the routed experts stayed at to_empty
+KimiGroupedExperts subclass -- so the routed experts stayed at to_empty
 garbage. The model still trained to a plausible loss on the dense, shared and
 latent paths, and the routed contribution was measurably nil: loss with real
 experts and loss with every expert weight zeroed were bit-identical.

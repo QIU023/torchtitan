@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""MoonViT-V2 against the released reference and the shipped checkpoint keys.
+"""KimiK3VisionEncoder-V2 against the released reference and the shipped checkpoint keys.
 
 The checkpoint's key list is the strongest available ground truth: it settles
 questions the config cannot (whether the time embedding is learned, which
@@ -23,11 +23,11 @@ import torch
 import torch.nn as nn
 
 from torchtitan.models.kimi_k3.vision_encoder import (
-    MoonViT,
-    MoonViTConfig,
-    PatchMergerMLPV2,
+    _temporal_pool_and_merge,
+    KimiK3VisionConfig,
+    KimiK3VisionEncoder,
+    KimiK3VisionProjector,
     sincos_1d,
-    tpool_patch_merger,
 )
 
 _OFFICIAL = (
@@ -39,10 +39,10 @@ _CONFIG = _OFFICIAL / "config.json"
 _INDEX = _OFFICIAL / "reference" / "model.safetensors.index.json"
 
 
-def _tiny() -> MoonViTConfig:
+def _tiny() -> KimiK3VisionConfig:
     """Same structure, small extents. head_dim 24 stays divisible by 4 for
     2-D RoPE and qkv_hidden_size stays wider than hidden_size, as K3's is."""
-    return MoonViTConfig(
+    return KimiK3VisionConfig(
         num_hidden_layers=2,
         hidden_size=32,
         num_attention_heads=2,
@@ -62,7 +62,7 @@ class TestAgainstOfficialConfig(unittest.TestCase):
         if not _CONFIG.exists():
             self.skipTest("official config not present")
         v = json.loads(_CONFIG.read_text())["vision_config"]
-        c = MoonViTConfig()
+        c = KimiK3VisionConfig()
         for ours, theirs in (
             ("num_hidden_layers", "vt_num_hidden_layers"),
             ("hidden_size", "vt_hidden_size"),
@@ -81,8 +81,8 @@ class TestAgainstOfficialConfig(unittest.TestCase):
         self.assertEqual(c.head_dim, 128)
 
     def test_encoder_size_matches_the_model_card(self):
-        # the model card states MoonViT-V2 is 401M parameters
-        n = MoonViT(MoonViTConfig()).encoder_num_parameters()
+        # the model card states KimiK3VisionEncoder-V2 is 401M parameters
+        n = KimiK3VisionEncoder(KimiK3VisionConfig()).encoder_num_parameters()
         self.assertAlmostEqual(n / 1e6, 401.0, delta=1.5)
 
 
@@ -102,7 +102,7 @@ class TestAgainstCheckpointKeys(unittest.TestCase):
         }
 
     def _ours(self):
-        model = MoonViT(MoonViTConfig())
+        model = KimiK3VisionEncoder(KimiK3VisionConfig())
         out = set()
         for name, _ in model.named_parameters():
             if name.startswith("mm_projector."):
@@ -141,7 +141,7 @@ class TestAgainstCheckpointKeys(unittest.TestCase):
         table would appear here."""
         pos = {k for k in self.vision if "pos_emb" in k}
         self.assertEqual(pos, {"vision_tower.patch_embed.pos_emb.weight"})
-        model = MoonViT(_tiny())
+        model = KimiK3VisionEncoder(_tiny())
         self.assertNotIn(
             "patch_embed.time_weight",
             dict(model.named_parameters()),
@@ -150,7 +150,7 @@ class TestAgainstCheckpointKeys(unittest.TestCase):
         self.assertIn("patch_embed.time_weight", dict(model.named_buffers()))
 
     def test_projector_is_v2_post_norm(self):
-        """PatchMergerMLPV2 has post_norm and no pre_norm; the v1 variant is the
+        """KimiK3VisionProjector has post_norm and no pre_norm; the v1 variant is the
         other way round."""
         proj = {k for k in self.vision if k.startswith("mm_projector.")}
         self.assertIn("mm_projector.post_norm.weight", proj)
@@ -159,7 +159,7 @@ class TestAgainstCheckpointKeys(unittest.TestCase):
 
 class TestStructure(unittest.TestCase):
     def test_no_biases_anywhere(self):
-        model = MoonViT(_tiny())
+        model = KimiK3VisionEncoder(_tiny())
         offenders = [
             name
             for name, m in model.named_modules()
@@ -170,7 +170,7 @@ class TestStructure(unittest.TestCase):
     def test_all_norms_are_rmsnorm(self):
         # report sec 2.4: RMSNorm throughout. The projector's is RMSNorm too in
         # v2, unlike v1's LayerNorm.
-        model = MoonViT(_tiny())
+        model = KimiK3VisionEncoder(_tiny())
         for name, m in model.named_modules():
             if isinstance(m, nn.LayerNorm) and not isinstance(m, nn.RMSNorm):
                 self.fail(f"{name} is a plain LayerNorm")
@@ -186,13 +186,13 @@ class TestStructure(unittest.TestCase):
 class TestForward(unittest.TestCase):
     def _model(self):
         torch.manual_seed(0)
-        m = MoonViT(_tiny())
+        m = KimiK3VisionEncoder(_tiny())
         m.init_weights()
         return m
 
     def test_image_forward_and_token_reduction(self):
         m = self._model()
-        patches, grid = MoonViT.patchify(torch.randn(2, 3, 32, 32), 4)
+        patches, grid = KimiK3VisionEncoder.patchify(torch.randn(2, 3, 32, 32), 4)
         out = m(patches, grid)
         self.assertEqual(len(out), 2)
         # 8x8 patch grid -> 64 tokens -> 16 after the 2x2 merge
@@ -202,7 +202,7 @@ class TestForward(unittest.TestCase):
 
     def test_video_collapses_the_time_axis_entirely(self):
         m = self._model()
-        patches, grid = MoonViT.patchify(torch.randn(1, 4, 3, 32, 32), 4)
+        patches, grid = KimiK3VisionEncoder.patchify(torch.randn(1, 4, 3, 32, 32), 4)
         out = m(patches, grid)
         # mean over ALL frames, so 4 frames still yield one frame's tokens
         self.assertEqual(out[0].shape, (16, 64))
@@ -210,8 +210,8 @@ class TestForward(unittest.TestCase):
     def test_mixed_resolution_batch(self):
         """Native-resolution packing: one batch, different grids per sample."""
         m = self._model()
-        a, ga = MoonViT.patchify(torch.randn(1, 3, 32, 32), 4)
-        b, gb = MoonViT.patchify(torch.randn(1, 3, 16, 24), 4)
+        a, ga = KimiK3VisionEncoder.patchify(torch.randn(1, 3, 32, 32), 4)
+        b, gb = KimiK3VisionEncoder.patchify(torch.randn(1, 3, 16, 24), 4)
         patches = torch.cat([a, b], dim=0)
         grid = torch.cat([ga, gb], dim=0)
         out = m(patches, grid)
@@ -222,8 +222,8 @@ class TestForward(unittest.TestCase):
         """Block-diagonal attention: a sample's output must not change when a
         different sample is packed alongside it."""
         m = self._model()
-        a, ga = MoonViT.patchify(torch.randn(1, 3, 32, 32), 4)
-        b, gb = MoonViT.patchify(torch.randn(1, 3, 16, 16), 4)
+        a, ga = KimiK3VisionEncoder.patchify(torch.randn(1, 3, 32, 32), 4)
+        b, gb = KimiK3VisionEncoder.patchify(torch.randn(1, 3, 16, 16), 4)
         alone = m(a, ga)[0]
         together = m(torch.cat([a, b]), torch.cat([ga, gb]))[0]
         self.assertLess(
@@ -237,10 +237,10 @@ class TestForward(unittest.TestCase):
         it did not, a video would just be a batch of images."""
         m = self._model()
         frames = torch.randn(1, 2, 3, 32, 32)
-        p2, g2 = MoonViT.patchify(frames, 4)
+        p2, g2 = KimiK3VisionEncoder.patchify(frames, 4)
         joint = m(p2, g2)[0]
-        p1, g1 = MoonViT.patchify(frames[:, :1], 4)
-        p1b, g1b = MoonViT.patchify(frames[:, 1:], 4)
+        p1, g1 = KimiK3VisionEncoder.patchify(frames[:, :1], 4)
+        p1b, g1b = KimiK3VisionEncoder.patchify(frames[:, 1:], 4)
         separate = (m(p1, g1)[0] + m(p1b, g1b)[0]) / 2
         rel = ((joint - separate).norm() / separate.norm()).item()
         self.assertGreater(rel, 1e-3, "frames did not interact")
@@ -251,33 +251,31 @@ class TestForward(unittest.TestCase):
         m = self._model()
         with torch.no_grad():
             m.patch_embed.pos_emb.weight.zero_()
-        patches, grid = MoonViT.patchify(torch.randn(1, 3, 16, 16), 4)
+        patches, grid = KimiK3VisionEncoder.patchify(torch.randn(1, 3, 16, 16), 4)
         base = m(patches, grid)[0]
         # swap two patch positions; with no positional signal at all the
         # merged output would be a permutation of the same values
         swapped = patches.clone()
         swapped[[0, 5]] = swapped[[5, 0]]
         other = m(swapped, grid)[0]
-        self.assertGreater(
-            ((other - base).norm() / base.norm()).item(), 1e-4
-        )
+        self.assertGreater(((other - base).norm() / base.norm()).item(), 1e-4)
 
     def test_grid_indivisible_by_merge_kernel_is_rejected(self):
         x = torch.randn(7 * 8, 32)
         grid = torch.tensor([[1, 7, 8]])
         with self.assertRaisesRegex(ValueError, "merge kernel"):
-            tpool_patch_merger(x, grid)
+            _temporal_pool_and_merge(x, grid)
 
     def test_too_many_frames_is_rejected(self):
         m = self._model()
-        patches, grid = MoonViT.patchify(torch.randn(1, 4, 3, 16, 16), 4)
+        patches, grid = KimiK3VisionEncoder.patchify(torch.randn(1, 4, 3, 16, 16), 4)
         grid[0, 0] = 5  # beyond init_pos_emb_time
         with self.assertRaisesRegex(ValueError, "init_pos_emb_time"):
             m(patches, grid)
 
     def test_spatial_merge_is_space_to_depth_not_pooling(self):
         cfg = _tiny()
-        merger = PatchMergerMLPV2(cfg)
+        merger = KimiK3VisionProjector(cfg)
         with torch.no_grad():
             nn.init.eye_(merger.proj[0].weight)
             nn.init.normal_(merger.proj[2].weight, std=0.05)
@@ -290,7 +288,7 @@ class TestForward(unittest.TestCase):
 
     def test_gradients_reach_the_learned_position_table(self):
         m = self._model()
-        patches, grid = MoonViT.patchify(torch.randn(1, 2, 3, 32, 32), 4)
+        patches, grid = KimiK3VisionEncoder.patchify(torch.randn(1, 2, 3, 32, 32), 4)
         torch.cat(m(patches, grid)).sum().backward()
         g = m.patch_embed.pos_emb.weight.grad
         self.assertIsNotNone(g)

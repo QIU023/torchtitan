@@ -19,7 +19,7 @@ Architectural faithfulness (per Kimi Linear tech report §5):
   (NoPE MLA, faithful to Kimi's spec — not the DSv3 MLA in
   ``torchtitan.models.deepseek_v3``). Alternation pattern is
   layer-index-driven by ``config.kda_layers`` / ``config.full_attn_layers``.
-* Every layer's FFN is EITHER :class:`KimiMLP` (dense SwiGLU, used on
+* Every layer's FFN is EITHER :class:`KimiFeedForward` (dense SwiGLU, used on
   the first ``first_k_dense_replace`` layers) OR :class:`KimiMoE`
   (sparse sigmoid-gated grouped-topk, composed from torchtitan's
   common :class:`TokenChoiceTopKRouter` + :class:`GroupedExperts`
@@ -335,11 +335,11 @@ def situ_and_mul(
 # ----- Dense SwiGLU MLP --------------------------------------------------- #
 
 
-class KimiMLP(FeedForward):
+class KimiFeedForward(FeedForward):
     """SwiGLU dense FFN. Used for layer 0 (pre-MoE dense replace) AND
     as the shared-experts module in MoE layers.
 
-    Faithful to ``reference:KimiMLP`` (gate_proj, up_proj, down_proj), and reusing
+    Faithful to ``reference:KimiFeedForward`` (gate_proj, up_proj, down_proj), and reusing
     ``common.FeedForward`` for the plain SwiGLU case -- finding 7, which the maintainer
     raised as "should use our fused feed forward".
 
@@ -393,7 +393,7 @@ class KimiMLP(FeedForward):
         hidden_act: Literal["silu", "gelu", "situ"] = "silu",
         situ_beta: float = 4.0,
         situ_linear_beta: float | None = 25.0,
-    ) -> "KimiMLP.Config":
+    ) -> "KimiFeedForward.Config":
         """The dimensions-in form, until the flavor builder owns the tree.
 
         Callers still think in dimensions; this is the one place that turns them
@@ -409,7 +409,7 @@ class KimiMLP(FeedForward):
                 sharding_config=tp_shard(dim),
             )
 
-        return KimiMLP.Config(
+        return KimiFeedForward.Config(
             w1=_lin(hidden_size, intermediate_size, 0),
             w3=_lin(hidden_size, intermediate_size, 0),
             w2=_lin(intermediate_size, hidden_size, 1),
@@ -418,7 +418,7 @@ class KimiMLP(FeedForward):
             situ_linear_beta=situ_linear_beta,
         )
 
-    def __init__(self, config: "KimiMLP.Config") -> None:
+    def __init__(self, config: "KimiFeedForward.Config") -> None:
         # Skip FeedForward.__init__, which would build w1/w2/w3 as attributes of
         # those names. This class owns the release's names, so only the forward is
         # inherited; the grandparent call keeps torchtitan's Module setup.
@@ -1029,7 +1029,7 @@ class KimiMoE(Module):
     * :class:`GroupedExperts` — grouped-GEMM SwiGLU experts,
       training-capable, with a for-loop fallback for CPU.
     * Shared experts (``num_shared_experts``): a single
-      :class:`KimiMLP` instance whose output is added to the routed
+      :class:`KimiFeedForward` instance whose output is added to the routed
       output unconditionally.
 
     Load-balancing hook: ``expert_bias`` is registered as a buffer on
@@ -1051,7 +1051,7 @@ class KimiMoE(Module):
         moe: "MoE.Config"
         latent_size: int | None = None
         latent: "KimiLatentMoEProjection.Config | None" = None
-        shared_experts: "KimiMLP.Config | None" = None
+        shared_experts: "KimiFeedForward.Config | None" = None
 
     @staticmethod
     def make_config(config: KimiK3Config) -> "KimiMoE.Config":
@@ -1114,9 +1114,9 @@ class KimiMoE(Module):
         # K3 sets hidden_act="situ" globally, so the routed experts use
         # SiTU-GLU (Eq. 12); core GroupedExperts is SwiGLU-only.
         if config.hidden_act == "situ":
-            from torchtitan.models.kimi_k3.moe import KimiSiTUGroupedExperts
+            from torchtitan.models.kimi_k3.moe import KimiGroupedExperts
 
-            experts_config_cls = KimiSiTUGroupedExperts.Config
+            experts_config_cls = KimiGroupedExperts.Config
             experts_act_kwargs = {
                 "situ_beta": config.activation_situ_beta,
                 "situ_linear_beta": config.activation_situ_linear_beta,
@@ -1157,7 +1157,7 @@ class KimiMoE(Module):
             # Blackwell; CPU path raises so MoE forward is GPU-only.
         )
 
-        # Shared experts — Kimi's reference uses KimiMLP at
+        # Shared experts — Kimi's reference uses KimiFeedForward at
         # intermediate = moe_int * num_shared_experts. We swap to
         # torchtitan's FeedForward for consistency with MoE.Config;
         # the SwiGLU math is identical.
@@ -1275,7 +1275,7 @@ class KimiMoE(Module):
         shared_experts_cfg = None
         if config.num_shared_experts > 0 and latent_size is not None:
             shared_dim = config.moe_intermediate_size * config.num_shared_experts
-            shared_experts_cfg = KimiMLP.make_config(
+            shared_experts_cfg = KimiFeedForward.make_config(
                 config.hidden_size,
                 shared_dim,
                 hidden_act=config.hidden_act,
@@ -1383,11 +1383,11 @@ class UpstreamFSDPNames:
         return bool(getattr(self, "is_moe", False))
 
 
-class KimiDecoderLayer(Module, UpstreamFSDPNames):
+class KimiK3TransformerBlock(Module, UpstreamFSDPNames):
     """One transformer block: pre-norm + attention + residual +
     pre-norm + MoE/MLP + residual.
 
-    Faithful to ``reference:KimiDecoderLayer``.
+    Faithful to ``reference:KimiK3TransformerBlock``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -1406,10 +1406,12 @@ class KimiDecoderLayer(Module, UpstreamFSDPNames):
         attention: "KimiMLAAttention.Config | None" = None
         delta_attention: "KimiDeltaAttention.Config | None" = None
         moe: "KimiMoE.Config | None" = None
-        feed_forward: "KimiMLP.Config | None" = None
+        feed_forward: "KimiFeedForward.Config | None" = None
 
     @staticmethod
-    def make_config(config: KimiK3Config, layer_idx: int) -> "KimiDecoderLayer.Config":
+    def make_config(
+        config: KimiK3Config, layer_idx: int
+    ) -> "KimiK3TransformerBlock.Config":
         """The one place this class reads the flat config."""
 
         def _norm() -> "RMSNorm.Config":
@@ -1424,7 +1426,7 @@ class KimiDecoderLayer(Module, UpstreamFSDPNames):
                 sharding_config=norm_config(enable_sp=False),
             )
 
-        cfg = KimiDecoderLayer.Config(
+        cfg = KimiK3TransformerBlock.Config(
             layer_idx=layer_idx,
             hidden_size=config.hidden_size,
             input_layernorm=_norm(),
@@ -1452,14 +1454,14 @@ class KimiDecoderLayer(Module, UpstreamFSDPNames):
         ):
             cfg.moe = KimiMoE.make_config(config)
         else:
-            cfg.feed_forward = KimiMLP.make_config(
+            cfg.feed_forward = KimiFeedForward.make_config(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
             )
         return cfg
 
-    def __init__(self, config: "KimiDecoderLayer.Config") -> None:
+    def __init__(self, config: "KimiK3TransformerBlock.Config") -> None:
         super().__init__()
         self.layer_idx = config.layer_idx
         self.hidden_size = config.hidden_size
@@ -1539,7 +1541,7 @@ class KimiK3Model(Module):
 
         kimi_config: KimiK3Config
         tok_embeddings: "Embedding.Config"
-        layers: list["KimiDecoderLayer.Config"]
+        layers: list["KimiK3TransformerBlock.Config"]
         norm: "RMSNorm.Config"
         lm_head: "Linear.Config"
 
@@ -1553,7 +1555,7 @@ class KimiK3Model(Module):
                 embedding_dim=config.hidden_size,
             ),
             layers=[
-                KimiDecoderLayer.make_config(config, i)
+                KimiK3TransformerBlock.make_config(config, i)
                 for i in range(config.num_hidden_layers)
             ],
             norm=RMSNorm.Config(
@@ -1783,7 +1785,7 @@ class KimiK3Model(Module):
         # a hand-maintained exhaustive walk is exactly what broke here.
         #
         # isinstance, not a class-name string: K3's routed experts are
-        # KimiSiTUGroupedExperts, and the QAT/packing paths install further
+        # KimiGroupedExperts, and the QAT/packing paths install further
         # subclasses. And the parameters are enumerated from _parameters
         # rather than a hardcoded ("w1", "w2", "w3") tuple, because upstream
         # renamed them to shape-suffixed w1_EFD / w2_EDF / w3_EFD -- a stale
@@ -1908,7 +1910,7 @@ class KimiK3Spec:
         Separate from ``build`` because the multimodal spec overrides ``build``
         to construct a vision-bearing model; without a shared entry point every
         one of these config fields is silently dropped on multimodal flavors.
-        None of them can match a MoonViT module: the LoRA target names and the
+        None of them can match a KimiK3VisionEncoder module: the LoRA target names and the
         routed-expert QAT scope do not exist in the tower.
         """
         if self.lora_rank is not None:

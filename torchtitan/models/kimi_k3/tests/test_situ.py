@@ -20,7 +20,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.kimi_k3.model import KimiMLP, situ_and_mul
+from torchtitan.models.kimi_k3.model import KimiFeedForward, situ_and_mul
 
 
 class TestSituAndMul(unittest.TestCase):
@@ -29,9 +29,9 @@ class TestSituAndMul(unittest.TestCase):
         g = torch.randn(4, 8) * 10  # wide enough to exercise the caps
         u = torch.randn(4, 8) * 60
         beta, lin = 4.0, 25.0
-        expect = (
-            beta * torch.tanh(g / beta) * torch.sigmoid(g)
-        ) * (lin * torch.tanh(u / lin))
+        expect = (beta * torch.tanh(g / beta) * torch.sigmoid(g)) * (
+            lin * torch.tanh(u / lin)
+        )
         torch.testing.assert_close(situ_and_mul(g, u, beta, lin), expect)
 
     def test_saturates_at_beta(self):
@@ -65,8 +65,8 @@ class TestKimiMLPSitu(unittest.TestCase):
     def test_mlp_situ_path_runs_and_differs_from_silu(self):
         torch.manual_seed(0)
         x = torch.randn(2, 3, 16)
-        mlp_silu = KimiMLP.make_config(16, 32, hidden_act="silu").build()
-        mlp_situ = KimiMLP.make_config(16, 32, hidden_act="situ").build()
+        mlp_silu = KimiFeedForward.make_config(16, 32, hidden_act="silu").build()
+        mlp_situ = KimiFeedForward.make_config(16, 32, hidden_act="situ").build()
         # same weights, different activation -> different output
         mlp_situ.load_state_dict(mlp_silu.state_dict())
         y_silu, y_situ = mlp_silu(x), mlp_situ(x)
@@ -76,7 +76,9 @@ class TestKimiMLPSitu(unittest.TestCase):
     def test_mlp_situ_equals_hand_computed(self):
         torch.manual_seed(0)
         x = torch.randn(2, 5, 16)
-        mlp = KimiMLP.make_config(16, 32, hidden_act="situ", situ_beta=4.0, situ_linear_beta=25.0).build()
+        mlp = KimiFeedForward.make_config(
+            16, 32, hidden_act="situ", situ_beta=4.0, situ_linear_beta=25.0
+        ).build()
         expect = mlp.down_proj(
             situ_and_mul(mlp.gate_proj(x), mlp.up_proj(x), 4.0, 25.0)
         )
@@ -85,13 +87,13 @@ class TestKimiMLPSitu(unittest.TestCase):
     def test_silu_path_unchanged(self):
         torch.manual_seed(0)
         x = torch.randn(2, 4, 16)
-        mlp = KimiMLP.make_config(16, 32, hidden_act="silu").build()
+        mlp = KimiFeedForward.make_config(16, 32, hidden_act="silu").build()
         expect = mlp.down_proj(F.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
         torch.testing.assert_close(mlp(x), expect)
 
     def test_unknown_act_raises(self):
         with self.assertRaises(ValueError):
-            KimiMLP.make_config(8, 16, hidden_act="nope").build()
+            KimiFeedForward.make_config(8, 16, hidden_act="nope").build()
 
 
 if __name__ == "__main__":

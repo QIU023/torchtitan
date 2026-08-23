@@ -7,7 +7,7 @@
 """head -> body -> tail chained must equal the single vision stage.
 
 Report 5.2.3's "balances vision forward and backward passes across PP stages" needs the
-tower to span stages. ``test_moonvit_stage_split`` pins the tower arithmetic; this pins
+tower to span stages. ``test_vision_encoder_stage_split`` pins the tower arithmetic; this pins
 the STAGE layer around it -- the text embedding, the sentinel mask, the fixed-capacity
 patch payload and the splice -- driven in one process so a mismatch is attributable to
 this code and not to PP plumbing.
@@ -25,11 +25,11 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
-from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig
 from torchtitan.models.kimi_k3.multimodal_model import (
     KimiK3MultimodalConfig,
     KimiK3ViTStage,
 )
+from torchtitan.models.kimi_k3.vision_encoder import KimiK3VisionConfig
 
 SENTINEL = -200
 MERGE = 2
@@ -37,7 +37,7 @@ MERGE = 2
 
 def _cfg(num_vit_layers: int = 4):
     kc = build_kimi_linear_config("k3mini", vocab_size=256)
-    vc = MoonViTConfig(
+    vc = KimiK3VisionConfig(
         num_hidden_layers=num_vit_layers,
         hidden_size=32,
         num_attention_heads=2,
@@ -89,11 +89,11 @@ def _stage(cfg):
     An equivalence test built on that compares noise and fails for a reason that has
     nothing to do with the code under test. (It did.)
     """
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViT
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3Model
+    from torchtitan.models.kimi_k3.vision_encoder import KimiK3VisionEncoder
 
     torch.manual_seed(0)
-    tower = MoonViT(cfg.vision_config)
+    tower = KimiK3VisionEncoder(cfg.vision_config)
     lm = KimiK3Model.make_config(cfg.kimi_config).build()
     stage = KimiK3ViTStage.from_parts(cfg, tower, lm).to(torch.float32)
     torch.manual_seed(0)

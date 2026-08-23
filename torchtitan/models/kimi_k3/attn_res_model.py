@@ -32,9 +32,9 @@ from torchtitan.models.kimi_k3.attn_res import (
     unstack_blocks,
 )
 from torchtitan.models.kimi_k3.model import (
-    KimiDecoderLayer,
     KimiK3Config,
     KimiK3Model,
+    KimiK3TransformerBlock,
     Linear,
     RMSNorm,
     splice_vision_embeds,
@@ -82,7 +82,7 @@ def _plain_stream(
 class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
     """Kimi decoder layer with AttnRes woven around attn and FFN.
 
-    Structurally the same as :class:`KimiDecoderLayer` (per-layer KDA/MLA
+    Structurally the same as :class:`KimiK3TransformerBlock` (per-layer KDA/MLA
     choice + MoE/MLP choice) but the forward is driven by the model's
     block-threading loop: takes ``(blocks, partial_block, is_block_start)``
     and returns the updated ``(blocks, partial_block)``.
@@ -108,7 +108,7 @@ class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
         """
 
         layer_idx: int
-        base: "KimiDecoderLayer.Config"
+        base: "KimiK3TransformerBlock.Config"
         attention_res_proj: "AttnResProjection.Config"
         ffn_res_proj: "AttnResProjection.Config"
         attention_res_norm: "RMSNorm.Config"
@@ -133,7 +133,7 @@ class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
 
         return KimiAttnResDecoderLayer.Config(
             layer_idx=layer_idx,
-            base=KimiDecoderLayer.make_config(config, layer_idx),
+            base=KimiK3TransformerBlock.make_config(config, layer_idx),
             attention_res_proj=AttnResProjection.Config(
                 dim=d, sharding_config=tp_replicate()
             ),
@@ -148,7 +148,7 @@ class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
     def __init__(self, config: "KimiAttnResDecoderLayer.Config") -> None:
         super().__init__()
         gated = config.attn_res_gated
-        # Reuse the base KimiDecoderLayer entirely -- we just delegate
+        # Reuse the base KimiK3TransformerBlock entirely -- we just delegate
         # to its sub-modules rather than calling its forward.
         base = config.base.build()
         self.layer_idx = config.layer_idx
@@ -428,7 +428,7 @@ class KimiK3AttnResModel(KimiK3Model):
     MoE/MLP FFN per layer). AttnRes weaving adds:
 
       * per-layer :class:`KimiAttnResDecoderLayer` in place of
-        :class:`KimiDecoderLayer`
+        :class:`KimiK3TransformerBlock`
       * one final aggregation (``output_res_proj`` + norm) before
         ``norm`` + ``lm_head`` on the last stage
       * ``layers_per_block`` attribute so block-start detection is
@@ -545,7 +545,7 @@ class KimiK3AttnResModel(KimiK3Model):
         config = cfg.kimi_config
 
         # Skip KimiK3Model.__init__'s layer build (it builds
-        # KimiDecoderLayer); we need KimiAttnResDecoderLayer instead.
+        # KimiK3TransformerBlock); we need KimiAttnResDecoderLayer instead.
         # Call nn.Module's init, then build what we need ourselves.
         nn.Module.__init__(self)
         self.config = config

@@ -22,7 +22,7 @@ from torchtitan.models.common.moe import GroupedExperts
 
 from torchtitan.models.kimi_k3.model import KimiMoE, situ_and_mul
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
-from torchtitan.models.kimi_k3.moe import KimiSiTUGroupedExperts
+from torchtitan.models.kimi_k3.moe import KimiGroupedExperts
 
 
 class TestSiTUGroupedExperts(unittest.TestCase):
@@ -33,7 +33,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
             with torch.device("meta"):
                 moe = KimiMoE.make_config(cfg).build()
             experts = moe._moe.routed_experts.inner_experts
-            self.assertIsInstance(experts, KimiSiTUGroupedExperts, size)
+            self.assertIsInstance(experts, KimiGroupedExperts, size)
             self.assertEqual(experts.situ_beta, 4.0)
             self.assertEqual(experts.situ_linear_beta, 25.0)
 
@@ -44,7 +44,7 @@ class TestSiTUGroupedExperts(unittest.TestCase):
             moe = KimiMoE.make_config(cfg).build()
         experts = moe._moe.routed_experts.inner_experts
         self.assertIsInstance(experts, GroupedExperts)
-        self.assertNotIsInstance(experts, KimiSiTUGroupedExperts)
+        self.assertNotIsInstance(experts, KimiGroupedExperts)
 
     def test_param_names_unchanged_so_adapters_keep_working(self):
         # the whole point of subclassing rather than a new module: the
@@ -59,8 +59,8 @@ class TestSiTUGroupedExperts(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "grouped_mm needs CUDA")
     def test_forward_matches_hand_computed_situ(self):
         torch.manual_seed(0)
-        cfg = KimiSiTUGroupedExperts.Config(dim=32, hidden_dim=64, num_experts=2)
-        experts = KimiSiTUGroupedExperts(cfg).cuda()
+        cfg = KimiGroupedExperts.Config(dim=32, hidden_dim=64, num_experts=2)
+        experts = KimiGroupedExperts(cfg).cuda()
         # std chosen so pre-activations reach O(8) > situ_beta=4: SiTU only
         # differs from SiLU once the tanh clip engages (see
         # test_situ_matches_silu_below_the_clip), so a small init would make

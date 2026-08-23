@@ -8,7 +8,7 @@
 
 Pure functions, no collectives and no torch tensors in the signatures, so the
 scheduling decisions can be tested without spawning ranks. The distributed half
-lives in ``multimodal_model`` and ``moonvit``.
+lives in ``multimodal_model`` and ``vision_encoder``.
 
 Report 5.2.3 asks for two things:
 
@@ -67,7 +67,7 @@ def row_partition(
     * **The merge kernel.** The projector merges each ``(kh, kw)`` block, so a cut
       inside ``kh`` rows would ask two ranks to merge halves of one block. Bands are
       therefore multiples of ``kh``.
-    * **The temporal pool.** ``tpool_patch_merger`` is ``sd2_tpool``: it takes
+    * **The temporal pool.** ``_temporal_pool_and_merge`` is ``sd2_tpool``: it takes
       ``mean(dim=0)`` over ALL frames, collapsing time completely. Splitting a video
       by FRAMES therefore gives each rank the mean of its own frames and the
       concatenation is ``t`` times too many tokens, not the mean -- measured as a

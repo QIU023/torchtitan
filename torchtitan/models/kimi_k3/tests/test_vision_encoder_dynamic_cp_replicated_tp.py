@@ -21,7 +21,7 @@ a 4-head tower, which is why it read as "vision TP plus dynamic CP" rather than
 **What this test covers, and what it deliberately does not.** The subject is the
 conversion contract the fix introduces: a replicated DTensor taken to local for the
 gather and re-wrapped afterwards, with the gradient neither dropped nor double
-counted. The gather ITSELF is covered by ``test_moonvit_dynamic_cp.py``, so it is
+counted. The gather ITSELF is covered by ``test_vision_encoder_dynamic_cp.py``, so it is
 replaced here by a local stand-in. That is not laziness about coverage -- on gloo,
 ``dist_nn.all_gather``'s backward cannot run on a process subgroup at all: its
 scatter fallback passes a group-local index where a global rank is expected, so any
@@ -53,9 +53,12 @@ N_PATCHES = 16
 
 
 def _build(dim: int):
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig, MoonViTEncoderLayer
+    from torchtitan.models.kimi_k3.vision_encoder import (
+        KimiK3VisionBlock,
+        KimiK3VisionConfig,
+    )
 
-    cfg = MoonViTConfig(
+    cfg = KimiK3VisionConfig(
         hidden_size=dim,
         intermediate_size=2 * dim,
         num_attention_heads=HEADS,
@@ -65,7 +68,7 @@ def _build(dim: int):
         text_hidden_size=dim,
     )
     torch.manual_seed(0)  # identical weights on every rank
-    return MoonViTEncoderLayer(cfg)
+    return KimiK3VisionBlock(cfg)
 
 
 def _local_attend(_self, q, k, v, _plan):
@@ -95,11 +98,11 @@ def _body(rank: int, queue) -> None:
 
         from torchtitan.models.kimi_k3.vision_encoder import (
             CPPatchPlan,
-            MoonViTEncoderLayer,
+            KimiK3VisionBlock,
         )
 
         tp_mesh = init_device_mesh("cpu", (WORLD,), mesh_dim_names=("tp",))
-        MoonViTEncoderLayer._attend_gather_kv = _local_attend
+        KimiK3VisionBlock._attend_gather_kv = _local_attend
 
         # Replicated over TP means every rank holds the SAME patches, which is what
         # makes DTensor(Replicate) truthful here. The CP split lives on a different
@@ -151,7 +154,7 @@ def _body(rank: int, queue) -> None:
             dist.destroy_process_group()
 
 
-class TestMoonViTDynamicCPReplicatedTP(unittest.TestCase):
+class TestVisionEncoderDynamicCPReplicatedTP(unittest.TestCase):
     def test_replicated_attention_keeps_the_gradient_unscaled(self):
         ctx = mp.get_context("spawn")
         queue = ctx.Queue()

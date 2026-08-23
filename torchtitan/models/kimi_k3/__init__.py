@@ -33,12 +33,12 @@ try:
     )
     from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
     from torchtitan.models.kimi_k3.model import (
-        KimiDecoderLayer,
+        KimiFeedForward,
         KimiK3Config,
         KimiK3Model,
         KimiK3Spec,
+        KimiK3TransformerBlock,
         KimiMLAAttention,
-        KimiMLP,
         KimiMoE,
     )
     from torchtitan.models.kimi_k3.model_configs import (
@@ -62,14 +62,14 @@ __all__ = [
     # deliberate rather than an unused import.
     "SCALING_LAW_TABLE",
     "KimiAttnResDecoderLayer",
-    "KimiDecoderLayer",
+    "KimiK3TransformerBlock",
     "KimiDeltaAttention",
     "KimiK3AttnResModel",
     "KimiK3Config",
     "KimiK3Model",
     "KimiK3Spec",
     "KimiMLAAttention",
-    "KimiMLP",
+    "KimiFeedForward",
     "KimiMoE",
     "build_kimi_linear_config",
     "flavor_names",

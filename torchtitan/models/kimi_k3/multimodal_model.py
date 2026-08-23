@@ -4,18 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""MoonViT-V2 + Kimi Linear, wired as the K3 release has it.
+"""KimiK3VisionEncoder-V2 + Kimi Linear, wired as the K3 release has it.
 
 ``KimiK3MultimodalModel`` owns the native vision path: the tower produces
 variable-length per-image features (native resolution), the projector belongs to the
-tower (``mm_projector`` is a MoonViT child in the checkpoint), and the features are
+tower (``mm_projector`` is a KimiK3VisionEncoder child in the checkpoint), and the features are
 spliced into pre-reserved sentinel positions in the LLM's embedding stream.
 ``KimiK3ViTStage`` is the same model wearing a pipeline stage's interface, used when
 DEP (report 5.2.3) gives the tower its own stage.
 
 The LLaVA-style scaffold that used to live here -- a frozen tower plus a separate
 2-layer projector, reached only by its own test -- is gone. It described the opposite
-recipe to the release, which trains MoonViT-V2 jointly rather than freezing it.
+recipe to the release, which trains KimiK3VisionEncoder-V2 jointly rather than freezing it.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor, Replicate
 from torchtitan.distributed.fsdp import add_zero_valued_dependency
 from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
 from torchtitan.models.kimi_k3.model import KimiK3Config, KimiK3Model, KimiK3Spec
-from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig  # noqa: F401
+from torchtitan.models.kimi_k3.vision_encoder import KimiK3VisionConfig  # noqa: F401
 
 from torchtitan.tools.logging import logger
 
@@ -51,9 +51,9 @@ class KimiK3MultimodalConfig:
     Three properties follow from the release rather than from the LLaVA recipe
     the deleted scaffold implemented:
 
-    * the projector belongs to the tower (``mm_projector`` is a MoonViT child in
+    * the projector belongs to the tower (``mm_projector`` is a KimiK3VisionEncoder child in
       the checkpoint), so there is no separate projector here;
-    * the tower is NOT frozen -- report sec 2.4 trains MoonViT-V2 from scratch
+    * the tower is NOT frozen -- report sec 2.4 trains KimiK3VisionEncoder-V2 from scratch
       with next-token prediction, and the whole point of that choice was joint
       stability, so freezing it reproduces the opposite recipe;
     * vision features are variable length per sample (native resolution), so
@@ -61,7 +61,7 @@ class KimiK3MultimodalConfig:
     """
 
     kimi_config: KimiK3Config
-    vision_config: "MoonViTConfig"
+    vision_config: "KimiK3VisionConfig"
     num_blocks: int | None = None
     # Block size for Block AttnRes, when the flavor derives its block count
     # from one. num_blocks alone cannot express K3's "full blocks plus a short
@@ -143,7 +143,7 @@ class _PlainGradBoundary(torch.autograd.Function):
 
 
 class KimiK3MultimodalModel(nn.Module):
-    """MoonViT-V2 + Kimi Linear backbone, wired as the release has it.
+    """KimiK3VisionEncoder-V2 + Kimi Linear backbone, wired as the release has it.
 
     Submodule names mirror the checkpoint (``vision_tower``, ``language_model``)
     so ``hf_key_map`` is a prefix rename.
@@ -183,10 +183,10 @@ class KimiK3MultimodalModel(nn.Module):
 
     def __init__(self, config: KimiK3MultimodalConfig) -> None:
         super().__init__()
-        from torchtitan.models.kimi_k3.vision_encoder import MoonViT
+        from torchtitan.models.kimi_k3.vision_encoder import KimiK3VisionEncoder
 
         self.config = config
-        self.vision_tower = MoonViT(config.vision_config)
+        self.vision_tower = KimiK3VisionEncoder(config.vision_config)
         if config.num_blocks is None:
             self.language_model = KimiK3Model.make_config(config.kimi_config).build()
         else:
@@ -236,7 +236,7 @@ class KimiK3MultimodalModel(nn.Module):
 
         The two sides disagree on layout and the shapes do not collide loudly:
         ``MMCollator`` emits ``[num_images, max_patches, C*P*P]``, zero-PADDED
-        to the largest image in the batch, while MoonViT's patch_embed is a
+        to the largest image in the batch, while KimiK3VisionEncoder's patch_embed is a
         ``Conv2d`` over ``[L, C, P, P]`` with the images CONCATENATED and no
         padding. Feeding the collator's tensor straight through reaches the
         conv as a 3-D input and fails there.
@@ -498,7 +498,7 @@ class KimiK3MultimodalModel(nn.Module):
         if not getattr(self, "_dynamic_cp_logged", False):
             self._dynamic_cp_logged = True
             logger.info(
-                "MoonViT dynamic CP: %d large image(s) of %d over %d sub-CP "
+                "KimiK3VisionEncoder dynamic CP: %d large image(s) of %d over %d sub-CP "
                 "group(s) of %d rank(s); min_patches=%d",
                 len(large),
                 len(counts),
@@ -692,7 +692,9 @@ class KimiK3MultimodalModel(nn.Module):
         if not getattr(self, "_cp_image_shard_logged", False):
             self._cp_image_shard_logged = True
             logger.info(
-                "MoonViT CP: sharding %d images over %d CP ranks", len(counts), cp_size
+                "KimiK3VisionEncoder CP: sharding %d images over %d CP ranks",
+                len(counts),
+                cp_size,
             )
 
         local_packed = torch.cat([pixel_values[i, : counts[i]] for i in mine], dim=0)
@@ -873,7 +875,7 @@ class KimiK3MultimodalModel(nn.Module):
         if isinstance(text, DTensor):
             # The text stream is a DTensor now; the vision tower still hands out
             # plain tensors because its TP is a separate mechanism
-            # (_apply_tp_moonvit_mlp), so LIFT the vision side to the text
+            # (_apply_tp_vision_mlp), so LIFT the vision side to the text
             # stream's layout rather than unwrapping the stream. Both are
             # Replicate on the tp axis here, so this is metadata only.
             flat = DTensor.from_local(
@@ -1495,7 +1497,7 @@ def _mm_verify_module_protocol(self) -> None:
 
     KimiK3Model overrides this as a no-op because its internals are plain
     nn.Modules rather than Config-built ``Module`` instances -- it ports the HF
-    reference layer by layer. The multimodal wrapper adds a MoonViT tower built
+    reference layer by layer. The multimodal wrapper adds a KimiK3VisionEncoder tower built
     the same way, so the same holds. The trainer calls this post-build; without
     it the multimodal flavor cannot be constructed at all.
     """
@@ -1516,7 +1518,7 @@ class KimiK3MultimodalSpec(KimiK3Spec):
     only ``build`` to construct the vision-bearing model.
     """
 
-    vision_config: "MoonViTConfig" = None  # type: ignore[assignment]
+    vision_config: "KimiK3VisionConfig" = None  # type: ignore[assignment]
 
     vision_token_id: int = -200
     """Sentinel id the splice scans for; must equal the tokenizer's image id.

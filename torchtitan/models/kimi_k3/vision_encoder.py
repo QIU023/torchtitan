@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""MoonViT-V2: Kimi K3's vision tower.
+"""KimiK3VisionEncoder-V2: Kimi K3's vision tower.
 
     Reconciled against the RELEASED reference implementation and the shipped
     checkpoint's key list, not against the report's prose -- the two disagree, and
@@ -61,7 +61,7 @@ class CPPatchPlan:
     padding would contribute to every softmax -- silently, since the shapes are
     all correct.
 
-    ``full_grid`` and ``patch_start`` exist because MoonViT carries position
+    ``full_grid`` and ``patch_start`` exist because KimiK3VisionEncoder carries position
     information TWICE -- the divided_fixed absolute embedding added at the patch
     embed, and 2-D RoPE applied to q/k in every block -- and both are built from
     the grid starting at row 0. Describing a shard as a standalone image therefore
@@ -119,8 +119,8 @@ def _slice_for_shard(table: torch.Tensor, plan: "CPPatchPlan"):
 
 
 @dataclass(kw_only=True)
-class MoonViTConfig:
-    """MoonViT-V2 config. Defaults are K3's released ``vision_config``."""
+class KimiK3VisionConfig:
+    """KimiK3VisionEncoder-V2 config. Defaults are K3's released ``vision_config``."""
 
     num_hidden_layers: int = 27
     hidden_size: int = 1024
@@ -172,7 +172,7 @@ def sincos_1d(dim: int, length: int, device=None) -> torch.Tensor:
     return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
 
 
-class MoonViTPatchEmbed(nn.Module):
+class KimiK3VisionPatchEmbed(nn.Module):
     """Patch projection plus the divided_fixed absolute position embedding.
 
     The spatial table is learned at a fixed 64 x 64 patch grid and interpolated
@@ -182,7 +182,7 @@ class MoonViTPatchEmbed(nn.Module):
     the t=0 entry.
     """
 
-    def __init__(self, config: MoonViTConfig) -> None:
+    def __init__(self, config: KimiK3VisionConfig) -> None:
         super().__init__()
         self.config = config
         self.patch_size = config.patch_size
@@ -302,7 +302,7 @@ class MoonViTPatchEmbed(nn.Module):
         return self.add_pos_emb(x, grid_thws)
 
 
-class MoonViTRope2D(nn.Module):
+class VisionRotaryEmbedding2D(nn.Module):
     """2-D RoPE over the patch grid, repeated across frames.
 
     Applied to q/k in every block, ON TOP of the absolute embedding above. Half
@@ -398,7 +398,7 @@ def _vit_rowwise() -> "ShardingConfig":
     )
 
 
-class MoonViTMLP(Module):
+class KimiK3VisionMLP(Module):
     """``mlp2``. Named fc0/fc1 to match the checkpoint.
 
     A Module with declared linears so the declarative driver can reach them; a
@@ -411,8 +411,8 @@ class MoonViTMLP(Module):
         fc1: "Linear.Config"
 
     @staticmethod
-    def make_config(config: MoonViTConfig) -> "MoonViTMLP.Config":
-        return MoonViTMLP.Config(
+    def make_config(config: KimiK3VisionConfig) -> "KimiK3VisionMLP.Config":
+        return KimiK3VisionMLP.Config(
             fc0=Linear.Config(
                 in_features=config.hidden_size,
                 out_features=config.intermediate_size,
@@ -427,10 +427,10 @@ class MoonViTMLP(Module):
             ),
         )
 
-    def __init__(self, config: "MoonViTConfig | MoonViTMLP.Config") -> None:
+    def __init__(self, config: "KimiK3VisionConfig | KimiK3VisionMLP.Config") -> None:
         super().__init__()
-        if not isinstance(config, MoonViTMLP.Config):
-            config = MoonViTMLP.make_config(config)
+        if not isinstance(config, KimiK3VisionMLP.Config):
+            config = KimiK3VisionMLP.make_config(config)
         self.fc0 = config.fc0.build()
         self.fc1 = config.fc1.build()
 
@@ -438,10 +438,10 @@ class MoonViTMLP(Module):
         return self.fc1(_gelu_tanh(self.fc0(x)))
 
 
-class MoonViTEncoderLayer(nn.Module):
+class KimiK3VisionBlock(nn.Module):
     """Pre-norm block: RMSNorm, one varlen attention, RMSNorm, MLP. No biases."""
 
-    def __init__(self, config: MoonViTConfig) -> None:
+    def __init__(self, config: KimiK3VisionConfig) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
@@ -463,7 +463,7 @@ class MoonViTEncoderLayer(nn.Module):
             eps=config.rms_norm_eps,
             sharding_config=tp_replicate(),
         ).build()
-        self.mlp = MoonViTMLP(config)
+        self.mlp = KimiK3VisionMLP(config)
 
     def _attend_gather_kv(
         self,
@@ -547,8 +547,8 @@ class MoonViTEncoderLayer(nn.Module):
         L = x_LD.size(0)
         qkv = self.wqkv(x_LD).view(L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=1)
-        q = MoonViTRope2D.apply(q, freqs_cis)
-        k = MoonViTRope2D.apply(k, freqs_cis)
+        q = VisionRotaryEmbedding2D.apply(q, freqs_cis)
+        k = VisionRotaryEmbedding2D.apply(k, freqs_cis)
 
         # Tensor parallel over heads. wqkv stays REPLICATED and every rank
         # projects all heads: its fused output is [3, A, K] with the 3 outermost,
@@ -587,7 +587,7 @@ class MoonViTEncoderLayer(nn.Module):
             if isinstance(q, _DT):
                 if any(not isinstance(p, _R) for p in q.placements):
                     raise ValueError(
-                        "MoonViT dynamic CP expects replicated attention inputs "
+                        "KimiK3VisionEncoder dynamic CP expects replicated attention inputs "
                         f"when attention is not head-sharded, got {q.placements}"
                     )
                 tp_mesh = q.device_mesh
@@ -640,7 +640,7 @@ class MoonViTEncoderLayer(nn.Module):
         return x_LD + self.mlp(self.norm1(x_LD))
 
 
-def tpool_patch_merger(
+def _temporal_pool_and_merge(
     x_LD: torch.Tensor,
     grid_thws: torch.Tensor,
     merge_kernel_size: tuple[int, int] = (2, 2),
@@ -673,7 +673,7 @@ def tpool_patch_merger(
     return outputs
 
 
-class PatchMergerMLPV2(nn.Module):
+class KimiK3VisionProjector(nn.Module):
     """``patchmergerv2``: two bias-free Linears, GELU, RMSNorm AFTER.
 
     The post-norm placement (and the absence of a pre-norm) is what
@@ -682,7 +682,7 @@ class PatchMergerMLPV2(nn.Module):
     shipped.
     """
 
-    def __init__(self, config: MoonViTConfig) -> None:
+    def __init__(self, config: KimiK3VisionConfig) -> None:
         super().__init__()
         kh, kw = config.merge_kernel_size
         merged = config.hidden_size * kh * kw
@@ -715,14 +715,14 @@ class PatchMergerMLPV2(nn.Module):
         nn.init.ones_(self.post_norm.weight)
 
 
-class MoonViTEncoder(nn.Module):
+class KimiK3VisionEncoderStack(nn.Module):
     """The 27 blocks plus the final norm."""
 
-    def __init__(self, config: MoonViTConfig) -> None:
+    def __init__(self, config: KimiK3VisionConfig) -> None:
         super().__init__()
-        self.rope_2d = MoonViTRope2D(config.head_dim, config.rope_max_grid)
+        self.rope_2d = VisionRotaryEmbedding2D(config.head_dim, config.rope_max_grid)
         self.blocks = nn.ModuleList(
-            MoonViTEncoderLayer(config) for _ in range(config.num_hidden_layers)
+            KimiK3VisionBlock(config) for _ in range(config.num_hidden_layers)
         )
         self.final_layernorm = RMSNorm.Config(
             normalized_shape=config.hidden_size,
@@ -817,20 +817,20 @@ class MoonViTEncoder(nn.Module):
         return self.run_blocks(x_LD, grid_thws, cp_plan)
 
 
-class MoonViT(nn.Module):
-    """MoonViT-V2 tower + PatchMergerMLPV2 projector.
+class KimiK3VisionEncoder(nn.Module):
+    """KimiK3VisionEncoder-V2 tower + KimiK3VisionProjector projector.
 
     Submodule names (``patch_embed``, ``encoder``, and the projector held
     separately as ``mm_projector``) mirror the checkpoint so the state-dict
     adapter is a prefix rename rather than a structural remap.
     """
 
-    def __init__(self, config: MoonViTConfig) -> None:
+    def __init__(self, config: KimiK3VisionConfig) -> None:
         super().__init__()
         self.config = config
-        self.patch_embed = MoonViTPatchEmbed(config)
-        self.encoder = MoonViTEncoder(config)
-        self.mm_projector = PatchMergerMLPV2(config)
+        self.patch_embed = KimiK3VisionPatchEmbed(config)
+        self.encoder = KimiK3VisionEncoderStack(config)
+        self.mm_projector = KimiK3VisionProjector(config)
 
     @staticmethod
     def patchify(pixels_BFCHW: torch.Tensor, patch_size: int):
@@ -930,7 +930,7 @@ class MoonViT(nn.Module):
             block_slice=slice(from_block, len(self.encoder.blocks)),
             apply_final_norm=True,
         )
-        merged = tpool_patch_merger(x, grid_thws, self.config.merge_kernel_size)
+        merged = _temporal_pool_and_merge(x, grid_thws, self.config.merge_kernel_size)
         return self.mm_projector(merged)
 
     def forward(
@@ -974,7 +974,7 @@ class MoonViT(nn.Module):
             raise ValueError(f"unknown tower part {part!r}")
         x = self.patch_embed(patches_LCHW, grid_thws, cp_plan)
         x = self.encoder(x, grid_thws, cp_plan)
-        merged = tpool_patch_merger(x, grid_thws, self.config.merge_kernel_size)
+        merged = _temporal_pool_and_merge(x, grid_thws, self.config.merge_kernel_size)
         return self.mm_projector(merged)
 
     def encoder_num_parameters(self) -> int:

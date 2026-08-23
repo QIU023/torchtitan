@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""K3's native vision path: MoonViT-V2 spliced into the Kimi Linear backbone."""
+"""K3's native vision path: KimiK3VisionEncoder-V2 spliced into the Kimi Linear backbone."""
 
 from __future__ import annotations
 
@@ -13,10 +13,13 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
-from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
 from torchtitan.models.kimi_k3.multimodal_model import (
     KimiK3MultimodalConfig,
     KimiK3MultimodalModel,
+)
+from torchtitan.models.kimi_k3.vision_encoder import (
+    KimiK3VisionConfig,
+    KimiK3VisionEncoder,
 )
 
 SENTINEL = -200
@@ -24,7 +27,7 @@ SENTINEL = -200
 
 def _cfg(num_blocks=2):
     kc = build_kimi_linear_config("k3mini", vocab_size=256)
-    vc = MoonViTConfig(
+    vc = KimiK3VisionConfig(
         num_hidden_layers=2,
         hidden_size=32,
         num_attention_heads=2,
@@ -55,7 +58,7 @@ class TestK3MultimodalStructure(unittest.TestCase):
         self.assertIn("mm_projector", {n for n, _ in m.vision_tower.named_children()})
 
     def test_vision_tower_is_trainable(self):
-        """Report sec 2.4 trains MoonViT-V2 from scratch jointly; the LLaVA
+        """Report sec 2.4 trains KimiK3VisionEncoder-V2 from scratch jointly; the LLaVA
         stage-1 habit of freezing the tower reproduces the opposite recipe."""
         with torch.device("meta"):
             m = KimiK3MultimodalModel(_cfg())
@@ -88,7 +91,7 @@ class TestK3MultimodalForward(unittest.TestCase):
         m = self._model()
         ids = torch.randint(0, 256, (1, 128), device="cuda")
         ids[0, 10] = SENTINEL
-        patches, grid = MoonViT.patchify(
+        patches, grid = KimiK3VisionEncoder.patchify(
             torch.randn(1, 3, 32, 32, device="cuda", dtype=torch.bfloat16), 4
         )
         out = m(ids, patches, grid)
@@ -104,9 +107,9 @@ class TestK3MultimodalForward(unittest.TestCase):
         ids = torch.randint(0, 256, (1, 128), device="cuda")
         ids[0, 10] = SENTINEL
         pixels = torch.randn(1, 3, 32, 32, device="cuda", dtype=torch.bfloat16)
-        patches, grid = MoonViT.patchify(pixels, 4)
+        patches, grid = KimiK3VisionEncoder.patchify(pixels, 4)
         a = m(ids, patches, grid)
-        other, _ = MoonViT.patchify(pixels * 3.0 + 1.0, 4)
+        other, _ = KimiK3VisionEncoder.patchify(pixels * 3.0 + 1.0, 4)
         b = m(ids, other, grid)
         rel = ((a.float() - b.float()).norm() / a.float().norm()).item()
         self.assertGreater(rel, 1e-4, "changing the image did not change logits")
@@ -115,7 +118,7 @@ class TestK3MultimodalForward(unittest.TestCase):
         m = self._model()
         ids = torch.randint(0, 256, (1, 128), device="cuda")
         ids[0, 10] = SENTINEL
-        patches, grid = MoonViT.patchify(
+        patches, grid = KimiK3VisionEncoder.patchify(
             torch.randn(1, 3, 32, 32, device="cuda", dtype=torch.bfloat16), 4
         )
         m(ids, patches, grid).float().sum().backward()
@@ -127,7 +130,7 @@ class TestK3MultimodalForward(unittest.TestCase):
     def test_patches_without_a_sentinel_is_rejected(self):
         m = self._model()
         ids = torch.randint(0, 256, (1, 128), device="cuda")
-        patches, grid = MoonViT.patchify(
+        patches, grid = KimiK3VisionEncoder.patchify(
             torch.randn(1, 3, 32, 32, device="cuda", dtype=torch.bfloat16), 4
         )
         with self.assertRaisesRegex(ValueError, "no vision_token_id"):
@@ -138,7 +141,7 @@ class TestK3MultimodalForward(unittest.TestCase):
         ids = torch.randint(0, 256, (1, 128), device="cuda")
         ids[0, 10] = SENTINEL
         ids[0, 20] = SENTINEL  # two sentinels, one image
-        patches, grid = MoonViT.patchify(
+        patches, grid = KimiK3VisionEncoder.patchify(
             torch.randn(1, 3, 32, 32, device="cuda", dtype=torch.bfloat16), 4
         )
         with self.assertRaisesRegex(ValueError, "match neither the image count"):

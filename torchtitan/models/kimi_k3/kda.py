@@ -282,7 +282,7 @@ class KimiDeltaAttention(Module):
         Returns:
             ``[B, T, D]`` KDA output.
         """
-        # Under TP, the parent KimiDecoderLayer's NoParallel(self_attn)
+        # Under TP, the parent KimiK3TransformerBlock's NoParallel(self_attn)
         # wraps this forward: x arrives as DTensor(Replicate) on tp_mesh,
         # and all child params (q/k/v projections, conv1d weights,
         # A_log, dt_bias, FusedRMSNormGated) are DTensors on the same

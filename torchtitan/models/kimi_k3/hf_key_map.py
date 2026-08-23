@@ -112,7 +112,7 @@ def official_to_titan(key: str, *, kda_layers: set[int]) -> tuple[str, str]:
     if key in (LM_HEAD, TEXT_ONLY_LM_HEAD):
         return "lm_head.weight", "param"
     if key.startswith(VISION_PREFIX) or key.startswith(PROJECTOR_PREFIX):
-        # Our MoonViT holds the projector as a child, so mm_projector.* becomes
+        # Our KimiK3VisionEncoder holds the projector as a child, so mm_projector.* becomes
         # a child path and vision_tower.* loses its prefix.
         if key.startswith(PROJECTOR_PREFIX):
             return f"vision_tower.mm_projector.{key[len(PROJECTOR_PREFIX):]}", "vision"
@@ -434,7 +434,7 @@ _VISION_PASSTHROUGH = (
 
 
 def titan_vision_config_to_official(vision_config) -> dict:
-    """Serialize a ``MoonViTConfig`` to the official vision-config schema."""
+    """Serialize a ``KimiK3VisionConfig`` to the official vision-config schema."""
     cfg: dict = {"model_type": "kimi_k3_vision"}
     for ours, theirs in _VISION_RENAME.items():
         if hasattr(vision_config, ours):

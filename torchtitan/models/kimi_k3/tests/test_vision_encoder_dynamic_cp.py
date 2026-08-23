@@ -32,9 +32,12 @@ DIM, HEADS, HEAD_DIM = 32, 2, 16
 
 
 def _build(dim: int):
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig, MoonViTEncoderLayer
+    from torchtitan.models.kimi_k3.vision_encoder import (
+        KimiK3VisionBlock,
+        KimiK3VisionConfig,
+    )
 
-    cfg = MoonViTConfig(
+    cfg = KimiK3VisionConfig(
         hidden_size=dim,
         intermediate_size=2 * dim,
         num_attention_heads=HEADS,
@@ -44,7 +47,7 @@ def _build(dim: int):
         text_hidden_size=dim,
     )
     torch.manual_seed(0)  # identical weights on every rank
-    return MoonViTEncoderLayer(cfg)
+    return KimiK3VisionBlock(cfg)
 
 
 def _body(rank: int, n_patches: int, queue) -> None:
@@ -110,7 +113,7 @@ def _body(rank: int, n_patches: int, queue) -> None:
             dist.destroy_process_group()
 
 
-class TestMoonViTDynamicCP(unittest.TestCase):
+class TestVisionEncoderDynamicCP(unittest.TestCase):
     def _run(self, n_patches: int) -> None:
         ctx = mp.get_context("spawn")
         queue = ctx.Queue()

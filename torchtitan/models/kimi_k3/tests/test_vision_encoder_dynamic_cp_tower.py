@@ -6,7 +6,7 @@
 
 """The WHOLE tower under dynamic CP must reproduce the unpartitioned features.
 
-``test_moonvit_dynamic_cp`` pins the attention path. This pins everything the
+``test_vision_encoder_dynamic_cp`` pins the attention path. This pins everything the
 partition also touches and which attention alone cannot see:
 
 * the divided_fixed absolute position embedding at the patch embed,
@@ -24,7 +24,7 @@ difference is reduction order at 1e-6. It passed while a real 1e-3 defect was
 present. It now runs at ``rtol=1e-5``.
 
 **``--training.dtype float32`` does not reach the tower.** Measured: the tensors
-arriving at ``MoonViT.forward`` are bf16 even in an fp32 run, because the "fsdp"
+arriving at ``KimiK3VisionEncoder.forward`` are bf16 even in an fp32 run, because the "fsdp"
 mesh here is ``dp_shard x cp`` -- so CP alone puts FSDP in the path, and FSDP
 all-gathers the fp32 master into a bf16 compute copy. Reading
 ``patch_embed.proj.weight`` before the forward hook shows fp32 and is misleading.
@@ -50,13 +50,16 @@ DIM, HEADS, HEAD_DIM, PATCH = 32, 2, 16, 2
 
 
 def _tower(dim: int, faithful: bool = False):
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
+    from torchtitan.models.kimi_k3.vision_encoder import (
+        KimiK3VisionConfig,
+        KimiK3VisionEncoder,
+    )
 
     if faithful:
         # kimi_k3_debugmodel_report_arch's own vision config: 3 heads (which no TP
         # degree divides, hence the vit4h flavor elsewhere), head_dim 128, patch 14,
         # and a 64x64 position table interpolated down to the input grid.
-        cfg = MoonViTConfig(
+        cfg = KimiK3VisionConfig(
             hidden_size=256,
             num_attention_heads=3,
             qkv_hidden_size=384,
@@ -70,11 +73,11 @@ def _tower(dim: int, faithful: bool = False):
             text_hidden_size=256,
         )
         torch.manual_seed(0)
-        tower = MoonViT(cfg)
+        tower = KimiK3VisionEncoder(cfg)
         tower.init_weights()
         return tower, cfg
 
-    cfg = MoonViTConfig(
+    cfg = KimiK3VisionConfig(
         hidden_size=dim,
         intermediate_size=2 * dim,
         num_attention_heads=HEADS,
@@ -87,7 +90,7 @@ def _tower(dim: int, faithful: bool = False):
         init_pos_emb_width=16,
     )
     torch.manual_seed(0)  # identical weights on every rank
-    tower = MoonViT(cfg)
+    tower = KimiK3VisionEncoder(cfg)
     tower.init_weights()
     return tower, cfg
 
@@ -163,7 +166,7 @@ def _body(rank: int, grid: tuple[int, int, int], queue, faithful: bool = False) 
             dist.destroy_process_group()
 
 
-class TestMoonViTDynamicCPTower(unittest.TestCase):
+class TestVisionEncoderDynamicCPTower(unittest.TestCase):
     def _run(self, grid, faithful: bool = False) -> None:
         ctx = mp.get_context("spawn")
         queue = ctx.Queue()

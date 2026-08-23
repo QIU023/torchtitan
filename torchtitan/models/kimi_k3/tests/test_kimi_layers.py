@@ -10,7 +10,7 @@ Scope: verify that the torchtitan-idiom port produces
 forward outputs with the right shapes, on CPU, for:
 
 * :class:`KimiRMSNorm` — trivial
-* :class:`KimiMLP` — SwiGLU dense
+* :class:`KimiFeedForward` — SwiGLU dense
 * :class:`KimiMLAAttention` — NoPE MLA, causal
 * :class:`KimiDeltaAttention` — KDA via fla-core
 
@@ -30,7 +30,11 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
-from torchtitan.models.kimi_k3.model import KimiK3Config, KimiMLAAttention, KimiMLP
+from torchtitan.models.kimi_k3.model import (
+    KimiFeedForward,
+    KimiK3Config,
+    KimiMLAAttention,
+)
 
 
 def _tiny_config(num_hidden_layers: int = 2) -> KimiK3Config:
@@ -70,9 +74,9 @@ def _tiny_config(num_hidden_layers: int = 2) -> KimiK3Config:
     )
 
 
-class TestKimiMLP(unittest.TestCase):
+class TestKimiFeedForward(unittest.TestCase):
     def test_forward_shape(self):
-        mlp = KimiMLP.make_config(
+        mlp = KimiFeedForward.make_config(
             hidden_size=128, intermediate_size=256, hidden_act="silu"
         ).build()
         x = torch.randn(2, 7, 128)
@@ -80,7 +84,7 @@ class TestKimiMLP(unittest.TestCase):
         self.assertEqual(out.shape, x.shape)
 
     def test_gelu_alias_accepted(self):
-        mlp = KimiMLP.make_config(
+        mlp = KimiFeedForward.make_config(
             hidden_size=64, intermediate_size=128, hidden_act="gelu"
         ).build()
         x = torch.randn(1, 3, 64)

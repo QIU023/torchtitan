@@ -256,7 +256,7 @@ def parallelize_kimi_k3(
         # recomputed (~2x invocations). ``full`` mode is safer if you can
         # spare the recompute (see fla fused_norm_gate crash history).
         ac_config.build(dump_folder=dump_folder).apply(model)
-        logger.info("Applied activation checkpointing to KimiDecoderLayer stack.")
+        logger.info("Applied activation checkpointing to KimiK3TransformerBlock stack.")
     # torch.compile applied per-decoder-layer BEFORE FSDP wrap (so each
     # FSDP unit wraps a compiled subgraph). MoE for-loop expert path
     # is NOT compiled (torchtitan upstream has the same carve-out: see
@@ -267,7 +267,7 @@ def parallelize_kimi_k3(
     if compile_config.enable:
         _apply_compile_kimi_k3(model, compile_config)
         logger.info(
-            "Compiled each KimiDecoderLayer with torch.compile (backend=%s).",
+            "Compiled each KimiK3TransformerBlock with torch.compile (backend=%s).",
             compile_config.backend,
         )
 
@@ -747,8 +747,8 @@ def _model_has_moe(model: nn.Module) -> bool:
     return any(bool(getattr(layer, "is_moe", False)) for layer in model.layers.values())
 
 
-def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
-    """Tensor-parallelize the MoonViT encoder MLPs. Returns blocks covered.
+def _apply_tp_vision_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
+    """Tensor-parallelize the KimiK3VisionEncoder encoder MLPs. Returns blocks covered.
 
     Report sec 5.2.3 asks for a genuinely parallel vision tower, not a replicated
     one. This is the half that is unambiguous: fc0 is hidden -> intermediate and
@@ -792,7 +792,7 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
     per_rank = num_heads // tp_size if shard_heads else 0
     if not shard_heads and num_heads:
         logger.warning(
-            "MoonViT TP: %d attention heads do not divide %d ranks; attention "
+            "KimiK3VisionEncoder TP: %d attention heads do not divide %d ranks; attention "
             "stays replicated and only the MLPs are sharded",
             num_heads,
             tp_size,
@@ -804,7 +804,7 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
         # tower activations into DTensors at the boundary, so the block
         # residual is a DTensor and fc1 must hand back a DTensor too --
         # use_local_output=False here fails the add on mixed Tensor/DTensor.
-        pass  # the MLP is declared on MoonViTMLP.Config
+        pass  # the MLP is declared on KimiK3VisionMLP.Config
 
     if shard_heads:
         for i in range(len(blocks)):
@@ -822,7 +822,7 @@ def _apply_tp_moonvit_mlp(vision_tower: nn.Module, tp_mesh: DeviceMesh) -> int:
             block._tp_head_slice = (tp_rank * per_rank, (tp_rank + 1) * per_rank)
 
     logger.info(
-        "MoonViT TP: %d encoder MLPs sharded%s",
+        "KimiK3VisionEncoder TP: %d encoder MLPs sharded%s",
         len(blocks),
         f", attention over {per_rank}/{num_heads} heads per rank"
         if shard_heads
@@ -883,7 +883,7 @@ def apply_tp_kimi_k3(
     # as "aten.embedding.default got mixed torch.Tensor and DTensor". Descend to
     # the text model for the top-level names.
     #
-    # MoonViT itself wants no TP at this size (no head axis worth sharding), but
+    # KimiK3VisionEncoder itself wants no TP at this size (no head axis worth sharding), but
     # "leave it alone" is not the same as "replicate it". Untouched, its params
     # stay plain tensors, FSDP wraps them on the dp_mesh alone, and the text
     # params -- TP'd first, then FSDP'd -- land on the 2D (dp, tp) mesh. Nothing
@@ -892,12 +892,12 @@ def apply_tp_kimi_k3(
     # every parameter shares one mesh.
     # distribute_module with no partition_fn replicates the whole subtree's
     # parameters and installs NO boundary hooks. NoParallel would be the obvious
-    # choice, but its output hook assumes a single DTensor and MoonViT returns a
+    # choice, but its output hook assumes a single DTensor and KimiK3VisionEncoder returns a
     # LIST of per-sample feature blocks. encode_images does the two boundary
     # conversions instead, where the list is in hand.
     vision_tower = getattr(model, "vision_tower", None)
     if vision_tower is not None:
-        _apply_tp_moonvit_mlp(vision_tower, tp_mesh)
+        _apply_tp_vision_mlp(vision_tower, tp_mesh)
         distribute_module(vision_tower, tp_mesh)
         # Record the mesh rather than letting encode_images sniff the weight.
         # Once FSDP also shards the tower its params are DTensors too, so
@@ -925,7 +925,7 @@ def apply_tp_kimi_k3(
         use_local_output=True,
     )
 
-    # Per-layer plan. Each layer is a KimiDecoderLayer (or AttnRes
+    # Per-layer plan. Each layer is a KimiK3TransformerBlock (or AttnRes
     # subclass with attention_res_proj + attention_res_norm).
     for layer in model.layers.values():
         is_moe = bool(getattr(layer, "is_moe", False))
@@ -937,7 +937,7 @@ def apply_tp_kimi_k3(
         # to_local_if_dtensor; downstream dense MLP's prepare_input
         # accepts both. Plain NoParallel is the most natural choice.
         # The two layer norms are declarative now (norm_config in
-        # KimiDecoderLayer.make_config), so they are not in the plan.
+        # KimiK3TransformerBlock.make_config), so they are not in the plan.
         plan: dict[str, object] = {}
 
         if is_kda:
@@ -1038,7 +1038,7 @@ def apply_tp_kimi_k3(
             # promote w1/w2/w3 to DTensor(Replicate) manually below
             # (after parallelize_module).
             #
-            # shared_experts (KimiMLP): each leaf Linear must be
+            # shared_experts (KimiFeedForward): each leaf Linear must be
             # individually wrapped as no_par_local so it accepts the
             # plain input from MoE.forward (post-to_local at line 410)
             # while keeping its weight as DTensor on tp_mesh.
@@ -1509,7 +1509,7 @@ def _drive_declarative_sharding(model: nn.Module, parallel_dims: ParallelDims) -
 
     ``Module.parallelize`` recurses through its own children and looks THROUGH
     non-``Module`` containers, but something has to call it. Our containers
-    (``KimiDecoderLayer``, ``KimiK3Model``, ``KimiMoE``) are plain ``nn.Module``, so
+    (``KimiK3TransformerBlock``, ``KimiK3Model``, ``KimiMoE``) are plain ``nn.Module``, so
     nothing ever did -- which left the 64 modules that already carry a
     ``sharding_config`` declaring into the void. Measured with a probe: after this
     driver they hold DTensors with exactly the declared placements
@@ -1729,7 +1729,7 @@ def _disable_dynamo_on_fla_ops() -> None:
 
 
 def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> None:
-    """Wrap each KimiDecoderLayer with torch.compile.
+    """Wrap each KimiK3TransformerBlock with torch.compile.
 
     Carve-outs (must NOT be compiled):
     * fla-core triton kernels (chunk_kda, ShortConvolution,
@@ -1744,7 +1744,7 @@ def _apply_compile_kimi_k3(model: nn.Module, compile_config: CompileConfig) -> N
     opaque (otherwise the backward pass re-enters dynamo at e.g.
     ``cuda_utils.get_device_properties`` and emits warnings).
 
-    Recompile-limit handling: KimiDecoderLayer alternates between
+    Recompile-limit handling: KimiK3TransformerBlock alternates between
     KDA and MLA attention (3:1 by layer index). Default dynamo
     recompile_limit=8 is too small — the type check on
     the attention module triggers a recompile per attention class, and once

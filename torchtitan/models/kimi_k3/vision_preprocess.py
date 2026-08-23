@@ -24,7 +24,7 @@ Two details that are easy to get wrong and change the token count:
 * dimensions are reached by ZERO-PADDING after the resize, not by resizing to a
   multiple. Padding to ``merge_kernel_size * patch_size = 28`` is what
   guarantees the patch grid tiles the 2x2 merge -- the condition
-  ``tpool_patch_merger`` raises on.
+  ``_temporal_pool_and_merge`` raises on.
 
 ``temporal_merge_kernel_size 4`` and ``init_pos_emb_time 4`` are the same number
 for a reason: the processor groups up to 4 frames into one sample with ``t <= 4``,
@@ -135,7 +135,7 @@ def prepare_image(
     """One image -> ``([N, C, p, p]`` patches, ``(1, h, w))``.
 
     Resizes per :func:`navit_resize`, zero-pads, normalizes, then cuts patches in
-    row-major order -- the order ``MoonViTPatchEmbed`` and the position tables
+    row-major order -- the order ``KimiK3VisionPatchEmbed`` and the position tables
     assume.
     """
     if pixels_CHW.dim() != 3:
@@ -175,7 +175,7 @@ def prepare_image(
 def pack_images(images: list[torch.Tensor], **kw) -> tuple[torch.Tensor, torch.Tensor]:
     """Several images of DIFFERENT sizes -> one packed batch + ``grid_thws``.
 
-    This is the shape MoonViT's forward takes, and the reason it takes that
+    This is the shape KimiK3VisionEncoder's forward takes, and the reason it takes that
     shape: native-resolution training mixes resolutions inside one batch, so
     there is no rectangular tensor to hand it.
     """
@@ -231,11 +231,11 @@ def from_titan_collator(
     merge_kernel_size: int = MERGE_KERNEL_SIZE,
     channels: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Adapt torchtitan's multimodal collator output to MoonViT's input.
+    """Adapt torchtitan's multimodal collator output to KimiK3VisionEncoder's input.
 
     Core's ``MultiModalCollator`` yields ``pixel_values`` as
     ``[num_images, max_num_patch, patch_dim]`` -- PADDED to the batch's longest
-    image -- plus ``grid_thw`` as ``[num_images, 3]``. MoonViT takes a PACKED
+    image -- plus ``grid_thw`` as ``[num_images, 3]``. KimiK3VisionEncoder takes a PACKED
     ``[L, C, p, p]`` stream with no padding. Two conversions are needed, and the
     second one is a correctness trap rather than a reshape:
 
@@ -245,7 +245,7 @@ def from_titan_collator(
     2. **Reorder from block order to row-major.** Core's ``vision_to_patches``
        emits patches so that each ``merge_size x merge_size`` spatial group is
        contiguous (the Qwen2-VL convention, matching a merger that consumes
-       groups in sequence). MoonViT's position tables and ``tpool_patch_merger``
+       groups in sequence). KimiK3VisionEncoder's position tables and ``_temporal_pool_and_merge``
        both assume ROW-MAJOR order -- the merger reshapes
        ``[t, h/kh, kh, w/kw, kw, D]``, which only groups 2x2 neighbourhoods if
        the patches arrive row by row. Feeding block order straight through

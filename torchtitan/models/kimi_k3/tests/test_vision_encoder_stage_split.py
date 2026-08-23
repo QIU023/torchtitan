@@ -23,7 +23,7 @@ Two properties are separate and both matter:
 
 Run in fp32 with a tight tolerance. The only legitimate difference here is reduction
 order, at 1e-6; a loose tolerance would pass while hiding a real defect, which has
-already happened once in this model's history (see test_moonvit_dynamic_cp_tower).
+already happened once in this model's history (see test_vision_encoder_dynamic_cp_tower).
 """
 
 from __future__ import annotations
@@ -34,9 +34,12 @@ import torch
 
 
 def _encoder(num_layers: int):
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig, MoonViTEncoder
+    from torchtitan.models.kimi_k3.vision_encoder import (
+        KimiK3VisionConfig,
+        KimiK3VisionEncoderStack,
+    )
 
-    cfg = MoonViTConfig(
+    cfg = KimiK3VisionConfig(
         hidden_size=32,
         intermediate_size=64,
         num_attention_heads=2,
@@ -47,12 +50,12 @@ def _encoder(num_layers: int):
         rope_max_grid=64,
     )
     torch.manual_seed(0)
-    enc = MoonViTEncoder(cfg).to(torch.float32)
+    enc = KimiK3VisionEncoderStack(cfg).to(torch.float32)
     enc.eval()
     return enc
 
 
-class TestMoonViTStageSplit(unittest.TestCase):
+class TestVisionEncoderStageSplit(unittest.TestCase):
     def _inputs(self, num_patches: int, dim: int = 32):
         torch.manual_seed(1)
         x = torch.randn(num_patches, dim, dtype=torch.float32)
@@ -158,19 +161,22 @@ class TestMoonViTStageSplit(unittest.TestCase):
             self.assertTrue(weight.grad.abs().sum() > 0, f"block {share} grad is zero")
 
 
-class TestMoonViTTowerSplit(unittest.TestCase):
-    """The whole tower split into shares must equal ``MoonViT.forward``.
+class TestVisionEncoderTowerSplit(unittest.TestCase):
+    """The whole tower split into shares must equal ``KimiK3VisionEncoder.forward``.
 
-    ``TestMoonViTStageSplit`` pins the encoder blocks. This pins what the PP stages
+    ``TestVisionEncoderStageSplit`` pins the encoder blocks. This pins what the PP stages
     will actually call: head (patch_embed + early blocks), bodies, tail (late blocks +
     final norm + merge + projector). A defect here would otherwise surface at pp4 as a
     number that is hard to attribute to arithmetic rather than plumbing.
     """
 
     def _tower(self, num_layers: int = 4):
-        from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
+        from torchtitan.models.kimi_k3.vision_encoder import (
+            KimiK3VisionConfig,
+            KimiK3VisionEncoder,
+        )
 
-        cfg = MoonViTConfig(
+        cfg = KimiK3VisionConfig(
             hidden_size=32,
             intermediate_size=64,
             num_attention_heads=2,
@@ -182,7 +188,7 @@ class TestMoonViTTowerSplit(unittest.TestCase):
             merge_kernel_size=(2, 2),
         )
         torch.manual_seed(0)
-        tower = MoonViT(cfg).to(torch.float32)
+        tower = KimiK3VisionEncoder(cfg).to(torch.float32)
         # pos_emb.weight is a bare torch.empty until init_weights runs, so without this the
         # tower reads uninitialised memory -- finite most of the time and NaN occasionally,
         # which showed up as this file failing roughly one full-suite run in five.
@@ -238,7 +244,7 @@ class TestMoonViTTowerSplit(unittest.TestCase):
             torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
 
     def test_block_bounds_are_even_and_cover_everything(self):
-        tower, _ = self._tower(num_layers=27)  # the real MoonViT depth
+        tower, _ = self._tower(num_layers=27)  # the real KimiK3VisionEncoder depth
         for n in (1, 2, 4, 8):
             bounds = tower.block_bounds(n)
             self.assertEqual(len(bounds), n)

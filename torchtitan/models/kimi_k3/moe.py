@@ -28,7 +28,7 @@ from torchtitan.models.common.moe import GroupedExperts
 from .model import situ_and_mul
 
 
-class KimiSiTUGroupedExperts(GroupedExperts):
+class KimiGroupedExperts(GroupedExperts):
     """Grouped routed experts with K3's SiTU-GLU activation (Eq. 12).
 
     ``situ_linear_beta=None`` leaves the linear branch unclipped; K3 ships

@@ -418,11 +418,11 @@ def kimi_k3_debugmodel_gated_lora() -> Trainer.Config:
 
 
 def kimi_k3_mini_vl() -> Trainer.Config:
-    """K3-faithful multimodal downscale: text k3mini plus a shrunk MoonViT-V2.
+    """K3-faithful multimodal downscale: text k3mini plus a shrunk KimiK3VisionEncoder-V2.
 
     K3 is natively multimodal, so a debug flavor that drops the vision tower
     misrepresents the architecture. But the RELEASED tower does not shrink with the
-    text side: MoonViT-V2 is 447.4M parameters with its projector (401M in the
+    text side: KimiK3VisionEncoder-V2 is 447.4M parameters with its projector (401M in the
     report's Table 1, which counts encoder plus position embeddings and excludes the
     46.1M projector), against k3mini's 80.9M text side -- so a debug run carrying
     the real tower would be dominated by the encoder instead of exercising the K3
@@ -436,22 +436,22 @@ def kimi_k3_mini_vl() -> Trainer.Config:
     report 5.2.3 addresses -- and that is not a parameter count.
 
     The tower is therefore SHRUNK, not simplified: 4 layers and hidden 256
-    instead of 27 and 1024, while every structural feature of MoonViT-V2 is
+    instead of 27 and 1024, while every structural feature of KimiK3VisionEncoder-V2 is
     kept -- the single varlen attention pass (not the factorized one the report
     describes), 2D RoPE with the divided_fixed absolute embedding, sd2_tpool,
-    and PatchMergerMLPV2. So the multimodal path is genuinely exercised: NaViT
+    and KimiK3VisionProjector. So the multimodal path is genuinely exercised: NaViT
     packing, the projector, the image_mask splice into the LM hidden states.
 
     Head count drops to 4 to keep head_dim at 64, matching the released tower.
     """
     from torchtitan.components.tokenizer import MultiModalTokenizer
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
+    from torchtitan.models.kimi_k3.vision_encoder import KimiK3VisionConfig
 
     cfg = kimi_k3_mini_block_attn_res()
     cfg.model_spec.flavor = "kimi_k3_mini_vl"
     kc = cfg.model_spec.model.kimi_config
-    vision = MoonViTConfig(
+    vision = KimiK3VisionConfig(
         num_hidden_layers=4,
         hidden_size=256,
         num_attention_heads=4,
@@ -461,8 +461,8 @@ def kimi_k3_mini_vl() -> Trainer.Config:
     )
     # KimiK3MultimodalConfig, not KimiMultimodalConfig: it is the
     # release-faithful one. The projector belongs to the tower (mm_projector is
-    # a MoonViT child in the checkpoint) and the tower is NOT frozen -- report
-    # sec 2.4 trains MoonViT-V2 from scratch jointly with the text model, and
+    # a KimiK3VisionEncoder child in the checkpoint) and the tower is NOT frozen -- report
+    # sec 2.4 trains KimiK3VisionEncoder-V2 from scratch jointly with the text model, and
     # freezing it reproduces the opposite recipe.
     # The bundled tokenizer appends the media tokens ABOVE the 2016-token text
     # vocab (image 2016, vision_start 2017, vision_end 2018, pad 2019), so the
@@ -484,7 +484,7 @@ def kimi_k3_mini_vl() -> Trainer.Config:
     # Without these the flavor inherits the TEXT dataloader, which emits no
     # patches -- forward then takes its text-only branch and the tower never
     # runs, so a "multimodal" run silently validates nothing vision-side.
-    # patch_size and spatial_merge_size must match MoonViTConfig's patch_size
+    # patch_size and spatial_merge_size must match KimiK3VisionConfig's patch_size
     # and merge_kernel_size. The bundled test tokenizer already carries the
     # media tokens the collator needs.
     cfg.tokenizer = MultiModalTokenizer.Config(
@@ -995,8 +995,9 @@ def kimi_k3_mini_k3recipe() -> Trainer.Config:
     """
     import dataclasses as _dc
 
-    from torchtitan.models.kimi_k3.muon import default_muon
     from torchtitan.components.quantile_balance import register_quantile_balancing
+
+    from torchtitan.models.kimi_k3.muon import default_muon
 
     cfg = kimi_k3_mini_block_attn_res()
     cfg.model_spec.flavor = "kimi_k3_mini_k3recipe"
@@ -1069,7 +1070,7 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
     kv_lora 64, qk_nope 32 / qk_rope 16 / v 32, full attention on layers
     {4, 8, 12} and KDA (head_dim 32, conv 4) elsewhere, AttnRes block size 12,
     LatentMoE with latent 128 / expert hidden 128 / 8 experts top-2 / 2 shared,
-    dense FFN hidden 1024, vocab 163840, and a 4-layer 3-head MoonViT at
+    dense FFN hidden 1024, vocab 163840, and a 4-layer 3-head KimiK3VisionEncoder at
     dim 256 / qkv 384 / hidden 1024 with spatial merge 2.
 
     #4025 raises NotImplementedError on tensor, context and pipeline parallel
@@ -1080,8 +1081,8 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
     import dataclasses as _dc
 
     from torchtitan.components.tokenizer import MultiModalTokenizer
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
+    from torchtitan.models.kimi_k3.vision_encoder import KimiK3VisionConfig
 
     cfg = kimi_k3_mini_vl()
     cfg.model_spec.flavor = "kimi_k3_debugmodel_pr_4025"
@@ -1102,7 +1103,7 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
         # of the same stack contradicting each other.
         kda_layers=[i for i in range(1, 14) if i not in (4, 8, 12)],
     )
-    vision = MoonViTConfig(
+    vision = KimiK3VisionConfig(
         num_hidden_layers=4,
         hidden_size=256,
         num_attention_heads=3,
@@ -1235,7 +1236,7 @@ def kimi_k3_debugmodel_report_arch_vit4h() -> Trainer.Config:
 
     The debug tower ships 3 attention heads, which no tensor-parallel degree
     divides, so vision attention cannot be head-sharded on it and an A/B against
-    the replicated path compares nothing. MoonViT-V2 itself has 12 heads, so 3 is
+    the replicated path compares nothing. KimiK3VisionEncoder-V2 itself has 12 heads, so 3 is
     a debug-config artifact rather than a property of the architecture.
 
     4 heads over the same ``qkv_hidden_size`` 384 gives head_dim 96, which still
@@ -1400,7 +1401,7 @@ def kimi_k3_debugmodel_report_arch_lora() -> Trainer.Config:
     ``kimi_k3_debugmodel_report_arch``, which makes any per-cell difference
     attributable to the adapter path rather than to the model.
 
-    Multimodal, like the flavor it derives from: the matrix runs MoonViT plus the
+    Multimodal, like the flavor it derives from: the matrix runs KimiK3VisionEncoder plus the
     backbone, so a LoRA cell exercises the adapters on the vision tower's
     projections too.
     """
@@ -1531,7 +1532,7 @@ def kimi_k3_2p8t_vl() -> Trainer.Config:
     the released config.json carries a full ``vision_config``. K3 is natively
     multimodal, so a 2.8T flavor without it is not the released model.
 
-    Every vision extent comes from that artifact, and MoonViTConfig's defaults
+    Every vision extent comes from that artifact, and KimiK3VisionConfig's defaults
     already are those values -- 27 layers, hidden 1024, 12 heads, qkv 1536,
     intermediate 4096, patch 14, 2x2 merge, text_hidden 7168 -- so this passes
     the config through rather than restating it, and a drift in the defaults
@@ -1545,15 +1546,15 @@ def kimi_k3_2p8t_vl() -> Trainer.Config:
     Needs real hardware; it exists so the multimodal scale-up is also a config
     selection rather than a code change.
     """
-    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
+    from torchtitan.models.kimi_k3.vision_encoder import KimiK3VisionConfig
 
     cfg = kimi_k3_2p8t_block_attn_res()
     cfg.model_spec.flavor = "kimi_k3_2p8t_vl"
     text = cfg.model_spec.model
     cfg.model_spec.model = KimiK3MultimodalSpec(
         kimi_config=text.kimi_config,
-        vision_config=MoonViTConfig(text_hidden_size=text.kimi_config.hidden_size),
+        vision_config=KimiK3VisionConfig(text_hidden_size=text.kimi_config.hidden_size),
         num_blocks=text.num_blocks,
         vision_token_id=163605,
     )

@@ -14,7 +14,10 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
+from torchtitan.models.kimi_k3.vision_encoder import (
+    KimiK3VisionConfig,
+    KimiK3VisionEncoder,
+)
 from torchtitan.models.kimi_k3.vision_preprocess import (
     from_titan_collator,
     navit_resize,
@@ -57,7 +60,7 @@ class TestPolicyMatchesOfficial(unittest.TestCase):
         self.assertEqual(256 * 14, 3584)
 
     def test_dimensions_always_tile_the_merge_kernel(self):
-        """The condition tpool_patch_merger raises on. Padding to
+        """The condition _temporal_pool_and_merge raises on. Padding to
         merge_kernel_size * patch_size is what guarantees it."""
         for w, h in ((1, 1), (37, 91), (224, 224), (1000, 600), (4000, 4000)):
             plan = navit_resize(w, h)
@@ -100,7 +103,7 @@ class TestPacking(unittest.TestCase):
         self.assertTrue(all(row[0] <= 4 for row in grid.tolist()))
 
     def test_packed_output_feeds_the_tower(self):
-        cfg = MoonViTConfig(
+        cfg = KimiK3VisionConfig(
             num_hidden_layers=1,
             hidden_size=32,
             num_attention_heads=2,
@@ -113,7 +116,7 @@ class TestPacking(unittest.TestCase):
             rope_max_grid=32,
         )
         torch.manual_seed(0)
-        tower = MoonViT(cfg)
+        tower = KimiK3VisionEncoder(cfg)
         tower.init_weights()
         patches, grid = pack_images([torch.rand(3, 112, 112), torch.rand(3, 56, 84)])
         out = tower(patches, grid)
@@ -123,7 +126,7 @@ class TestPacking(unittest.TestCase):
 
 
 class TestCollatorBridge(unittest.TestCase):
-    """torchtitan's collator emits BLOCK order; MoonViT needs ROW-MAJOR."""
+    """torchtitan's collator emits BLOCK order; KimiK3VisionEncoder needs ROW-MAJOR."""
 
     def _block_order(self, rowmajor, h, w, pad=0):
         flat = rowmajor.reshape(h * w, -1)
@@ -212,9 +215,7 @@ class TestResizePlanCarriesItsPatchSize(unittest.TestCase):
 
     def test_grid_matches_padded_size_at_every_patch_size(self):
         for patch_size in (2, 4, 7, 14):
-            plan = navit_resize(
-                768, 768, patch_size=patch_size, merge_kernel_size=2
-            )
+            plan = navit_resize(768, 768, patch_size=patch_size, merge_kernel_size=2)
             padded_h, padded_w = plan.padded_size
             self.assertEqual(
                 plan.patch_grid,

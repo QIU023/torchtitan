@@ -22,10 +22,11 @@ import unittest
 
 import torch
 
+from torchtitan.components.mx_qat import apply_mxfp4_qat
+
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
-from torchtitan.models.kimi_k3.moe import KimiSiTUGroupedExperts
-from torchtitan.components.mx_qat import apply_mxfp4_qat
+from torchtitan.models.kimi_k3.moe import KimiGroupedExperts
 from torchtitan.models.kimi_k3.quant_scope import (
     is_ignored,
     is_quantizable,
@@ -44,7 +45,9 @@ _ARTIFACT = (
 
 def _k3mini_model() -> KimiK3Model:
     with torch.device("meta"):
-        return KimiK3Model.make_config(build_kimi_linear_config("k3mini", vocab_size=256)).build()
+        return KimiK3Model.make_config(
+            build_kimi_linear_config("k3mini", vocab_size=256)
+        ).build()
 
 
 class TestQuantScope(unittest.TestCase):
@@ -67,7 +70,7 @@ class TestQuantScope(unittest.TestCase):
             self.assertTrue(fqn.endswith("routed_experts.inner_experts"), fqn)
         # every MoE layer contributes exactly one
         moe_layers = sum(
-            1 for _, m in model.named_modules() if isinstance(m, KimiSiTUGroupedExperts)
+            1 for _, m in model.named_modules() if isinstance(m, KimiGroupedExperts)
         )
         self.assertEqual(len(scoped), moe_layers)
 
@@ -145,8 +148,8 @@ class TestQuantScope(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "grouped_mm needs CUDA")
     def test_qat_changes_expert_output_and_passes_gradient(self):
         torch.manual_seed(0)
-        cfg = KimiSiTUGroupedExperts.Config(dim=64, hidden_dim=128, num_experts=2)
-        experts = KimiSiTUGroupedExperts(cfg).cuda()
+        cfg = KimiGroupedExperts.Config(dim=64, hidden_dim=128, num_experts=2)
+        experts = KimiGroupedExperts(cfg).cuda()
         for p in experts.parameters():
             torch.nn.init.normal_(p, std=0.1)
         x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
@@ -193,10 +196,10 @@ class TestGroupedExpertMXFP4Packing(unittest.TestCase):
 
     def _experts(self, dim=64, hidden=128, num_experts=4):
         torch.manual_seed(0)
-        cfg = KimiSiTUGroupedExperts.Config(
+        cfg = KimiGroupedExperts.Config(
             dim=dim, hidden_dim=hidden, num_experts=num_experts
         )
-        e = KimiSiTUGroupedExperts(cfg)
+        e = KimiGroupedExperts(cfg)
         for p in e.parameters():
             torch.nn.init.normal_(p, std=0.1)
         return e

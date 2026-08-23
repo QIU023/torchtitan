@@ -19,7 +19,7 @@ placeholder interfaces).
 
 | File | Role |
 | --- | --- |
-| [`model.py`](./model.py) | K3 backbone: `KimiDeltaAttention` (KDA via `fla-core`), `KimiMLAAttention`, `KimiMoE`, `KimiDecoderLayer`, `KimiK3Model` |
+| [`model.py`](./model.py) | K3 backbone: `KimiDeltaAttention` (KDA via `fla-core`), `KimiMLAAttention`, `KimiMoE`, `KimiK3TransformerBlock`, `KimiK3Model` |
 | [`attn_res_model.py`](./attn_res_model.py) | `KimiK3AttnResModel`: AttnRes weave over the backbone (per-block-start RMSNorm + zero-init pseudo-queries) |
 | [`attn_res.py`](./attn_res.py) | `block_attn_res()` primitive, `AttnResConfig`, `AttnResProjection`, `stack_blocks` / `unstack_blocks` |
 | [`multimodal_model.py`](./multimodal_model.py) | `KimiK3LlavaMultimodalModel` + `KimiVisionProjector` (SigLIP-splice scaffold for the vision-native path) |
