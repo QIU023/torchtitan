@@ -138,3 +138,28 @@ def kimi_k3_debugmodel_text() -> Trainer.Config:
         activation_checkpoint=SelectiveAC.Config(),
     )
 
+
+
+def kimi_k3_debugmodel_lora() -> Trainer.Config:
+    """The multimodal debug model with LoRA adapters on the attention output.
+
+    Uses core's LoRAConverter rather than a model-local implementation. The
+    targets are named by the last segment of the FQN, so wo covers MLA and
+    output_proj covers KDA; the KDA adapters are trainable but its kernels read
+    the merged weight, which is why the target list names them explicitly
+    rather than defaulting to every Linear.
+    """
+    from torchtitan.components.lora import LoRAConverter
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(
+                rank=8,
+                alpha=16.0,
+                target_modules=["wq_b", "wkv_b", "wo"],
+            )
+        ],
+    )
+    return config
