@@ -615,17 +615,20 @@ class KimiK3Model(Decoder):
         """Is the tower wrapped in something that issues per-forward collectives?
 
         True once FSDP has sharded it, which is when skipping it desynchronizes
-        the process group. Before that, running a placeholder buys nothing.
+        the process group. A replicated DTensor -- what a tp-invariant module
+        holds -- issues no all-gather to match, so the test is on the placement
+        and not merely on the type.
         """
         return any(
-            isinstance(p, DTensor) for p in self.vision_encoder.parameters()
+            isinstance(p, DTensor) and any(pl.is_shard() for pl in p.placements)
+            for p in self.vision_encoder.parameters()
         )
 
     def _tower_placeholder(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The smallest input the tower accepts, for a rank with no images."""
         kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
         grid = torch.tensor(
-            [[1, kernel_h, kernel_w]], dtype=torch.int32, device=self._device()
+            [[1, kernel_h, kernel_w]], dtype=torch.long, device=self._device()
         )
         weight = self.vision_encoder.patch_embed.weight
         # A plain tensor, not weight.new_zeros: once FSDP has sharded the
@@ -685,13 +688,18 @@ class KimiK3Model(Decoder):
             grid_thw[:, 2] // kernel_w
         )
         if self._cp_group is not None and dist.get_world_size(self._cp_group) > 1:
-            return self._scatter_vision_embeds_cp(
-                embeddings_TD,
-                tokens=tokens,
-                vision_embeds=vision_embeds,
-                num_tokens_per_item=num_tokens_per_item,
-                placeholder_id=special_tokens["image_id"],
+            # This rank holds a slice of the sequence but encoded every image,
+            # so take the slice of the features its placeholders correspond to
+            # and scatter those. get_vision_positions cannot be used on a
+            # shard: it requires exactly one whole run per visual item, and a
+            # shard legitimately holds none, or half of one.
+            local_mask = tokens == special_tokens["image_id"]
+            counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
+            mine = self._select_cp_shard(vision_embeds, counts)
+            embeddings_TD = embeddings_TD.masked_scatter(
+                local_mask.unsqueeze(-1), mine.to(embeddings_TD.dtype)
             )
+            return add_zero_valued_dependency(embeddings_TD, vision_embeds)
         vision_positions = get_vision_positions(
             tokens,
             num_tokens_per_item,
@@ -703,65 +711,49 @@ class KimiK3Model(Decoder):
             vision_positions=vision_positions,
         )
 
-    def _scatter_vision_embeds_cp(
-        self,
-        embeddings_TD: torch.Tensor,
-        *,
-        tokens: torch.Tensor,
-        vision_embeds: torch.Tensor,
-        num_tokens_per_item: torch.Tensor,
-        placeholder_id: int,
-    ) -> torch.Tensor:
-        """Scatter vision features when the token sequence is CP-sharded.
+    def _exchange_sentinel_counts(self, local: int) -> torch.Tensor:
+        """Per-rank vision-placeholder counts across the CP group.
 
-        ``get_vision_positions`` reads placeholder runs off the whole sequence
-        and requires exactly one run per visual item. A CP rank holds a slice,
-        so it may see no runs at all, or half of one -- both of which that
-        function rejects, correctly, as a text/vision misalignment.
-
-        The pixel tensors are not sharded (``prepare_context_parallel_input``
-        cuts only inputs, labels, positions and masks), so every rank already
-        produced every embedding. What is missing is where this rank's slice
-        sits in the whole sequence, and one all-gather of the token ids -- an
-        int64 vector, once per step, not per layer -- answers that. Runs that
-        straddle a rank boundary are handled by intersecting each run with the
-        local window rather than assuming a run lies within one rank.
-
-        This assumes contiguous rank-ordered sharding, which is why the config
-        rejects a load balancer under CP.
+        Called whenever CP is on, including on ranks with no images: the
+        collective's participants are decided by the mesh, never by the batch.
         """
-        cp_group = self._cp_group
-        cp_size = dist.get_world_size(cp_group)
-        cp_rank = dist.get_rank(cp_group)
-        num_local = tokens.shape[0]
-
-        shards = [torch.empty_like(tokens) for _ in range(cp_size)]
-        dist.all_gather(shards, tokens.contiguous(), group=cp_group)
-        vision_positions = get_vision_positions(
-            torch.cat(shards), num_tokens_per_item, placeholder_id
+        group = self._cp_group
+        counts = torch.zeros(
+            dist.get_world_size(group),
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
         )
+        counts[dist.get_rank(group)] = local
+        dist.all_reduce(counts, group=group)
+        return counts
 
-        lo, hi = cp_rank * num_local, (cp_rank + 1) * num_local
-        offset = 0
-        for _, start, num_tokens in vision_positions:
-            begin, end = max(start, lo), min(start + num_tokens, hi)
-            if begin < end:
-                embeddings_TD[begin - lo : end - lo] = vision_embeds[
-                    offset + (begin - start) : offset + (end - start)
-                ].to(embeddings_TD.dtype)
-            offset += num_tokens
-        if offset != vision_embeds.shape[0]:
+    def _select_cp_shard(
+        self, vision_embeds: torch.Tensor, counts: torch.Tensor
+    ) -> torch.Tensor:
+        """Keep only the visual features belonging to this CP rank's shard.
+
+        ``prepare_context_parallel_input`` shards inputs, labels and positions
+        along the sequence but leaves ``pixel_values`` whole, so every rank
+        encodes every image while holding only a slice of the placeholders. The
+        features are ordered by sequence position and the shards are contiguous
+        and equal -- the config rejects a load balancer under CP precisely
+        because a permuting one would break that -- so this rank's slice starts
+        after however many placeholders the lower ranks hold.
+
+        This is correctness, not the report's sec 5.2.3 optimization: the
+        encoder still runs redundantly on every CP rank.
+        """
+        num_rows = vision_embeds.shape[0]
+        if int(counts.sum().item()) != num_rows:
             raise ValueError(
-                f"Vision placeholder runs consume {offset} embeddings but the "
-                f"packed vision output contains {vision_embeds.shape[0]}."
+                f"CP ranks hold {int(counts.sum().item())} vision "
+                f"placeholder(s) in total but {num_rows} visual token(s) were "
+                "encoded; the sequence shard and the image batch disagree"
             )
-        # Keep the tower in every rank's autograd graph. A rank whose slice
-        # holds no image tokens consumes no embedding, so the tower would get
-        # no gradient there, FSDP would skip that rank's reduce_scatter, and
-        # the ranks would deadlock on mismatched collectives -- observed as a
-        # 300s watchdog timeout with one rank still in reduce_scatter while
-        # the other had moved two collectives ahead.
-        return add_zero_valued_dependency(embeddings_TD, vision_embeds)
+        rank = dist.get_rank(self._cp_group)
+        start = int(counts[:rank].sum().item())
+        local = int(counts[rank].item())
+        return vision_embeds[start : start + local]
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
