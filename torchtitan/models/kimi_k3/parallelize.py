@@ -39,6 +39,14 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
+            # Tensor parallel: the declarations are in place and measurably
+            # take effect -- wq_b Shard(0), wo Shard(1), w1 Shard(0), lm_head
+            # Shard(0), KDA replicated -- but the forward does not run through
+            # yet. Each fix so far uncovered the next surface: norms, then the
+            # KDA convolutions and its own A_log/dt_bias, then the fla kernel
+            # needing its inputs unwrapped, then the latent MoE pair that
+            # core's set_moe_sharding_config does not know about. It now stops
+            # inside dynamo with "RuntimeError when making fake tensor call".
             ("tensor parallel", parallel_dims.tp_enabled),
         )
         if enabled
@@ -71,7 +79,11 @@ def parallelize_kimi_k3(
         )
 
     assert isinstance(model, KimiK3Model)
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
+    if (
+        parallelism.spmd_backend == "spmd_types"
+        or parallel_dims.tp_enabled
+        or parallel_dims.ep_enabled
+    ):
         model.parallelize(parallel_dims)
 
     if parallel_dims.cp_enabled:
