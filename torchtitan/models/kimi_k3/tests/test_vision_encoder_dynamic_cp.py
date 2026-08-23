@@ -32,7 +32,7 @@ DIM, HEADS, HEAD_DIM = 32, 2, 16
 
 
 def _build(dim: int):
-    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig, MoonViTEncoderLayer
+    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig, MoonViTEncoderLayer
 
     cfg = MoonViTConfig(
         hidden_size=dim,
@@ -53,7 +53,7 @@ def _body(rank: int, n_patches: int, queue) -> None:
         os.environ["MASTER_PORT"] = "29731" if n_patches % WORLD == 0 else "29732"
         dist.init_process_group("gloo", rank=rank, world_size=WORLD)
 
-        from torchtitan.models.kimi_k3.moonvit import CPPatchPlan
+        from torchtitan.models.kimi_k3.vision_encoder import CPPatchPlan
 
         layer = _build(DIM)
         torch.manual_seed(1)  # identical inputs on every rank

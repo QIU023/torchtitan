@@ -22,7 +22,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from torchtitan.models.kimi_k3.moonvit import (
+from torchtitan.models.kimi_k3.vision_encoder import (
     MoonViT,
     MoonViTConfig,
     PatchMergerMLPV2,

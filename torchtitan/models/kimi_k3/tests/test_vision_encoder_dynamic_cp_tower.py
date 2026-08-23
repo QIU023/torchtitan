@@ -50,7 +50,7 @@ DIM, HEADS, HEAD_DIM, PATCH = 32, 2, 16, 2
 
 
 def _tower(dim: int, faithful: bool = False):
-    from torchtitan.models.kimi_k3.moonvit import MoonViT, MoonViTConfig
+    from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
 
     if faithful:
         # kimi_k3_debugmodel_report_arch's own vision config: 3 heads (which no TP
@@ -99,7 +99,7 @@ def _body(rank: int, grid: tuple[int, int, int], queue, faithful: bool = False) 
         os.environ["MASTER_PORT"] = str(29750 + h * 4 + t)
         dist.init_process_group("gloo", rank=rank, world_size=WORLD)
 
-        from torchtitan.models.kimi_k3.moonvit import CPPatchPlan
+        from torchtitan.models.kimi_k3.vision_encoder import CPPatchPlan
         from torchtitan.models.kimi_k3.vit_cp_plan import row_partition
 
         tower, cfg = _tower(DIM, faithful)

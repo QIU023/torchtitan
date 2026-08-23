@@ -53,7 +53,7 @@ N_PATCHES = 16
 
 
 def _build(dim: int):
-    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig, MoonViTEncoderLayer
+    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig, MoonViTEncoderLayer
 
     cfg = MoonViTConfig(
         hidden_size=dim,
@@ -93,7 +93,7 @@ def _body(rank: int, queue) -> None:
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.tensor import distribute_module, DTensor, Replicate
 
-        from torchtitan.models.kimi_k3.moonvit import (
+        from torchtitan.models.kimi_k3.vision_encoder import (
             CPPatchPlan,
             MoonViTEncoderLayer,
         )

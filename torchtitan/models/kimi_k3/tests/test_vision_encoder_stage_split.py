@@ -34,7 +34,7 @@ import torch
 
 
 def _encoder(num_layers: int):
-    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig, MoonViTEncoder
+    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig, MoonViTEncoder
 
     cfg = MoonViTConfig(
         hidden_size=32,
@@ -168,7 +168,7 @@ class TestMoonViTTowerSplit(unittest.TestCase):
     """
 
     def _tower(self, num_layers: int = 4):
-        from torchtitan.models.kimi_k3.moonvit import MoonViT, MoonViTConfig
+        from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
 
         cfg = MoonViTConfig(
             hidden_size=32,

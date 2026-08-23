@@ -13,7 +13,7 @@ import unittest
 import torch
 
 from torchtitan.models.kimi_k3.model_configs import build_kimi_linear_config
-from torchtitan.models.kimi_k3.moonvit import MoonViT, MoonViTConfig
+from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
 from torchtitan.models.kimi_k3.multimodal_model import (
     KimiK3MultimodalConfig,
     KimiK3MultimodalModel,

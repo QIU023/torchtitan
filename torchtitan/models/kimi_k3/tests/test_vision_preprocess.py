@@ -14,7 +14,7 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.moonvit import MoonViT, MoonViTConfig
+from torchtitan.models.kimi_k3.vision_encoder import MoonViT, MoonViTConfig
 from torchtitan.models.kimi_k3.vision_preprocess import (
     from_titan_collator,
     navit_resize,

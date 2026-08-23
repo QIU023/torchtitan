@@ -445,7 +445,7 @@ def kimi_k3_mini_vl() -> Trainer.Config:
     Head count drops to 4 to keep head_dim at 64, matching the released tower.
     """
     from torchtitan.components.tokenizer import MultiModalTokenizer
-    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
+    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
 
     cfg = kimi_k3_mini_block_attn_res()
@@ -1080,7 +1080,7 @@ def kimi_k3_debugmodel_pr_4025() -> Trainer.Config:
     import dataclasses as _dc
 
     from torchtitan.components.tokenizer import MultiModalTokenizer
-    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
+    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
 
     cfg = kimi_k3_mini_vl()
@@ -1545,7 +1545,7 @@ def kimi_k3_2p8t_vl() -> Trainer.Config:
     Needs real hardware; it exists so the multimodal scale-up is also a config
     selection rather than a code change.
     """
-    from torchtitan.models.kimi_k3.moonvit import MoonViTConfig
+    from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig
     from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalSpec
 
     cfg = kimi_k3_2p8t_block_attn_res()

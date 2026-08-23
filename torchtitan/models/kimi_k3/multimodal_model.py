@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor, Replicate
 from torchtitan.distributed.fsdp import add_zero_valued_dependency
 from torchtitan.models.kimi_k3.attn_res_model import KimiK3AttnResModel
 from torchtitan.models.kimi_k3.model import KimiK3Config, KimiK3Model, KimiK3Spec
-from torchtitan.models.kimi_k3.moonvit import MoonViTConfig  # noqa: F401
+from torchtitan.models.kimi_k3.vision_encoder import MoonViTConfig  # noqa: F401
 
 from torchtitan.tools.logging import logger
 
@@ -183,7 +183,7 @@ class KimiK3MultimodalModel(nn.Module):
 
     def __init__(self, config: KimiK3MultimodalConfig) -> None:
         super().__init__()
-        from torchtitan.models.kimi_k3.moonvit import MoonViT
+        from torchtitan.models.kimi_k3.vision_encoder import MoonViT
 
         self.config = config
         self.vision_tower = MoonViT(config.vision_config)
@@ -451,7 +451,7 @@ class KimiK3MultimodalModel(nn.Module):
 
         import torch.distributed._functional_collectives as funcol
 
-        from torchtitan.models.kimi_k3.moonvit import CPPatchPlan
+        from torchtitan.models.kimi_k3.vision_encoder import CPPatchPlan
         from torchtitan.models.kimi_k3.vit_cp_plan import (
             balance_images,
             classify,
