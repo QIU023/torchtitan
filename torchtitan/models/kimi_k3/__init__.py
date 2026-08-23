@@ -19,6 +19,7 @@ is private to this experiment by design -- see the AttnRes RFC history.
 """
 
 from dataclasses import dataclass
+
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
@@ -30,9 +31,9 @@ try:
         KimiAttnResDecoderLayer,
         KimiK3AttnResModel,
     )
+    from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
     from torchtitan.models.kimi_k3.model import (
         KimiDecoderLayer,
-        KimiDeltaAttention,
         KimiK3Config,
         KimiK3Model,
         KimiK3Spec,

@@ -31,7 +31,7 @@ CP = MeshAxisName.CP
 
 class TestCPContracts(unittest.TestCase):
     def test_ulysses_pair_matches_the_all_to_all_reshape(self):
-        """S(1) -> S(2) is exactly what _cp_all_to_all_headseq does to the shape.
+        """S(1) -> S(2) is exactly what cp_all_to_all_headseq does to the shape.
 
         Run with a stub for the collective: on a single process the all-to-all is
         the identity, so the surrounding reshape/permute is what gets checked --
@@ -52,13 +52,13 @@ class TestCPContracts(unittest.TestCase):
         k3_model.dist.get_world_size = lambda group: cp
         dist_nn.all_to_all_single = lambda out, inp, group=None: inp
         try:
-            fwd = k3_model._cp_all_to_all_headseq(
+            fwd = k3_model.cp_all_to_all_headseq(
                 x, _Stub(), src_dim=SEQ_DIM, dst_dim=HEAD_DIM
             )
             # in_src S(1): sequence is the sharded axis, so t_loc is a shard.
             # in_dst S(2): heads become the sharded axis, sequence goes full.
             self.assertEqual(fwd.shape, (B, cp * t_loc, num_heads // cp, K))
-            back = k3_model._cp_all_to_all_headseq(
+            back = k3_model.cp_all_to_all_headseq(
                 fwd, _Stub(), src_dim=HEAD_DIM, dst_dim=SEQ_DIM
             )
             self.assertEqual(back.shape, x.shape)
@@ -82,7 +82,7 @@ class TestCPContracts(unittest.TestCase):
 
         x = torch.randn(2, 8, 12, 6)
         with self.assertRaises(ValueError) as cm:
-            k3_model._cp_all_to_all_headseq(x, object(), src_dim=SEQ_DIM, dst_dim=3)
+            k3_model.cp_all_to_all_headseq(x, object(), src_dim=SEQ_DIM, dst_dim=3)
         self.assertIn("no Ulysses all-to-all", str(cm.exception))
 
         # And the pair the contract actually names is one of the implemented ones.

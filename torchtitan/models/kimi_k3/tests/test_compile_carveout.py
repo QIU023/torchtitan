@@ -22,17 +22,19 @@ class TestFlaCarveOut(unittest.TestCase):
         from torchtitan.models.kimi_k3 import (
             attn_res as attn_res_mod,
             attn_res_model as attn_res_model_mod,
-            model as model_mod,
+            kda as kda_mod,
             parallelize as pz,
         )
 
         self.pz = pz
-        self.model_mod = model_mod
+        # The fla ops are called from kda.py, so that is the module whose
+        # bindings the carve-out has to replace.
+        self.kda_mod = kda_mod
         self.op_names = ("chunk_kda", "fused_recurrent_kda", "fused_kda_gate")
         # The carve-out is global state, so anything it touches is restored.
-        self._saved = {n: getattr(model_mod, n) for n in self.op_names}
+        self._saved = {n: getattr(kda_mod, n) for n in self.op_names}
         self._saved_flag = pz._fla_dynamo_carveout_done
-        self._saved_kda_forward = model_mod.KimiDeltaAttention.forward
+        self._saved_kda_forward = kda_mod.KimiDeltaAttention.forward
         self._saved_block = (
             attn_res_mod.block_attn_res,
             attn_res_model_mod.block_attn_res,
@@ -43,8 +45,8 @@ class TestFlaCarveOut(unittest.TestCase):
 
     def tearDown(self):
         for name, fn in self._saved.items():
-            setattr(self.model_mod, name, fn)
-        self.model_mod.KimiDeltaAttention.forward = self._saved_kda_forward
+            setattr(self.kda_mod, name, fn)
+        self.kda_mod.KimiDeltaAttention.forward = self._saved_kda_forward
         self._attn_res_mod.block_attn_res = self._saved_block[0]
         self._attn_res_model_mod.block_attn_res = self._saved_block[1]
         self.pz._fla_dynamo_carveout_done = self._saved_flag
@@ -64,11 +66,11 @@ class TestFlaCarveOut(unittest.TestCase):
         self.pz._disable_dynamo_on_fla_ops()
         for name in self.op_names:
             with self.subTest(op=name):
-                patched = getattr(self.model_mod, name)
+                patched = getattr(self.kda_mod, name)
                 self.assertIsNot(patched, self._saved[name], f"{name} not rebound")
-        # Rebinding fla's own module would not help: model.py bound these names
+        # Rebinding fla's own module would not help: kda.py bound these names
         # at import time, so the call site reads its own global.
-        self.assertIsNot(self.model_mod.chunk_kda, fla.ops.kda.chunk_kda)
+        self.assertIsNot(self.kda_mod.chunk_kda, fla.ops.kda.chunk_kda)
 
     def test_block_attn_res_is_rebound_in_both_modules(self):
         self.pz._disable_dynamo_on_fla_ops()
@@ -80,13 +82,13 @@ class TestFlaCarveOut(unittest.TestCase):
 
     def test_applying_it_twice_does_not_wrap_twice(self):
         self.pz._disable_dynamo_on_fla_ops()
-        once = self.model_mod.chunk_kda
-        once_forward = self.model_mod.KimiDeltaAttention.forward
+        once = self.kda_mod.chunk_kda
+        once_forward = self.kda_mod.KimiDeltaAttention.forward
         # _apply_compile_kimi_k3 runs per model part, so under PP this would
         # otherwise stack one wrapper per part.
         self.pz._disable_dynamo_on_fla_ops()
-        self.assertIs(self.model_mod.chunk_kda, once)
-        self.assertIs(self.model_mod.KimiDeltaAttention.forward, once_forward)
+        self.assertIs(self.kda_mod.chunk_kda, once)
+        self.assertIs(self.kda_mod.KimiDeltaAttention.forward, once_forward)
 
 
 if __name__ == "__main__":

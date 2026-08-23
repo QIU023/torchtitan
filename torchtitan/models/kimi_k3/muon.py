@@ -214,7 +214,8 @@ def tag_per_head_muon(model: nn.Module) -> int:
     from shapes, and a projection whose output width is not a multiple of its
     head count is left untagged instead of partitioned wrongly.
     """
-    from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiMLAAttention
+    from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
+    from torchtitan.models.kimi_k3.model import KimiMLAAttention
 
     tagged = 0
     for module in model.modules():

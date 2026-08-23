@@ -465,7 +465,8 @@ def apply_cp_kimi_k3(
     # inner_attention isn't the torchtitan SDPA type
     # apply_cp_to_forward expects -- hence this module-internal CP
     # rather than the upstream dispatcher.
-    from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiMLAAttention
+    from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
+    from torchtitan.models.kimi_k3.model import KimiMLAAttention
     from torchtitan.models.kimi_k3.sharding import (
         contract_for_mode,
         KCP as KCP_CONTRACT,
@@ -915,7 +916,7 @@ def apply_tp_kimi_k3(
     # MLA inner_attention: the ONE place use_local_output=True survives the
     # residual-stream flip. q/k/v arrive head-sharded and SDPA has no DTensor
     # rule, so the kernel must see plain tensors -- the same reason the fla
-    # kernels get _to_local_if_dtensor at their call sites. Setting it False with
+    # kernels get to_local_if_dtensor at their call sites. Setting it False with
     # everything else made every tp>1 cell die inside
     # F.scaled_dot_product_attention with the operands at Shard(1).
     inner_attn_plan = PrepareModuleInput(
@@ -933,7 +934,7 @@ def apply_tp_kimi_k3(
         # input_layernorm and post_attention_layernorm: plain NoParallel
         # (DTensor output). Downstream MLA forward consumes DTensor
         # naturally; downstream KDA strips DTensor at entry via
-        # _to_local_if_dtensor; downstream dense MLP's prepare_input
+        # to_local_if_dtensor; downstream dense MLP's prepare_input
         # accepts both. Plain NoParallel is the most natural choice.
         # The two layer norms are declarative now (norm_config in
         # KimiDecoderLayer.make_config), so they are not in the plan.
@@ -944,7 +945,7 @@ def apply_tp_kimi_k3(
             # "aten.cat.default got mixed" because its output stayed a DTensor
             # while AttnRes concatenated it against a plain stream; the stream is
             # a DTensor now, so the mismatch is gone. It already strips DTensor
-            # at the fla kernel call sites itself (_to_local_if_dtensor).
+            # at the fla kernel call sites itself (to_local_if_dtensor).
             pass
         else:
             # MLA layer: DSv3-style plan.
@@ -1671,16 +1672,17 @@ def _disable_dynamo_on_fla_ops() -> None:
     # torch.compiler.disable RETURNS a wrapper; it does not mark the function
     # in place. Discarding the return left all three ops fully traceable, so
     # this carve-out did nothing. Rebinding has to happen on the module that
-    # CALLS them -- model.py's own `from fla.ops.kda import ...` bindings --
+    # CALLS them -- kda.py's own `from fla.ops.kda import ...` bindings --
     # for the same reason spelled out for block_attn_res below. Patching
-    # fla.ops.kda alone would not be seen by an already-imported name.
-    from torchtitan.models.kimi_k3 import model as _model_mod
+    # fla.ops.kda alone would not be seen by an already-imported name, and
+    # patching model.py would miss the call sites now that KDA lives elsewhere.
+    from torchtitan.models.kimi_k3 import kda as _kda_mod
 
     for _name in ("chunk_kda", "fused_recurrent_kda", "fused_kda_gate"):
         setattr(
-            _model_mod,
+            _kda_mod,
             _name,
-            torch.compiler.disable(getattr(_model_mod, _name), recursive=True),
+            torch.compiler.disable(getattr(_kda_mod, _name), recursive=True),
         )
     for cls in (ShortConvolution, FusedRMSNormGated):
         cls.forward = torch.compiler.disable(cls.forward, recursive=True)
@@ -1710,7 +1712,7 @@ def _disable_dynamo_on_fla_ops() -> None:
 
     # KDA forward: also opaque to dynamo. Body is all fla-core triton
     # kernels (already disabled) plus simple linears. Under TP, the
-    # forward starts with ``_to_local_if_dtensor(x)`` to strip the
+    # forward starts with ``to_local_if_dtensor(x)`` to strip the
     # incoming DTensor; dynamo's fake-tensor mode doesn't always
     # propagate the type-narrowing of an ``isinstance`` branch through
     # the linear ops that follow, so the q_proj call sees the original
@@ -1718,7 +1720,7 @@ def _disable_dynamo_on_fla_ops() -> None:
     # KDA forward eagerly runs the to_local + the linears, which is
     # negligible compute cost on top of the already-eager triton
     # kernels.
-    from torchtitan.models.kimi_k3.model import KimiDeltaAttention
+    from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
 
     KimiDeltaAttention.forward = torch.compiler.disable(
         KimiDeltaAttention.forward,

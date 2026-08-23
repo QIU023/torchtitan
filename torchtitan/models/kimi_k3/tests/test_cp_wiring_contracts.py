@@ -291,7 +291,8 @@ class TestKcpBatchLoop(unittest.TestCase):
     """
 
     def _kda(self):
-        from torchtitan.models.kimi_k3.model import KimiDeltaAttention, KimiK3Config
+        from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
+        from torchtitan.models.kimi_k3.model import KimiK3Config
 
         flat = KimiK3Config(
             hidden_size=32,

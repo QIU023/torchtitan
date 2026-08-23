@@ -28,9 +28,10 @@ from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.models.common.linear import Linear
 
-# The wrapper and the placement helper live in model.py; model.py does not
-# import this file, so there is no cycle.
-from torchtitan.models.kimi_k3.model import _tp_replicate, RMSNorm
+# RMSNorm comes from model.py, which does not import this file, so there is no
+# cycle; the placement helper comes from sharding.py, a leaf module.
+from torchtitan.models.kimi_k3.model import RMSNorm
+from torchtitan.models.kimi_k3.sharding import tp_replicate
 from torchtitan.protocols.module import Module
 
 
@@ -451,7 +452,7 @@ class MoonViTEncoderLayer(nn.Module):
         self.norm0 = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
-            sharding_config=_tp_replicate(),
+            sharding_config=tp_replicate(),
         ).build()
         self.wqkv = nn.Linear(
             config.hidden_size, 3 * config.qkv_hidden_size, bias=False
@@ -460,7 +461,7 @@ class MoonViTEncoderLayer(nn.Module):
         self.norm1 = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
-            sharding_config=_tp_replicate(),
+            sharding_config=tp_replicate(),
         ).build()
         self.mlp = MoonViTMLP(config)
 
@@ -694,7 +695,7 @@ class PatchMergerMLPV2(nn.Module):
         self.post_norm = RMSNorm.Config(
             normalized_shape=config.text_hidden_size,
             eps=config.projector_ln_eps,
-            sharding_config=_tp_replicate(),
+            sharding_config=tp_replicate(),
         ).build()
 
     def forward(self, merged: list[torch.Tensor] | torch.Tensor):
@@ -726,7 +727,7 @@ class MoonViTEncoder(nn.Module):
         self.final_layernorm = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
-            sharding_config=_tp_replicate(),
+            sharding_config=tp_replicate(),
         ).build()
 
     def set_cp_patch_plan(self, plan: CPPatchPlan | None) -> None:

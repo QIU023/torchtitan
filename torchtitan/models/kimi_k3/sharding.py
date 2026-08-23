@@ -18,16 +18,34 @@ declaring both here would be two mesh axes on tensor dim 2, which SpmdLayout
 rejects without an explicit partition_spec.
 
 See CP_DECLARATIVE.md in the logbook for why KCP is an identity pair.
+
+Also the two TP declaration helpers the K3 modules share. They live here rather
+than in ``model.py`` so that ``kda.py``, ``vision_encoder.py`` and
+``attn_res_model.py`` can reach them without importing the model module, and so
+that replacing ``tp_replicate`` with core's invariant shape is one edit.
 """
 
 from dataclasses import dataclass
 
 import spmd_types as spmd
 
+import torch
+import torch.distributed as dist
+
 from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
+from torchtitan.models.common.decoder_sharding import dense_param_placement
+from torchtitan.protocols.sharding import ShardingConfig
 
 
-__all__ = ["CPContract", "KCP", "ULYSSES", "contract_for_mode"]
+__all__ = [
+    "CPContract",
+    "KCP",
+    "ULYSSES",
+    "contract_for_mode",
+    "cp_all_to_all_headseq",
+    "tp_replicate",
+    "tp_shard",
+]
 
 CP = MeshAxisName.CP
 
@@ -115,6 +133,69 @@ def contract_for_mode(mode: str) -> CPContract:
     if mode not in _BY_MODE:
         raise ValueError(f"kda_cp_mode must be one of {sorted(_BY_MODE)}, got {mode!r}")
     return _BY_MODE[mode]
+
+
+def cp_all_to_all_headseq(
+    x: torch.Tensor, cp_group, *, src_dim: int, dst_dim: int
+) -> torch.Tensor:
+    """Differentiable Ulysses all-to-all moving the CP shard between tensor dims.
+
+    ``(1, 2)``: ``[B, T/cp, H, K]`` (seq-sharded) -> ``[B, T, H/cp, K]``.
+    ``(2, 1)``: ``[B, T, H/cp, K]`` -> ``[B, T/cp, H, K]``.
+
+    The dims come from the CP contract's placement pair rather than a flag, so a
+    contract that names a pair with no implementation raises here instead of being
+    quietly ignored.
+
+    Numerics (round-trip and per-head chunk_kda parity) validated
+    bit-exact against a single-rank reference; backward is the
+    transposed all-to-all via torch.distributed.nn.functional.
+    """
+    import torch.distributed.nn.functional as dist_nn
+
+    if (src_dim, dst_dim) not in ((SEQ_DIM, HEAD_DIM), (HEAD_DIM, SEQ_DIM)):
+        raise ValueError(
+            f"no Ulysses all-to-all for CP shard dims {src_dim} -> {dst_dim}; "
+            f"implemented pairs are {SEQ_DIM} <-> {HEAD_DIM}"
+        )
+    cp = dist.get_world_size(cp_group)
+    B, d1, d2, K = x.shape
+    if (src_dim, dst_dim) == (SEQ_DIM, HEAD_DIM):
+        t_loc, num_heads = d1, d2
+        # [B, T/cp, H, K] -> [cp, B, T/cp, H/cp, K] (split heads by dest)
+        x_split = (
+            x.reshape(B, t_loc, cp, num_heads // cp, K)
+            .permute(2, 0, 1, 3, 4)
+            .contiguous()
+        )
+        out = dist_nn.all_to_all_single(
+            torch.empty_like(x_split), x_split, group=cp_group
+        )
+        # recv[s] holds src s's T/cp for THIS rank's head subset -> stack seq
+        return (
+            out.permute(1, 0, 2, 3, 4)
+            .reshape(B, cp * t_loc, num_heads // cp, K)
+            .contiguous()
+        )
+    t_full, h_loc = d1, d2
+    t_loc = t_full // cp
+    x_split = x.reshape(B, cp, t_loc, h_loc, K).permute(1, 0, 2, 3, 4).contiguous()
+    out = dist_nn.all_to_all_single(torch.empty_like(x_split), x_split, group=cp_group)
+    # out[s] = src s's head subset for THIS rank's seq shard; put T/cp
+    # before the src(cp) axis so reshape stacks heads in ascending order.
+    return out.permute(1, 2, 0, 3, 4).reshape(B, t_loc, cp * h_loc, K).contiguous()
+
+
+def tp_shard(dim: int) -> ShardingConfig:
+    """Weight sharded on ``dim`` of the tp axis; colwise is 0, rowwise is 1."""
+    return ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(dim))}
+    )
+
+
+def tp_replicate() -> ShardingConfig:
+    """Weight replicated on the tp axis (the NoParallel case)."""
+    return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
 # ---------------------------------------------------------------------------

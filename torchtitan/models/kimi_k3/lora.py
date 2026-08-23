@@ -274,11 +274,7 @@ class KimiLoRALinear(nn.Module):
         """
         if not self._quantize_act or self._quantize_base != "mxfp4":
             return x
-        from torchtitan.components.mx_qat import (
-            _ACT_ELEM,
-            _BLOCK,
-            _fake_quant_mx,
-        )
+        from torchtitan.components.mx_qat import _ACT_ELEM, _BLOCK, _fake_quant_mx
 
         return _fake_quant_mx(x, _ACT_ELEM, _BLOCK)
 
@@ -568,7 +564,7 @@ def apply_lora(
     parameter except LoRA adapters and the AttnRes graft params
     (alpha-fullparam exception).
     """
-    from torchtitan.models.kimi_k3.model import KimiDeltaAttention
+    from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
 
     leaf_targets = frozenset(t for t in targets if "." not in t)
     suffix_targets = tuple(f".{t}" for t in targets if "." in t)

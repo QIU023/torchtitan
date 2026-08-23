@@ -32,8 +32,6 @@ from torchtitan.models.kimi_k3.attn_res import (
     unstack_blocks,
 )
 from torchtitan.models.kimi_k3.model import (
-    _tp_replicate,
-    _tp_shard,
     KimiDecoderLayer,
     KimiK3Config,
     KimiK3Model,
@@ -42,6 +40,7 @@ from torchtitan.models.kimi_k3.model import (
     splice_vision_embeds,
     UpstreamFSDPNames,
 )
+from torchtitan.models.kimi_k3.sharding import tp_replicate, tp_shard
 from torchtitan.protocols.module import Module
 
 
@@ -129,17 +128,17 @@ class KimiAttnResDecoderLayer(Module, UpstreamFSDPNames):
             return RMSNorm.Config(
                 normalized_shape=d,
                 eps=config.rms_norm_eps,
-                sharding_config=_tp_replicate(),
+                sharding_config=tp_replicate(),
             )
 
         return KimiAttnResDecoderLayer.Config(
             layer_idx=layer_idx,
             base=KimiDecoderLayer.make_config(config, layer_idx),
             attention_res_proj=AttnResProjection.Config(
-                dim=d, sharding_config=_tp_replicate()
+                dim=d, sharding_config=tp_replicate()
             ),
             ffn_res_proj=AttnResProjection.Config(
-                dim=d, sharding_config=_tp_replicate()
+                dim=d, sharding_config=tp_replicate()
             ),
             attention_res_norm=_norm(),
             ffn_res_norm=_norm(),
@@ -401,13 +400,13 @@ class KimiK3MTPLayer(nn.Module):
         super().__init__()
         d = config.hidden_size
         self.enorm = RMSNorm.Config(
-            normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()
+            normalized_shape=d, eps=config.rms_norm_eps, sharding_config=tp_replicate()
         ).build()
         self.hnorm = RMSNorm.Config(
-            normalized_shape=d, eps=config.rms_norm_eps, sharding_config=_tp_replicate()
+            normalized_shape=d, eps=config.rms_norm_eps, sharding_config=tp_replicate()
         ).build()
         self.eh_proj = Linear.Config(
-            in_features=2 * d, out_features=d, bias=False, sharding_config=_tp_shard(0)
+            in_features=2 * d, out_features=d, bias=False, sharding_config=tp_shard(0)
         ).build()
         self.gated = gated
         self.block = KimiAttnResDecoderLayer.make_config(
@@ -504,12 +503,12 @@ class KimiK3AttnResModel(KimiK3Model):
                 bias=False,
             ),
             output_res_proj=AttnResProjection.Config(
-                dim=config.hidden_size, sharding_config=_tp_replicate()
+                dim=config.hidden_size, sharding_config=tp_replicate()
             ),
             output_res_norm=RMSNorm.Config(
                 normalized_shape=config.hidden_size,
                 eps=config.rms_norm_eps,
-                sharding_config=_tp_replicate(),
+                sharding_config=tp_replicate(),
             ),
             num_blocks=num_blocks,
             layers_per_block=layers_per_block,

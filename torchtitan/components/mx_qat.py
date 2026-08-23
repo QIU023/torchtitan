@@ -268,7 +268,7 @@ def apply_mx_qat(
         # bypasses module forward, so a wrapper there is silently dead. That is a
         # property of the model, so the model names it -- the default keeps the
         # existing callers working.
-        from torchtitan.models.kimi_k3.model import KimiDeltaAttention
+        from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
 
         skip_subtrees = (KimiDeltaAttention,)
 

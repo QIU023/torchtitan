@@ -29,12 +29,8 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import (
-    KimiDeltaAttention,
-    KimiK3Config,
-    KimiMLAAttention,
-    KimiMLP,
-)
+from torchtitan.models.kimi_k3.kda import KimiDeltaAttention
+from torchtitan.models.kimi_k3.model import KimiK3Config, KimiMLAAttention, KimiMLP
 
 
 def _tiny_config(num_hidden_layers: int = 2) -> KimiK3Config:
@@ -76,13 +72,17 @@ def _tiny_config(num_hidden_layers: int = 2) -> KimiK3Config:
 
 class TestKimiMLP(unittest.TestCase):
     def test_forward_shape(self):
-        mlp = KimiMLP.make_config(hidden_size=128, intermediate_size=256, hidden_act="silu").build()
+        mlp = KimiMLP.make_config(
+            hidden_size=128, intermediate_size=256, hidden_act="silu"
+        ).build()
         x = torch.randn(2, 7, 128)
         out = mlp(x)
         self.assertEqual(out.shape, x.shape)
 
     def test_gelu_alias_accepted(self):
-        mlp = KimiMLP.make_config(hidden_size=64, intermediate_size=128, hidden_act="gelu").build()
+        mlp = KimiMLP.make_config(
+            hidden_size=64, intermediate_size=128, hidden_act="gelu"
+        ).build()
         x = torch.randn(1, 3, 64)
         self.assertEqual(mlp(x).shape, x.shape)
 
@@ -90,7 +90,9 @@ class TestKimiMLP(unittest.TestCase):
 class TestKimiMLAAttention(unittest.TestCase):
     def test_forward_shape(self):
         cfg = _tiny_config()
-        mla = KimiMLAAttention.make_config(cfg, layer_idx=1).build()  # layer_idx 1 is MLA per tiny_config
+        mla = KimiMLAAttention.make_config(
+            cfg, layer_idx=1
+        ).build()  # layer_idx 1 is MLA per tiny_config
         B, T = 2, 16
         x = torch.randn(B, T, cfg.hidden_size)
         out = mla(x)
@@ -127,7 +129,12 @@ class TestKimiDeltaAttention(unittest.TestCase):
         """T > 64 triggers chunk mode in KDA. Requires CUDA + Triton."""
         cfg = _tiny_config()
         device = torch.device("cuda")
-        kda = KimiDeltaAttention.make_config(cfg, layer_idx=0).build().to(device).to(torch.bfloat16)
+        kda = (
+            KimiDeltaAttention.make_config(cfg, layer_idx=0)
+            .build()
+            .to(device)
+            .to(torch.bfloat16)
+        )
         B, T = 2, 128
         x = torch.randn(B, T, cfg.hidden_size, device=device, dtype=torch.bfloat16)
         out = kda(x)
