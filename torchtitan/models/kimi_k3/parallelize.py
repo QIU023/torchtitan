@@ -40,11 +40,10 @@ def parallelize_kimi_k3(
         name
         for name, enabled in (
             ("tensor parallel", parallel_dims.tp_enabled),
-            # Expert parallel needs the model to declare its sharding: with no
-            # ShardingConfig anywhere, model.parallelize leaves every one of
-            # the 680 parameters a plain tensor (measured), so the experts
-            # never reach an ep mesh and clip_grad_norm_ then stacks norms
-            # from two different meshes. Blocked on the declarative pass.
+            # Expert parallel: the declarations now land and the dispatcher
+            # runs, but the grouped GEMM fails with "matrix batch sizes have to
+            # match" -- the local expert count and the offsets disagree
+            # somewhere between dispatch and inner_experts. Not diagnosed.
             ("expert parallel", parallel_dims.ep_enabled),
         )
         if enabled

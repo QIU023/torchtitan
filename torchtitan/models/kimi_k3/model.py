@@ -20,7 +20,11 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     FlexAttention,
 )
+import spmd_types as spmd
+
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
+from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     scatter_vision_embeds,
@@ -376,7 +380,40 @@ class KimiK3Model(Decoder):
                     "parallelism.context_parallel_load_balancer=None; "
                     f"got {parallelism.context_parallel_load_balancer!r}."
                 )
+            self._set_sharding_config(
+                enable_ep=parallelism.expert_parallel_degree > 1,
+                enable_tp=parallelism.tensor_parallel_degree > 1,
+            )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
+
+        def _set_sharding_config(self, *, enable_ep: bool, enable_tp: bool) -> None:
+            """Declare the sharding the SPMD backends act on.
+
+            Sequence parallel is not offered: the sequence is already the axis
+            context parallel shards here, and this model's CP is not
+            ShardingConfig-driven, so the two would be describing the same axis
+            from two places.
+
+            Only the parts that upstream already has a helper for. Everything
+            else is left undeclared on purpose rather than filled in with a
+            guess -- an undeclared module is inert, a wrongly declared one is a
+            silent numerics change.
+            """
+            if not (enable_ep or enable_tp):
+                return
+            set_decoder_sharding_config(self, enable_sp=False)
+            for layer in self.layers:
+                if layer.moe is not None:
+                    set_moe_sharding_config(
+                        layer.moe,
+                        enable_ep=enable_ep,
+                        enable_sp=False,
+                        expert_param_layout={
+                            "w1_EFD": spmd.S(1),
+                            "w2_EDF": spmd.S(2),
+                            "w3_EFD": spmd.S(1),
+                        },
+                    )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
