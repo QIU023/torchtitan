@@ -460,6 +460,9 @@ class KimiK3Model(Decoder):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        # Smallest image worth partitioning across CP ranks. Below it the
+        # replicated encode is cheaper: splitting buys one gather per layer.
+        dynamic_cp_min_patches: int = 256
         # KDA runs on fla triton kernels, which do not dispatch through
         # DTensor, so no ShardingConfig can drive its context parallel -- the
         # layer implements both CP modes itself, and the preconditions that
@@ -606,6 +609,7 @@ class KimiK3Model(Decoder):
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
+        self.dynamic_cp_min_patches = config.dynamic_cp_min_patches
 
 
     def _tower_needs_collectives(self) -> bool:
@@ -642,6 +646,58 @@ class KimiK3Model(Decoder):
     def _device(self) -> torch.device:
         return next(self.parameters()).device
 
+
+    def _encode_images(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode every image, splitting the large ones across CP ranks.
+
+        Report sec 5.2.3: a single large image is partitioned along the patch
+        dimension and attention gathers key-value pairs across ranks, which is
+        what reduces the encoder latency of large samples and the cross-device
+        imbalance. Small images are left replicated -- splitting one buys a
+        gather per layer and saves nothing, so the threshold is on the image's
+        own patch count rather than on the batch.
+
+        Without CP, or with every image below the threshold, this is exactly the
+        replicated call it replaces.
+        """
+        from torchtitan.models.kimi_k3.vit_cp_plan import classify
+        from torchtitan.models.kimi_k3.vision_encoder import make_cp_patch_plan
+
+        group = self._cp_group
+        cp_size = dist.get_world_size(group) if group is not None else 1
+        grids = grid_thw.tolist()
+        counts = [t * h * w for t, h, w in grids]
+        big = set(classify(counts, cp_size, min_patches=self.dynamic_cp_min_patches))
+        if not big:
+            return self.vision_encoder(pixel_values, grid_thw=grid_thw)
+
+        rank = dist.get_rank(group)
+        kernel_h, _ = self.vision_encoder.merge_kernel_size
+        outputs = []
+        offset = 0
+        for i, (grid, count) in enumerate(zip(grids, counts, strict=True)):
+            item = pixel_values[offset : offset + count]
+            item_grid = torch.tensor([grid], dtype=grid_thw.dtype, device=grid_thw.device)
+            offset += count
+            if i not in big:
+                outputs.append(self.vision_encoder(item, grid_thw=item_grid))
+                continue
+            plan, ranges = make_cp_patch_plan(
+                tuple(grid), group=group, rank=rank, merge_kernel_h=kernel_h
+            )
+            shard = torch.cat([item[lo:hi] for lo, hi in ranges], dim=0)
+            mine = self.vision_encoder(shard, grid_thw=item_grid, cp_plan=plan)
+            # Every rank needs the whole image's tokens: the text side splices
+            # them at positions this rank may or may not hold, and the CP
+            # sentinel selection downstream cuts to what it does hold.
+            parts = [torch.empty_like(mine) for _ in range(cp_size)]
+            dist.all_gather(parts, mine.contiguous())
+            outputs.append(torch.cat(parts, dim=0))
+        return torch.cat(outputs, dim=0)
+
+
     def _prepare_multimodal_embeds(
         self,
         tokens: torch.Tensor,
@@ -677,7 +733,7 @@ class KimiK3Model(Decoder):
             raise ValueError("special_tokens are required for multimodal inputs.")
 
         pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
-        vision_embeds = self.vision_encoder(pixel_values, grid_thw=grid_thw)
+        vision_embeds = self._encode_images(pixel_values, grid_thw)
         # MoonViT collapses time and merges spatially, so the text-side token
         # count per item is (h/kh)*(w/kw), independent of t.
         kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
