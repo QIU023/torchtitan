@@ -1446,6 +1446,23 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     extras = [n for n in _KIMI_ATTN_RES_LAST_STAGE_FQNS if hasattr(model, n)]
     if extras:
         fqns[-1].extend(extras)
+    # The tower belongs with whichever chunk kept the embedding: vision
+    # features are spliced into the embeddings, so nothing vision-side crosses
+    # a stage boundary. Naming it matters -- core sets every child not named by
+    # some stage to None, so leaving it out gives every stage a None tower and
+    # the first multimodal batch reports "pixel_values were provided without a
+    # vision encoder". DEP is the exception and gets its own stage below.
+    if not dep_enabled() and hasattr(model, "vision_encoder"):
+        embed_stage = next(
+            (
+                stage
+                for stage in fqns
+                if "tok_embeddings" in stage or "embed_tokens" in stage
+            ),
+            fqns[0],
+        )
+        embed_stage.append("vision_encoder")
+
     if dep_enabled():
         # DEP: one stage ahead of the text ones that owns the vision tower. The
         # FQN deliberately matches NOTHING in the text model, so core's
