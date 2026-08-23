@@ -399,6 +399,10 @@ class KimiK3Model(Decoder):
                 seq_len,
             )
 
+    # Set by apply_cp_kimi_k3; the vision scatter needs it to place this
+    # rank's slice of the sequence.
+    _cp_group = None
+
     def __init__(self, config: Config):
         super().__init__(config)
         self.output_res_norm = config.output_res_norm.build()
@@ -437,6 +441,14 @@ class KimiK3Model(Decoder):
         num_tokens_per_item = (grid_thw[:, 1] // kernel_h) * (
             grid_thw[:, 2] // kernel_w
         )
+        if self._cp_group is not None and dist.get_world_size(self._cp_group) > 1:
+            return self._scatter_vision_embeds_cp(
+                embeddings_TD,
+                tokens=tokens,
+                vision_embeds=vision_embeds,
+                num_tokens_per_item=num_tokens_per_item,
+                placeholder_id=special_tokens["image_id"],
+            )
         vision_positions = get_vision_positions(
             tokens,
             num_tokens_per_item,
@@ -447,6 +459,67 @@ class KimiK3Model(Decoder):
             vision_embeds=vision_embeds,
             vision_positions=vision_positions,
         )
+
+    def _scatter_vision_embeds_cp(
+        self,
+        embeddings_TD: torch.Tensor,
+        *,
+        tokens: torch.Tensor,
+        vision_embeds: torch.Tensor,
+        num_tokens_per_item: torch.Tensor,
+        placeholder_id: int,
+    ) -> torch.Tensor:
+        """Scatter vision features when the token sequence is CP-sharded.
+
+        ``get_vision_positions`` reads placeholder runs off the whole sequence
+        and requires exactly one run per visual item. A CP rank holds a slice,
+        so it may see no runs at all, or half of one -- both of which that
+        function rejects, correctly, as a text/vision misalignment.
+
+        The pixel tensors are not sharded (``prepare_context_parallel_input``
+        cuts only inputs, labels, positions and masks), so every rank already
+        produced every embedding. What is missing is where this rank's slice
+        sits in the whole sequence, and one all-gather of the token ids -- an
+        int64 vector, once per step, not per layer -- answers that. Runs that
+        straddle a rank boundary are handled by intersecting each run with the
+        local window rather than assuming a run lies within one rank.
+
+        This assumes contiguous rank-ordered sharding, which is why the config
+        rejects a load balancer under CP.
+        """
+        cp_group = self._cp_group
+        cp_size = dist.get_world_size(cp_group)
+        cp_rank = dist.get_rank(cp_group)
+        num_local = tokens.shape[0]
+
+        shards = [torch.empty_like(tokens) for _ in range(cp_size)]
+        dist.all_gather(shards, tokens.contiguous(), group=cp_group)
+        vision_positions = get_vision_positions(
+            torch.cat(shards), num_tokens_per_item, placeholder_id
+        )
+
+        lo, hi = cp_rank * num_local, (cp_rank + 1) * num_local
+        offset = 0
+        for _, start, num_tokens in vision_positions:
+            begin, end = max(start, lo), min(start + num_tokens, hi)
+            if begin < end:
+                embeddings_TD[begin - lo : end - lo] = vision_embeds[
+                    offset + (begin - start) : offset + (end - start)
+                ].to(embeddings_TD.dtype)
+            offset += num_tokens
+        if offset != vision_embeds.shape[0]:
+            raise ValueError(
+                f"Vision placeholder runs consume {offset} embeddings but the "
+                f"packed vision output contains {vision_embeds.shape[0]}."
+            )
+        # Keep the tower in every rank's autograd graph. A rank whose slice
+        # holds no image tokens consumes no embedding, so the tower would get
+        # no gradient there, FSDP would skip that rank's reduce_scatter, and
+        # the ranks would deadlock on mismatched collectives -- observed as a
+        # 300s watchdog timeout with one rank still in reduce_scatter while
+        # the other had moved two collectives ahead. Adding an exact zero
+        # leaves the embeddings unchanged.
+        return embeddings_TD + vision_embeds.sum() * 0.0
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
