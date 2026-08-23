@@ -115,6 +115,7 @@ def apply_cp_kimi_k3(model: nn.Module, parallel_dims: ParallelDims) -> None:
     config for why the declarative path cannot serve them.
     """
     cp_group = parallel_dims.get_mesh("cp").get_group()
+    model._cp_group = cp_group
     num_mla = num_kda = 0
     for module in model.modules():
         if isinstance(module, KimiMLAAttention):
