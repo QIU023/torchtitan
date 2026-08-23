@@ -35,9 +35,17 @@ def to_local_if_dtensor(t):
     isinstance(t, DTensor) is the safe check that dynamo's fake-tensor
     mode honors (``hasattr(t, "to_local")`` is unreliable: dynamo's
     type tracking can elide attribute lookups on DTensor parameters).
+
+    ``grad_placements`` is passed rather than left to default, which the
+    distributed rules ask for on every ``to_local``. It is the forward
+    placement, which is also what the default would pick -- and that is the
+    right answer only because every rank does the SAME work with the unwrapped
+    value. When ranks diverge the gradient of a replicated value is their sum,
+    and :func:`to_local_partial_grad` is the spelling for that; stating this
+    one explicitly is what makes the pair readable as a choice.
     """
     if isinstance(t, DTensor):
-        return t.to_local()
+        return t.to_local(grad_placements=list(t.placements))
     return t
 
 
