@@ -55,8 +55,8 @@ from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
     norm_config,
-    pre_lm_head_norm_config,
     rowwise_config,
+    set_decoder_sharding_config,
     set_gqa_inner_attention_local_map,
 )
 from torchtitan.models.common.embedding import Embedding
@@ -71,50 +71,7 @@ from torchtitan.models.kimi_k3.sharding import (
     ULYSSES,
 )
 from torchtitan.protocols.module import Module
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
-
-
-def _vocab_parallel_embedding() -> ShardingConfig:
-    """Vocab-sharded embedding: weight S(0) on tp, output Partial on tp.
-
-    Both halves are required and neither is optional. Embedding.forward takes its
-    vocab-parallel branch whenever a tp group exists; that branch indexes the weight
-    with ``input - rank * ceil(vocab / tp)``, so the rows it holds must BE that chunk
-    (the S(0) half), and it zeroes ids outside its range, so the per-rank results are
-    partial sums that something has to add up (the P half).
-
-    Upstream declares tok_embeddings exactly this way. Declaring only the weight leaves
-    every rank holding its own slice's contribution with nothing summing them.
-    """
-    embed_input = dense_activation_placement(tp=spmd.R)
-    return ShardingConfig(
-        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
-        in_src_shardings={"input": embed_input},
-        in_dst_shardings={"input": embed_input},
-        out_src_shardings=dense_activation_placement(tp=spmd.P),
-        out_dst_shardings=dense_activation_placement(tp=spmd.R),
-        local_map=LocalMapConfig(in_grad_placements=None),
-    )
-
-
-def _lm_head_sharding() -> ShardingConfig:
-    """Vocab-parallel lm_head: weight S(0), input replicated, output S(-1).
-
-    Shard(-1) rather than Replicate on the output because core's cross-entropy has
-    a vocab-parallel path for exactly that placement (``_LossParallelCrossEntropy``).
-    This is upstream's ``set_decoder_sharding_config`` entry verbatim, and it is what
-    the ``ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1))`` plan
-    entry it replaces already did.
-    """
-    replicated = dense_activation_placement(tp=spmd.R)
-    vocab_sharded = dense_activation_placement(tp=spmd.S(-1))
-    return ShardingConfig(
-        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
-        in_src_shardings={"input": replicated},
-        in_dst_shardings={"input": replicated},
-        out_src_shardings=vocab_sharded,
-        out_dst_shardings=vocab_sharded,
-    )
+from torchtitan.protocols.sharding import ShardingConfig
 
 
 def _tp_shard(dim: int) -> ShardingConfig:
@@ -2286,12 +2243,11 @@ class KimiK3Model(Module):
     @staticmethod
     def make_config(config: KimiK3Config) -> "KimiK3Model.Config":
         """The one place the trunk reads the flat config."""
-        return KimiK3Model.Config(
+        cfg = KimiK3Model.Config(
             kimi_config=config,
             tok_embeddings=Embedding.Config(
                 num_embeddings=config.vocab_size,
                 embedding_dim=config.hidden_size,
-                sharding_config=_vocab_parallel_embedding(),
             ),
             layers=[
                 KimiDecoderLayer.make_config(config, i)
@@ -2300,15 +2256,21 @@ class KimiK3Model(Module):
             norm=RMSNorm.Config(
                 normalized_shape=config.hidden_size,
                 eps=config.rms_norm_eps,
-                sharding_config=pre_lm_head_norm_config(enable_sp=False),
             ),
             lm_head=Linear.Config(
                 in_features=config.hidden_size,
                 out_features=config.vocab_size,
                 bias=False,
-                sharding_config=_lm_head_sharding(),
             ),
         )
+        # The three root entries come from core rather than being copied here:
+        # tok_embeddings, norm and lm_head are exactly what
+        # set_decoder_sharding_config writes, and our field names are the ones it
+        # writes to. Copying them by hand is how tok_embeddings' out_dst drifted
+        # to Replicate while upstream leaves it Invariant and lets the norm do
+        # the reduction.
+        set_decoder_sharding_config(cfg, enable_sp=False)
+        return cfg
 
     def __init__(self, config: "KimiK3Model.Config") -> None:
         super().__init__()

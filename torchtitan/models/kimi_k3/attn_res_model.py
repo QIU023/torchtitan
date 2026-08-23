@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate
 
-from torchtitan.models.common.decoder_sharding import pre_lm_head_norm_config
+from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
 
 from torchtitan.models.common.embedding import Embedding as _TTEmbedding
 from torchtitan.models.kimi_k3.attn_res import (
@@ -32,10 +32,8 @@ from torchtitan.models.kimi_k3.attn_res import (
     unstack_blocks,
 )
 from torchtitan.models.kimi_k3.model import (
-    _lm_head_sharding,
     _tp_replicate,
     _tp_shard,
-    _vocab_parallel_embedding,
     KimiDecoderLayer,
     KimiK3Config,
     KimiK3Model,
@@ -486,12 +484,11 @@ class KimiK3AttnResModel(KimiK3Model):
     ) -> "KimiK3AttnResModel.Config":
         """The one place this class reads the flat config."""
         n_layers = config.num_hidden_layers
-        return KimiK3AttnResModel.Config(
+        cfg = KimiK3AttnResModel.Config(
             kimi_config=config,
             tok_embeddings=_TTEmbedding.Config(
                 num_embeddings=config.vocab_size,
                 embedding_dim=config.hidden_size,
-                sharding_config=_vocab_parallel_embedding(),
             ),
             layers=[
                 KimiAttnResDecoderLayer.make_config(config, i, gated=gated)
@@ -500,13 +497,11 @@ class KimiK3AttnResModel(KimiK3Model):
             norm=RMSNorm.Config(
                 normalized_shape=config.hidden_size,
                 eps=config.rms_norm_eps,
-                sharding_config=pre_lm_head_norm_config(enable_sp=False),
             ),
             lm_head=Linear.Config(
                 in_features=config.hidden_size,
                 out_features=config.vocab_size,
                 bias=False,
-                sharding_config=_lm_head_sharding(),
             ),
             output_res_proj=AttnResProjection.Config(
                 dim=config.hidden_size, sharding_config=_tp_replicate()
@@ -520,6 +515,10 @@ class KimiK3AttnResModel(KimiK3Model):
             layers_per_block=layers_per_block,
             attn_res_gated=gated,
         )
+        # Same three root entries as the plain trunk, from core rather than
+        # copied: see KimiK3Model.make_config.
+        set_decoder_sharding_config(cfg, enable_sp=False)
+        return cfg
 
     def __init__(
         self,
