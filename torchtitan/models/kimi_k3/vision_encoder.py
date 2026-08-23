@@ -378,17 +378,18 @@ class KimiK3VisionCPAttention(VisionAttention):
         )
         total = k_full.size(0)
 
-        mask = None
-        if plan.valid_total < total:
-            keep = _padded_key_keep(plan, total, x.device)
+        # Built unconditionally: flex requires a BlockMask, and with no padding
+        # the keep vector is all true, which is the dense mask the replicated
+        # path would use for a single image.
+        keep = _padded_key_keep(plan, total, x.device)
 
-            def _mask_mod(b, h, q_idx, kv_idx):
-                del b, h, q_idx
-                return keep[kv_idx]
+        def _mask_mod(b, h, q_idx, kv_idx):
+            del b, h, q_idx
+            return keep[kv_idx]
 
-            mask = create_attention_mask(
-                _mask_mod, None, None, q_THDh.size(0), total, device=x.device
-            )
+        mask = create_attention_mask(
+            _mask_mod, None, None, q_THDh.size(0), total, device=x.device
+        )
         out_THDh = self.flex_attention(
             q_THDh, k_full, v_full, attention_masks=mask
         )
@@ -629,5 +630,16 @@ class KimiK3VisionEncoder(Module):
             # the next replicated forward gather across ranks.
             self.set_cp_patch_plan(None)
         hidden_TD = self.final_norm(hidden_TD)
-        merged_MF = _temporal_pool_and_merge(hidden_TD, grids, self.merge_kernel_size)
+        # The merge sees the SHARD's grid, not the image's: this rank holds a
+        # band of rows for every frame, so its own (t, band, w) is what the
+        # (kh, kw) blocking and the temporal mean are over. The positions above
+        # needed the whole image; this needs the piece.
+        merge_grids = (
+            [[cp_plan.full_grid[0], cp_plan.band, cp_plan.full_grid[2]]]
+            if cp_plan is not None
+            else grids
+        )
+        merged_MF = _temporal_pool_and_merge(
+            hidden_TD, merge_grids, self.merge_kernel_size
+        )
         return self.projector(merged_MF)
