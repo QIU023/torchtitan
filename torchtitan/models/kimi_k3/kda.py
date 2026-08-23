@@ -292,15 +292,14 @@ class KimiDeltaAttention(Module):
         Shape suffixes beyond the file legend: L local sequence (T/cp), G this
         rank's head count (H/cp), W the packed per-head channel width.
         """
+        # Head divisibility is checked at wiring time, against tp*cp rather
+        # than cp -- under TP the head axis is already split once. Repeating a
+        # cp-only version of that test here would reject configurations that
+        # run.
         cp_size = dist.get_world_size(cp_group)
         cp_rank = dist.get_rank(cp_group)
         t_loc = x_TD.shape[0]
         num_heads, head_dim = self.num_heads, self.head_dim
-        if num_heads % cp_size != 0:
-            raise ValueError(
-                f"KDA Ulysses CP: num_heads {num_heads} is not divisible by "
-                f"cp={cp_size}"
-            )
         h_cp = num_heads // cp_size
         h0 = cp_rank * h_cp
 

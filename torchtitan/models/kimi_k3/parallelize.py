@@ -21,6 +21,7 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.tools.logging import logger
 
 from .kda import KimiDeltaAttention
+from .sharding import contract_for_mode, ULYSSES
 from .model import KimiK3Model, KimiMLAAttention
 
 
@@ -139,33 +140,93 @@ def parallelize_kimi_k3(
     return model
 
 
+def _check_head_divisibility(
+    contract, num_heads: int, divisor: int, divisor_expr: str, kind: str, field: str
+) -> None:
+    """Enforce the head split a contract asks for, if it asks for one."""
+    if not contract.head_sharded:
+        return
+    if num_heads % divisor != 0:
+        raise ValueError(
+            f"{kind} {field}={num_heads} must be divisible by "
+            f"{divisor_expr}={divisor} for {contract.name} CP head sharding"
+        )
+
+
 def apply_cp_kimi_k3(model: nn.Module, parallel_dims: ParallelDims) -> None:
-    """Hand every attention layer the CP process group.
+    """Wire context parallelism: KCP on the KDA layers, Ulysses on the MLA layers.
 
-    Both attention kinds shard the sequence, so both need the group, but they
-    do different things with it. MLA trades the sharded axis for heads
-    (Ulysses). KDA keeps the sequence sharded and passes recurrent state along
-    the ranks, or trades axes too, depending on its ``cp_mode``.
+    Both at once, on disjoint layer kinds. KCP decomposes the delta-rule
+    recurrence and says nothing about softmax attention, so it does not replace
+    Ulysses; ``cp_mode="ulysses"`` runs the KDA layers the second way and is
+    kept as an A/B.
 
-    This is imperative rather than declared because KDA's kernels are fla
-    triton and never see a DTensor; see ``cp_via_sharding_config`` on the model
-    config for why the declarative path cannot serve them.
+    Imperative rather than declared because KDA's kernels are fla triton and
+    never see a DTensor; see ``cp_via_sharding_config`` on the model config for
+    why the declarative path cannot serve them.
     """
     cp_group = parallel_dims.get_mesh("cp").get_group()
+    cp_degree, tp_degree = parallel_dims.cp, parallel_dims.tp
     model._cp_group = cp_group
-    num_mla = num_kda = 0
+
+    num_mla = 0
+    kda_modules = []
     for module in model.modules():
         if isinstance(module, KimiMLAAttention):
+            # Under TP the head axis is already tp-sharded, so Ulysses splits
+            # what TP left: heads must divide by tp*cp, not by cp.
+            _check_head_divisibility(
+                ULYSSES,
+                module.n_heads,
+                tp_degree * cp_degree,
+                "tp*cp",
+                "MLA",
+                "n_heads",
+            )
             module._cp_group = cp_group
             num_mla += 1
         elif isinstance(module, KimiDeltaAttention):
-            module._cp_group = cp_group
-            num_kda += 1
-    if num_mla + num_kda == 0:
+            kda_modules.append(module)
+
+    modes = {m.cp_mode for m in kda_modules}
+    for mode in modes:
+        contract = contract_for_mode(mode)
+        for module in kda_modules:
+            if module.cp_mode == mode:
+                _check_head_divisibility(
+                    contract,
+                    module.num_heads,
+                    tp_degree * cp_degree,
+                    "tp*cp",
+                    "KDA",
+                    "num_heads",
+                )
+    if "kcp" in modes:
+        # Checked here rather than at the first forward: the message is
+        # actionable at wiring time and the failure is otherwise an ImportError
+        # from inside a layer.
+        try:
+            from fla.modules.conv.cp.ops import causal_conv1d_cp  # noqa: F401
+            from fla.ops.cp.context import build_cp_context  # noqa: F401
+        except ImportError as err:
+            raise ValueError(
+                "cp_mode='kcp' needs fla-core's CP ops "
+                "(fla.ops.cp.context.build_cp_context and "
+                "fla.modules.conv.cp.ops.causal_conv1d_cp), which ship in "
+                f"fla-core >= 0.5.1; import failed with: {err}. Install a "
+                "newer fla-core or use cp_mode='ulysses'."
+            ) from err
+
+    for module in kda_modules:
+        module._cp_group = cp_group
+    if num_mla + len(kda_modules) == 0:
         raise ValueError(
             "context parallel is enabled but no attention layer was found to "
             "wire it onto."
         )
     logger.info(
-        "Applied context parallel to %d MLA and %d KDA layers.", num_mla, num_kda
+        "Applied context parallel to %d MLA and %d KDA layer(s), modes=%s.",
+        num_mla,
+        len(kda_modules),
+        sorted(modes) or ["-"],
     )
