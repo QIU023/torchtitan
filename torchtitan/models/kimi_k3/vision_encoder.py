@@ -338,6 +338,10 @@ class KimiK3VisionCPAttention(VisionAttention):
     Without a plan this is exactly ``VisionAttention``.
     """
 
+    @dataclass(kw_only=True, slots=True)
+    class Config(VisionAttention.Config):
+        """Same fields; a distinct Config so build() returns this class."""
+
     # Set by the encoder for the duration of one forward; None means replicated.
     _cp_plan: "CPPatchPlan | None" = None
 
@@ -510,13 +514,32 @@ class KimiK3VisionEncoder(Module):
         )
         return learned_pos, rope_cache
 
+    def set_cp_patch_plan(self, plan: "CPPatchPlan | None") -> None:
+        """Hand every block's attention the plan, or clear it.
+
+        The plan lives on the attention rather than being threaded through the
+        block signature because the block is shared with the replicated path
+        and has nothing to do with it.
+        """
+        for block in self.layers.values():
+            block.attn._cp_plan = plan
+
     def forward(
         self,
         pixel_values: torch.Tensor,
         *,
         grid_thw: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
     ) -> torch.Tensor:
-        """Encode packed raster-order patches and return packed text features."""
+        """Encode packed raster-order patches and return packed text features.
+
+        With ``cp_plan``, ``pixel_values`` is this rank's patch shard of ONE
+        image and ``grid_thw`` still describes the whole image: the position
+        tables are built for the whole image and sliced, because both the
+        learned absolute embedding and the 2-D RoPE are indexed from row 0 and
+        describing a shard as a standalone image would give every rank rank 0's
+        positions.
+        """
         grids = grid_thw.tolist()
 
         kernel_h, kernel_w = self.merge_kernel_size
@@ -530,27 +553,43 @@ class KimiK3VisionEncoder(Module):
         segment_lengths = grid_thw.prod(dim=-1)
         total_tokens = pixel_values.shape[0]
         expected_tokens = sum(t * h * w for t, h, w in grids)
-        if total_tokens != expected_tokens:
+        if cp_plan is None and total_tokens != expected_tokens:
             raise ValueError(
                 f"pixel_values contains {total_tokens} patches but grid_thw "
                 f"describes {expected_tokens}."
             )
+        if cp_plan is not None and len(grids) != 1:
+            raise ValueError(
+                "a CP patch plan describes one image, but grid_thw carries "
+                f"{len(grids)}; a mixed stream needs a per-segment plan."
+            )
 
         learned_pos, rope_cache = self._compute_position_embeddings(grids)
+        if cp_plan is not None:
+            learned_pos = _slice_for_shard(learned_pos, cp_plan)
+            rope_cache = _slice_for_shard(rope_cache, cp_plan)
         hidden_TD = self.patch_embed(pixel_values) + learned_pos
 
-        with spmd.no_typecheck():
-            attention_mask = create_block_diagonal_mask(
-                segment_lengths,
-                total_tokens,
-                hidden_TD.device,
-            )
-        for block in self.layers.values():
-            hidden_TD = block(
-                hidden_TD,
-                rope_cache=rope_cache,
-                attention_mask=attention_mask,
-            )
+        attention_mask = None
+        if cp_plan is None:
+            with spmd.no_typecheck():
+                attention_mask = create_block_diagonal_mask(
+                    segment_lengths,
+                    total_tokens,
+                    hidden_TD.device,
+                )
+        self.set_cp_patch_plan(cp_plan)
+        try:
+            for block in self.layers.values():
+                hidden_TD = block(
+                    hidden_TD,
+                    rope_cache=rope_cache,
+                    attention_mask=attention_mask,
+                )
+        finally:
+            # Cleared unconditionally: a plan left behind would silently make
+            # the next replicated forward gather across ranks.
+            self.set_cp_patch_plan(None)
         hidden_TD = self.final_norm(hidden_TD)
         merged_MF = _temporal_pool_and_merge(hidden_TD, grids, self.merge_kernel_size)
         return self.projector(merged_MF)
