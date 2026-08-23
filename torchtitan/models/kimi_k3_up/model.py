@@ -4,94 +4,36 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Kimi K3 language model components.
-
-Every operator outside the KDA recurrence is plain eager PyTorch, so the model
-mirrors the released HuggingFace math and stays directly inspectable. KDA runs
-on FLA's chunked Triton kernel, which is what makes the model trainable at
-speed; the pure-PyTorch recurrence it is checked against lives in
-``tests/unit_tests/test_kimi_k3.py`` and is far too slow for training.
-"""
-
 from dataclasses import dataclass, field
 
 import torch
-import torch.nn.functional as F
-
-from fla.ops.kda import chunk_kda
 from torch import nn
-from torch.distributed.tensor import DTensor
 
-from torchtitan.models.common import Conv1d, Linear
+from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
+
+from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
-    ScaledDotProductAttention,
+    FlexAttention,
 )
 from torchtitan.models.common.decoder import Decoder
-from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.moe import GroupedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
-from torchtitan.models.kimi_k3_up.vision_encoder import KimiK3VisionEncoder
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
+from .kda import KimiDeltaAttention
+from .moe import KimiFeedForward, KimiLatentMoE
+from .vision_encoder import KimiK3VisionEncoder
+
 # Shape suffixes:
-# B = batch, L = sequence length, D = model dimension, H = heads,
-# K = key head dimension, V = value head dimension, E = experts,
-# T = flattened tokens, N = attention-residual entries.
-
-
-class KimiRMSNormGated(Module):
-    """Per-head RMSNorm followed by a sigmoid output gate."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        dim: int
-        eps: float = 1e-5
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.eps = config.eps
-        self.weight = nn.Parameter(torch.empty(config.dim))
-
-    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x_float = x.float()
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_float = x_float * torch.rsqrt(variance + self.eps)
-        x_float = self.weight.float() * x_float
-        return (x_float * torch.sigmoid(gate.float())).to(input_dtype)
-
-
-class KimiFeedForward(FeedForward):
-    """FeedForward with Kimi's SiTU activation"""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(FeedForward.Config):
-        beta: float = 1.0
-        linear_beta: float | None = None
-
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self.beta = config.beta
-        self.linear_beta = config.linear_beta
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.w1(x)
-        up = self.w3(x)
-        input_dtype = gate.dtype
-        gate = gate.float()
-        up = up.float()
-        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
-        if self.linear_beta is not None:
-            up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        return self.w2((gate * up).to(input_dtype))
+# T = packed tokens, D = model dimension, H = heads,
+# K = key head dimension, V = value head dimension,
+# N = attention-residual entries.
 
 
 class KimiMLAAttention(BaseAttention):
@@ -100,10 +42,7 @@ class KimiMLAAttention(BaseAttention):
     Unlike DeepSeek-V3 MLA, the released K3 configuration sets
     ``mla_use_nope=True``: the RoPE-sized query/key slices remain part of the
     projected head, but no rotary transform is applied, so this has no rope
-    config at all. Attention itself runs through ``ScaledDotProductAttention``
-    rather than a hand-written softmax: torchtitan's training path has no
-    need to match HF eager's bit-for-bit fp32 softmax, so it uses the same
-    SDPA inner attention the rest of the codebase relies on.
+    config at all. Attention delegates to the configured inner backend.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -121,9 +60,7 @@ class KimiMLAAttention(BaseAttention):
         wkv_b: Linear.Config
         gate: Linear.Config
         wo: Linear.Config
-        inner_attention: Module.Config = field(
-            default_factory=ScaledDotProductAttention.Config
-        )
+        inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -147,366 +84,48 @@ class KimiMLAAttention(BaseAttention):
 
     def forward(
         self,
-        x_BLD: torch.Tensor,
+        x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del positions
-        if attention_masks is not None:
-            raise NotImplementedError(
-                "Kimi K3 reference MLA does not support packed-document masks."
-            )
 
-        B, L, _ = x_BLD.shape
-        q_BLNH = self.wq_b(self.q_norm(self.wq_a(x_BLD))).view(
-            B, L, self.n_heads, self.q_head_dim
+        num_tokens = x_TD.shape[0]
+        q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
+            num_tokens, self.n_heads, self.q_head_dim
         )
 
-        compressed_kv = self.wkv_a(x_BLD)
-        kv_latent, k_rope = torch.split(
-            compressed_kv,
+        compressed_kv_TC = self.wkv_a(x_TD)
+        kv_latent_TC, k_rope_TK = torch.split(
+            compressed_kv_TC,
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_BLNH = self.wkv_b(self.kv_norm(kv_latent)).view(
-            B,
-            L,
+        kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
+            num_tokens,
             self.n_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-        k_nope, v_BLNH = torch.split(
-            kv_BLNH,
+        k_nope_THK, v_THV = torch.split(
+            kv_THC,
             [self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
-        k_rope = k_rope.view(B, L, 1, self.qk_rope_head_dim).expand(
-            -1, -1, self.n_heads, -1
+        k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
+            -1, self.n_heads, -1
         )
-        k_BLNH = torch.cat((k_nope, k_rope), dim=-1)
+        k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
 
-        out_BLNV = self.inner_attention(q_BLNH, k_BLNH, v_BLNH, scale=self.scale)
-        out_BLD = out_BLNV.reshape(B, L, self.n_heads * self.v_head_dim)
-        out_BLD = out_BLD * torch.sigmoid(self.gate(x_BLD))
-        return self.wo(out_BLD)
-
-
-class KimiKDAKernel(Module):
-    """Stateless dispatch to FLA's chunked KDA kernel.
-
-    The gate activation, the beta sigmoid, and the query/key L2 norm are all
-    fused into the kernel rather than materialized here, so the decay never
-    exists as a full ``(B, L, H, K)`` tensor. ``ReferenceKimiKDAKernel`` in
-    ``tests/unit_tests/test_kimi_k3.py`` implements the same interface as an
-    explicit recurrence and is the numerical baseline for this kernel; it also
-    lets the CPU test suite exercise the surrounding model without Triton.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        head_dim: int
-        lower_bound: float | None = -5.0
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.head_dim = config.head_dim
-        self.lower_bound = config.lower_bound
-        if self.lower_bound is not None and not (-5.0 <= self.lower_bound < 0.0):
-            raise ValueError("KDA lower_bound must be in the safe range [-5, 0).")
-
-    def forward(
-        self,
-        q_BLHK: torch.Tensor,
-        k_BLHK: torch.Tensor,
-        v_BLHV: torch.Tensor,
-        gate_BLHK: torch.Tensor,
-        beta_BLH: torch.Tensor,
-        A_log_H: torch.Tensor,
-        dt_bias_HK: torch.Tensor,
-    ) -> torch.Tensor:
-        if q_BLHK.shape != k_BLHK.shape:
-            raise ValueError(
-                f"KDA q/k shapes must match, got {q_BLHK.shape} and {k_BLHK.shape}."
-            )
-        if q_BLHK.shape[:3] != v_BLHV.shape[:3]:
-            raise ValueError("Kimi KDA requires equal q/k/value head counts.")
-
-        # safe_gate selects the bounded gate activation
-        # lower_bound * sigmoid(exp(A_log) * (gate + dt_bias)); without it the
-        # kernel applies -exp(A_log) * softplus(gate + dt_bias).
-        out_BLHV, _ = chunk_kda(
-            q_BLHK,
-            k_BLHK,
-            v_BLHV,
-            gate_BLHK,
-            beta_BLH,
-            A_log=A_log_H,
-            dt_bias=dt_bias_HK.reshape(-1),
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            safe_gate=self.lower_bound is not None,
-            lower_bound=self.lower_bound,
+        out_THV = self.inner_attention(
+            q_THK,
+            k_THK,
+            v_THV,
+            attention_masks=attention_masks,
+            scale=self.scale,
         )
-        return out_BLHV
-
-
-class KimiDeltaAttention(Module):
-    """Kimi Delta Attention with causal convolutions and reference recurrence."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        dim: int
-        num_heads: int
-        head_dim: int
-        conv_kernel_size: int
-        q_proj: Linear.Config
-        k_proj: Linear.Config
-        v_proj: Linear.Config
-        q_conv: Conv1d.Config
-        k_conv: Conv1d.Config
-        v_conv: Conv1d.Config
-        forget_a: Linear.Config
-        forget_b: Linear.Config
-        beta: Linear.Config
-        output_gate: Linear.Config
-        # Typed as the base config so the KDA kernel stays swappable, matching
-        # how VisionAttention types its inner_attention. Anything assigned here
-        # must accept KimiKDAKernel.forward's arguments.
-        kernel: Module.Config
-        output_norm: KimiRMSNormGated.Config
-        output_proj: Linear.Config
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-        self.conv_kernel_size = config.conv_kernel_size
-
-        self.q_proj = config.q_proj.build()
-        self.k_proj = config.k_proj.build()
-        self.v_proj = config.v_proj.build()
-        self.q_conv = config.q_conv.build()
-        self.k_conv = config.k_conv.build()
-        self.v_conv = config.v_conv.build()
-        self.forget_a = config.forget_a.build()
-        self.forget_b = config.forget_b.build()
-        self.beta = config.beta.build()
-        self.output_gate = config.output_gate.build()
-        self.kernel = config.kernel.build()
-        self.output_norm = config.output_norm.build()
-        self.output_proj = config.output_proj.build()
-
-        self.A_log = nn.Parameter(torch.empty(config.num_heads))
-        self.dt_bias = nn.Parameter(torch.empty(config.num_heads, config.head_dim))
-
-    def _causal_conv(self, x_BLC: torch.Tensor, conv: Conv1d) -> torch.Tensor:
-        x_BCL = F.pad(x_BLC.transpose(1, 2), (self.conv_kernel_size - 1, 0))
-        return F.silu(conv(x_BCL)).transpose(1, 2)
-
-    def forward(
-        self,
-        x_BLD: torch.Tensor,
-        attention_masks: AttentionMasksType | None = None,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        del positions
-        if attention_masks is not None:
-            raise NotImplementedError(
-                "Kimi K3 reference KDA does not support packed-document masks."
-            )
-
-        B, L, _ = x_BLD.shape
-        q_BLHK = self._causal_conv(self.q_proj(x_BLD), self.q_conv).view(
-            B, L, self.num_heads, self.head_dim
-        )
-        k_BLHK = self._causal_conv(self.k_proj(x_BLD), self.k_conv).view(
-            B, L, self.num_heads, self.head_dim
-        )
-        v_BLHV = self._causal_conv(self.v_proj(x_BLD), self.v_conv).view(
-            B, L, self.num_heads, self.head_dim
-        )
-        forget_BLHK = self.forget_b(self.forget_a(x_BLD)).view(
-            B, L, self.num_heads, self.head_dim
-        )
-        beta_BLH = self.beta(x_BLD).float()
-
-        out_BLHV = self.kernel(
-            q_BLHK,
-            k_BLHK,
-            v_BLHV,
-            forget_BLHK,
-            beta_BLH,
-            self.A_log,
-            self.dt_bias,
-        )
-        output_gate_BLHV = self.output_gate(x_BLD).view(
-            B, L, self.num_heads, self.head_dim
-        )
-        out_BLHV = self.output_norm(out_BLHV, output_gate_BLHV)
-        return self.output_proj(out_BLHV.reshape(B, L, -1))
-
-
-class KimiGroupedExperts(GroupedExperts):
-    """``common/moe.py::GroupedExperts`` with Kimi's SiTU activation.
-
-    Inherits its stacked-weight shape (``w1_EFD``/``w2_EDF``/``w3_EFD``) and
-    parameter allocation; only ``forward`` differs, since the activation is
-    baked into the ``torch._grouped_mm`` call sequence rather than being a
-    swappable argument. ``inner_experts`` returns ``self`` so the shared FSDP
-    wrapper's ``moe.routed_experts.inner_experts`` discovery path works
-    without a separate dispatch-composing wrapper class.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(GroupedExperts.Config):
-        beta: float = 1.0
-        linear_beta: float | None = None
-
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self.beta = config.beta
-        self.linear_beta = config.linear_beta
-
-    @property
-    def inner_experts(self) -> "KimiGroupedExperts":
-        return self
-
-    def forward(
-        self,
-        x_RD: torch.Tensor,
-        num_tokens_per_expert_E: torch.Tensor,
-    ) -> torch.Tensor:
-        if isinstance(self.w1_EFD, DTensor):
-            w1_EFD = self.w1_EFD.to_local()
-            assert isinstance(self.w2_EDF, DTensor)
-            w2_EDF = self.w2_EDF.to_local()
-            assert isinstance(self.w3_EFD, DTensor)
-            w3_EFD = self.w3_EFD.to_local()
-        else:
-            w1_EFD = self.w1_EFD
-            w2_EDF = self.w2_EDF
-            w3_EFD = self.w3_EFD
-
-        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-
-        gate_RF = torch._grouped_mm(
-            x_RD.bfloat16(), w1_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
-        )
-        up_RF = torch._grouped_mm(
-            x_RD.bfloat16(), w3_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
-        )
-
-        input_dtype = gate_RF.dtype
-        gate_RF = gate_RF.float()
-        up_RF = up_RF.float()
-        gate_RF = self.beta * torch.tanh(gate_RF / self.beta) * torch.sigmoid(gate_RF)
-        if self.linear_beta is not None:
-            up_RF = self.linear_beta * torch.tanh(up_RF / self.linear_beta)
-        h_RF = (gate_RF * up_RF).to(input_dtype)
-
-        return torch._grouped_mm(
-            h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
-        ).type_as(x_RD)
-
-
-class KimiLatentMoE(Module):
-    """Eager trainable implementation of Kimi K3 latent MoE."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        num_experts: int
-        router: TokenChoiceTopKRouter.Config
-        routed_down: Linear.Config
-        routed_experts: KimiGroupedExperts.Config
-        token_dispatcher: LocalTokenDispatcher.Config
-        routed_norm: RMSNorm.Config
-        routed_up: Linear.Config
-        shared_experts: KimiFeedForward.Config
-        load_balance_coeff: float | None = 1e-3
-
-    def __init__(self, config: Config):
-        super().__init__()
-        if config.routed_experts.num_experts != config.num_experts:
-            raise ValueError("routed_experts.num_experts must equal num_experts.")
-        self.num_experts = config.num_experts
-        self.router = config.router.build()
-        self.routed_down = config.routed_down.build()
-        self.routed_experts = config.routed_experts.build()
-        self.token_dispatcher = config.token_dispatcher.build()
-        self.routed_norm = config.routed_norm.build()
-        self.routed_up = config.routed_up.build()
-        self.shared_experts = config.shared_experts.build()
-        self.load_balance_coeff = config.load_balance_coeff
-        if self.load_balance_coeff is not None:
-            if self.load_balance_coeff <= 0.0:
-                raise ValueError("load_balance_coeff must be positive.")
-            self.register_buffer(
-                "expert_bias_E",
-                torch.zeros(config.num_experts, dtype=torch.float32),
-                persistent=True,
-            )
-        else:
-            self.expert_bias_E = None
-        self.register_buffer(
-            "tokens_per_expert_E",
-            torch.zeros(config.num_experts, dtype=torch.float32),
-            persistent=False,
-        )
-
-    def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
-        weights_BLK, expert_ids_BLK, _ = self.router(x_BLD, self.expert_bias_E)
-        B, L, _ = x_BLD.shape
-        routing_map_BLE = torch.zeros(
-            B,
-            L,
-            self.num_experts,
-            dtype=torch.bool,
-            device=x_BLD.device,
-        ).scatter(-1, expert_ids_BLK, True)
-        num_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
-        with torch.no_grad():
-            # In place so the load-balancing hook registered on the optimizer
-            # keeps referring to this buffer across steps.
-            self.tokens_per_expert_E.add_(num_tokens_per_expert_E.float())
-
-        latent_BLD = self.routed_down(x_BLD)
-        latent_dim = latent_BLD.shape[-1]
-        K = weights_BLK.shape[-1]
-        T = B * L
-        latent_TD = latent_BLD.reshape(T, latent_dim)
-        weights_TK = weights_BLK.reshape(T, K)
-        expert_ids_TK = expert_ids_BLK.reshape(T, K)
-
-        # Every expert's weights are packed into one grouped-mm call, so an
-        # expert with zero assigned tokens still sits in the autograd graph
-        # and receives an all-zero gradient rather than None.
-        (
-            routed_input_RD,
-            num_tokens_per_expert_E,
-            metadata,
-        ) = self.token_dispatcher.dispatch(
-            latent_TD, weights_TK, expert_ids_TK, num_tokens_per_expert_E
-        )
-        routed_output_RD = self.routed_experts(routed_input_RD, num_tokens_per_expert_E)
-        routed_TD = self.token_dispatcher.combine(
-            routed_output_RD,
-            metadata,
-            latent_TD,
-        )
-
-        routed_BLD = self.routed_up(self.routed_norm(routed_TD.view(B, L, latent_dim)))
-        return routed_BLD + self.shared_experts(x_BLD)
-
-    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
-        if buffer_device is None:
-            buffer_device = self.tokens_per_expert_E.device
-        self.tokens_per_expert_E = torch.zeros(
-            self.num_experts, dtype=torch.float32, device=buffer_device
-        )
-        if self.load_balance_coeff is not None:
-            self.expert_bias_E = torch.zeros(
-                self.num_experts, dtype=torch.float32, device=buffer_device
-            )
+        out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
+        out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
+        return self.wo(out_TD)
 
 
 def _apply_attention_residual(
@@ -515,7 +134,11 @@ def _apply_attention_residual(
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
-    """Apply Kimi's block-level attention residual in FP32."""
+    """Apply Kimi's block-level attention residual in FP32.
+
+    TODO: Add TP Support. The current implementation assumes that the input tensors are on a single device.
+    """
+    assert norm.eps is not None
 
     values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
     values_float = values_TND.float()
@@ -541,8 +164,8 @@ class KimiK3TransformerBlock(Module):
         moe: KimiLatentMoE.Config | None
         attention_norm: RMSNorm.Config
         ffn_norm: RMSNorm.Config
-        attention_res_norm: RMSNorm.Config
-        attention_res_proj: Linear.Config
+        attention_res_norm: RMSNorm.Config | None
+        attention_res_proj: Linear.Config | None
         ffn_res_norm: RMSNorm.Config
         ffn_res_proj: Linear.Config
 
@@ -571,104 +194,86 @@ class KimiK3TransformerBlock(Module):
         self.moe_enabled = self.moe is not None
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
-        self.attention_res_norm = config.attention_res_norm.build()
-        self.attention_res_proj = config.attention_res_proj.build()
+        self.attention_res_norm = (
+            config.attention_res_norm.build()
+            if config.attention_res_norm is not None
+            else None
+        )
+        self.attention_res_proj = (
+            config.attention_res_proj.build()
+            if config.attention_res_proj is not None
+            else None
+        )
         self.ffn_res_norm = config.ffn_res_norm.build()
         self.ffn_res_proj = config.ffn_res_proj.build()
 
     def forward(
         self,
-        x_BLD: torch.Tensor,
+        x_TD: torch.Tensor,
         block_residual_TND: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Blocks that do not extend the attention residual return it unchanged.
-        # FSDP2 aliases module inputs to drive its backward hooks, so passing it
-        # back out makes this FSDP unit return a view, which draws PyTorch's
-        # warning about in-place ops dropping the pre-backward hook. Nothing
-        # mutates it in place, and routing it back through the module boundary
-        # is what keeps FSDP gradients bitwise equal to eager -- returning None
-        # here instead reassociates the residual's gradient accumulation and
-        # perturbs tok_embeddings.weight.grad by ~2e-3 relative.
-        B, L, D = x_BLD.shape
-        prefix_sum_BLD: torch.Tensor | None = x_BLD
+        prefix_sum_TD = x_TD
 
         if block_residual_TND.shape[1] > 0:
-            assert prefix_sum_BLD is not None
-            x_BLD = _apply_attention_residual(
-                prefix_sum_BLD.reshape(-1, D),
+            assert self.attention_res_proj is not None
+            assert self.attention_res_norm is not None
+            x_TD = _apply_attention_residual(
+                prefix_sum_TD,
                 block_residual_TND,
                 self.attention_res_proj,
                 self.attention_res_norm,
-            ).view(B, L, D)
+            )
 
-        if self.layer_id % self.attn_res_block_size == 0:
-            assert prefix_sum_BLD is not None
+        opens_block = self.layer_id % self.attn_res_block_size == 0
+        if opens_block:
             block_residual_TND = torch.cat(
                 (
                     block_residual_TND,
-                    prefix_sum_BLD.reshape(-1, D).unsqueeze(1),
+                    prefix_sum_TD.unsqueeze(1),
                 ),
                 dim=1,
             )
-            prefix_sum_BLD = None
 
-        h_BLD = self.attention_norm(x_BLD)
+        h_TD = self.attention_norm(x_TD)
         if self.attention is not None:
-            h_BLD = self.attention(h_BLD, attention_masks, positions)
+            h_TD = self.attention(h_TD, attention_masks, positions)
         else:
             assert self.delta_attention is not None
-            h_BLD = self.delta_attention(h_BLD, attention_masks, positions)
-        prefix_sum_BLD = h_BLD if prefix_sum_BLD is None else prefix_sum_BLD + h_BLD
+            h_TD = self.delta_attention(h_TD, None, positions)
+        prefix_sum_TD = h_TD if opens_block else prefix_sum_TD + h_TD
 
-        assert prefix_sum_BLD is not None
-        h_BLD = _apply_attention_residual(
-            prefix_sum_BLD.reshape(-1, D),
+        h_TD = _apply_attention_residual(
+            prefix_sum_TD,
             block_residual_TND,
             self.ffn_res_proj,
             self.ffn_res_norm,
-        ).view(B, L, D)
-        h_BLD = self.ffn_norm(h_BLD)
+        )
+        h_TD = self.ffn_norm(h_TD)
         if self.moe is not None:
-            h_BLD = self.moe(h_BLD)
+            h_TD = self.moe(h_TD)
         else:
             assert self.feed_forward is not None
-            h_BLD = self.feed_forward(h_BLD)
-        return prefix_sum_BLD + h_BLD, block_residual_TND
+            h_TD = self.feed_forward(h_TD)
+        return prefix_sum_TD + h_TD, block_residual_TND
 
 
 class KimiK3Model(Decoder):
-    """Reduced Kimi K3 multimodal model used for first-version validation."""
-
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         layers: list[KimiK3TransformerBlock.Config]
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
-        spatial_merge_size: int = 2
 
         def update_from_config(self, *, config, **kwargs) -> None:
-            del kwargs
-            parallelism = config.parallelism
-            unsupported = {
-                "tensor parallel": parallelism.tensor_parallel_degree,
-                "pipeline parallel": parallelism.pipeline_parallel_degree,
-                "context parallel": parallelism.context_parallel_degree,
-                "expert parallel": parallelism.expert_parallel_degree,
-            }
-            enabled = [name for name, degree in unsupported.items() if degree > 1]
-            if enabled:
-                raise NotImplementedError(
-                    "Kimi K3 eager reference supports FSDP2 data parallelism only; "
-                    f"disable {', '.join(enabled)}."
-                )
-            dataloader = getattr(config, "dataloader", None)
-            if getattr(dataloader, "packing_buffer_size", 0) > 0:
-                raise NotImplementedError(
-                    "Kimi K3 v1 does not support packed documents."
-                )
+            dataset = config.dataloader.dataset
+            # TODO: Support sample packing by resetting the Q/K/V causal-convolution
+            # and KDA recurrent states at document boundaries.
+            if isinstance(dataset, MMSamplePackingConfig):
+                raise ValueError("Kimi K3 does not yet support sample packing.")
+            Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
@@ -678,6 +283,9 @@ class KimiK3Model(Decoder):
                 raise ValueError(
                     "Kimi K3 requires at least one MLA layer for FLOP accounting."
                 )
+            # KDA and the vision encoder have no dedicated term here, so their
+            # parameters only contribute the dense 6*N estimate; reported MFU is
+            # approximate.
             return get_moe_model_nparams_and_flops(
                 self,
                 model,
@@ -695,27 +303,6 @@ class KimiK3Model(Decoder):
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
-        self.spatial_merge_size = config.spatial_merge_size
-        if self.vision_encoder is not None:
-            # The decoder sizes each image's placeholder run from
-            # spatial_merge_size while the encoder merges patches with
-            # merge_kernel_size. A mismatch surfaces much later as a
-            # placeholder-run misalignment that blames the prompt.
-            merge_kernel_size = self.vision_encoder.merge_kernel_size
-            if merge_kernel_size != (
-                config.spatial_merge_size,
-                config.spatial_merge_size,
-            ):
-                raise ValueError(
-                    f"spatial_merge_size {config.spatial_merge_size} does not "
-                    f"match the vision encoder's merge_kernel_size "
-                    f"{merge_kernel_size}; each image would occupy a different "
-                    "number of text positions than the encoder produces."
-                )
-
-    def get_attention_masks(self, positions: torch.Tensor) -> AttentionMasksType | None:
-        del positions
-        return None
 
     def _prepare_multimodal_embeds(
         self,
@@ -725,14 +312,14 @@ class KimiK3Model(Decoder):
         grid_thw: torch.Tensor | None,
         special_tokens: dict[str, int] | None,
     ) -> torch.Tensor:
-        embeddings = self.tok_embeddings(tokens)
+        embeddings_TD = self.tok_embeddings(tokens)
         if (pixel_values is None) != (grid_thw is None):
             raise ValueError(
                 "pixel_values and grid_thw must either both be provided or "
                 "both be omitted."
             )
         if pixel_values is None:
-            return embeddings
+            return embeddings_TD
         assert grid_thw is not None
         if self.vision_encoder is None:
             raise ValueError("pixel_values were provided without a vision encoder.")
@@ -741,20 +328,19 @@ class KimiK3Model(Decoder):
 
         pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
         vision_embeds = self.vision_encoder(pixel_values, grid_thw=grid_thw)
-        num_tokens_per_item = (grid_thw[:, 1] // self.spatial_merge_size) * (
-            grid_thw[:, 2] // self.spatial_merge_size
+        # MoonViT collapses time and merges spatially, so the text-side token
+        # count per item is (h/kh)*(w/kw), independent of t.
+        kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
+        num_tokens_per_item = (grid_thw[:, 1] // kernel_h) * (
+            grid_thw[:, 2] // kernel_w
         )
         vision_positions = get_vision_positions(
             tokens,
             num_tokens_per_item,
             special_tokens["image_id"],
         )
-        if not vision_positions:
-            raise ValueError(
-                "pixel_values were provided but no image placeholder tokens were found."
-            )
         return scatter_vision_embeds(
-            embeddings,
+            embeddings_TD,
             vision_embeds=vision_embeds,
             vision_positions=vision_positions,
         )
@@ -774,32 +360,32 @@ class KimiK3Model(Decoder):
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
         if self.tok_embeddings is not None:
-            h_BLD = self._prepare_multimodal_embeds(
+            h_TD = self._prepare_multimodal_embeds(
                 tokens,
                 pixel_values=pixel_values,
                 grid_thw=grid_thw,
                 special_tokens=special_tokens,
             )
         else:
-            h_BLD = tokens
+            h_TD = tokens
 
-        B, L, D = h_BLD.shape
-        block_residual_TND = h_BLD.new_zeros(B * L, 0, D)
+        num_tokens, D = h_TD.shape
+        block_residual_TND = h_TD.new_zeros(num_tokens, 0, D)
         for layer in self.layers.values():
-            h_BLD, block_residual_TND = layer(
-                h_BLD,
+            h_TD, block_residual_TND = layer(
+                h_TD,
                 block_residual_TND,
                 attention_masks,
                 positions,
             )
 
-        h_BLD = _apply_attention_residual(
-            h_BLD.reshape(-1, D),
+        h_TD = _apply_attention_residual(
+            h_TD,
             block_residual_TND,
             self.output_res_proj,
             self.output_res_norm,
-        ).view(B, L, D)
-        h_BLD = self.norm(h_BLD) if self.norm is not None else h_BLD
+        )
+        h_TD = self.norm(h_TD) if self.norm is not None else h_TD
         if self._skip_lm_head:
-            return h_BLD
-        return self.lm_head(h_BLD) if self.lm_head is not None else h_BLD
+            return h_TD
+        return self.lm_head(h_TD) if self.lm_head is not None else h_TD
