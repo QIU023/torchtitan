@@ -36,7 +36,6 @@ from torchtitan.models.common.decoder_sharding import (
     set_dense_ffn_sharding,
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     scatter_vision_embeds,
@@ -558,25 +557,17 @@ class KimiK3Model(Decoder):
                         layer.moe.routed_norm.sharding_config = norm_config(
                             enable_sp=False
                         )
-                    if enable_ep:
-                        # LocalTokenDispatcher only reorders tokens within a
-                        # rank, so it hands the experts the GLOBAL per-expert
-                        # counts. With the expert weights sharded on E, the
-                        # grouped GEMM then sees 32 offsets against 16 local
-                        # experts and reports "matrix batch sizes have to
-                        # match" -- which reads as a shape bug in the model.
-                        # The two configs carry the same fields.
-                        dispatcher = layer.moe.routed_experts.token_dispatcher
-                        layer.moe.routed_experts.token_dispatcher = (
-                            AllToAllTokenDispatcher.Config(
-                                num_experts=dispatcher.num_experts,
-                                top_k=dispatcher.top_k,
-                            )
-                        )
                     set_moe_sharding_config(
                         layer.moe,
                         enable_ep=enable_ep,
-                        enable_sp=False,
+                        # Not a constant. With EP on, tp becomes a token axis
+                        # inside the MoE region -- the sparse mesh folds it into
+                        # efsdp -- so keying the desired layouts on enable_sp
+                        # alone asks for S(1) -> P(sum), which DTensor rejects.
+                        # Declaring SP when both are on makes source and
+                        # destination agree. Same expression as the
+                        # implementation this was ported from.
+                        enable_sp=enable_ep and enable_tp,
                         expert_param_layout={
                             "w1_EFD": spmd.S(1),
                             "w2_EDF": spmd.S(2),
