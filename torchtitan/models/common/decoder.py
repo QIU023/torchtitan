@@ -96,15 +96,6 @@ class Decoder(BaseModel):
         # at this point no model declares anything and the check would be
         # silently skipped for all of them.
         cp_via_sharding_config: bool = True
-        # Whether this model's context parallel is driven by ShardingConfig.
-        # ``validate_cp_backend`` is documented as being for "the models that
-        # declare CP in ShardingConfig", but the check below runs for every
-        # decoder, so a model whose CP cannot be declarative has no way to say
-        # so. Kernels that do not dispatch through DTensor are the case that
-        # forces this: nothing in a ShardingConfig can reach them, and the
-        # model implements CP itself. Such a model sets this False and is then
-        # responsible for its own CP preconditions.
-        cp_via_sharding_config: bool = True
 
         @property
         def first_attention(self) -> BaseAttention.Config | None:

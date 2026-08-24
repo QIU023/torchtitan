@@ -209,11 +209,16 @@ def apply_cp_kimi_k3(
         contract = contract_for_mode(mode)
         for module in kda_modules:
             if module.cp_mode == mode:
+                # cp alone, not tp*cp: KDA is TP-replicated (_set_kda_sharding
+                # replicates every projection), so TP does not split its heads
+                # and _forward_ulysses splits by cp_size only. Requiring tp*cp
+                # rejects configurations that run -- tp=2, cp=2, 6 KDA heads is
+                # the reference tree's example.
                 _check_head_divisibility(
                     contract,
                     module.num_heads,
-                    tp_degree * cp_degree,
-                    "tp*cp",
+                    cp_degree,
+                    "cp",
                     "KDA",
                     "num_heads",
                 )
