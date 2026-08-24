@@ -57,6 +57,12 @@ KIMI_K3_SPECIAL_TOKENS = {
 }
 
 
+# AttnRes pseudo-queries MUST be zero-initialized: attn_res.py documents that
+# the softmax over blocks starts uniform only if proj.weight is zero, which is
+# what makes AttnRes reduce to a standard residual at step 0 (report requirement,
+# and the reference tree's init_weights zero-inits every one of them). Without it
+# the block mixing is non-uniform from the first step.
+_RES_PROJ_INIT = {"weight": nn.init.zeros_}
 _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
     "bias": nn.init.zeros_,
@@ -435,9 +441,11 @@ def _kimi_k3_config(
                 attention_norm=_norm(dim),
                 ffn_norm=_norm(dim),
                 attention_res_norm=None if layer_idx == 0 else _norm(dim),
-                attention_res_proj=None if layer_idx == 0 else _linear(dim, 1),
+                attention_res_proj=None
+                if layer_idx == 0
+                else _linear(dim, 1, param_init=_RES_PROJ_INIT),
                 ffn_res_norm=_norm(dim),
-                ffn_res_proj=_linear(dim, 1),
+                ffn_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
             )
         )
 
@@ -457,7 +465,7 @@ def _kimi_k3_config(
             param_init=_output_linear_init(dim),
         ),
         output_res_norm=_norm(dim),
-        output_res_proj=_linear(dim, 1),
+        output_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
         vision_encoder=vision_encoder,
     )
 
