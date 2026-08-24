@@ -165,9 +165,6 @@ class KimiK3VisionCPAttention(VisionAttention):
     class Config(VisionAttention.Config):
         """Same fields; a distinct Config so build() returns this class."""
 
-    # Set by the encoder for the duration of one forward; None means replicated.
-    _cp_plan: "CPPatchPlan | None" = None
-
     def forward(
         self,
         x: torch.Tensor,
@@ -175,8 +172,13 @@ class KimiK3VisionCPAttention(VisionAttention):
         rope_cache: torch.Tensor,
         rope_apply,
         attention_mask,
+        cp_plan: "CPPatchPlan | None" = None,
     ) -> torch.Tensor:
-        plan = self._cp_plan
+        # An argument rather than module state: activation checkpointing
+        # recomputes this forward in backward from the arguments it saved, and
+        # state set around the call has been cleared by then -- the tower then
+        # took the replicated branch on recompute and asserted on a None mask.
+        plan = cp_plan
         if plan is None:
             return super().forward(
                 x,
@@ -219,44 +221,6 @@ class KimiK3VisionCPAttention(VisionAttention):
         return self.proj(out_THDh.reshape(num_tokens, -1))
 
 
-
-def make_cp_patch_plan(
-    grid: tuple[int, int, int],
-    *,
-    group,
-    rank: int,
-    merge_kernel_h: int,
-) -> tuple["CPPatchPlan", tuple[int, int]]:
-    """Build this rank's plan for one image, and the flat range it owns.
-
-    Bands are multiples of the merge kernel height: the projector merges each
-    (kh, kw) block, so a cut inside kh rows would ask two ranks to merge halves
-    of one block. Every rank keeps every frame -- the temporal pool is a mean
-    over all of them, so splitting by frame would give each rank the mean of its
-    own frames instead.
-
-    The ceiling split leaves any deficit on the trailing ranks, which is what
-    makes the padding land at the end of each frame's band rather than inside
-    it; ``_padded_key_keep`` relies on exactly that arithmetic.
-    """
-    from torchtitan.models.kimi_k3.vit_cp_plan import row_partition
-
-    t, h, w = grid
-    group_size = dist.get_world_size(group)
-    shards = row_partition(t, h, w, kh=merge_kernel_h, group_size=group_size)
-    band = max(s.row_end - s.row_start for s in shards)
-    mine = shards[rank]
-    plan = CPPatchPlan(
-        group=group,
-        valid_total=t * h * w,
-        full_grid=(t, h, w),
-        row_start=mine.row_start,
-        band=band,
-        real_rows=mine.row_end - mine.row_start,
-    )
-    return plan, mine.ranges
-
-
 class KimiK3VisionProjector(Module):
     """PatchMergerMLPV2 projector from merged vision features to text width."""
 
@@ -290,11 +254,6 @@ class KimiK3VisionEncoder(MoonViTEncoder):
         final_norm: RMSNorm.Config  # pyrefly: ignore [bad-override]
         projector: KimiK3VisionProjector.Config  # pyrefly: ignore [bad-override]
 
-    def set_cp_patch_plan(self, plan: "CPPatchPlan | None") -> None:
-        """Hand every block's attention the plan, or clear it."""
-        for block in self.layers.values():
-            block.attn._cp_plan = plan
-
     def forward(  # pyrefly: ignore [bad-override]
         self,
         pixel_values: torch.Tensor,
@@ -324,24 +283,24 @@ class KimiK3VisionEncoder(MoonViTEncoder):
                 "a CP patch plan describes one image, but grid_thw carries "
                 f"{len(grids)}; a mixed stream needs a per-segment plan."
             )
-        learned_pos, rope_cache = self.compute_position_embeddings(grids)
+        # The position tables are built for the WHOLE image and then sliced to
+        # this rank's band: ``grid_thw`` describes only the local shard, so
+        # building from it would give every rank the positions of rank 0's
+        # patches. The full grid travels on the plan.
+        full_grid = [list(cp_plan.full_grid)]
+        learned_pos, rope_cache = self.compute_position_embeddings(full_grid)
         learned_pos = _slice_for_shard(learned_pos, cp_plan)
         rope_cache = _slice_for_shard(rope_cache, cp_plan)
         x = self.patch_embed(pixel_values) + learned_pos
 
-        self.set_cp_patch_plan(cp_plan)
-        try:
-            for block in self.layers.values():
-                x = block(
-                    x,
-                    rope_cache=rope_cache,
-                    rope_apply=ComplexRoPE.apply_rotary_emb,
-                    attention_mask=None,
-                )
-        finally:
-            # Cleared unconditionally: a plan left behind would silently make
-            # the next replicated forward gather across ranks.
-            self.set_cp_patch_plan(None)
+        for block in self.layers.values():
+            x = block(
+                x,
+                rope_cache=rope_cache,
+                rope_apply=ComplexRoPE.apply_rotary_emb,
+                attention_mask=None,
+                cp_plan=cp_plan,
+            )
 
         x = self.final_norm(x)
         # The merge sees the SHARD's grid: this rank holds a band of rows for
