@@ -17,7 +17,6 @@ from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.nn_modules import GELU, RMSNorm
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 from torchtitan.models.common.vision_encoder import (
-    VisionAttention,
     VisionMLP,
     VisionTransformerBlock,
 )
@@ -31,7 +30,11 @@ from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
 from .parallelize import parallelize_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
-from .vision_encoder import KimiK3VisionEncoder, KimiK3VisionProjector
+from .vision_encoder import (
+    KimiK3VisionCPAttention,
+    KimiK3VisionEncoder,
+    KimiK3VisionProjector,
+)
 
 __all__ = [
     "KIMI_K3_SPECIAL_TOKENS",
@@ -286,7 +289,7 @@ def _vision_encoder_config(
     block = VisionTransformerBlock.Config(
         norm1=vision_norm,
         norm2=vision_norm,
-        attn=VisionAttention.Config(
+        attn=KimiK3VisionCPAttention.Config(
             dim=qkv_dim,
             num_heads=num_heads,
             wq=_linear(dim, qkv_dim),
@@ -488,6 +491,18 @@ def _debugmodel(attn_backend: str) -> KimiK3Model.Config:
     )
 
 
+def _debugmodel_text(attn_backend: str) -> KimiK3Model.Config:
+    """The debug decoder with no vision tower.
+
+    The text arm of the context-parallel matrix needs a flavor with no vision
+    path, so that a failure there is attributable to the decoder's CP rather
+    than to the tower or to the image/text token interleaving.
+    """
+    config = _debugmodel(attn_backend)
+    config.vision_encoder = None
+    return config
+
+
 def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
@@ -526,6 +541,7 @@ def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
 
 kimi_k3_configs = {
     "debugmodel": _debugmodel,
+    "debugmodel_text": _debugmodel_text,
     "Kimi-K3": _kimi_k3,
 }
 
