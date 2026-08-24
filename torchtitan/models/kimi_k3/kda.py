@@ -292,10 +292,9 @@ class KimiDeltaAttention(Module):
         Shape suffixes beyond the file legend: L local sequence (T/cp), G this
         rank's head count (H/cp), W the packed per-head channel width.
         """
-        # Head divisibility is checked at wiring time, against tp*cp rather
-        # than cp -- under TP the head axis is already split once. Repeating a
-        # cp-only version of that test here would reject configurations that
-        # run.
+        # Head divisibility is checked at wiring time, against cp: KDA is
+        # TP-replicated, so TP does not split its heads and this splits by
+        # cp_size alone.
         cp_size = dist.get_world_size(cp_group)
         cp_rank = dist.get_rank(cp_group)
         t_loc = x_TD.shape[0]

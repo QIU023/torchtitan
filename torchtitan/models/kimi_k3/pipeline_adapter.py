@@ -1102,72 +1102,16 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     if tower is None or inner is None:
         # A model whose tower is its own child needs no re-wrapping: core's
         # _split_module sees the tower directly, so DEP is expressed by the FQN
-        # split alone (see _inject_kimi_k3_fqns).
+        # split alone (see _inject_kimi_k3_fqns). That is every layout this
+        # model ships, so there is nothing else to do here. The wrapper form --
+        # a language_model sibling that _split_module cannot see through --
+        # does not exist in this tree.
         return model
-
-    from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
-
-    mm_config = model.config
-    inner_parallelize = kwargs["parallelize_fn"]
-
-    step_inputs = None
-    if dep_enabled():
-        from torchtitan.models.kimi_k3.vit_prefetch import VisionStepInputs
-
-        # Marker submodules so each vision chunk knows WHICH share it is. They must
-        # really exist on the module being split: _split_module keeps children whose
-        # name is in the chunk's FQN list and sets the rest to None, so a marker that
-        # matched nothing (the previous scheme) leaves every share indistinguishable.
-        # They hold no parameters, so they add nothing to any stage.
-        for i in range(dep_vision_stages()):
-            inner.add_module(f"{_DEP_VISION_FQN}{i}", nn.Module())
-        step_inputs = VisionStepInputs()
-        # Read back by the pipelining_fn, which needs to hook the schedule that does
-        # not exist yet at this point.
-        inner._dep_step_inputs_holder = step_inputs
-
-    def _parallelize_with_tower(part: nn.Module, **pk):
-        if dep_enabled():
-            from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
-
-            # Which vision share is this? The marker submodule that survived
-            # _split_module carries the index, so identity comes from the chunk
-            # itself. Call order cannot be used: a rank holding several virtual
-            # stages sees them in an order this function is not told. And "holds
-            # embed_tokens and no layers" only identifies share 0 -- the later
-            # shares hold neither, so they are indistinguishable from a text chunk
-            # without the marker.
-            share = _dep_vision_share_index(part)
-            if share is not None:
-                n_vit = dep_vision_stages()
-                stage = KimiK3ViTStage.promote(part)
-                if n_vit > 1:
-                    bounds = stage.vision_encoder.block_bounds(n_vit)
-                    role = (
-                        "head"
-                        if share == 0
-                        else ("tail" if share == n_vit - 1 else "body")
-                    )
-                    stage.set_dep_role(
-                        role,
-                        bounds=bounds[share],
-                        num_shares=n_vit,
-                        step_inputs=step_inputs,
-                    )
-                return inner_parallelize(stage, **pk)
-            _register_mm_prefix_hooks(part)
-            return inner_parallelize(part, **pk)
-
-        # The embed_tokens-owning chunk is the first stage by construction.
-        if getattr(part, "embed_tokens", None) is not None:
-            part = KimiK3MultimodalModel.from_parts(mm_config, tower, part)
-        else:
-            _register_mm_prefix_hooks(part)
-        return inner_parallelize(part, **pk)
-
-    kwargs["parallelize_fn"] = _parallelize_with_tower
-    return inner
-
+    raise NotImplementedError(
+        "a multimodal wrapper layout (vision_encoder beside a language_model "
+        "child) is not supported: the pipeline split cannot see through it. "
+        "This model carries the tower as its own child."
+    )
 
 def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
     """Give every vision stage its micro-batch index, and the step its ``kwarg_mbs``.
