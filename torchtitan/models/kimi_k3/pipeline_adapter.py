@@ -1128,7 +1128,7 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
 
     def _parallelize_with_tower(part: nn.Module, **pk):
         if dep_enabled():
-            from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+            from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
 
             # Which vision share is this? The marker submodule that survived
             # _split_module carries the index, so identity comes from the chunk
@@ -1140,7 +1140,7 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
             share = _dep_vision_share_index(part)
             if share is not None:
                 n_vit = dep_vision_stages()
-                stage = KimiK3ViTStage.from_parts(mm_config, tower, part)
+                stage = KimiK3ViTStage.promote(part)
                 if n_vit > 1:
                     bounds = stage.vision_encoder.block_bounds(n_vit)
                     role = (
@@ -1182,7 +1182,7 @@ def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
     Returns how many stages were wired, so a caller can assert engagement instead of
     inferring it from numerics.
     """
-    from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+    from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
     from torchtitan.models.kimi_k3.vit_prefetch import install_step_hook
 
     if step_inputs is not None:
@@ -1523,7 +1523,7 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     changes nothing here.
     """
     from torchtitan.models.kimi_k3.knobs import topology
-    from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+    from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
     from torchtitan.models.kimi_k3.vit_prefetch import (
         install_step_hook,
         prefetch_depth,
