@@ -492,6 +492,13 @@ class KimiK3Model(Decoder):
         # layer implements both CP modes itself, and the preconditions that
         # replaces the backend check with are enforced below.
         cp_via_sharding_config: bool = False
+        # DEP (report sec 5.2.3): when the tower spans pipeline stages, the
+        # patch stream crossing a stage boundary must have a static shape --
+        # pipelining sizes its buffers once. These bound the padded payload;
+        # a batch exceeding them raises rather than silently truncating.
+        dep_max_images: int = 8
+        dep_max_grid_h: int = 64
+        dep_max_grid_w: int = 64
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
