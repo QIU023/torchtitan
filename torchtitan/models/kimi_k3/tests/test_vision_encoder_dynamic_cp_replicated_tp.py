@@ -118,8 +118,7 @@ def _body(rank: int, queue) -> None:
 
         # Reference: plain tensors, the path that has always worked.
         plain = _build(DIM)
-        plain._cp_patch_plan = plan
-        ref = plain._attend(x, cu, freqs)
+        ref = plain._attend(x, cu, freqs, plan)
         ref.square().sum().backward()
         ref_grad = plain.wqkv.weight.grad.clone()
 
@@ -128,10 +127,9 @@ def _body(rank: int, queue) -> None:
         # parallelize.py leaves behind when the heads do not divide the TP ranks.
         under_test = _build(DIM)
         distribute_module(under_test, tp_mesh)
-        under_test._cp_patch_plan = plan
         x_dt = DTensor.from_local(x, tp_mesh, [Replicate()], run_check=False)
         f_dt = DTensor.from_local(freqs, tp_mesh, [Replicate()], run_check=False)
-        got = under_test._attend(x_dt, cu, f_dt)
+        got = under_test._attend(x_dt, cu, f_dt, plan)
 
         assert isinstance(got, DTensor), "wo must hand back a DTensor for the residual"
         torch.testing.assert_close(got.full_tensor(), ref, rtol=2e-4, atol=2e-5)

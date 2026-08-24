@@ -448,7 +448,6 @@ class KimiK3VisionBlock(nn.Module):
         # (lo, hi) head range this rank attends over; None = all heads.
         self._tp_head_slice: tuple[int, int] | None = None
         # Dynamic CP: set when this rank holds a patch shard of one large image.
-        self._cp_patch_plan: CPPatchPlan | None = None
         self.norm0 = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -543,6 +542,7 @@ class KimiK3VisionBlock(nn.Module):
         x_LD: torch.Tensor,
         seq_bounds: list[int],
         freqs_cis: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
     ) -> torch.Tensor:
         L = x_LD.size(0)
         qkv = self.wqkv(x_LD).view(L, 3, self.num_heads, self.head_dim)
@@ -572,7 +572,12 @@ class KimiK3VisionBlock(nn.Module):
                 q, k, v = (t.to_local(grad_placements=[_P()]) for t in (q, k, v))
             q, k, v = q[:, lo:hi], k[:, lo:hi], v[:, lo:hi]
 
-        plan = self._cp_patch_plan
+        # An argument, not module state: activation checkpointing recomputes
+        # this forward in backward from the arguments it saved, so a plan
+        # installed around the call is already gone by then and the tower would
+        # silently take the replicated branch. The flavor here defaults AC off,
+        # which is why this never fired; upstream's does not.
+        plan = cp_plan
         if plan is not None:
             # Dynamic CP gathers KV over the patch group with a plain process-group
             # collective, which needs local tensors. The head-sharded branch above
@@ -635,8 +640,11 @@ class KimiK3VisionBlock(nn.Module):
         x_LD: torch.Tensor,
         seq_bounds: list[int],
         freqs_cis: torch.Tensor,
+        cp_plan: "CPPatchPlan | None" = None,
     ) -> torch.Tensor:
-        x_LD = x_LD + self._attend(self.norm0(x_LD), seq_bounds, freqs_cis)
+        x_LD = x_LD + self._attend(
+            self.norm0(x_LD), seq_bounds, freqs_cis, cp_plan
+        )
         return x_LD + self.mlp(self.norm1(x_LD))
 
 
@@ -730,17 +738,6 @@ class KimiK3VisionEncoderStack(nn.Module):
             sharding_config=tp_replicate(),
         ).build()
 
-    def set_cp_patch_plan(self, plan: CPPatchPlan | None) -> None:
-        """Apply (or clear) a dynamic-CP patch partition on every block.
-
-        Set per forward, not once at build: which images are large enough to
-        partition depends on the batch, so a plan that outlived its batch would
-        make the next batch's attention gather across a group for a partition that
-        no longer exists.
-        """
-        for block in self.blocks:
-            block._cp_patch_plan = plan
-
     def block_inputs(
         self,
         x_LD: torch.Tensor,
@@ -797,15 +794,8 @@ class KimiK3VisionEncoderStack(nn.Module):
         # recomputes it locally rather than receiving it over the pipe.
         seq_bounds = cu_seqlens.tolist()
         blocks = self.blocks if block_slice is None else self.blocks[block_slice]
-        self.set_cp_patch_plan(cp_plan)
-        try:
-            for block in blocks:
-                x_LD = block(x_LD, seq_bounds, freqs_cis)
-        finally:
-            # The encoder owns the plan's lifetime so a caller cannot leak one
-            # into the next batch, where it would gather for a partition that no
-            # longer exists.
-            self.set_cp_patch_plan(None)
+        for block in blocks:
+            x_LD = block(x_LD, seq_bounds, freqs_cis, cp_plan)
         return self.final_layernorm(x_LD) if apply_final_norm else x_LD
 
     def forward(

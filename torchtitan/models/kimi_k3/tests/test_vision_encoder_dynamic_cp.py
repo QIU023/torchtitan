@@ -68,8 +68,7 @@ def _body(rank: int, n_patches: int, queue) -> None:
         cu = torch.tensor([0, n_patches], dtype=torch.int32)
 
         # Reference: the whole image on one rank, no partition.
-        layer._cp_patch_plan = None
-        ref = layer._attend(x, cu, freqs)
+        ref = layer._attend(x, cu, freqs, None)
 
         # Partitioned: pad the tail so every rank holds an equal shard, which is
         # what a fixed-shape collective needs.
@@ -81,10 +80,8 @@ def _body(rank: int, n_patches: int, queue) -> None:
         f_pad[:n_patches] = freqs
         lo, hi = rank * shard, (rank + 1) * shard
 
-        layer._cp_patch_plan = CPPatchPlan(
-            group=dist.group.WORLD, valid_total=n_patches
-        )
-        got = layer._attend(x_pad[lo:hi], cu, f_pad[lo:hi])
+        plan = CPPatchPlan(group=dist.group.WORLD, valid_total=n_patches)
+        got = layer._attend(x_pad[lo:hi], cu, f_pad[lo:hi], plan)
 
         # Compare only the rows this rank really owns; the padded tail is garbage
         # by construction and is discarded when the shards are reassembled.
