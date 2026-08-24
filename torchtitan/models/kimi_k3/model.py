@@ -183,6 +183,24 @@ class KimiMLAAttention(BaseAttention):
         Cached per (length, device) because the shape is constant across layers
         and steps, and create_block_mask is compiled.
         """
+        # The mask the decoder builds at dp1 is causal AND packed-document
+        # (common/decoder._create_flex_attention_mask_for_document). This
+        # rebuild is causal only, which is equivalent exactly when the folded
+        # stream holds ONE document. Sample packing is already rejected in
+        # update_from_config, but a microbatch wider than the context window
+        # folds several documents into one stream as well, and then CP would
+        # let a sample attend to the previous one while dp1 would not --
+        # silently, since every shape stays valid. Caught here rather than
+        # documented.
+        limit = getattr(self, "_cp_max_context_length", None)
+        if limit is not None and num_tokens > limit:
+            raise NotImplementedError(
+                f"context parallel folds {num_tokens} tokens into one stream "
+                f"but the context window is {limit}, so the "
+                "stream holds more than one document. The CP path rebuilds a "
+                "causal-only mask and cannot see document boundaries; use a "
+                "microbatch no wider than the context window."
+            )
         key = (num_tokens, device)
         if self._cp_mask is None or self._cp_mask[0] != key:
             mask = create_attention_mask(
