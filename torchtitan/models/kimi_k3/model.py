@@ -119,9 +119,16 @@ class KimiMLAAttention(BaseAttention):
         del positions
 
         num_tokens = x_TD.shape[0]
-        q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
-            num_tokens, self.n_heads, self.q_head_dim
-        )
+        # The head count is DERIVED from the projection width, not read off
+        # self.n_heads, because the two differ under TP: wq_b/wkv_b are
+        # column-parallel, so each rank produces n_heads/tp of them. Under
+        # partial_dtensor the view sees the global shape and the distinction
+        # stays hidden; under any local-tensor backend the global count fails.
+        # Deriving works either way and needs no branch on the backend (ported
+        # from the reference tree).
+        q_proj_TE = self.wq_b(self.q_norm(self.wq_a(x_TD)))
+        h_local = q_proj_TE.shape[-1] // self.q_head_dim
+        q_THK = q_proj_TE.view(num_tokens, h_local, self.q_head_dim)
 
         compressed_kv_TC = self.wkv_a(x_TD)
         kv_latent_TC, k_rope_TK = torch.split(
@@ -131,7 +138,7 @@ class KimiMLAAttention(BaseAttention):
         )
         kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
             num_tokens,
-            self.n_heads,
+            h_local,
             self.qk_nope_head_dim + self.v_head_dim,
         )
         k_nope_THK, v_THV = torch.split(
@@ -140,7 +147,7 @@ class KimiMLAAttention(BaseAttention):
             dim=-1,
         )
         k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-            -1, self.n_heads, -1
+            -1, h_local, -1
         )
         k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
 
@@ -157,7 +164,7 @@ class KimiMLAAttention(BaseAttention):
                 attention_masks=attention_masks,
                 scale=self.scale,
             )
-        out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
+        out_TD = out_THV.reshape(num_tokens, h_local * self.v_head_dim)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
 
@@ -210,12 +217,16 @@ class KimiMLAAttention(BaseAttention):
         """
         import torch.distributed.nn.functional as dist_nn
 
+        from torchtitan.models.kimi_k3.dtensor_ops import to_local_partial_grad
+
         # Head divisibility is checked at wiring time, against tp*cp rather
         # than cp; see apply_cp_kimi_k3.
         cp_size = dist.get_world_size(cp_group)
         t_loc = q_LHQ.shape[0]
         t_full = t_loc * cp_size
-        h_cp = self.n_heads // cp_size
+        # Local head count: q_LHQ already carries this rank's TP-local heads
+        # (H/tp), so the CP split is over that, not over the global n_heads.
+        h_cp = q_LHQ.shape[1] // cp_size
 
         packed_LHW = torch.cat([q_LHQ, kv_LHC], dim=-1)
         src_dim, dst_dim = ULYSSES.in_dims()
@@ -227,6 +238,15 @@ class KimiMLAAttention(BaseAttention):
             [self.q_head_dim, self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
+
+        # wkv_a is replicated on the TP axis, so every TP rank ran it on the
+        # same input and its gradient is the SUM across TP ranks, i.e. Partial.
+        # Without this the sum never happens and wkv_a's gradient is
+        # rank-dependent while its placement still says Replicate -- measured on
+        # the reference tree as 1-6% gradient error on every MLA kv_a layer at
+        # tp2 x cp2, bit-identical at tp2 alone. A no-op when the input is a
+        # plain tensor (tp=1), so the reachable CP-only path is unchanged.
+        k_rope_LR = to_local_partial_grad(k_rope_LR)
 
         # Differentiable all-gather: the backward is a reduce-scatter, which is
         # what a value every rank consumed needs.
