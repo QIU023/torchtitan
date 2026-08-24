@@ -57,6 +57,12 @@ KIMI_K3_SPECIAL_TOKENS = {
 }
 
 
+# The AttnRes pseudo-queries must start at zero. The block softmax is over the
+# per-block scores this projection produces, so a zero weight is what makes the
+# initial weights uniform and the residual reduce to the standard one at step 0
+# -- the report's requirement. The default trunc_normal leaves the block mixing
+# non-uniform from the first step.
+_RES_PROJ_INIT = {"weight": nn.init.zeros_}
 _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
     "bias": nn.init.zeros_,
@@ -437,9 +443,9 @@ def _kimi_k3_config(
                 attention_res_norm=None if layer_idx == 0 else _norm(dim),
                 attention_res_proj=None
                 if layer_idx == 0
-                else _linear(dim, 1),
+                else _linear(dim, 1, param_init=_RES_PROJ_INIT),
                 ffn_res_norm=_norm(dim),
-                ffn_res_proj=_linear(dim, 1),
+                ffn_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
             )
         )
 
@@ -459,7 +465,7 @@ def _kimi_k3_config(
             param_init=_output_linear_init(dim),
         ),
         output_res_norm=_norm(dim),
-        output_res_proj=_linear(dim, 1),
+        output_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
         vision_encoder=vision_encoder,
     )
 
