@@ -1370,10 +1370,27 @@ def dep_vision_stages() -> int:
     ``embed_tokens``, the last share takes its blocks plus the projector and the
     splice, and what crosses each hop is a fixed-capacity patch stream alongside the
     text embeddings. See ``KimiK3ViTStage.set_dep_role``.
+
+    That split is NOT reachable on a model whose tower is its own child. Splitting
+    the tower needs the per-share stage class, and the only path that installs it
+    is ``_unwrap_multimodal_for_pp``, which returns early here because there is no
+    ``language_model`` child -- ``_split_module`` cannot cut into
+    ``vision_encoder.layers`` either, since it descends only into a ModuleDict or
+    ModuleList that is a DIRECT child of the model. So this raises rather than
+    silently running clause 1 while the config asked for clause 2.
     """
     from torchtitan.models.kimi_k3.knobs import topology
 
-    return max(1, topology().vit_dep_stages)
+    stages = max(1, topology().vit_dep_stages)
+    if stages > 1:
+        raise NotImplementedError(
+            f"vit_dep_stages={stages} splits the vision tower across pipeline "
+            "stages (report sec 5.2.3 clause 2), which this model layout does "
+            "not support yet: the tower is a child of the model, and the stage "
+            "split cannot reach into vision_encoder.layers. Use "
+            "vit_dep_stages=1, which gives the tower its own stage (clause 1)."
+        )
+    return stages
 
 
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
