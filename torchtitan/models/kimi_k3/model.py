@@ -7,10 +7,12 @@
 from dataclasses import dataclass, field
 
 import torch
+from torch.distributed.tensor import DTensor
 from torch import nn
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 
+from torchtitan.distributed.fsdp import add_zero_valued_dependency
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -266,6 +268,13 @@ class KimiK3Model(Decoder):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        # DEP (report sec 5.2.3): when the tower spans pipeline stages, the
+        # patch stream crossing a stage boundary must have a static shape --
+        # pipelining sizes its buffers once. These bound the padded payload;
+        # a batch exceeding them raises rather than silently truncating.
+        dep_max_images: int = 8
+        dep_max_grid_h: int = 64
+        dep_max_grid_w: int = 64
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
@@ -304,6 +313,40 @@ class KimiK3Model(Decoder):
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
 
+    def _tower_needs_collectives(self) -> bool:
+        """Is the tower wrapped in something that issues per-forward collectives?
+
+        True once FSDP has sharded it, which is when skipping it desynchronizes
+        the process group. A replicated DTensor -- what a tp-invariant module
+        holds -- issues no all-gather to match, so the test is on the placement
+        and not merely on the type.
+        """
+        return any(
+            isinstance(p, DTensor) and any(pl.is_shard() for pl in p.placements)
+            for p in self.vision_encoder.parameters()
+        )
+
+    def _tower_placeholder(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The smallest input the tower accepts, for a rank with no images."""
+        kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
+        grid = torch.tensor(
+            [[1, kernel_h, kernel_w]], dtype=torch.long, device=self._device()
+        )
+        weight = self.vision_encoder.patch_embed.weight
+        # A plain tensor, not weight.new_zeros: once FSDP has sharded the
+        # tower the weight is a DTensor, and a placeholder inheriting that
+        # meets the tower's own plain tensors as "aten.mm got mixed".
+        patches = torch.zeros(
+            kernel_h * kernel_w,
+            weight.shape[-1],
+            dtype=weight.dtype,
+            device=self._device(),
+        )
+        return patches, grid
+
+    def _device(self) -> torch.device:
+        return next(self.parameters()).device
+
     def _prepare_multimodal_embeds(
         self,
         tokens: torch.Tensor,
@@ -319,6 +362,18 @@ class KimiK3Model(Decoder):
                 "both be omitted."
             )
         if pixel_values is None:
+            # An image-free batch is normal, and skipping the tower on it is
+            # what the vision TODO in parallelize.py describes: FSDP2 issues
+            # the tower's all-gather from its pre-forward hook, so a rank that
+            # does not run it leaves its peers waiting in that collective until
+            # the watchdog fires. Run it on a placeholder and keep the graph
+            # edge with a zero-valued dependency, so every rank issues the same
+            # collectives and the tower's contribution to the data-parallel
+            # average is a correct zero.
+            if self.vision_encoder is not None and self._tower_needs_collectives():
+                placeholder, placeholder_grid = self._tower_placeholder()
+                unused = self.vision_encoder(placeholder, grid_thw=placeholder_grid)
+                return add_zero_valued_dependency(embeddings_TD, unused)
             return embeddings_TD
         assert grid_thw is not None
         if self.vision_encoder is None:
@@ -348,6 +403,7 @@ class KimiK3Model(Decoder):
     def forward(  # pyrefly: ignore [bad-override]
         self,
         tokens: torch.Tensor,
+        block_residual_TND: torch.Tensor | None = None,
         *,
         pixel_values: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
@@ -359,6 +415,11 @@ class KimiK3Model(Decoder):
     ) -> torch.Tensor:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
+        # Under pipeline parallel a middle stage receives its predecessor's
+        # two outputs, the hidden states and the accumulated block residual;
+        # see the return below for why the residual has to travel.
+        block_residual_in = block_residual_TND
+
         if self.tok_embeddings is not None:
             h_TD = self._prepare_multimodal_embeds(
                 tokens,
@@ -370,7 +431,11 @@ class KimiK3Model(Decoder):
             h_TD = tokens
 
         num_tokens, D = h_TD.shape
-        block_residual_TND = h_TD.new_zeros(num_tokens, 0, D)
+        block_residual_TND = (
+            block_residual_in
+            if block_residual_in is not None
+            else h_TD.new_zeros(num_tokens, 0, D)
+        )
         for layer in self.layers.values():
             h_TD, block_residual_TND = layer(
                 h_TD,
@@ -379,6 +444,15 @@ class KimiK3Model(Decoder):
                 positions,
             )
 
+        # The final aggregation belongs to whichever stage owns the head. Under
+        # pipeline parallel the other stages have these set to None, the same
+        # way norm and lm_head are, and the block residual they accumulated has
+        # to travel to the next stage: a block attention residual is defined
+        # over the whole stack, so a stage that dropped it would train against
+        # a different model. Measured on the debug flavor at pp2, dropping it
+        # moved step 3 from 7.44679 to 9.30017.
+        if self.output_res_proj is None:
+            return h_TD, block_residual_TND
         h_TD = _apply_attention_residual(
             h_TD,
             block_residual_TND,
