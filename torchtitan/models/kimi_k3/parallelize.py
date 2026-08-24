@@ -105,7 +105,7 @@ def parallelize_kimi_k3(
         model.parallelize(parallel_dims)
 
     if parallel_dims.cp_enabled:
-        apply_cp_kimi_k3(model, parallel_dims)
+        apply_cp_kimi_k3(model, parallel_dims, training.max_context_length)
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
@@ -156,7 +156,11 @@ def _check_head_divisibility(
         )
 
 
-def apply_cp_kimi_k3(model: nn.Module, parallel_dims: ParallelDims) -> None:
+def apply_cp_kimi_k3(
+    model: nn.Module,
+    parallel_dims: ParallelDims,
+    max_context_length: int | None = None,
+) -> None:
     """Wire context parallelism: KCP on the KDA layers, Ulysses on the MLA layers.
 
     Both at once, on disjoint layer kinds. KCP decomposes the delta-rule
@@ -172,11 +176,19 @@ def apply_cp_kimi_k3(model: nn.Module, parallel_dims: ParallelDims) -> None:
     cp_degree, tp_degree = parallel_dims.cp, parallel_dims.tp
     model._cp_group = cp_group
     model._cp_subgroups = _build_cp_subgroups(cp_group)
+    # The CP mask rebuild is causal-only; hand the layers the context window
+    # so they can reject a folded stream that holds several documents.
+    # The window comes from the training config: K3's MLA is nope, so the
+    # decoder's RoPE-derived max_context_length raises rather than returning
+    # one. A folded stream longer than this holds more than one document, which
+    # the causal-only CP mask cannot represent.
+    max_ctx = max_context_length
 
     num_mla = 0
     kda_modules = []
     for module in model.modules():
         if isinstance(module, KimiMLAAttention):
+            module._cp_max_context_length = max_ctx
             # Under TP the head axis is already tp-sharded, so Ulysses splits
             # what TP left: heads must divide by tp*cp, not by cp.
             _check_head_divisibility(
