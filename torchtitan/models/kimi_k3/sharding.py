@@ -24,8 +24,14 @@ import spmd_types as spmd
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 
 from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
+from torchtitan.models.common.attention import (
+    create_attention_mask,
+    get_causal_mask_mod,
+)
+from torchtitan.models.kimi_k3.dtensor_ops import to_local_partial_grad
 
 
 __all__ = [
@@ -168,3 +174,92 @@ def cp_all_to_all_headseq(
     # out[s] = source s's head subset for THIS rank's sequence chunk; put T/cp
     # first so the reshape stacks heads in ascending source order.
     return out.permute(1, 0, 2, 3).reshape(t_loc, cp * h_loc, K).contiguous()
+
+
+def full_sequence_causal_mask(attn, num_tokens: int, device):
+    """Causal-only mask for the sequence Ulysses reassembles, cached on
+    ``attn`` per (length, device). Correct only while the folded stream holds
+    ONE document, so a stream wider than the context window is rejected -- a
+    causal-only rebuild cannot see document boundaries."""
+    limit = getattr(attn, "_cp_max_context_length", None)
+    if limit is not None and num_tokens > limit:
+        raise NotImplementedError(
+            f"context parallel folds {num_tokens} tokens into one stream "
+            f"but the context window is {limit}, so the "
+            "stream holds more than one document. The CP path rebuilds a "
+            "causal-only mask and cannot see document boundaries; use a "
+            "microbatch no wider than the context window."
+        )
+    key = (num_tokens, device)
+    if attn._cp_mask is None or attn._cp_mask[0] != key:
+        mask = create_attention_mask(
+            get_causal_mask_mod(), None, None, num_tokens, num_tokens, device=device
+        )
+        attn._cp_mask = (key, mask)
+    return attn._cp_mask[1]
+
+
+def mla_ulysses_attention(
+    attn,
+    q_LHQ: torch.Tensor,
+    kv_LHC: torch.Tensor,
+    k_rope_LR: torch.Tensor,
+    cp_group,
+) -> torch.Tensor:
+    """MLA attention over the full sequence for this rank's head subset.
+
+    * One fused all-to-all trades the sharded axis, sequence for heads; the
+      attention backend runs unchanged; a second all-to-all trades back.
+    * The rotary slice stays OUT of the exchange: it is headless (one vector
+      per token), so it is all-gathered along the sequence and expanded onto
+      local heads. Packing the expanded key instead reassembles it against the
+      wrong head subset.
+    * Shape suffixes beyond the legend: L local sequence (T/cp), G this rank's
+      head count, W packed channel width, R rotary width.
+    """
+    cp_size = dist.get_world_size(cp_group)
+    t_loc = q_LHQ.shape[0]
+    t_full = t_loc * cp_size
+    # q_LHQ already carries this rank's TP-local heads, so cp splits those.
+    h_cp = q_LHQ.shape[1] // cp_size
+
+    packed_LHW = torch.cat([q_LHQ, kv_LHC], dim=-1)
+    src_dim, dst_dim = ULYSSES.in_dims()
+    packed_TGW = cp_all_to_all_headseq(
+        packed_LHW, cp_group, src_dim=src_dim, dst_dim=dst_dim
+    )
+    q_TGQ, k_nope_TGN, v_TGV = torch.split(
+        packed_TGW,
+        [attn.q_head_dim, attn.qk_nope_head_dim, attn.v_head_dim],
+        dim=-1,
+    )
+
+    # wkv_a is TP-replicated, so its gradient is the SUM across TP ranks:
+    # Partial, not the Replicate the default would keep. A no-op at tp=1.
+    k_rope_LR = to_local_partial_grad(k_rope_LR)
+    # Differentiable all-gather: backward is the reduce-scatter a value every
+    # rank consumed needs.
+    k_rope_TR = torch.cat(
+        dist_nn.all_gather(k_rope_LR.contiguous(), group=cp_group), dim=0
+    )
+    k_TGQ = torch.cat(
+        [
+            k_nope_TGN,
+            k_rope_TR.view(t_full, 1, attn.qk_rope_head_dim).expand(
+                t_full, h_cp, attn.qk_rope_head_dim
+            ),
+        ],
+        dim=-1,
+    )
+
+    out_TGV = attn.inner_attention(
+        q_TGQ,
+        k_TGQ,
+        v_TGV,
+        attention_masks=full_sequence_causal_mask(attn, t_full, q_TGQ.device),
+        scale=attn.scale,
+    )
+    out_src_dim, out_dst_dim = ULYSSES.out_dims()
+    return cp_all_to_all_headseq(
+        out_TGV.contiguous(), cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
+    )
