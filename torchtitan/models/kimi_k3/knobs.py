@@ -26,7 +26,7 @@ it -- so resolving once and reading it back is not the wrong shape, provided the
 CONFIG is the source of truth and the resolution point is explicit.
 
 ``register_topology`` is therefore called at both entry points that see a config
-(``parallelize_kimi_k3`` and ``pipeline_kimi_k3_with_cache_adapter``) and is
+(``parallelize_kimi_k3`` and ``pipeline_kimi_k3``) and is
 idempotent. If a knob is read before any registration, the accessors fall back to
 the environment and say so once -- silently reading a default while a config field
 said otherwise is the failure mode this file is meant to remove, so it must not be

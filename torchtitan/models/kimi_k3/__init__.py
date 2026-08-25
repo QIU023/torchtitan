@@ -29,7 +29,7 @@ from .kda import KimiDeltaAttention, KimiKDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
 from .parallelize import parallelize_kimi_k3
-from .pipeline_adapter import pipeline_kimi_k3_with_cache_adapter
+from .pipeline_adapter import pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import (
     KimiK3VisionCPAttention,
@@ -610,7 +610,7 @@ def model_registry(
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_kimi_k3,
-        pipelining_fn=pipeline_kimi_k3_with_cache_adapter,
+        pipelining_fn=pipeline_kimi_k3,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=KimiK3StateDictAdapter,
     )
