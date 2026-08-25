@@ -110,9 +110,8 @@ ULYSSES = CPContract(
 )
 
 # KCP: the sequence stays sharded end to end (report sec 5.1.2). The delta-rule
-# recurrence carries state rank to rank, which is a sequential dependency, not a
-# redistribution -- no placement pair describes it, so it stays inside the op and
-# the contract is an identity. Declared anyway to keep one shape for both modes.
+# recurrence carries state rank to rank -- a sequential dependency no placement
+# pair describes -- so the contract is an identity, declared to keep one shape.
 KCP = CPContract(
     name="kcp",
     in_src=_cp(spmd.S(SEQ_DIM)),

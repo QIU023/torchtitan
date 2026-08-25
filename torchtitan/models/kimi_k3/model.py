@@ -50,8 +50,7 @@ from .sharding import mla_ulysses_attention
 from .moe import KimiFeedForward, KimiLatentMoE
 from .vision_encoder import KimiK3VisionEncoder
 
-# Shape suffixes:
-# T = packed tokens, D = model dimension, H = heads,
+# Shape suffixes: T = packed tokens, D = model dimension, H = heads,
 # K = key head dimension, V = value head dimension,
 # N = attention-residual entries.
 
@@ -117,13 +116,9 @@ class KimiMLAAttention(BaseAttention):
         del positions
 
         num_tokens = x_TD.shape[0]
-        # The head count is DERIVED from the projection width, not read off
-        # self.n_heads, because the two differ under TP: wq_b/wkv_b are
-        # column-parallel, so each rank produces n_heads/tp of them. Under
-        # partial_dtensor the view sees the global shape and the distinction
-        # stays hidden; under any local-tensor backend the global count fails.
-        # Deriving works either way and needs no branch on the backend (ported
-        # from the reference tree).
+        # Head count DERIVED from the projection width, not self.n_heads: the
+        # two differ under TP (wq_b/wkv_b are column-parallel, n_heads/tp per
+        # rank). Deriving holds under every DTensor backend with no branch.
         q_proj_TE = self.wq_b(self.q_norm(self.wq_a(x_TD)))
         h_local = q_proj_TE.shape[-1] // self.q_head_dim
         q_THK = q_proj_TE.view(num_tokens, h_local, self.q_head_dim)
@@ -398,10 +393,9 @@ class KimiK3Model(Decoder):
         # Smallest image worth partitioning across CP ranks. Below it the
         # replicated encode is cheaper: splitting buys one gather per layer.
         dynamic_cp_min_patches: int = 256
-        # DEP (report sec 5.2.3): when the tower spans pipeline stages, the
-        # patch stream crossing a stage boundary must have a static shape --
-        # pipelining sizes its buffers once. These bound the padded payload;
-        # a batch exceeding them raises rather than silently truncating.
+        # DEP (report sec 5.2.3): a patch stream crossing a stage boundary
+        # needs a static shape -- pipelining sizes its buffers once. These
+        # bound the padded payload; exceeding them raises, never truncates.
         dep_max_images: int = 8
         dep_max_grid_h: int = 64
         dep_max_grid_w: int = 64
@@ -424,11 +418,9 @@ class KimiK3Model(Decoder):
                 parallelism.context_parallel_degree > 1
                 and parallelism.context_parallel_load_balancer is not None
             ):
-                # Both CP algorithms here read the sequence as rank-ordered
-                # contiguous chunks: the Ulysses all-to-all reassembles it in
-                # rank order, and KDA's recurrence passes state from rank r to
-                # rank r+1. A load balancer permutes tokens across ranks, which
-                # silently breaks both -- the shapes still line up.
+                # Both CP algorithms read the sequence as rank-ordered
+                # contiguous chunks (Ulysses reassembly, KDA's rank-to-rank
+                # state). A load balancer silently breaks both.
                 raise ValueError(
                     "Kimi K3 context parallel requires "
                     "parallelism.context_parallel_load_balancer=None; "
@@ -459,11 +451,9 @@ class KimiK3Model(Decoder):
             attn_x_layout = dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
             for layer in self.layers:
                 if enable_tp:
-                    # Every norm and the residual projections stay whole. They
-                    # sit on the block stream, which TP does not split, and
-                    # leaving them undeclared makes them plain tensors meeting
-                    # DTensor activations: "aten._fused_rms_norm.default got
-                    # mixed torch.Tensor and DTensor".
+                    # Every norm and the residual projections stay whole: they
+                    # sit on the block stream, which TP does not split. Left
+                    # undeclared they meet DTensor activations as plain tensors.
                     for name in (
                         "attention_norm",
                         "ffn_norm",
@@ -490,10 +480,8 @@ class KimiK3Model(Decoder):
                 if layer.moe is not None:
                     if enable_tp:
                         # The latent pair is Kimi's addition to core's MoE, so
-                        # set_moe_sharding_config below does not know about it
-                        # and would leave it plain against DTensor activations.
-                        # It stays whole: it compresses to a rank, not to
-                        # heads or to the expert axis.
+                        # set_moe_sharding_config does not know it. It stays
+                        # whole: it compresses to a rank, not heads or experts.
                         layer.moe.routed_down.sharding_config = (
                             _tp_replicate_config()
                         )
@@ -506,13 +494,10 @@ class KimiK3Model(Decoder):
                     set_moe_sharding_config(
                         layer.moe,
                         enable_ep=enable_ep,
-                        # Not a constant. With EP on, tp becomes a token axis
-                        # inside the MoE region -- the sparse mesh folds it into
-                        # efsdp -- so keying the desired layouts on enable_sp
-                        # alone asks for S(1) -> P(sum), which DTensor rejects.
-                        # Declaring SP when both are on makes source and
-                        # destination agree. Same expression as the
-                        # implementation this was ported from.
+                        # Not a constant: with EP on, tp becomes a token axis
+                        # inside the MoE region (the sparse mesh folds it into
+                        # efsdp), so SP must be declared when both are on or
+                        # DTensor rejects S(1) -> P(sum).
                         enable_sp=enable_ep and enable_tp,
                         expert_param_layout={
                             "w1_EFD": spmd.S(1),
@@ -622,18 +607,10 @@ class KimiK3Model(Decoder):
         """
         if not torch.cuda.is_available():
             return None
-        # Only when no autograd graph is being recorded. A graph recorded here has its
-        # backward run here too, and with prefetch several micro-batches then accumulate
-        # into the same tower parameters from two streams with nothing ordering them --
-        # which cost mm_full/tp2_pp2_cp2 its reproducibility: seven runs, seven distinct
-        # traces. Forcing the encode onto the current stream gives one trace over three
-        # runs, bit-identical to the DEP-without-prefetch numbers, so the stream was only
-        # ever changing reduction order, never the result.
-        #
-        # Nothing is lost today because both callers join immediately, so the stream
-        # overlaps nothing while grad is on. The machinery stays for the deferred design
-        # (report 5.2.3), which needs cross-stream collective ordering this does not yet
-        # establish -- and will need ordered accumulation before it can carry gradients.
+        # Only when no autograd graph is being recorded: with prefetch, several
+        # micro-batches' backwards accumulate into the tower parameters from two
+        # streams with nothing ordering them. Both callers join immediately, so
+        # grad-on loses nothing; the deferred design (report 5.2.3) orders first.
         if torch.is_grad_enabled():
             return None
         s = getattr(self, "_vision_side_stream", None)
@@ -664,10 +641,9 @@ class KimiK3Model(Decoder):
         for t in tensors:
             if isinstance(t, torch.Tensor) and t.is_cuda:
                 t.record_stream(side)
-        # Bracket the encode ON THE SIDE STREAM so its own GPU time is measurable.
-        # Without this the only observable is the span between issue and join, which is
-        # dominated by text compute and PP communication and therefore reads the same
-        # whether or not the encode ran concurrently -- a metric that cannot be falsified.
+        # Bracket the encode ON THE SIDE STREAM so its own GPU time is
+        # measurable; the issue-to-join span is dominated by text compute and
+        # reads the same whether or not the encode ran concurrently.
         started = torch.cuda.Event(enable_timing=True)
         finished = torch.cuda.Event(enable_timing=True)
         with torch.cuda.stream(side):
@@ -883,14 +859,9 @@ class KimiK3Model(Decoder):
                 "both be omitted."
             )
         if pixel_values is None:
-            # An image-free batch is normal, and skipping the tower on it is
-            # what the vision TODO in parallelize.py describes: FSDP2 issues
-            # the tower's all-gather from its pre-forward hook, so a rank that
-            # does not run it leaves its peers waiting in that collective until
-            # the watchdog fires. Run it on a placeholder and keep the graph
-            # edge with a zero-valued dependency, so every rank issues the same
-            # collectives and the tower's contribution to the data-parallel
-            # average is a correct zero.
+            # An image-free batch is normal, but FSDP2 issues the tower's
+            # all-gather from its pre-forward hook, so every rank must run it.
+            # A zero-valued placeholder keeps collectives and the DP average right.
             if self.vision_encoder is not None and self._tower_needs_collectives():
                 placeholder, placeholder_grid = self._tower_placeholder()
                 unused = self.vision_encoder(placeholder, grid_thw=placeholder_grid)
@@ -911,11 +882,9 @@ class KimiK3Model(Decoder):
             grid_thw[:, 2] // kernel_w
         )
         if self._cp_group is not None and dist.get_world_size(self._cp_group) > 1:
-            # This rank holds a slice of the sequence but encoded every image,
-            # so take the slice of the features its placeholders correspond to
-            # and scatter those. get_vision_positions cannot be used on a
-            # shard: it requires exactly one whole run per visual item, and a
-            # shard legitimately holds none, or half of one.
+            # This rank holds a sequence slice but encoded every image: take the
+            # feature slice its placeholders correspond to and scatter it.
+            # get_vision_positions needs whole visual items, which a shard lacks.
             local_mask = tokens == special_tokens["image_id"]
             counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
             mine = self._select_cp_shard(vision_embeds, counts)
@@ -1022,13 +991,10 @@ class KimiK3Model(Decoder):
                 positions,
             )
 
-        # The final aggregation belongs to whichever stage owns the head. Under
-        # pipeline parallel the other stages have these set to None, the same
-        # way norm and lm_head are, and the block residual they accumulated has
-        # to travel to the next stage: a block attention residual is defined
-        # over the whole stack, so a stage that dropped it would train against
-        # a different model. Measured on the debug flavor at pp2, dropping it
-        # moved step 3 from 7.44679 to 9.30017.
+        # The final aggregation belongs to the head-owning stage; other stages
+        # have these None, like norm and lm_head. The accumulated block residual
+        # must travel on: a block residual is defined over the whole stack, and
+        # a stage that dropped it would train against a different model.
         if self.output_res_proj is None:
             return h_TD, block_residual_TND
         if self.output_res_proj is not None:

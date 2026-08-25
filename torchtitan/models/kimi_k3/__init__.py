@@ -57,11 +57,9 @@ KIMI_K3_SPECIAL_TOKENS = {
 }
 
 
-# The AttnRes pseudo-queries must start at zero. The block softmax is over the
-# per-block scores this projection produces, so a zero weight is what makes the
-# initial weights uniform and the residual reduce to the standard one at step 0
-# -- the report's requirement. The default trunc_normal leaves the block mixing
-# non-uniform from the first step.
+# The AttnRes pseudo-queries start at zero: the block softmax over this
+# projection's scores is then uniform, so the residual reduces to the standard
+# one at step 0 (the report's requirement); trunc_normal would not.
 _RES_PROJ_INIT = {"weight": nn.init.zeros_}
 _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
@@ -255,11 +253,6 @@ def _latent_moe_config(
                     "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
                 },
             ),
-            # core's factory, and "standard" unconditionally: it returns the
-            # all-to-all dispatcher and falls back to local dispatch when the
-            # ep mesh is None, so EP=1 is unchanged. Selecting the dispatcher
-            # by whether EP happens to be on splits one decision across two
-            # places and leaves the model's config depending on the topology.
             # core's dispatcher factory, pinned to the standard all-to-all; it
             # falls back to local dispatch when the ep mesh is None, so EP=1 is
             # unchanged. MoonEP is out of scope and deliberately not a choice.

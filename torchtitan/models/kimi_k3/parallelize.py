@@ -139,12 +139,9 @@ def apply_cp_kimi_k3(
     cp_degree, tp_degree = parallel_dims.cp, parallel_dims.tp
     model._cp_group = cp_group
     model._cp_subgroups = _build_cp_subgroups(cp_group)
-    # The CP mask rebuild is causal-only; hand the layers the context window
-    # so they can reject a folded stream that holds several documents.
-    # The window comes from the training config: K3's MLA is nope, so the
-    # decoder's RoPE-derived max_context_length raises rather than returning
-    # one. A folded stream longer than this holds more than one document, which
-    # the causal-only CP mask cannot represent.
+    # The CP mask rebuild is causal-only, so the layers get the context window
+    # to reject a folded stream holding several documents. It comes from the
+    # training config: K3's MLA is nope, so the RoPE-derived length would raise.
     max_ctx = max_context_length
 
     num_mla = 0

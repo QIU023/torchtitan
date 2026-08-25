@@ -73,10 +73,9 @@ class BubblePlan:
     synchronous: tuple[int, ...]
     idle_slots: int
     cost_ratio: float
-    # Why the idle slots that placed nothing placed nothing. Without these the two
-    # reasons are indistinguishable from the outside, and they call for opposite fixes:
-    # starved means the bubbles are too short for this cost ratio, exhausted means the
-    # bubbles come after every remaining micro-batch has already been consumed.
+    # Why idle slots placed nothing -- the two reasons call for opposite fixes:
+    # starved means the bubbles are too short for this cost ratio, exhausted
+    # means they come after every remaining micro-batch was already consumed.
     slots_starved: int = 0
     slots_exhausted: int = 0
 
@@ -108,11 +107,9 @@ def plan_for_rank(
     """
     if cost_ratio <= 0:
         raise ValueError(f"cost_ratio must be positive, got {cost_ratio}")
-    # Where each micro-batch's features are CONSUMED: the vision-owning stage's forward
-    # of that micro-batch. A bubble after that point cannot pay for the encode, however
-    # much budget has accumulated -- the consumer has already run. Without this the walk
-    # happily placed micro-batch 8's encode before micro-batch 14's forward, which reads
-    # as a successful placement and is a wrong answer.
+    # Where each micro-batch's features are CONSUMED: the vision-owning stage's
+    # forward of that micro-batch. A bubble after that point cannot pay for the
+    # encode however much budget accumulated -- placing there is a wrong answer.
     consume_slot: dict[int, int] = {}
     for slot, action in enumerate(actions):
         if action is None:
@@ -129,27 +126,17 @@ def plan_for_rank(
     idle = 0
     slots_starved = 0
     slots_exhausted = 0
-    # The action most recently completed. Placements anchor on THIS, and the runtime
-    # fires after it returns -- the start of the idle interval, reachable without any
-    # receive to hook.
-    #
-    # Anchoring on the action AFTER the bubble was the first attempt and it cannot work
-    # where it matters. The hook available there is fwd_recv_ops.pop, the moment the
-    # runtime is about to wait for a receive; but the rank owning the tower owns
-    # pipeline stage 0, whose forward receives nothing, so no pop ever happens for it.
-    # Measured on a real pp8xvp4 cell: 8 placements planned, 0 fired, which the
-    # fired-vs-placed warning reported instead of hiding.
+    # The action most recently completed. Placements anchor on THIS: the runtime
+    # fires after it returns, at the start of the idle interval. The action
+    # AFTER the bubble has no hook on stage 0, whose forward receives nothing.
     prev: tuple[str, int, int] | None = None
     for slot, action in enumerate(actions):
         if action is None:
             budget += 1.0
             idle += 1
-            # Keep placing while this bubble's accumulated budget can pay. The previous
-            # version placed at most ONE encode per idle slot, which made `placed` bounded
-            # by the idle-slot count no matter how small the cost ratio got -- and a small
-            # cost ratio is precisely what dynamic CP produces, since it divides the
-            # per-rank encoder cost before DEP sees it. Measured at pp4 x mb64: 14 idle
-            # slots, 4 placed, 56 left synchronous.
+            # Keep placing while this bubble's accumulated budget can pay. One
+            # encode per slot would bound `placed` by the idle-slot count however
+            # small the cost ratio -- and dynamic CP makes the ratio small.
             if prev is not None:
                 while budget >= cost_ratio:
                     k = next(

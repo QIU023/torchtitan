@@ -38,13 +38,9 @@ class _AnchorFirer:
         self._on_anchor = on_anchor
         self._by_anchor: dict[tuple[int, int], list[int]] = {}
         self.fired = 0
-        # Wall-clock actually spent inside the planned encodes, and the count of them.
-        # The plan is built from a STATIC cost ratio, and this session paid for the gap
-        # that leaves: a ratio measured at seq 4096 (0.493) was handed to a seq-256 cell
-        # where the true value is about 14, so each encode overran its interval roughly
-        # 28-fold. Every counter still read green, because "ran at the planned point" was
-        # true -- occupancy is not hiding. Measuring the encodes is what makes that
-        # visible as something other than a slower step.
+        # Wall-clock inside the planned encodes, and their count. The plan uses
+        # a STATIC cost ratio, so a ratio measured at another sequence length
+        # overruns every interval while every counter reads green; time shows it.
         self.encode_seconds = 0.0
         self.encode_calls = 0
 
@@ -64,13 +60,9 @@ class _AnchorFirer:
         queued = self._by_anchor.pop((stage_index, mb_index), None)
         if not queued:
             return
-        # perf_counter around a CUDA call measures launch, not execution, unless the
-        # stream is synchronized. The encodes run on the MAIN stream and the next
-        # pipeline action is issued to it immediately, so a sync here would serialize
-        # what the mechanism exists to overlap. Timing the launch window is still worth
-        # having: an encode whose kernels do not fit the interval shows up as the launch
-        # blocking on a full queue, and the step-time comparison remains the real
-        # measurement.
+        # perf_counter around a CUDA call measures launch, not execution, and a
+        # sync would serialize what this exists to overlap. Still useful: an
+        # oversized encode shows up as the launch blocking on a full queue.
         start = time.perf_counter()
         self._on_anchor(queued)
         self.encode_seconds += time.perf_counter() - start
@@ -156,19 +148,14 @@ def install_bubble_runtime(
             # this step, i.e. the plan and the schedule disagree. Silence there would
             # let the encode fall back to its synchronous path and still look correct.
             level = logger.info if fired == placed else logger.warning
-            # Encode time per call alongside the counts, because the counts alone
-            # cannot distinguish "hidden in the bubble" from "ran at the planned point
-            # and overran it". The budget comes from a static cost ratio, so a ratio taken
-            # at another sequence length makes every placement look green while overrunning.
+            # Encode time per call: counts alone cannot distinguish "hidden in
+            # the bubble" from "ran at the planned point and overran it".
             per = (
                 firer.encode_seconds / firer.encode_calls if firer.encode_calls else 0.0
             )
-            # idle_slots is the one number that separates "the schedule has no bubbles"
-            # from "it has bubbles and the planner under-placed". The planner places at
-            # most ONE encode per idle slot, so placed can never exceed it however small
-            # the cost ratio gets -- which is exactly the case dynamic CP creates, since
-            # it divides the per-rank encoder cost before DEP ever sees it. Without this
-            # printed, a run showing 4 placements out of 64 looks the same either way.
+            # idle_slots separates "the schedule has no bubbles" from "it has
+            # bubbles and the planner under-placed". placed can never exceed it,
+            # so 4 placements out of 64 reads the same either way without it.
             level(
                 "DEP bubble runtime: %d/%d planned encode(s) ran in a bubble, "
                 "%d upfront, %d left synchronous, %d idle slot(s) "

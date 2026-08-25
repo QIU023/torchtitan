@@ -59,11 +59,9 @@ class ResizePlan:
     pad_width: int
     pad_height: int
     num_tokens: int
-    # The patch size this plan was computed with. Carried rather than assumed: the
-    # property below used to divide by the module constant, so a plan built with a
-    # non-default patch_size reported a grid that did not match its own dimensions and
-    # prepare_image died in the view. A default keeps every existing constructor call
-    # working.
+    # The patch size this plan was computed with, carried rather than assumed:
+    # the property below divides by it, so a plan built with a non-default
+    # patch_size still reports a grid matching its own dimensions.
     patch_size: int = PATCH_SIZE
 
     @property
@@ -151,11 +149,9 @@ def prepare_image(
             size=(plan.new_height, plan.new_width),
             mode="bicubic",
             align_corners=False,
-            # antialias=True to match the reference resampler. PIL/torchvision
-            # antialias on DOWNSCALE; interpolate defaults to False, which skips the
-            # prefilter and aliases high-frequency detail. Every downscaled image then
-            # differs systematically from what the released preprocessing produces --
-            # no error, just a parity gap that surfaces as worse finetune numbers.
+            # antialias=True matches the reference resampler: PIL/torchvision
+            # antialias on DOWNSCALE, interpolate defaults to False. Skipping the
+            # prefilter is a silent parity gap against the released preprocessing.
             antialias=True,
         ).clamp(0.0, 1.0)
     if plan.pad_height or plan.pad_width:

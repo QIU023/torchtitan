@@ -140,10 +140,9 @@ def _padded_key_keep(plan: "CPPatchPlan", total: int, device) -> torch.Tensor:
                 keep[pos : pos + real_rows * row_len] = True
                 pos += plan.band * row_len
     else:
-        # A plan carrying no grid describes a flat patch split with no frame
-        # structure, where the padding IS a trailing run. Falling back rather
-        # than computing from zeros matters: the branch above would mark
-        # nothing valid and mask every key.
+        # A plan with no grid describes a flat patch split where the padding IS
+        # a trailing run. Falling back matters: the branch above would compute
+        # from zeros, mark nothing valid, and mask every key.
         keep[: plan.valid_total] = True
     return keep
 
@@ -175,9 +174,8 @@ class KimiK3VisionCPAttention(VisionAttention):
         cp_plan: "CPPatchPlan | None" = None,
     ) -> torch.Tensor:
         # An argument rather than module state: activation checkpointing
-        # recomputes this forward in backward from the arguments it saved, and
-        # state set around the call has been cleared by then -- the tower then
-        # took the replicated branch on recompute and asserted on a None mask.
+        # recomputes this forward from its saved arguments, and state set
+        # around the call has been cleared by recompute time.
         plan = cp_plan
         if plan is None:
             return super().forward(
@@ -279,12 +277,9 @@ class KimiK3VisionEncoder(MoonViTEncoder):
         Kimi K3 feature -- it is what its report describes -- and k2.5 has no
         use for it.
         """
-        # ``part`` selects one share of a tower that spans PP stages (report sec
-        # 5.2.3 clause 2). The shares have to be reached THROUGH this forward
-        # rather than by calling forward_head / forward_body / forward_tail
-        # directly, because FSDP2 registers its all-gather on the module's
-        # __call__: a direct method call leaves patch_embed.weight a sharded
-        # DTensor and the conv fails on mixed Tensor/DTensor.
+        # ``part`` selects one share of a tower spanning PP stages (report sec
+        # 5.2.3 clause 2), reached THROUGH this forward: FSDP2 hooks __call__,
+        # and calling forward_head directly meets still-sharded DTensor weights.
         if part is not None:
             if part == "head":
                 return self.forward_head(
@@ -307,20 +302,17 @@ class KimiK3VisionEncoder(MoonViTEncoder):
                 "a CP patch plan describes one image, but grid_thw carries "
                 f"{len(grids)}; a mixed stream needs a per-segment plan."
             )
-        # The position tables are built for the WHOLE image and then sliced to
-        # this rank's band: ``grid_thw`` describes only the local shard, so
-        # building from it would give every rank the positions of rank 0's
-        # patches. The full grid travels on the plan.
+        # Position tables are built for the WHOLE image, then sliced to this
+        # rank's band: ``grid_thw`` describes only the local shard, and building
+        # from it gives every rank rank 0's positions. The full grid rides the plan.
         x, rope_cache = self._embed_patches(pixel_values, cp_plan)
         x = self._run_blocks(x, rope_cache=rope_cache, cp_plan=cp_plan)
         return self._merge_and_project(self.final_norm(x), cp_plan)
 
     # ---- DEP: the tower split across pipeline stages (report sec 5.2.3) ----
     #
-    # Report 5.2.3 asks for vision forward and backward "balanced across PP
-    # stages", which needs the tower to run in contiguous block ranges rather
-    # than as one call. The decomposition mirrors the reference tree's
-    # forward_head / forward_body / forward_tail.
+    # The report asks for vision forward and backward balanced across PP
+    # stages, so the tower runs as contiguous block ranges: head / body / tail.
 
     def _embed_patches(self, pixel_values, cp_plan):
         """Patch embed plus position tables. Returns (x, rope_cache)."""
@@ -376,11 +368,10 @@ class KimiK3VisionEncoder(MoonViTEncoder):
             lo = hi
         return bounds
 
-    # Every share recomputes its own block inputs -- position tables and the
-    # block-diagonal attention mask -- from grid_thw rather than receiving them
-    # over the pipe: RoPE indices and segment bounds do not survive PP's dummy
-    # metadata values, so only float activations may cross a stage boundary.
-    # DEP and CP are mutually exclusive, so no share here carries a patch plan.
+    # Every share recomputes position tables and the block-diagonal mask from
+    # grid_thw: RoPE indices and segment bounds do not survive PP's dummy
+    # metadata values, so only float activations cross a stage boundary. DEP
+    # and CP are mutually exclusive, so no share here carries a patch plan.
 
     def _share_block_inputs(self, grid_thw, num_tokens, device):
         """Position tables and attention mask for a share, from the grid alone."""
