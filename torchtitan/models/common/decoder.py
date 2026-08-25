@@ -160,7 +160,6 @@ class Decoder(BaseModel):
             that case the training/debug setup is skipped.
             """
             from torchtitan.config import ParallelismConfig
-            from torchtitan.distributed.context_parallel import validate_cp_backend
             from torchtitan.trainer import Trainer
 
             assert hasattr(config, "parallelism"), (
