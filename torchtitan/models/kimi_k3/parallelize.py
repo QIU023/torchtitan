@@ -41,28 +41,9 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            # Tensor parallel: the declarations are in place and measurably
-            # take effect -- wq_b Shard(0), wo Shard(1), w1 Shard(0), lm_head
-            # Shard(0), KDA replicated -- but the forward does not run through
-            # yet. Each fix so far uncovered the next surface: the per-layer
-            # norms, then the KDA convolutions and its own A_log/dt_bias, then
-            # the fla kernel needing its inputs unwrapped, then the latent MoE
-            # pair that core's set_moe_sharding_config does not know about.
-            # It stops inside the compiled FlexAttention region -- model
-            # compile is off, so this is flex's own torch.compile -- on
-            #   getitem(int32[256], DTensor(scalar int32, Replicate on tp))
-            #   -> aten.index.Tensor got mixed torch.Tensor and DTensor
-            # Not AC: the same error appears with activation-checkpoint:none.
-            # Cause, corrected: it is NOT that KimiLatentMoE overrides
-            # MoE.forward. Core's MoE.forward computes the same DTensor
-            # bookkeeping and says so -- "MoE.forward() operates on DTensors;
-            # the DTensor->local conversion happens at the GroupedExperts
-            # boundary". The difference is what reaches that boundary: core
-            # passes x_TD to routed_experts, this one passes routed_down(x_TD),
-            # and routed_experts carries the local_map that set_moe_sharding_config
-            # declared for x_TD's layout. The latent entry point is a second
-            # input path the declaration does not name.
-            # Paused on maintainer request.
+            # Tensor parallel: declarations are in place but the forward does
+            # not yet run end to end -- the latent MoE's second input path is
+            # not named by the declaration. Paused on maintainer request.
             ("tensor parallel", parallel_dims.tp_enabled),
 
 
