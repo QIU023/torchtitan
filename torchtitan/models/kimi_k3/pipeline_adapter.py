@@ -48,36 +48,11 @@ from torchtitan.tools.logging import logger
 
 
 def adapter_enabled() -> bool:
-    """Config gate for delta mode. Opt-in, and the trust now has a measurement.
+    """Config gate for the delta-mode block transport. Off by default.
 
-    3000 steps per arm at pp2 x vp2, two commits per stage
-    (matrix_scripts/run_delta_convergence.sh): naive 1.77437, delta 1.78017, and the
-    SAME configuration reseeded 1.76570. The delta-vs-naive mean relative gap runs
-    0.00245 over the first tenth to 0.00342 over the last; the reseed-vs-naive gap runs
-    0.00465 to 0.00555. Neither grows, so it is not a divergence.
-
-    But it is not noise either, and the distinction is the point. Delta's difference is
-    DETERMINISTIC -- a summation-order difference from the mid-stage block-stack rebuild
-    and from ``grad + captured`` where autograd would have accumulated -- so comparing it
-    against a reseed spread bounds detectability, not bias.
-    ``run_delta_sign_test.sh`` runs the pair across seeds and reads the sign of the tail
-    difference, which is what separates a coincidence from a bias. At six seeds: +0.14%,
-    +0.24%, +0.20%, -0.16%, +0.08%, +0.14% -- five positive, one negative, mean +0.107%.
-    Five of six same-signed has probability 0.219 under no bias, so this is NOT a
-    detectable systematic effect; the first three seeds all landing positive was the
-    coincidence that 3/3 at p = 0.25 always risked being.
-
-    The accurate statement is therefore narrow: the difference is DETERMINISTIC in
-    mechanism -- same seed, same digits -- and unbiased in aggregate, with a magnitude
-    (0.107% mean) well inside the 0.56% spread between two runs of one configuration. It
-    behaves like noise without being noise, and neither transport is favoured.
-
-    Still False by default, because engaging it needs more than trust: Interleaved1F1B
-    (otherwise this returns and the adapter passes through), n_layers divisible by the
-    stage count, and an even split (first/last_stage_less_layers 0). Flipping the default
-    would leave most configurations on the passthrough they already take, while the ones
-    that do qualify would change transport without a gate cell able to see it -- the
-    58-cell gate never enters delta mode at all.
+    Engaging it changes summation order (curves match from step 1, not bitwise)
+    and requires Interleaved1F1B, n_layers divisible by the stage count, and an
+    even split; anything else passes through on the naive transport.
     """
     from torchtitan.models.kimi_k3.knobs import topology
 
