@@ -422,10 +422,13 @@ class KimiK3Model(Decoder):
         # axis. Off means the tower runs replicated there.
         vit_tp_heads: bool = True
         # Ship only the blocks a receiver does not already hold on each
-        # pipeline hop, instead of the whole stack. Changes the order the block
-        # gradients are summed, so it is not bitwise against the naive
-        # transport, and it needs an even split under Interleaved1F1B.
-        attn_res_cache: bool = False
+        # pipeline hop, instead of the whole stack. On by default: under
+        # pipeline parallelism this is the transport, and the naive one is
+        # the fallback, not the other way round. It changes the order the
+        # block gradients are summed, so it is not bitwise against that
+        # fallback. Engages only on Interleaved1F1B with an even split;
+        # anything else warns and passes through.
+        attn_res_cache: bool = True
         # DEP (report sec 5.2.3): a patch stream crossing a stage boundary
         # needs a static shape -- pipelining sizes its buffers once. These
         # bound the padded payload; exceeding them raises, never truncates.
