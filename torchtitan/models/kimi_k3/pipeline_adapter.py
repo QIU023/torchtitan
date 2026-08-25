@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import math
-import os
 import threading
 import warnings
 
@@ -92,7 +91,7 @@ class RankLocalCache:
     """Per-rank, per-microbatch forward-block cache shared across VP stages.
 
     Every adapter on the same physical rank reads/writes the SAME cache
-    (Kimi §4.1 invariant). Holds only forward-path state: the cached
+    (Kimi section 4.1 invariant). Holds only forward-path state: the cached
     block tensors (autograd-live against their original source) and
     producer metadata for layout bookkeeping.
 
@@ -288,15 +287,6 @@ def _reset_rank_caches_for_testing() -> None:
 # (Raising_PRs/k3_pr_c_pp_attnres/PR_BODY.md, "The local grad bridge").
 
 
-_DBG = os.environ.get("ATTNRES_ADAPTER_DBG") == "1"
-
-
-def _dbg(msg: str) -> None:
-    if _DBG:
-        rank = os.environ.get("RANK", "?")
-        print(f"[adapter-dbg rank={rank}] {msg}", flush=True)
-
-
 def _install_augment_hook(
     block_tensor: torch.Tensor,
     slot_key: tuple[int, int, int],
@@ -316,11 +306,6 @@ def _install_augment_hook(
 
     def _hook(grad: torch.Tensor) -> torch.Tensor:
         captured, count = rank_cache.pop_grad(slot_key)
-        _dbg(
-            f"augment_hook slot={slot_key} "
-            f"captured={'yes' if captured is not None else 'no'} "
-            f"count={count} expected={expected_captures}"
-        )
         if expected_captures is not None and count != expected_captures:
             mb_index, producer_stage, block_idx_in_producer = slot_key
             raise RuntimeError(
@@ -360,14 +345,12 @@ class _LocalCacheCapture(torch.autograd.Function):
     def forward(ctx, block_tensor, slot_key, rank_cache):  # type: ignore[override]
         ctx.slot_key = slot_key
         ctx.rank_cache = rank_cache
-        _dbg(f"Capture.forward slot={slot_key}")
         # Return a distinct Tensor wrapper so Function.apply builds a
         # fresh grad_fn node here. ``view(shape)`` is zero-copy.
         return block_tensor.view(block_tensor.shape)
 
     @staticmethod
     def backward(ctx, grad_out):  # type: ignore[override]
-        _dbg(f"Capture.backward slot={ctx.slot_key}")
         ctx.rank_cache.capture_grad(ctx.slot_key, grad_out)
         return None, None, None
 
@@ -448,11 +431,11 @@ class CrossStageCacheAdapter(nn.Module):
     backward flow through the autograd graph. Cached-prefix blocks are
     handled two ways depending on who committed them:
 
-    * **Different rank** (producer_rank != self.pp_rank) → cached block
+    * Different rank (producer_rank != self.pp_rank) -> cached block
       is a slice of an older ``recv_delta_tensor``. Passed through
       unwrapped; its grad flows back via that tensor and PP's built-in
       ``SEND_B`` drains it to the producer rank.
-    * **Same rank** (producer_rank == self.pp_rank) → cached block
+    * Same rank (producer_rank == self.pp_rank) -> cached block
       came from an earlier virtual stage on this rank and was stored
       DETACHED in the cache (no autograd link to the producer). At
       read time it is wrapped in :class:`_LocalCacheCapture`; Capture's
@@ -609,7 +592,7 @@ class CrossStageCacheAdapter(nn.Module):
         )
 
     def _forward_delta(self, *args, **kwargs):
-        """Interleaved1F1B delta forward (spec §4.1).
+        """Interleaved1F1B delta forward (spec section 4.1).
 
         Cached-prefix blocks whose producer is on a DIFFERENT rank are
         passed through unwrapped: their autograd graph already goes
@@ -667,7 +650,7 @@ class CrossStageCacheAdapter(nn.Module):
         # ``requires_grad_(True)`` + ``autograd.Function.apply`` both
         # fail under ``torch.no_grad()`` (which the torchtitan Validator
         # uses via ``pp_schedule.eval()``). Use the cached block tensors
-        # raw — fwd math is identical.
+        # raw -- fwd math is identical.
         grad_active = torch.is_grad_enabled()
         for blk, meta in zip(earlier_blocks_raw, earlier_meta):
             producer_rank, producer_stage, block_idx_in_producer = meta
@@ -987,7 +970,6 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         # stage's forward graph is thus traversed exactly once per mb,
         # which is the naive-PP baseline.
         _set_mb_index(adapter_key, bwd_chunk_id)
-        _dbg(f"patched_bwd ENTER stage={adapter.stage_id} mb={bwd_chunk_id}")
         try:
             return orig_bwd(
                 bwd_chunk_id,
@@ -996,7 +978,6 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
                 last_backward=last_backward,
             )
         finally:
-            _dbg(f"patched_bwd EXIT stage={adapter.stage_id} mb={bwd_chunk_id}")
             # Mark the mb as seen so the step-end drop sweep evicts it.
             # We don't drop here: the shared rank cache is still live
             # for peers / later virtual stages.
@@ -1061,8 +1042,8 @@ def _kimi_llm_fqns(
 ) -> list[list[str]]:
     """Kimi-named version of ``generate_llm_fqn_per_model_part``.
 
-    Substitutes ``tok_embeddings``→``embed_tokens`` and
-    ``output``→``lm_head``. Keeps the layer distribution logic
+    Substitutes ``tok_embeddings``->``embed_tokens`` and
+    ``output``->``lm_head``. Keeps the layer distribution logic
     (delegated to core's function, then re-mapped) so any future
     tweaks there apply to us automatically.
     """
@@ -1602,7 +1583,7 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
       Interleaved1F1B AND the wrapped model is AttnRes (has
       ``num_blocks`` + ``layers_per_block`` attrs): wrap each stage's
       ``submod`` in ``CrossStageCacheAdapter`` (the
-      implementation, reused unchanged — it duck-types the wrapped
+      implementation, reused unchanged -- it duck-types the wrapped
       model's forward signature).
     * Otherwise: pass through (plain PP, no cache adapter).
     """
@@ -1696,7 +1677,7 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
     layers_per_block = getattr(inner0, "layers_per_block", None)
     if num_blocks is None or layers_per_block is None:
         warnings.warn(
-            "Stage 0 model has no 'num_blocks'/'layers_per_block' — "
+            "Stage 0 model has no 'num_blocks'/'layers_per_block' -- "
             "this is a baseline (non-AttnRes) Kimi Linear run; the "
             "cross-stage cache adapter only applies to AttnRes variants. "
             "Running without the adapter."
