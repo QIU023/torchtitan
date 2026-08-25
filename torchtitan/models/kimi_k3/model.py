@@ -393,6 +393,39 @@ class KimiK3Model(Decoder):
         # Smallest image worth partitioning across CP ranks. Below it the
         # replicated encode is cheaper: splitting buys one gather per layer.
         dynamic_cp_min_patches: int = 256
+        # DEP (report sec 5.2.3): the vision tower gets a pipeline stage of its
+        # own ahead of the text stages, so its compute leaves the critical path
+        # of the stage that owns the embedding. Opt-in: it changes the stage
+        # count, which the schedule and the checkpoint layout both see.
+        vit_dep: bool = False
+        # How many stages the tower is split across. 1 is the tower on its own
+        # stage; more than 1 needs the split to address vision_encoder.layers,
+        # which _split_module cannot reach, and raises rather than silently
+        # falling back to 1.
+        vit_dep_stages: int = 1
+        # How many micro-batches ahead the tower's encode is issued. 0 keeps
+        # the encode inline, which is the measured-nothing default.
+        vit_prefetch: int = 0
+        # Run the planned encodes in the schedule's idle intervals on the main
+        # stream instead of ahead of time on a side stream. The two are
+        # alternatives, not layers: this takes over placement when it is on.
+        vit_bubble: bool = False
+        # One tower forward in units of one text-stage forward. A parameter and
+        # not a measurement, because a plan derived from each rank's own timing
+        # would stop being identical across ranks.
+        vit_bubble_cost_ratio: float = 0.5
+        # How many deferred vision backwards may wait; each holds a
+        # micro-batch's tower forward graph alive, so this is the backward
+        # half's memory window. 0 is unbounded.
+        vit_bubble_max_pending: int = 0
+        # Whether the tower's attention shards its heads on the tensor-parallel
+        # axis. Off means the tower runs replicated there.
+        vit_tp_heads: bool = True
+        # Ship only the blocks a receiver does not already hold on each
+        # pipeline hop, instead of the whole stack. Changes the order the block
+        # gradients are summed, so it is not bitwise against the naive
+        # transport, and it needs an even split under Interleaved1F1B.
+        attn_res_cache: bool = False
         # DEP (report sec 5.2.3): a patch stream crossing a stage boundary
         # needs a static shape -- pipelining sizes its buffers once. These
         # bound the padded payload; exceeding them raises, never truncates.
