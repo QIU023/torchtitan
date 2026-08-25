@@ -525,11 +525,6 @@ class KimiK3Model(Decoder):
         # Smallest image worth partitioning across CP ranks. Below it the
         # replicated encode is cheaper: splitting buys one gather per layer.
         dynamic_cp_min_patches: int = 256
-        # KDA runs on fla triton kernels, which do not dispatch through
-        # DTensor, so no ShardingConfig can drive its context parallel -- the
-        # layer implements both CP modes itself, and the preconditions that
-        # replaces the backend check with are enforced below.
-        cp_via_sharding_config: bool = False
         # DEP (report sec 5.2.3): when the tower spans pipeline stages, the
         # patch stream crossing a stage boundary must have a static shape --
         # pipelining sizes its buffers once. These bound the padded payload;
@@ -537,6 +532,13 @@ class KimiK3Model(Decoder):
         dep_max_images: int = 8
         dep_max_grid_h: int = 64
         dep_max_grid_w: int = 64
+
+
+        def _validate_cp_backend(self, parallelism) -> None:
+            """This model's CP is not ShardingConfig-driven -- the KDA kernels
+            are fla triton and never see a DTensor -- so the spmd_types
+            requirement does not apply; apply_cp_kimi_k3 checks its own
+            preconditions at wiring time."""
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
