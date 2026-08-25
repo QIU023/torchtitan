@@ -39,10 +39,9 @@ class TopologyKnobs:
     # runtime measurement, because a plan derived from each rank's own timing
     # would stop being identical across ranks.
     vit_bubble_cost_ratio: float = 0.5
-    # How many deferred vision backwards may wait at once. Each one holds a
-    # micro-batch's tower forward graph alive, so this is the memory window of the
-    # backward half. 0 is unbounded, which is the measured-nothing default -- see
-    # GradQueue for why a guessed bound would be worse than none.
+    # How many deferred vision backwards may wait; each holds a micro-batch's
+    # tower forward graph alive, so this is the backward half's memory window.
+    # 0 is unbounded, the measured-nothing default (see GradQueue).
     vit_bubble_max_pending: int = 0
     vit_tp_heads: bool = True
     attn_res_cache: bool = False

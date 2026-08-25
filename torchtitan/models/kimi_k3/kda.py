@@ -223,11 +223,9 @@ class KimiDeltaAttention(Module):
         )
         beta_TH = self.beta(x_TD).float()
 
-        # The kernel is fla triton and does not dispatch through DTensor.
-        # Under TP these arrive wrapped, and handing a DTensor to it produces
-        # an illegal memory access rather than anything legible, so the unwrap
-        # happens at the call site and the result is re-wrapped for the
-        # module's declared output layout.
+        # The kernel is fla triton and does not dispatch through DTensor: under
+        # TP these arrive wrapped and it fails illegibly, so unwrap at the call
+        # site and re-wrap the result to the module's declared output layout.
         out_THV = self.kernel(
             to_local_if_dtensor(q_THK).unsqueeze(0),
             to_local_if_dtensor(k_THK).unsqueeze(0),

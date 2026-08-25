@@ -100,16 +100,14 @@ class RankLocalCache:
         # Every backward marks its mb here so the step-end drop sweep
         # on the last virtual stage knows which mbs to evict.
         self._seen_mbs: set[int] = set()
-        # Captured grads for the local-only _LocalCacheAugment/Capture
-        # dance. Keyed by (mb_index, producer_stage_id, block_idx). A
-        # consumer-side Capture.backward accumulates grad here; the
-        # producer-side Augment.backward pops and sums the captured
-        # grad into its incoming grad when stage R's own backward runs.
+        # Captured grads for the local-only Capture/Augment bridge, keyed by
+        # (mb_index, producer_stage_id, block_idx): consumer-side
+        # Capture.backward accumulates here; producer-side Augment.backward
+        # pops and sums it into its incoming grad.
         self._captured_grads: dict[tuple[int, int, int], torch.Tensor] = {}
-        # Parallel counter: how many Capture.backward calls have deposited
-        # into each slot. The producer-side hook compares this against
-        # ``layout.expected_same_rank_captures(...)`` to turn silent grad
-        # loss (a consumer's backward never fired) into a raised error.
+        # How many Capture.backward calls deposited into each slot; the
+        # producer-side hook compares it to expected_same_rank_captures to turn
+        # silent grad loss (a consumer backward never fired) into an error.
         self._capture_counts: dict[tuple[int, int, int], int] = {}
         # Commits whose producer installed no augment hook (no gradient path through
         # them). A consumer must not deposit into those slots; see mark_no_hook.
@@ -362,9 +360,8 @@ def _set_mb_index(adapter_key: int, mb_index: int | None) -> None:
 
 
 # ----- state_dict key rewriting -------------------------------------------- #
-# The adapter stores its wrapped model under ``self.wrapped``. The Llama3 HF
-# state_dict_adapter keys off raw names like ``tok_embeddings.weight``, so
-# we strip the prefix on save and re-prepend on load.
+# The wrapped model lives under ``self.wrapped``; HF state_dict adapters key
+# off raw names like ``tok_embeddings.weight``, so strip on save, re-prepend on load.
 
 _WRAPPED_PREFIX = "wrapped."
 
@@ -598,26 +595,17 @@ class CrossStageCacheAdapter(nn.Module):
             f"expected {len(incoming_block_indices)}, got {len(recv_list)}."
         )
 
-        # Pull earlier cached blocks out of the rank cache. Recv-originated
-        # entries were stored attached to their recv_delta_tensor, so leaving
-        # them unwrapped lets PP's own SEND_B drain their grad to the producer
-        # rank. Own-rank commits were stored DETACHED (see _finish_forward), so
-        # they need requires_grad plus a _LocalCacheCapture wrapper: Capture
-        # deposits the grad in a rank-local slot and the producer-side hook
-        # from _install_augment_hook sums it in when the producer's backward
-        # runs. Routing it through a slot rather than the graph is the point --
-        # detached means autograd cannot walk into the producer and free its
-        # saved tensors early.
+        # Pull earlier cached blocks from the rank cache. Recv-originated
+        # entries stay attached so PP's SEND_B drains their grad; own-rank
+        # commits were stored DETACHED and get requires_grad + a Capture whose
+        # slot the producer-side Augment hook sums in (see the bridge above).
         earlier_blocks_raw = list(self._cache.get_blocks(mb))
         earlier_meta = list(self._cache.get_meta(mb))
         cached_indices = [layout.commits_at(meta[1])[meta[2]] for meta in earlier_meta]
         earlier_blocks: list[torch.Tensor] = []
-        # Eval / no_grad path: skip the Capture wrapping. With no
-        # backward to run, there is nothing to capture into a slot, and
-        # ``requires_grad_(True)`` + ``autograd.Function.apply`` both
-        # fail under ``torch.no_grad()`` (which the torchtitan Validator
-        # uses via ``pp_schedule.eval()``). Use the cached block tensors
-        # raw -- fwd math is identical.
+        # Eval / no_grad path: skip the Capture wrapping. There is no backward
+        # to capture, and requires_grad_(True) + autograd.Function.apply both
+        # fail under torch.no_grad() (the Validator's pp_schedule.eval()).
         grad_active = torch.is_grad_enabled()
         for blk, meta in zip(earlier_blocks_raw, earlier_meta):
             producer_rank, producer_stage, block_idx_in_producer = meta
@@ -681,10 +669,9 @@ class CrossStageCacheAdapter(nn.Module):
             f"blocks at stage {self.stage_id}, expected {len(my_commits)}."
         )
 
-        # Append relayed blocks so later virtual stages on this rank see
-        # them; producer metadata comes from the static layout. Slices
-        # of ``prev_recv_tensor`` stay autograd-live against it, so
-        # PP's SEND_B on backward will drain their grads upstream.
+        # Append relayed blocks so later virtual stages on this rank see them;
+        # producer metadata comes from the static layout. Slices stay
+        # autograd-live against prev_recv_tensor, so SEND_B drains their grads.
         if prev_recv_tensor is not None:
             recv_list = unstack_blocks(prev_recv_tensor)
             for bidx, blk in zip(incoming_block_indices, recv_list):
@@ -697,15 +684,10 @@ class CrossStageCacheAdapter(nn.Module):
                     (producer_rank, producer_stage, block_idx_in_producer),
                 )
 
-        # Append own commits. Each new block gets a grad hook that, during THIS
-        # stage's backward, sums in any grad a later same-rank virtual stage's
-        # _LocalCacheCapture deposited; the outgoing-delta path uses the
-        # attached block, so the next stage's SEND_B reaches the same grad_fn.
-        # The RANK CACHE gets a DETACHED copy: that severs it from the
-        # producer's forward graph, so a later same-rank consumer's backward
-        # physically cannot walk into the producer and free its saved tensors
-        # early -- the double-backward crash the previous
-        # _LocalCacheAugment.apply + view pattern hit under PP + FSDP + AC.
+        # Append own commits. Each new block gets a grad hook that sums in, at
+        # THIS stage's backward, grads a later same-rank Capture deposited; the
+        # outgoing delta uses the attached block. The RANK CACHE gets a DETACHED
+        # copy so a consumer backward cannot free the producer graph early.
         new_blocks_list = unstack_blocks(new_blocks_tensor)
         for local_idx, blk in enumerate(new_blocks_list):
             slot_key = (mb, self.stage_id, local_idx)
@@ -734,11 +716,9 @@ class CrossStageCacheAdapter(nn.Module):
         # `wrapped_new_blocks` variable.
         attached_new_blocks = new_blocks_list
 
-        # Build outgoing delta: subset of (cache + new), by canonical bidx.
-        # ``cache_by_bidx`` reads from the rank cache directly so
-        # relayed (recv-originated) blocks that show up in the outgoing
-        # delta also route grad correctly via their existing autograd
-        # link to ``prev_recv_tensor``.
+        # Build the outgoing delta from (cache + new) by canonical bidx.
+        # cache_by_bidx reads the rank cache directly, so relayed blocks in the
+        # delta keep their autograd link to prev_recv_tensor for grad routing.
         out_indices = layout.delta_to_send(self.stage_id)
         cache_by_bidx = {
             layout.commits_at(meta[1])[meta[2]]: blk
@@ -796,19 +776,17 @@ class CrossStageCacheAdapter(nn.Module):
             pp_size = self._layout.P if self._layout is not None else self.num_stages
             if self.stage_id + pp_size < self.num_stages:
                 return
-        # Union, not just the seen-set: only backward marks an mb as seen, so a
-        # forward-only pass (evaluation) caches blocks that nothing would ever
-        # announce for eviction. Nothing in the cache outlives the step, so the
-        # keys actually present are the right thing to drop.
+        # Union, not just the seen-set: only backward marks an mb seen, so a
+        # forward-only pass caches blocks nothing would announce for eviction.
+        # Nothing in the cache outlives the step, so drop the keys present.
         for mb_index in set(self._cache._seen_mbs) | set(self._cache._blocks):
             self._cache.drop(mb_index)
         # Defensive: ensure the seen-set is clear even if drop() didn't
         # remove every entry.
         self._cache._seen_mbs.clear()
         # Runs from a ``finally``, so also after a mid-backward failure, where a
-        # deposit can be stranded between consumer and producer. Slots hold real
-        # grad tensors, so clear them outright; outside the exception path a
-        # residual slot means an on_microbatch_end assertion did not run.
+        # deposit can be stranded. Outside the exception path a residual slot
+        # means an on_microbatch_end assertion did not run.
         leaked = self._cache.clear_capture_slots()
         if leaked:
             logger.warning(
@@ -830,10 +808,9 @@ class CrossStageCacheAdapter(nn.Module):
         self._cache._seen_mbs.add(mb_index)
         if self._delta_mode and self._layout is not None:
             pp_size = self._layout.P
-            # Earliest virtual stage on this rank: stage_id < pp_size.
-            # Its backward fires LAST among the rank's virtual stages
-            # for this mb, so by the time we reach here every slot
-            # for this mb should have been popped by an Augment.
+            # Earliest virtual stage on this rank (stage_id < pp_size): its
+            # backward fires LAST among the rank's virtual stages for this mb,
+            # so every slot for the mb should have been popped by an Augment.
             if self.stage_id < pp_size:
                 assert not self._cache.has_captured_for_mb(mb_index), (
                     f"Captured grad slot for mb {mb_index} survived past "
@@ -944,9 +921,8 @@ def _install_step_drop_patch(
                     adapter._drop_all_cached_and_clear()
                 except Exception:
                     # Continue so one poisoned adapter cannot keep the others
-                    # from clearing -- but say so. Swallowing this silently
-                    # turns a cache that stopped evicting into a slow memory
-                    # leak with no symptom until OOM.
+                    # from clearing -- but say so: swallowed, a cache that
+                    # stopped evicting is a slow leak with no symptom until OOM.
                     logger.warning(
                         "cross-stage cache sweep failed for one adapter; "
                         "continuing with the rest",
@@ -995,11 +971,8 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     inner = getattr(model, "language_model", None)
     if tower is None or inner is None:
         # A model whose tower is its own child needs no re-wrapping: core's
-        # _split_module sees the tower directly, so DEP is expressed by the FQN
-        # split alone (see _inject_kimi_k3_fqns). That is every layout this
-        # model ships, so there is nothing else to do here. The wrapper form --
-        # a language_model sibling that _split_module cannot see through --
-        # does not exist in this tree.
+        # _split_module sees the tower directly, so DEP is the FQN split alone
+        # (see _inject_kimi_k3_fqns) -- and that is every layout this model ships.
         return model
     raise NotImplementedError(
         "a multimodal wrapper layout (vision_encoder beside a language_model "
@@ -1211,10 +1184,9 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     if pp <= 1 or model_config is None:
         return
 
-    # Layer count: the flat kimi config stores it at ``num_hidden_layers``; a
-    # Config-tree model carries the layers themselves, and returning early on
-    # that shape silently skipped the whole injection, so the last stage lost
-    # the AttnRes aggregation modules and the split fell back to core's.
+    # The flat kimi config stores the layer count at ``num_hidden_layers``; a
+    # Config-tree model carries the layers themselves. Returning early on that
+    # shape skips the injection and the last stage loses AttnRes aggregation.
     num_layers = getattr(model_config, "num_hidden_layers", None)
     if num_layers is None:
         layers = getattr(model_config, "layers", None)
@@ -1248,10 +1220,9 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         num_virtual_stages -= n_vit
 
     fqns = _kimi_llm_fqns(num_virtual_stages, num_layers, input_weight, output_weight)
-    # ``_kimi_llm_fqns`` emits this folder's historical spellings. A model that
-    # uses core's names instead gets them mapped back, rather than being handed
-    # FQNs that match none of its children -- core sets every non-matching child
-    # to None, so that failure is a stage with no head at all.
+    # ``_kimi_llm_fqns`` emits this folder's historical spellings; map them
+    # back for a model using core's names. FQNs matching no child mean core
+    # sets every child to None -- a stage with no head at all.
     core_names = {"embed_tokens": "tok_embeddings", "lm_head": "lm_head"}
     present = {n for n, _ in model.named_children()}
     fqns = [
@@ -1266,24 +1237,14 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     if extras:
         fqns[-1].extend(extras)
     # The tower belongs with whichever chunk kept the embedding: vision
-    # features are spliced into the embeddings, so nothing vision-side crosses
-    # a stage boundary. Naming it matters -- core sets every child not named by
-    # some stage to None, so leaving it out gives every stage a None tower and
-    # the first multimodal batch reports "pixel_values were provided without a
-    # vision encoder". DEP is the exception and gets its own stage below.
+    # features splice into the embeddings, so nothing vision-side crosses a
+    # stage boundary. It must be NAMED -- core sets every child not named by
+    # some stage to None. DEP is the exception and gets its own stage below.
     if dep_enabled() and hasattr(model, "vision_encoder"):
-        # DEP (report sec 5.2.3): the tower gets a stage of its own, ahead of
-        # the text stages and carrying no decoder layers, so its compute can be
-        # hidden in the pipeline's bubbles instead of sitting on the critical
-        # path of the stage that owns the embedding.
-        #
-        # This model needs no separate stage class for that. Its forward already
-        # treats a missing tok_embeddings as "the input IS the hidden state",
-        # and a stage holding only the embedding and the tower runs the splice
-        # and returns (hidden, block_residual) like any other non-head stage.
-        # The tower has to travel with the embedding, not alone: the splice
-        # needs the token ids, and pipelining hands positional args to the
-        # first stage only.
+        # DEP (report sec 5.2.3): the tower gets its own stage ahead of the text
+        # stages, so its compute hides in pipeline bubbles; forward already
+        # treats missing tok_embeddings as "input IS the hidden state". It rides
+        # WITH the embedding: the splice needs ids, which only stage 0 receives.
         embed = "tok_embeddings" if hasattr(model, "tok_embeddings") else "embed_tokens"
         for stage in fqns:
             if embed in stage:
@@ -1301,25 +1262,14 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         embed_stage.append("vision_encoder")
 
     if dep_enabled() and not hasattr(model, "vision_encoder"):
-        # The marker-based split below is for the wrapper layout, where the
-        # tower is a sibling of the language model and the split has to be told
-        # which share each empty chunk is. A model that carries the tower as its
-        # own child took the simpler branch above instead.
-        #
-        # DEP: one stage ahead of the text ones that owns the vision tower. The
-        # FQN deliberately matches NOTHING in the text model, so core's
-        # _split_module -- which sets every non-matching child to None -- yields a
-        # zero-parameter chunk. pipeline_llm then does `stages[i].submod = m` with
-        # whatever parallelize_fn returns, so the empty chunk is replaced by the
-        # ViT stage module. That is why this needs no core change and no rename of
-        # language_model.*, which the alternative (hoisting the text stack's
-        # children to the wrapper) would have forced.
-        # The vision stage owns embed_tokens too, so the pipe carries the spliced
-        # EMBEDDING stream rather than ids. Ids cannot travel the pipe: PP's
-        # metadata inference pushes dummy values through it, and indexing an
-        # embedding with those asserts out of bounds. The first text stage
-        # therefore must NOT keep embed_tokens -- it receives pre-embedded input,
-        # which the backbone already supports when embed_tokens is None.
+        # Marker-based split for the wrapper layout, where the tower is a
+        # sibling of the language model. The ViT stage FQN matches NOTHING on
+        # purpose: core's _split_module yields a zero-parameter chunk, which
+        # parallelize_fn replaces with the ViT stage module -- no core change.
+        # The vision stage owns embed_tokens too: PP's metadata inference pushes
+        # dummy values through the pipe and indexing an embedding with them
+        # asserts, so the pipe carries the spliced EMBEDDING stream and the
+        # first text stage must NOT keep embed_tokens.
         fqns[0] = [f for f in fqns[0] if f != "embed_tokens"]
         vision = [[f"{_DEP_VISION_FQN}{i}"] for i in range(n_vit)]
         vision[0].append("embed_tokens")
@@ -1357,21 +1307,18 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     if prefetch_depth() <= 0 and not bubble:
         return
     if prefetch_depth() > 0 and bubble:
-        # Alternatives, not layers: the prefetch issues ahead on a side stream, the
-        # bubble runtime places encodes in idle intervals on the main stream. Both at
-        # once would have the prefetch satisfy every micro-batch before the planned slot
-        # arrived, so the placements would report as fired while the side stream did the
-        # work -- a green occupancy number for the wrong mechanism.
+        # Alternatives, not layers: the prefetch issues ahead on a side stream,
+        # the bubble runtime places encodes in main-stream idle intervals. Both
+        # at once satisfies every slot early -- green for the wrong mechanism.
         raise ValueError(
             "vit_prefetch and vit_bubble are alternatives; set exactly one. "
             f"Got prefetch={prefetch_depth()}, bubble={bubble}."
         )
 
     if dep_vision_stages() > 1 and prefetch_depth() > 0:
-        # The run-ahead prefetches by calling encode_images, which assumes one stage
-        # performs the whole encode. With the tower split that would run every block
-        # on share 0 and defeat the split. Refuse rather than silently negate it.
-        # Only the run-ahead is refused -- the bubble runtime is independent of the split.
+        # The run-ahead prefetches via encode_images, which assumes one stage
+        # performs the whole encode; with the tower split that defeats the
+        # split, so refuse. The bubble runtime is independent of the split.
         warnings.warn(
             f"vit_prefetch={prefetch_depth()} ignored: the run-ahead has no "
             f"cross-stage form yet, and vit_dep_stages="
@@ -1380,21 +1327,18 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         if not bool(topology().vit_bubble):
             return
 
-    # A stage owns the tower if it HOLDS one, not if it is a particular class.
-    # In the folded layout the tower is a child of KimiK3Model and the FQN split
-    # hands it to stage 0, so no KimiK3ViTStage is ever constructed -- keying on
-    # the type left this empty and the run-ahead silently off.
+    # A stage owns the tower if it HOLDS one, not if it is a particular class:
+    # in the folded layout the tower is a child of KimiK3Model on stage 0 and
+    # no KimiK3ViTStage exists -- keying on type leaves the run-ahead off.
     vision_stage_modules = [
         m
         for m in model_parts
         if isinstance(m, KimiK3ViTStage) or _holds_vision_tower(m)
     ]
     if not vision_stage_modules:
-        # Normal on a text-only rank: the vision stage is global stage 0, so only
-        # one rank holds it. Logged rather than silent because "the run-ahead did
-        # not install" and "the run-ahead did nothing" are otherwise the same
-        # observation -- but WARN only where the stage was supposed to be, or
-        # every text rank cries wolf on a correct run.
+        # Normal on a text-only rank: only one rank holds global stage 0. Logged
+        # because "did not install" and "did nothing" read the same otherwise --
+        # but WARN only where the stage was expected, or text ranks cry wolf.
         owns_vision_stage = any(
             getattr(s, "stage_index", None) == 0
             for s in _iter_schedule_stages(pp_schedule)
@@ -1456,11 +1400,9 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
     model = _unwrap_multimodal_for_pp(model, kwargs)
     step_inputs = getattr(model, "_dep_step_inputs_holder", None)
     if step_inputs is None and dep_enabled() and getattr(model, "vision_encoder", None) is not None:
-        # The folded layout has no wrapper to build this, but the run-ahead still
-        # needs it: a body/tail share -- and the prefetcher issuing micro-batch
-        # m+k -- reads grid_thw by micro-batch index, and pipelining hands the
-        # batch kwargs to the first stage only. Built here so the carrier exists
-        # for the layout that actually ships, rather than only for the wrapper.
+        # The folded layout has no wrapper to build this, but the run-ahead
+        # still needs it: shares and the prefetcher read grid_thw by micro-batch
+        # index, and pipelining hands batch kwargs to the first stage only.
         step_inputs = VisionStepInputs()
         model._dep_step_inputs_holder = step_inputs
     _inject_kimi_k3_fqns(model, kwargs)
@@ -1470,27 +1412,14 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
     # Every kimi_k3 flavor registers THIS pipelining_fn, so the DEP wiring has to
     # be installed here to be reachable at all.
     if dep_enabled() and step_inputs is not None:
-        # step_inputs is created only on the wrapper layout, where the tower is
-        # split into shares that each need the micro-batch index to find
-        # grid_thw. On a model that carries the tower as its own child, DEP
-        # gives it one whole stage, so there are no later shares to wire and
-        # nothing here applies.
-        #
-        # Wiring first, and unconditionally: a split tower's later shares need the
-        # micro-batch index to find grid_thw, and without it they pass activations
-        # through with no error at all.
+        # step_inputs exists only on the wrapper layout, where split tower
+        # shares need the micro-batch index to find grid_thw. Wire first and
+        # unconditionally: unwired shares pass activations through, no error.
         wired = _install_vision_stage_wiring(pp_schedule, step_inputs)
         # A split tower whose shares were never wired would run the
-        # metadata-inference path for real micro-batches: activations passed
-        # through, no tower, no splice, no error. So assert engagement -- but
-        # against what THIS rank should own, not against a global count.
-        #
-        # The vision stages are the first dep_vision_stages() global stage
-        # indices, so a rank owning none of them correctly wires zero. The first
-        # version of this check read `wired == 0 and n_vit > 1`, which assumed
-        # every rank owns a vision stage once the tower is split. That holds only
-        # when n_vit == pp_degree; at pp=4 with n_vit=2 the two ranks holding
-        # only text stages raised, and n_vit > 1 could not run at all.
+        # metadata-inference path for real micro-batches -- no tower, no splice,
+        # no error -- so assert engagement, against what THIS rank should own:
+        # the first dep_vision_stages() stages, so a text-only rank wires zero.
         n_vit = dep_vision_stages()
         expected = sum(
             1
@@ -1556,10 +1485,9 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
             layers_per_block=layers_per_block,
         )
     except ValueError:
-        # An unsupported configuration, not a rank-local mishap. Falling back
-        # here would leave this rank without an adapter while its peers have
-        # one, and a rank with no adapter sends no delta -- the first
-        # cross-stage hop would hang instead of reporting the real problem.
+        # An unsupported configuration, not a rank-local mishap: falling back
+        # leaves this rank without an adapter while its peers have one, and a
+        # rank sending no delta hangs the first cross-stage hop.
         raise
     except Exception as e:  # pragma: no cover - defensive
         warnings.warn(
@@ -1587,10 +1515,9 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
 
     _install_step_drop_patch(pp_schedule, installed_adapters)
 
-    # Say so on success, not only on the fallback paths. The adapter is numerically
-    # neutral by design, so loss reads the same whether it engaged or not -- without
-    # this line "wrapped" and "silently fell back" are indistinguishable from the
-    # outside.
+    # Say so on success, not only on fallback: the adapter is numerically
+    # neutral by design, so without this line "wrapped" and "silently fell
+    # back" are indistinguishable from the outside.
     logger.info(
         "cross-stage cache adapter wrapped %d stage(s): %s",
         len(installed_adapters),

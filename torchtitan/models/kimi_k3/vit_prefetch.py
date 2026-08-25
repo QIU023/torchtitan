@@ -43,18 +43,14 @@ class VisionPrefetcher:
         # done when its forward asked for it, which is the whole claim.
         self._hits = 0
         self._misses = 0
-        # Async bookkeeping. The overlap metric is DEFAULT-STREAM TIME BETWEEN ISSUE AND
-        # JOIN, not "was the encode complete on arrival" -- that first attempt was useless
-        # because the synchronous wrapper also leaves the encode complete by the time
-        # take() runs, so it read the same either way. Time on the current stream between
-        # ensure() and take() is zero when the issue path joins immediately and positive
-        # only when real work was interleaved.
+        # Async bookkeeping. The overlap metric is DEFAULT-STREAM TIME BETWEEN
+        # ISSUE AND JOIN -- "was the encode complete on arrival" reads the same
+        # for the synchronous wrapper, so it cannot distinguish real overlap.
         self._pending: dict[int, object] = {}
         self._issued_at: dict[int, object] = {}
-        # The encode's own GPU time, bracketed on the side stream. This is what decides
-        # whether there is anything to hide at all: if it is microseconds, no scheduling
-        # change can show up in a step time, and that is a fact about the config rather
-        # than about the implementation.
+        # The encode's own GPU time, bracketed on the side stream: what decides
+        # whether there is anything to hide at all. Microsecond encodes make any
+        # scheduling change invisible -- a fact about the config, not the code.
         self._encode_spans: list[tuple[object, object]] = []
 
     def begin_step(self, kwarg_mbs) -> None:
@@ -116,29 +112,18 @@ class VisionPrefetcher:
         if inputs is None:
             return
         pixel_values, grid_thw = inputs
-        # ISSUE without joining. Using the synchronous wrapper here would block the
-        # current stream on the encode straight away, so the encode would merely happen
-        # EARLIER rather than concurrently -- which is what it did before this split, and
-        # is why a 31/32 hit rate coexisted with no measurable overlap. The join happens
-        # in take(), when the consumer actually needs the features.
+        # ISSUE without joining -- the synchronous wrapper would block the
+        # current stream immediately, so the encode would merely happen EARLIER,
+        # not concurrently. The join happens in take(), at consumption.
         feats, done = self._owner._issue_on_vision_stream(
             lambda: self._owner.encode_images(pixel_values, grid_thw),
             pixel_values if isinstance(pixel_values, torch.Tensor) else None,
         )
-        # JOIN HERE, unconditionally. The deferred join that made the encode genuinely
-        # concurrent is reverted: the side-stream encode contains NCCL collectives (FSDP's
-        # tower all-gather, dynamic CP's gather-KV), and host issue order does NOT order
-        # device execution across streams, so leaving them in flight is the two-communicator
-        # cyclic wait this module's own docstring calls non-negotiable. An aborted step also
-        # leaves un-joined collectives and lets the allocator reuse buffers still being
-        # written.
-        #
-        # What decided it was the measurement, not caution: the encode costs 4.0 ms and the
-        # GPU is idle 99.88% of the step here (mfu 0.12%), so async and sync differ by
-        # 0.45% -- inside the 2-3% run-to-run spread. An unmeasurable gain does not buy a
-        # real deadlock risk. The deferred form is the right design on a SATURATED GPU,
-        # where the encode competes for SMs; it needs cross-stream collective ordering that
-        # is not established here.
+        # JOIN HERE, unconditionally. The side-stream encode contains NCCL
+        # collectives (FSDP all-gather, dynamic CP gather-KV), and host issue
+        # order does not order device execution across streams: leaving them in
+        # flight is the two-communicator cyclic wait the docstring forbids. The
+        # deferred join belongs on a saturated GPU with cross-stream ordering.
         self._owner._join_vision_stream(feats, done)
         if isinstance(feats, torch.Tensor):
             feats = [feats]

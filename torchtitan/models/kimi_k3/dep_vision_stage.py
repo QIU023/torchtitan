@@ -154,11 +154,9 @@ class KimiK3ViTStage(KimiK3Model):
 
         _, hi = self._dep_bounds
         if pixel_values is None or grid_thw is None:
-            # No images is a normal batch. The tower still has to run, or FSDP2's
-            # all-gather for these parameters is issued by some ranks and not
-            # others. Through the tower's __call__, not forward_head directly:
-            # FSDP2 registers its all-gather there, and a direct method call
-            # leaves patch_embed.weight a sharded DTensor.
+            # No images is a normal batch, but the tower still has to run or
+            # FSDP2's all-gather is issued by some ranks only -- and through
+            # __call__, where FSDP2 hooks; a direct method call stays sharded.
             x = self.vision_encoder(
                 self._dep_placeholder_patches(),
                 grid_thw=self._dep_placeholder_grid(),

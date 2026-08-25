@@ -65,13 +65,9 @@ def cut_for_deferred_backward(
     leaves that gradient as it is; returning anything else would rewrite it.
     """
     if not features.requires_grad:
-        # Nothing to defer: the tower has no gradient path this step, which is the normal
-        # case under LoRA when no adapter sits inside it. Cutting anyway would be worse
-        # than useless -- it introduces a grad-requiring leaf where the graph had none,
-        # so the splicing stage's output starts requiring grad and torch's stage_backward
-        # is dragged down a path it would not have taken. Measured: LoRA + bubble died in
-        # stage_backward with "grad can be implicitly created only for scalar outputs"
-        # while full-parameter passed.
+        # Nothing to defer: the tower has no gradient path this step (normal
+        # under LoRA with no adapter inside it). Cutting anyway adds a
+        # grad-requiring leaf and drags stage_backward down a path it never took.
         return features
 
     detached = features.detach().requires_grad_(True)
@@ -108,10 +104,9 @@ class GradQueue:
         self.drained = 0
         # Ran early because the bound was reached, not because a slot came up.
         self.forced = 0
-        # Slots that came up with nothing pending. The backward side is greedy and
-        # its placement assumes the earliest micro-batch's gradient arrives first;
-        # a high count here says that assumption does not hold for this schedule
-        # and the greedy min() should become any-pending.
+        # Slots that came up with nothing pending. The greedy placement assumes
+        # the earliest micro-batch's gradient arrives first; a high count says
+        # that fails for this schedule and min() should become any-pending.
         self.idle_slots = 0
 
     def stash(self, microbatch: int, output: torch.Tensor, grad: torch.Tensor) -> None:
@@ -188,10 +183,9 @@ class GradQueue:
 
     def report(self, placed: int) -> None:
         level = logger.info if self.drained == 0 else logger.warning
-        # forced and idle_slots are the two ways the placement can be working
-        # against the schedule while every gradient still runs: forced means the
-        # memory bound is what decided when, and idle_slots means slots came up
-        # with nothing to put in them. Both are silent in the loss.
+        # forced and idle_slots are the two ways the placement can work against
+        # the schedule while every gradient still runs: memory decided the when,
+        # or slots found nothing to place. Both are silent in the loss.
         level(
             "DEP bubble backward: %d ran at a planned slot, %d drained at step end, "
             "%d forced by the pending bound, %d slot(s) found nothing pending "

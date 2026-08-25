@@ -172,15 +172,11 @@ def classify(counts: list[int], cp_size: int, *, min_patches: int) -> list[int]:
 
 # --- The ViT/text stage boundary (DEP, report 5.2.3) ----------------------- #
 #
-# DEP splits ViT and text into separate PP stages, so the vision features have to
-# cross a pipeline hop. PP's point-to-point buffers are sized ONCE, not per step,
-# which forces a property that is easy to get wrong: the exchange shape must be a
-# CONFIG-level upper bound, never derived from the current batch. A batch-derived
-# shape works until a later batch carries more image tokens than the first one did,
-# and then it fails inside the P2P rather than anywhere near the cause.
-#
-# Sizing needs no communication either way: grid_thw is replicated, so every stage
-# computes the same layout from it. That is the same property dynamic CP relies on.
+# Vision features cross a pipeline hop, and PP's point-to-point buffers are
+# sized ONCE: the exchange shape must be a CONFIG-level upper bound, never
+# derived from the current batch -- that fails inside the P2P on the first
+# larger batch. grid_thw is replicated, so every stage computes the same
+# layout with no communication (the property dynamic CP relies on).
 
 
 def stage_exchange_lengths(
