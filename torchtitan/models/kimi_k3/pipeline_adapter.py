@@ -1590,7 +1590,7 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         )
 
 
-def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
+def pipeline_kimi_k3(model: nn.Module, **kwargs):
     """``pipelining_fn`` for Kimi Linear (baseline + AttnRes variants).
 
     Behavior:
@@ -1632,9 +1632,8 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
     )
-    # Every kimi_k3 flavor registers THIS pipelining_fn, so the DEP wiring has to be
-    # installed here; having it only in pipeline_llm_with_cache_adapter left it dead
-    # code, and its absence read as "the prefetch changes nothing".
+    # Every kimi_k3 flavor registers THIS pipelining_fn, so the DEP wiring has to
+    # be installed here to be reachable at all.
     if dep_enabled() and step_inputs is not None:
         # step_inputs is created only on the wrapper layout, where the tower is
         # split into shares that each need the micro-batch index to find
