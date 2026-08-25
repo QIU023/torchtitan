@@ -717,6 +717,109 @@ class KimiK3Model(Decoder):
         return next(self.parameters()).device
 
 
+    def encode_images(self, pixel_values, grid_thw):
+        """Public entry the DEP prefetcher calls.
+
+        The run-ahead issues the encode for a later micro-batch on the vision
+        stream, so it needs a name it can call on whichever module owns the
+        tower. Delegates to the private path that the forward uses, so the two
+        cannot drift.
+        """
+        return self._encode_images(pixel_values, grid_thw)
+
+    def _vision_stream(self):
+        """A dedicated CUDA stream for the tower, created once per module.
+
+        Groundwork for DEP's concurrent design (report 5.2.3), and it is only
+        groundwork: running on a side stream and immediately waiting for it cannot
+        overlap anything. The overlap needs the encode for micro-batch m+k issued
+        during micro-batch m's text compute, which is a scheduling change. What this
+        establishes is the part that has to be right first -- cross-stream tensor
+        lifetime and the interaction with FSDP2's tower all-gather, neither of which
+        the AttnRes PP adapter has ever had to deal with (it touches no streams at
+        all).
+
+        Same THREAD, separate stream. Not a worker thread: the adapter keys its
+        per-microbatch cache in a ``threading.local``, and its forward reads a
+        missing key as "this call is PP's shape inference" and diverts WITHOUT
+        raising. A worker thread would therefore take the shape-inference path and
+        return wrong shapes with no error.
+        """
+        if not torch.cuda.is_available():
+            return None
+        # Only when no autograd graph is being recorded. A graph recorded here has its
+        # backward run here too, and with prefetch several micro-batches then accumulate
+        # into the same tower parameters from two streams with nothing ordering them --
+        # which cost mm_full/tp2_pp2_cp2 its reproducibility: seven runs, seven distinct
+        # traces. Forcing the encode onto the current stream gives one trace over three
+        # runs, bit-identical to the DEP-without-prefetch numbers, so the stream was only
+        # ever changing reduction order, never the result.
+        #
+        # Nothing is lost today because both callers join immediately, so the stream
+        # overlaps nothing while grad is on. The machinery stays for the deferred design
+        # (report 5.2.3), which needs cross-stream collective ordering this does not yet
+        # establish -- and will need ordered accumulation before it can carry gradients.
+        if torch.is_grad_enabled():
+            return None
+        s = getattr(self, "_vision_side_stream", None)
+        if s is None:
+            s = torch.cuda.Stream()
+            self._vision_side_stream = s
+        return s
+
+    def _issue_on_vision_stream(self, fn, *tensors):
+        """Issue ``fn`` on the vision stream and return ``(out, event)`` WITHOUT waiting.
+
+        This is the half that makes overlap possible. :meth:`_run_on_vision_stream` joins
+        immediately, which is correct for a synchronous encode but means the side stream
+        buys nothing -- the caller blocks on it before running anything else. The
+        run-ahead needs the encode for micro-batch m+k in flight WHILE m's text compute
+        runs, so it issues here and joins later, in :meth:`_join_vision_stream`.
+
+        The input-side edges are the same as the synchronous path and equally required:
+        the side stream waits for the current one because ``fn``'s inputs were produced
+        there, and each input is ``record_stream``'d so the caching allocator cannot hand
+        its memory to another allocation while the side stream still reads it.
+        """
+        side = self._vision_stream()
+        if side is None:
+            return fn(), None
+        cur = torch.cuda.current_stream()
+        side.wait_stream(cur)
+        for t in tensors:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(side)
+        # Bracket the encode ON THE SIDE STREAM so its own GPU time is measurable.
+        # Without this the only observable is the span between issue and join, which is
+        # dominated by text compute and PP communication and therefore reads the same
+        # whether or not the encode ran concurrently -- a metric that cannot be falsified.
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(side):
+            started.record(side)
+            out = fn()
+            finished.record(side)
+        done = finished
+        self._last_encode_span = (started, finished)
+        return out, done
+
+    def _join_vision_stream(self, out, done) -> None:
+        """Make the current stream wait for an issued encode, and hand the outputs over.
+
+        Both halves are needed: without the wait the consumer reads memory the side
+        stream is still writing, and without ``record_stream`` on the outputs the
+        allocator may reuse buffers the side stream produced while the current stream
+        still holds them.
+        """
+        if done is None:
+            return
+        cur = torch.cuda.current_stream()
+        cur.wait_event(done)
+        outs = out if isinstance(out, (list, tuple)) else [out]
+        for t in outs:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(cur)
+
     def _encode_images(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> torch.Tensor:
