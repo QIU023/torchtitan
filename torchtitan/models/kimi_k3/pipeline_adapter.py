@@ -1518,7 +1518,16 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         if not bool(topology().vit_bubble):
             return
 
-    vision_stage_modules = [m for m in model_parts if isinstance(m, KimiK3ViTStage)]
+    # A stage owns the tower if it HOLDS one, not if it is a particular class.
+    # In the folded layout the tower is a child of KimiK3Model and the FQN split
+    # hands it to stage 0, so no KimiK3ViTStage is ever constructed -- keying on
+    # the type left this empty and the run-ahead silently off.
+    vision_stage_modules = [
+        m
+        for m in model_parts
+        if isinstance(m, KimiK3ViTStage)
+        or getattr(m, "vision_encoder", None) is not None
+    ]
     if not vision_stage_modules:
         # Normal on a text-only rank: the vision stage is global stage 0, so only
         # one rank holds it. Logged rather than silent because "the run-ahead did
