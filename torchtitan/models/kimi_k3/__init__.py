@@ -476,14 +476,22 @@ def _kimi_k3_config(
     )
 
 
-def _debugmodel(attn_backend: str) -> KimiK3Model.Config:
+def _debugmodel(
+    attn_backend: str,
+    *,
+    num_layers: int = 24,
+    full_attention_layers: set[int] | None = None,
+    attn_res_block_size: int = 12,
+) -> KimiK3Model.Config:
     dim = 1024
+    if full_attention_layers is None:
+        full_attention_layers = {3, 7, 11, 15, 19, 23}
     return _kimi_k3_config(
         dim=dim,
         vocab_size=163840,
-        num_layers=24,
-        full_attention_layers={3, 7, 11, 15, 19, 23},
-        attn_res_block_size=12,
+        num_layers=num_layers,
+        full_attention_layers=full_attention_layers,
+        attn_res_block_size=attn_res_block_size,
         num_heads=16,
         q_lora_rank=512,
         kv_lora_rank=256,
@@ -533,31 +541,14 @@ def _debugmodel_text_32l(attn_backend: str) -> KimiK3Model.Config:
     3 KDA : 1 MLA pattern at 32 layers covers the whole cross product with an
     integer split.
     """
-    config = _debugmodel(attn_backend)
-    config.vision_encoder = None
-    return _kimi_k3_config(
-        dim=1024,
-        vocab_size=163840,
+    config = _debugmodel(
+        attn_backend,
         num_layers=32,
-        full_attention_layers={3, 7, 11, 15, 19, 23, 27, 31},
+        full_attention_layers=set(range(3, 32, 4)),
         attn_res_block_size=16,
-        num_heads=16,
-        q_lora_rank=512,
-        kv_lora_rank=256,
-        qk_nope_head_dim=64,
-        qk_rope_head_dim=32,
-        v_head_dim=64,
-        kda_head_dim=64,
-        conv_kernel_size=4,
-        dense_hidden_dim=4096,
-        latent_dim=512,
-        expert_hidden_dim=384,
-        num_experts=32,
-        top_k=4,
-        num_shared_experts=2,
-        vision_encoder=None,
-        attn_backend=attn_backend,
     )
+    config.vision_encoder = None
+    return config
 
 
 def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
