@@ -1135,7 +1135,10 @@ def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
     wired = 0
     for stage in _iter_schedule_stages(pp_schedule):
         submod = getattr(stage, "submod", None)
-        if not isinstance(submod, KimiK3ViTStage):
+        # Holds a tower, rather than is a particular class: the folded layout
+        # never constructs KimiK3ViTStage, so a type test wired nothing and the
+        # count check below then raised on a correct run.
+        if not (isinstance(submod, KimiK3ViTStage) or _holds_vision_tower(submod)):
             continue
         orig_fwd = stage.forward_one_chunk
 
@@ -1472,6 +1475,21 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     parallelism.module_fqns_per_model_part = fqns
 
 
+def _holds_vision_tower(module) -> bool:
+    """Whether this stage owns the vision tower, through any wrapper.
+
+    FSDP2 replaces the module's class (KimiK3Model becomes FSDPKimiK3Model), and
+    a plain getattr for ``vision_encoder`` on the wrapper misses it -- which read
+    as "this rank has no vision stage" on a rank that owns one. Walk the modules
+    instead of trusting either the type or a direct attribute.
+    """
+    if getattr(module, "vision_encoder", None) is not None:
+        return True
+    return any(
+        getattr(m, "vision_encoder", None) is not None for m in module.modules()
+    )
+
+
 def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     """Give the DEP vision stage a prefetcher and tell it which micro-batch it serves.
 
@@ -1525,8 +1543,7 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     vision_stage_modules = [
         m
         for m in model_parts
-        if isinstance(m, KimiK3ViTStage)
-        or getattr(m, "vision_encoder", None) is not None
+        if isinstance(m, KimiK3ViTStage) or _holds_vision_tower(m)
     ]
     if not vision_stage_modules:
         # Normal on a text-only rank: the vision stage is global stage 0, so only
@@ -1601,6 +1618,16 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
 
     model = _unwrap_multimodal_for_pp(model, kwargs)
     step_inputs = getattr(model, "_dep_step_inputs_holder", None)
+    if step_inputs is None and dep_enabled() and getattr(model, "vision_encoder", None) is not None:
+        # The folded layout has no wrapper to build this, but the run-ahead still
+        # needs it: a body/tail share -- and the prefetcher issuing micro-batch
+        # m+k -- reads grid_thw by micro-batch index, and pipelining hands the
+        # batch kwargs to the first stage only. Built here so the carrier exists
+        # for the layout that actually ships, rather than only for the wrapper.
+        from torchtitan.models.kimi_k3.vit_prefetch import VisionStepInputs
+
+        step_inputs = VisionStepInputs()
+        model._dep_step_inputs_holder = step_inputs
     _inject_kimi_k3_fqns(model, kwargs)
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
