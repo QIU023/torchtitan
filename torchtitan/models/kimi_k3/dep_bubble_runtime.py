@@ -10,8 +10,6 @@
     puts it there. The hook fires AFTER a forward action returns rather than before a
     receive wait, because the rank owning the tower owns stage 0, whose forward receives
     nothing.
-
-    See ``phase13_k3like_48b_posttrain/DEP_BUBBLE_RUNTIME.md``.
     """
 
 from __future__ import annotations

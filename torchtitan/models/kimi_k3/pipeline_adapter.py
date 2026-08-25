@@ -6,16 +6,18 @@
 
 """Cross-stage caching adapter and ``pipelining_fn`` for AttnRes.
 
-    :class:`CrossStageCacheAdapter` wraps a per-stage AttnRes decoder. In delta mode
-    each hop ships only the blocks the receiver does not already hold; the receiver
-    rebuilds the stack from its cached prefix plus the delta. The block stack is a
-    live autograd path, not a cache -- gradients cross stage boundaries through it.
-
-    See ``phase13_k3like_48b_posttrain/PP_ATTNRES_ADAPTER.md``.
-    """
+* A block residual is defined over the whole layer stack, so under PP it travels
+  between stages as a second payload next to the hidden states.
+* :class:`CrossStageCacheAdapter` (delta mode, opt-in) ships per hop only the
+  blocks the receiver does not already hold; the receiver rebuilds the stack
+  from its cached prefix plus the delta.
+* The block stack is a live autograd path, not a cache -- gradients cross stage
+  boundaries through it.
+"""
 
 from __future__ import annotations
 
+import inspect
 import math
 import threading
 import warnings
@@ -39,10 +41,29 @@ try:
 except Exception:  # pragma: no cover - fallback for older torch
     _INTERLEAVED_1F1B_CLASS = None
 
-from torchtitan.models.kimi_k3.layout import unstack_blocks
+from torchtitan.distributed.pipeline_parallel import (
+    _generate_llm_fqn_per_model_part,
+    get_schedule_class as _tt_get_schedule_class,
+    pipeline_llm,
+)
+from torchtitan.models.kimi_k3.dep_bubble_backward import (
+    GradQueue,
+    install_backward_slots,
+)
+from torchtitan.models.kimi_k3.dep_bubble_plan import build_plans
+from torchtitan.models.kimi_k3.dep_bubble_runtime import install_bubble_runtime
+from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
+from torchtitan.models.kimi_k3.knobs import register_topology, topology
 from torchtitan.models.kimi_k3.layout import (
     _infer_block_layout_tables_from_stages,
     BlockLayoutTables,
+    unstack_blocks,
+)
+from torchtitan.models.kimi_k3.vit_prefetch import (
+    install_step_hook,
+    prefetch_depth,
+    VisionPrefetcher,
+    VisionStepInputs,
 )
 from torchtitan.tools.logging import logger
 
@@ -54,8 +75,6 @@ def adapter_enabled() -> bool:
     and requires Interleaved1F1B, n_layers divisible by the stage count, and an
     even split; anything else passes through on the naive transport.
     """
-    from torchtitan.models.kimi_k3.knobs import topology
-
     return topology().attn_res_cache
 
 
@@ -66,7 +85,7 @@ class RankLocalCache:
     """Per-rank, per-microbatch forward-block cache shared across VP stages.
 
     Every adapter on the same physical rank reads/writes the SAME cache
-    (Kimi section 4.1 invariant). Holds only forward-path state: the cached
+    -- one rank, one cache, any number of virtual stages. Holds only the cached
     block tensors (autograd-live against their original source) and
     producer metadata for layout bookkeeping.
 
@@ -152,13 +171,8 @@ class RankLocalCache:
         read by >1 later virtual stage on the same rank) sum into the
         same slot.
 
-        The first deposit is ``detach().clone()``-ed to decouple from
-        whatever storage the autograd engine / FSDP2 post-backward
-        pipeline hands us. The per-mb cost is O(Np*d) per consumer,
-        which is insignificant next to the PP collective cost at
-        realistic scale, and it removes a fragility: if a downstream
-        framework were to reuse the grad tensor's storage, the slot
-        value would silently corrupt.
+        The first deposit is ``detach().clone()``-ed so the slot never aliases
+        storage the autograd engine or FSDP2 may reuse.
         """
         prior = self._captured_grads.get(key)
         if prior is None:
@@ -191,14 +205,10 @@ class RankLocalCache:
     def mark_no_hook(self, key: tuple[int, int, int]) -> None:
         """Record that this commit has NO producer-side augment hook.
 
-        A consumer must then leave the cached block alone. The cache always stores a
-        DETACHED copy, so ``blk.requires_grad`` is False for every entry and cannot tell
-        a consumer whether the producer's own tensor had a gradient path -- which is why
-        the consumer used to force ``requires_grad_(True)`` unconditionally. That made
-        the two sides asymmetric: a deposit with no hook to pop it is a lost gradient
-        caught only by the mb-end assertion. Measured as unreachable in training (the
-        AttnRes graft projections are trainable even under LoRA, so the block always
-        requires grad), so this records the invariant rather than fixing a live bug.
+        A consumer must then leave the cached block alone: cache entries are
+        stored detached, so ``blk.requires_grad`` cannot tell a consumer whether
+        the producer had a gradient path, and a deposit with no hook to pop it
+        would be a lost gradient. Both sides consult this record instead.
         """
         self._no_hook.add(key)
 
@@ -250,16 +260,14 @@ def _reset_rank_caches_for_testing() -> None:
 
 # ----- Local-only grad bridge for own-rank cached commits ------------------ #
 #
-# A block committed by an earlier virtual stage and read back by a later one ON THE SAME
-# RANK would otherwise have its forward graph freed by the consumer's backward, and the
-# producer's own backward then fails with "backward through the graph a second time". A
-# producer-side grad hook plus a consumer-side detached leaf sever that link structurally;
-# both halves are rank-local, with no collectives. The detach is load-bearing, and
-# recv-originated blocks are deliberately left attached so PP's SEND_B still carries their
-# gradient to the producing rank.
-#
-# Full reasoning, including the two designs that did not hold, is in the PR-C body
-# (Raising_PRs/k3_pr_c_pp_attnres/PR_BODY.md, "The local grad bridge").
+# * Same-rank reuse must not let a consumer backward walk into the producer
+#   graph: that frees it, and the producer backward then fails with "backward
+#   through the graph a second time".
+# * So the cache stores a DETACHED copy; the consumer wraps it in a Capture that
+#   deposits the grad in a rank-local slot, and a producer-side hook sums the
+#   slot into the producer incoming grad. No collectives on this path.
+# * Recv-originated blocks stay attached on purpose: PP built-in backward P2P
+#   already carries their gradient to the producing rank.
 
 
 def _install_augment_hook(
@@ -273,8 +281,6 @@ def _install_augment_hook(
 
     Raises when the observed capture count diverges from what the layout tables predict:
     a silently missing capture is a lost gradient that no loss curve shows.
-
-    See ``phase13_k3like_48b_posttrain/PP_AUGMENT_HOOK.md``.
     """
     if not block_tensor.requires_grad:
         return False
@@ -539,35 +545,21 @@ class CrossStageCacheAdapter(nn.Module):
         if expected_K == new_blocks_out.shape[1]:
             return partial_out, new_blocks_out
 
-        # The placeholder must have the shape the RUNTIME emits, because the
-        # downstream recv buffer is sized from it. The runtime sends
-        # ``torch.stack(send_pieces, dim=1)`` over ``[T, D]`` pieces, i.e.
-        # ``[T, K, D]`` with T the flattened batch-sequence -- the carrier layout
-        # stack_blocks documents. Deriving it from partial_out is what makes that
-        # true for a stage that commits nothing, where new_blocks_out has no
-        # column to read a per-block shape from.
-        #
-        # Both previous forms were wrong and both needed expected_K != N to show
-        # it, which is why every delta run to date missed them: an empty commit
-        # took partial_out.shape whole and produced a FOUR-dimensional
-        # [K, B, L, D], and a non-empty one took new_blocks_out.shape[1:] and
-        # produced [K, N, D] with the block axis first. The four-dimensional case
-        # surfaced as a consumer failing _has_blocks_signature (which tests
-        # dim() == 3) and then passing the carrier positionally into ``blocks``:
-        # "got multiple values for argument 'blocks'", 32 layers at pp8 x vp2.
+        # The placeholder must match what the runtime emits, because the
+        # downstream recv buffer is sized from it:
+        # * shape [T, K, D], T the flattened batch-sequence -- derived from
+        #   partial_out so it holds even for a stage that commits nothing;
+        # * requires_grad mirroring the runtime delta, since pipelining derives
+        #   the recv-buffer and grad-send metadata from these tensors and a
+        #   False placeholder drops the delta backward edge.
         tokens_times_batch = partial_out.shape[0] * partial_out.shape[1]
-        # requires_grad must mirror the runtime delta emission: torch >= 2.12
-        # derives the downstream recv-buffer and grad-send metadata from the
-        # shape-inference tensors, and a requires_grad=False placeholder makes
-        # the consumer stage drop the delta's backward edge (None grads at
-        # SEND_B -> PipeliningMetadataError).
         return partial_out, partial_out.new_zeros(
             (tokens_times_batch, expected_K, partial_out.shape[-1]),
             requires_grad=partial_out.requires_grad,
         )
 
     def _forward_delta(self, *args, **kwargs):
-        """Interleaved1F1B delta forward (spec section 4.1).
+        """Interleaved1F1B delta forward.
 
         Cached-prefix blocks whose producer is on a DIFFERENT rank are
         passed through unwrapped: their autograd graph already goes
@@ -781,16 +773,8 @@ class CrossStageCacheAdapter(nn.Module):
     @staticmethod
     def _keepalive_touch(payload, prev_recv_tensor: torch.Tensor | None):
         """Ensure ``prev_recv_tensor`` is on the autograd graph that
-        produces ``payload``. Preserves tuple returns.
-
-        Profiled rather than left as a suspicion (matrix_scripts/pp_cp_overheads.py):
-        the touch costs 0.037 ms at 256x512, 4096x2048 and every shape between, rising
-        to 0.18 ms only at 16384x2048. It is launch-bound, not arithmetic-bound, so the
-        O(T*D) reduction it looks like is not what is being paid -- and a cheaper
-        formulation that reads one element instead of reducing would save nothing.
-        Against one projection it is 137% at 256x512 and 5.2% at 4096x2048; against a
-        whole stage's forward, which runs dozens of projections, it is well under a
-        percent at any production shape. Left as is.
+        produces ``payload``. Preserves tuple returns. Launch-bound (measured),
+        well under a percent of a stage forward at any production shape.
         """
         if prev_recv_tensor is None:
             return payload
@@ -821,14 +805,9 @@ class CrossStageCacheAdapter(nn.Module):
         # Defensive: ensure the seen-set is clear even if drop() didn't
         # remove every entry.
         self._cache._seen_mbs.clear()
-        # The step-end patch calls this from a ``finally``, so it also runs when
-        # the step raised. On that path a micro-batch's backward can stop between
-        # a consumer's deposit and the producer's pop, and the mb-keyed drop above
-        # only reaches slots whose mb still had cached blocks -- so clear the slot
-        # tables outright. A grad tensor per slot is real memory, and a step that
-        # dies in the backward of one micro-batch (OOM being the ordinary cause)
-        # would otherwise accumulate them for as long as the process keeps
-        # retrying. Reported rather than silent: outside the exception path a
+        # Runs from a ``finally``, so also after a mid-backward failure, where a
+        # deposit can be stranded between consumer and producer. Slots hold real
+        # grad tensors, so clear them outright; outside the exception path a
         # residual slot means an on_microbatch_end assertion did not run.
         leaked = self._cache.clear_capture_slots()
         if leaked:
@@ -840,21 +819,13 @@ class CrossStageCacheAdapter(nn.Module):
             )
 
     def on_microbatch_end(self, mb_index: int) -> None:
-        """Mark ``mb_index`` as seen on this rank so the step-end sweep
-        drops it. Actual eviction is deferred to ``pp_schedule.step``
-        return; see :func:`_install_step_drop_patch`.
+        """Mark ``mb_index`` seen; eviction happens at step end.
 
-        In delta mode, this is also the moment to assert that every
-        :class:`_LocalCacheCapture` deposit for this mb has been drained
-        by a matching :class:`_LocalCacheAugment` -- a surviving slot
-        would mean a producer's backward never ran, which is a bug.
-        Interleaved1F1B runs backward in reverse virtual-stage order
-        on each rank, so the EARLIEST virtual stage on this rank is
-        the last to call on_microbatch_end for a given mb. That is
-        the only point at which every producer-side Augment has had a
-        chance to drain its slot, so we guard the assertion to fire
-        there only (``stage_id < pp_size`` == "this rank's earliest
-        virtual stage").
+        * In delta mode, also assert every Capture deposit for this mb was
+          drained -- a surviving slot means a producer backward never ran.
+        * Interleaved1F1B runs backward in reverse virtual-stage order, so the
+          rank's EARLIEST virtual stage (``stage_id < pp_size``) is the last to
+          get here for an mb, and the only safe point for that assertion.
         """
         self._cache._seen_mbs.add(mb_index)
         if self._delta_mode and self._layout is not None:
@@ -909,9 +880,7 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
     # ``save_forward_output`` was added to ``_PipelineStageBase.forward_one_chunk``
     # in torch nightly (>=2.10). On torch 2.9 stable the kwarg doesn't
     # exist, so passing it raises TypeError. Detect once and dispatch.
-    import inspect as _inspect
-
-    _orig_fwd_sig = _inspect.signature(orig_fwd)
+    _orig_fwd_sig = inspect.signature(orig_fwd)
     _has_save_kw = "save_forward_output" in _orig_fwd_sig.parameters
 
     def patched_fwd(fwd_chunk_id, args, kwargs=None, save_forward_output=True):
@@ -934,16 +903,8 @@ def _install_mb_index_patch(stage, adapter: CrossStageCacheAdapter) -> None:
         full_backward: bool = True,
         last_backward: bool = False,
     ):
-        # Plain backward pass. The double-backward risk on own-rank
-        # cached commits is now handled structurally by
-        # :class:`_LocalCacheAugment` / :class:`_LocalCacheCapture`:
-        # the consumer-side Capture severs the consumer->producer
-        # autograd link (so the producer's graph is NOT traversed or
-        # freed by this stage's backward), and the producer-side
-        # Augment sums the captured grad into the producer's own
-        # incoming grad when THE PRODUCER's backward runs. Each
-        # stage's forward graph is thus traversed exactly once per mb,
-        # which is the naive-PP baseline.
+        # Plain backward: the Capture/hook bridge keeps each stage's forward
+        # graph traversed exactly once per mb, the naive-PP baseline.
         _set_mb_index(adapter_key, bwd_chunk_id)
         try:
             return orig_bwd(
@@ -995,17 +956,9 @@ def _install_step_drop_patch(
     pp_schedule.step = patched_step  # type: ignore[method-assign]
 
 
-# ----- FQN-split injection ------------------------------------------------- #
+# ----- FQN split and DEP wiring -------------------------------------------- #
 
-_ATTN_RES_EXTRA_LAST_STAGE_FQNS = ("output_res_proj", "output_res_norm")
-
-
-# ----- Custom pipelining_fn ------------------------------------------------ #
-
-
-# ----- Kimi Linear / K3 pipelining wiring (merged from kimi_linear/) ----- #
-
-# Kimi-specific FQNs injected into the last PP stage when AttnRes is enabled.
+# Injected into the last PP stage when AttnRes is enabled.
 _KIMI_ATTN_RES_LAST_STAGE_FQNS = ("output_res_proj", "output_res_norm")
 
 
@@ -1022,11 +975,7 @@ def _kimi_llm_fqns(
     (delegated to core's function, then re-mapped) so any future
     tweaks there apply to us automatically.
     """
-    from torchtitan.distributed.pipeline_parallel import (
-        _generate_llm_fqn_per_model_part as generate_llm_fqn_per_model_part,
-    )
-
-    raw = generate_llm_fqn_per_model_part(
+    raw = _generate_llm_fqn_per_model_part(
         num_stages, num_layers, input_weight, output_weight
     )
     rename = {"tok_embeddings": "embed_tokens", "output": "lm_head"}
@@ -1034,24 +983,13 @@ def _kimi_llm_fqns(
 
 
 def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
-    """Split the TEXT model, and re-wrap the stage that owns ``embed_tokens``.
+    """Reject the wrapper layout; pass a tower-as-child model through.
 
-    Core's ``_split_module`` iterates only top-level ``named_children()``. On the
-    multimodal wrapper those children are ``vision_encoder`` and
-    ``language_model``, so no FQN scheme reaches the text stack: flat names
-    (``embed_tokens``, ``layers.N``) match nothing, and dotted ones
-    (``language_model.layers.N``) are not recursed into either. Every child then
-    takes the "not in modules_to_keep" branch and is set to None, so the stage
-    holds zero parameters and the optimizer reports
-    ``pattern '.*' matched no parameters``.
-
-    Vision features are spliced into the embeddings, so the tower belongs with
-    whichever chunk kept ``embed_tokens`` -- nothing vision-side crosses a stage
-    boundary. Re-wrapping happens inside ``parallelize_fn`` so the tower is
-    present before SPMD is applied, not bolted on afterwards.
-
-    Returns the module to hand to ``pipeline_llm``: the text model when this is
-    the multimodal wrapper, otherwise ``model`` untouched.
+    Core's ``_split_module`` iterates only top-level ``named_children()``, so a
+    wrapper holding ``vision_encoder`` beside a ``language_model`` child is
+    unsplittable: no FQN scheme reaches the text stack and every stage comes
+    back parameterless. This model carries the tower as its own child, which
+    the FQN split handles directly.
     """
     tower = getattr(model, "vision_encoder", None)
     inner = getattr(model, "language_model", None)
@@ -1082,9 +1020,6 @@ def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
     Returns how many stages were wired, so a caller can assert engagement instead of
     inferring it from numerics.
     """
-    from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
-    from torchtitan.models.kimi_k3.vit_prefetch import install_step_hook
-
     if step_inputs is not None:
         install_step_hook(pp_schedule, step_inputs)
 
@@ -1143,21 +1078,12 @@ _MM_INNER_PREFIX = "language_model."
 def _register_mm_prefix_hooks(part: nn.Module) -> None:
     """Make a bare-text PP stage save and load under the wrapper's namespace.
 
-    Only the stage owning ``embed_tokens`` is re-wrapped as the multimodal
-    model, so its parameters are named ``language_model.*``. Every other stage
-    is the bare text model and names them ``layers.*``,
-    ``output_res_norm.weight`` and so on -- while a non-PP save, and the
-    first stage's own save, use the prefixed form.
-
-    That split namespace makes ANY checkpoint unloadable under PP for this
-    model, not just a seed checkpoint: a resume fails with
-    "Missing key in checkpoint state_dict: output_res_norm.weight". Cold
-    starts never noticed because they load nothing.
-
-    Fixed in the checkpoint path rather than by re-wrapping every stage: the
-    wrapper's forward expects a tower and an image-splice path, and giving the
-    middle stages one to satisfy a key-naming issue would trade a naming bug for
-    a forward bug.
+    * Only the stage owning ``embed_tokens`` is the multimodal model, so its
+      keys are ``language_model.*``; the other stages are the bare text model.
+    * Without these hooks that split namespace makes any checkpoint unloadable
+      under PP (resume: "Missing key ... output_res_norm.weight").
+    * Fixed at the checkpoint path: giving middle stages a wrapper to satisfy
+      key naming would trade a naming bug for a forward bug.
     """
 
     def _add_prefix(module, state_dict, prefix, local_metadata):
@@ -1189,8 +1115,6 @@ def dep_enabled() -> bool:
     Off by default because it changes the stage count, so a run that enables it
     silently would report a different pipeline shape than the config asked for.
     """
-    from torchtitan.models.kimi_k3.knobs import topology
-
     return topology().vit_dep
 
 
@@ -1202,10 +1126,6 @@ def _install_bubble_runtime_for(pp_schedule, prefetcher) -> None:
     stale plan would anchor on actions the schedule no longer runs. Rebuilding is pure
     Python over a list of actions, so it is not worth caching against that risk.
     """
-    from torchtitan.models.kimi_k3.dep_bubble_plan import build_plans
-    from torchtitan.models.kimi_k3.dep_bubble_runtime import install_bubble_runtime
-    from torchtitan.models.kimi_k3.knobs import topology
-
     cost_ratio = float(topology().vit_bubble_cost_ratio)
 
     def plan_for_step():
@@ -1246,14 +1166,8 @@ def _install_bubble_runtime_for(pp_schedule, prefetcher) -> None:
         upfront_encode=encode_now,
     )
 
-    # The backward half. The queue lives on the OWNER module, because the seam that
-    # cuts the graph is inside its forward and that is the only place the micro-batch
-    # index and the features meet.
-    from torchtitan.models.kimi_k3.dep_bubble_backward import (
-        GradQueue,
-        install_backward_slots,
-    )
-
+    # The queue lives on the OWNER module: the seam that cuts the graph is inside
+    # its forward, the only place the micro-batch index and the features meet.
     queue = GradQueue(max_pending=int(topology().vit_bubble_max_pending))
     prefetcher._owner._vision_grad_queue = queue
     install_backward_slots(pp_schedule, queue)
@@ -1262,28 +1176,12 @@ def _install_bubble_runtime_for(pp_schedule, prefetcher) -> None:
 def dep_vision_stages() -> int:
     """How many stages the vision tower occupies.
 
-    Report 5.2.3 requires vision forward and backward to be "balanced across PP
-    stages", so more than one is the target. It starts at 1 because the total stage
-    count must stay divisible by ``pp_degree`` -- the schedule asserts that -- and
-    the vision stages are taken OUT of the text budget rather than added on top.
-    Growing this therefore trades text stages for vision stages, which is the
-    balance the report is describing and which needs measurement to set.
-
-    Above 1 the tower is split: share 0 takes ``patch_embed`` plus its blocks and
-    ``embed_tokens``, the last share takes its blocks plus the projector and the
-    splice, and what crosses each hop is a fixed-capacity patch stream alongside the
-    text embeddings. See ``KimiK3ViTStage.set_dep_role``.
-
-    That split is NOT reachable on a model whose tower is its own child. Splitting
-    the tower needs the per-share stage class, and the only path that installs it
-    is ``_unwrap_multimodal_for_pp``, which returns early here because there is no
-    ``language_model`` child -- ``_split_module`` cannot cut into
-    ``vision_encoder.layers`` either, since it descends only into a ModuleDict or
-    ModuleList that is a DIRECT child of the model. So this raises rather than
-    silently running clause 1 while the config asked for clause 2.
+    * Vision stages come OUT of the text budget (total must stay divisible by
+      ``pp_degree``), so growing this trades text stages for vision stages.
+    * Above 1 the tower would be split across stages; that split cannot reach
+      into ``vision_encoder.layers`` on this layout, so values above 1 raise
+      instead of silently running the one-stage form.
     """
-    from torchtitan.models.kimi_k3.knobs import topology
-
     stages = max(1, topology().vit_dep_stages)
     if stages > 1:
         raise NotImplementedError(
@@ -1332,9 +1230,7 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
             (num_layers + input_weight + output_weight) / layers_per_stage
         )
     else:
-        from torchtitan.distributed.pipeline_parallel import get_schedule_class
-
-        schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
+        schedule_class = _tt_get_schedule_class(parallelism.pipeline_parallel_schedule)
         stages_per_rank = 1 if issubclass(schedule_class, PipelineScheduleSingle) else 2
         num_virtual_stages = pp * stages_per_rank
 
@@ -1347,7 +1243,7 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
             raise ValueError(
                 f"DEP wants {n_vit} vision stage(s) but only {num_virtual_stages} "
                 "stages exist; raise pipeline_parallel_degree or lower "
-                "KIMI_VIT_DEP_STAGES"
+                "vit_dep_stages"
             )
         num_virtual_stages -= n_vit
 
@@ -1457,14 +1353,6 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     A no-op when the prefetch depth is 0, which is the default, so enabling DEP alone
     changes nothing here.
     """
-    from torchtitan.models.kimi_k3.knobs import topology
-    from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
-    from torchtitan.models.kimi_k3.vit_prefetch import (
-        install_step_hook,
-        prefetch_depth,
-        VisionPrefetcher,
-    )
-
     bubble = bool(topology().vit_bubble)
     if prefetch_depth() <= 0 and not bubble:
         return
@@ -1475,7 +1363,7 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         # arrived, so the placements would report as fired while the side stream did the
         # work -- a green occupancy number for the wrong mechanism.
         raise ValueError(
-            "KIMI_VIT_PREFETCH and KIMI_VIT_BUBBLE are alternatives; set exactly one. "
+            "vit_prefetch and vit_bubble are alternatives; set exactly one. "
             f"Got prefetch={prefetch_depth()}, bubble={bubble}."
         )
 
@@ -1485,8 +1373,8 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         # on share 0 and defeat the split. Refuse rather than silently negate it.
         # Only the run-ahead is refused -- the bubble runtime is independent of the split.
         warnings.warn(
-            f"KIMI_VIT_PREFETCH={prefetch_depth()} ignored: the run-ahead has no "
-            f"cross-stage form yet, and KIMI_VIT_DEP_STAGES="
+            f"vit_prefetch={prefetch_depth()} ignored: the run-ahead has no "
+            f"cross-stage form yet, and vit_dep_stages="
             f"{dep_vision_stages()} splits the tower. Running without the run-ahead."
         )
         if not bool(topology().vit_bubble):
@@ -1518,7 +1406,7 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         parts = [type(m).__name__ for m in model_parts]
         if owns_vision_stage:
             warnings.warn(
-                f"KIMI_VIT_PREFETCH={prefetch_depth()} requested and this rank "
+                f"vit_prefetch={prefetch_depth()} requested and this rank "
                 f"owns pipeline stage 0, but no KimiK3ViTStage is present in its "
                 f"model parts ({parts}); the run-ahead is OFF."
             )
@@ -1551,26 +1439,19 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
 
     Behavior:
 
-    * Always: patch ``parallelism.module_fqns_per_model_part`` to use
-      Kimi names and include final AttnRes modules on the last stage,
-      then delegate to core ``pipeline_llm`` for the actual PP setup.
-    * When ``TORCHTITAN_ATTNRES_CACHE=1`` AND the schedule is
-      Interleaved1F1B AND the wrapped model is AttnRes (has
-      ``num_blocks`` + ``layers_per_block`` attrs): wrap each stage's
-      ``submod`` in ``CrossStageCacheAdapter`` (the
-      implementation, reused unchanged -- it duck-types the wrapped
-      model's forward signature).
+    * Always: patch ``parallelism.module_fqns_per_model_part`` to use this
+      model's names and include the AttnRes aggregation modules on the last
+      stage, then delegate to core ``pipeline_llm``.
+    * When the ``attn_res_cache`` config field is set AND the schedule is
+      Interleaved1F1B AND the model is an AttnRes variant: wrap each stage's
+      ``submod`` in :class:`CrossStageCacheAdapter`.
     * Otherwise: pass through (plain PP, no cache adapter).
     """
-    # Resolve the topology knobs from config ONCE (finding 32). This entry can run
+    # Resolve the topology knobs from config ONCE. This entry can run
     # before parallelize, so whichever comes first registers; register_topology is
     # idempotent and reports a disagreement rather than letting order decide.
-    from torchtitan.models.kimi_k3.knobs import register_topology
-
     if hasattr(model, "config"):
         register_topology(model.config)
-
-    from torchtitan.distributed.pipeline_parallel import pipeline_llm
 
     model = _unwrap_multimodal_for_pp(model, kwargs)
     step_inputs = getattr(model, "_dep_step_inputs_holder", None)
@@ -1580,8 +1461,6 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
         # m+k -- reads grid_thw by micro-batch index, and pipelining hands the
         # batch kwargs to the first stage only. Built here so the carrier exists
         # for the layout that actually ships, rather than only for the wrapper.
-        from torchtitan.models.kimi_k3.vit_prefetch import VisionStepInputs
-
         step_inputs = VisionStepInputs()
         model._dep_step_inputs_holder = step_inputs
     _inject_kimi_k3_fqns(model, kwargs)
@@ -1621,7 +1500,7 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
         )
         if wired != expected:
             raise RuntimeError(
-                f"KIMI_VIT_DEP_STAGES={n_vit}: this rank owns {expected} vision "
+                f"vit_dep_stages={n_vit}: this rank owns {expected} vision "
                 f"stage(s) by stage index but {wired} were wired; an unwired share "
                 "passes activations through unprocessed and reports no error"
             )

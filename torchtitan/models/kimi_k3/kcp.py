@@ -11,8 +11,6 @@
     token-dependent transition, so a prefix scan over (cumulative transition, zero-started
     state) fragments recovers it. The short convolutions need only the previous rank's
     tail, one fixed-size exchange.
-
-    See ``phase13_k3like_48b_posttrain/KCP_DESIGN.md``.
     """
 
 from __future__ import annotations

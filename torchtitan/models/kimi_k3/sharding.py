@@ -16,8 +16,6 @@ after the TP-wrapped projections, at the same gap the TP plan already strips
 DTensor, so TP's own head sharding is not this contract's to describe -- and
 declaring both here would be two mesh axes on tensor dim 2, which SpmdLayout
 rejects without an explicit partition_spec.
-
-See CP_DECLARATIVE.md in the logbook for why KCP is an identity pair.
 """
 
 from dataclasses import dataclass

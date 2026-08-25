@@ -9,8 +9,6 @@
     Issues micro-batch m+1's encode on a side stream during m's text compute. This is
     the run-ahead, and it is mutually exclusive with the bubble runtime -- both at once
     would credit the bubble placements for work the side stream did.
-
-    See ``phase13_k3like_48b_posttrain/VIT_PREFETCH_DESIGN.md``.
     """
 
 from __future__ import annotations
