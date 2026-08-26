@@ -59,6 +59,7 @@ from torchtitan.models.kimi_k3.layout import (
     BlockLayoutTables,
     unstack_blocks,
 )
+from torchtitan.models.kimi_k3.vit_cp_plan import stage_patch_capacity
 from torchtitan.models.kimi_k3.vit_prefetch import (
     install_step_hook,
     prefetch_depth,
@@ -1164,20 +1165,65 @@ def dep_vision_stages() -> int:
 
     * Vision stages come OUT of the text budget (total must stay divisible by
       ``pp_degree``), so growing this trades text stages for vision stages.
-    * Above 1 the tower would be split across stages; that split cannot reach
-      into ``vision_encoder.layers`` on this layout, so values above 1 raise
-      instead of silently running the one-stage form.
+    * Above 1 the tower spans stages (report sec 5.2.3 clause 2). The split is
+      NOT by FQN: ``_split_module`` descends only into a ModuleDict or ModuleList
+      that is a direct child, so ``vision_encoder`` is kept or nulled whole. Each
+      vision chunk therefore keeps the whole tower and runs only the block range
+      its role names -- see ``KimiK3ViTStage`` and ``_install_dep_vision_shares``.
     """
-    stages = max(1, topology().vit_dep_stages)
-    if stages > 1:
-        raise NotImplementedError(
-            f"vit_dep_stages={stages} splits the vision tower across pipeline "
-            "stages (report sec 5.2.3 clause 2), which this model layout does "
-            "not support yet: the tower is a child of the model, and the stage "
-            "split cannot reach into vision_encoder.layers. Use "
-            "vit_dep_stages=1, which gives the tower its own stage (clause 1)."
+    return max(1, topology().vit_dep_stages)
+
+
+def _install_dep_vision_shares(model: nn.Module, kwargs: dict) -> None:
+    """Prepare a tower that spans stages. Both halves run before ``pipeline_llm``.
+
+    * Marker submodules, one per share. They must really exist on the module
+      being split: ``_split_module`` keeps the children a stage names and nulls
+      the rest, so a marker matching nothing leaves every share
+      indistinguishable, and share 0 is the only one a "holds the embedding"
+      test can pick out. They carry no parameters.
+    * A ``parallelize_fn`` wrapper. Core calls it once per chunk and installs
+      what it returns, which is the only seam where a chunk can be re-classed as
+      a vision stage before it becomes one.
+
+    Not called for a single vision stage: there the chunk core hands back is
+    already the model it needs to be -- tower, embedding and no decoder layers --
+    and its own forward does the encode and the splice.
+    """
+    n_vit = dep_vision_stages()
+    for i in range(n_vit):
+        model.add_module(f"{_DEP_VISION_FQN}{i}", nn.Module())
+
+    # The stage's payload capacity comes from the config HERE, because the
+    # folded model does not keep its Config and the stage cannot look it up.
+    model_config = kwargs["model_config"]
+    capacity = stage_patch_capacity(
+        model_config.dep_max_grid_h,
+        model_config.dep_max_grid_w,
+        model_config.dep_max_images,
+    )
+    step_inputs = getattr(model, "_dep_step_inputs_holder", None)
+    inner_parallelize = kwargs["parallelize_fn"]
+
+    def _parallelize_vision_share(part: nn.Module, **pk):
+        share = _dep_vision_share_index(part)
+        if share is None:
+            return inner_parallelize(part, **pk)
+        stage = KimiK3ViTStage.promote(part, patch_capacity=capacity)
+        # Every share holds the whole tower, so every share computes the same
+        # bounds and reads its own row out. Deriving them from the share index
+        # rather than passing them down keeps the shares from disagreeing.
+        bounds = stage.vision_encoder.block_bounds(n_vit)
+        role = "head" if share == 0 else ("tail" if share == n_vit - 1 else "body")
+        stage.set_dep_role(
+            role,
+            bounds=bounds[share],
+            num_shares=n_vit,
+            step_inputs=step_inputs,
         )
-    return stages
+        return inner_parallelize(stage, **pk)
+
+    kwargs["parallelize_fn"] = _parallelize_vision_share
 
 
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
@@ -1262,7 +1308,20 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         for stage in fqns:
             if embed in stage:
                 stage.remove(embed)
-        fqns = [[embed, "vision_encoder"]] + fqns
+        if n_vit > 1:
+            # Every share names the tower: core deep-copies the model per stage,
+            # so each vision chunk keeps its own tower and runs only the block
+            # range its role gives it. The marker is what tells a chunk WHICH
+            # share it is; call order cannot, because a rank holding several
+            # virtual stages receives them in an order parallelize_fn is not
+            # told. See _install_dep_vision_shares, which adds the markers.
+            vision = [
+                ["vision_encoder", f"{_DEP_VISION_FQN}{i}"] for i in range(n_vit)
+            ]
+            vision[0].insert(0, embed)
+        else:
+            vision = [[embed, "vision_encoder"]]
+        fqns = vision + fqns
     elif hasattr(model, "vision_encoder"):
         embed_stage = next(
             (
@@ -1418,6 +1477,12 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
         # index, and pipelining hands batch kwargs to the first stage only.
         step_inputs = VisionStepInputs()
         model._dep_step_inputs_holder = step_inputs
+    if (
+        dep_enabled()
+        and dep_vision_stages() > 1
+        and getattr(model, "vision_encoder", None) is not None
+    ):
+        _install_dep_vision_shares(model, kwargs)
     _inject_kimi_k3_fqns(model, kwargs)
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs
