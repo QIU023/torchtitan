@@ -144,6 +144,17 @@ def kimi_k3_debugmodel_dyncp() -> Trainer.Config:
     return config
 
 
+def kimi_k3_debugmodel_dep() -> Trainer.Config:
+    """The multimodal debug model with the vision tower on its own stage.
+
+    DEP (report sec 5.2.3) is opt-in because it changes the stage count, so a
+    matrix needs a flavor that turns it on.
+    """
+    config = kimi_k3_debugmodel()
+    config.model_spec.model.vit_dep = True
+    return config
+
+
 def kimi_k3_debugmodel_lora() -> Trainer.Config:
     """The multimodal debug model with LoRA adapters on the attention output.
 
