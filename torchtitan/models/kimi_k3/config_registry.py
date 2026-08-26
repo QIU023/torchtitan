@@ -131,43 +131,6 @@ def kimi_k3_debugmodel_text_32l_naive() -> Trainer.Config:
 
 
 
-def kimi_k3_debugmodel_dyncp() -> Trainer.Config:
-    """The multimodal debug model with the dynamic-CP threshold lowered.
-
-    The debug dataloader caps images at 256 patches, which is the production
-    threshold, so with the default no image is ever large enough to partition
-    and the path is wired but never executed. This flavor lowers the threshold
-    so the matrix actually runs it.
-    """
-    config = kimi_k3_debugmodel()
-    config.model_spec.model.dynamic_cp_min_patches = 64
-    return config
-
-
-def kimi_k3_debugmodel_dep() -> Trainer.Config:
-    """The multimodal debug model with the vision tower split across stages.
-
-    DEP (report sec 5.2.3) is opt-in because it changes the stage count, so a
-    matrix needs a flavor that turns it on. What it turns on is clause 2, the
-    split tower, because that is the field default.
-    """
-    config = kimi_k3_debugmodel()
-    config.model_spec.model.vit_dep = True
-    return config
-
-
-def kimi_k3_debugmodel_dep_one_stage() -> Trainer.Config:
-    """DEP with the tower kept whole on a single pipeline stage.
-
-    Clause 1 of report sec 5.2.3, and the control for the split: the tower runs
-    off the text stages' critical path either way, so a matrix pairing this with
-    ``kimi_k3_debugmodel_dep`` isolates the SPLIT from DEP itself.
-    """
-    config = kimi_k3_debugmodel_dep()
-    config.model_spec.model.vit_dep_stages = 1
-    return config
-
-
 def kimi_k3_debugmodel_lora() -> Trainer.Config:
     """The multimodal debug model with LoRA adapters on the attention output.
 

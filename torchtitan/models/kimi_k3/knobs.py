@@ -28,10 +28,10 @@ from torchtitan.tools.logging import logger
 class TopologyKnobs:
     """Resolved topology."""
 
-    vit_dep: bool = False
-    # Splitting the tower is the default form of DEP; one vision stage still
-    # serializes the whole tower against one text stage. Must track the model
-    # Config field of the same name.
+    # These two must track the model Config fields of the same name. DEP is on
+    # by default and splits the tower by default: one vision stage still
+    # serializes the whole tower against one text stage.
+    vit_dep: bool = True
     vit_dep_stages: int = 2
     vit_prefetch: int = 0
     # Run the planned encodes in the schedule's idle intervals on the MAIN stream,

@@ -1097,10 +1097,11 @@ _DEP_VISION_FQN = "__kimi_dep_vision__"
 
 
 def dep_enabled() -> bool:
-    """DEP is opt-in while it is being brought up.
+    """Whether the vision tower takes pipeline stages of its own.
 
-    Off by default because it changes the stage count, so a run that enables it
-    silently would report a different pipeline shape than the config asked for.
+    On by default. It is reachable only under pipeline parallelism, and there
+    the tower riding along on the embedding's stage is the imbalance, not the
+    baseline -- so the split is the default and this switches it off.
     """
     return topology().vit_dep
 
@@ -1160,18 +1161,51 @@ def _install_bubble_runtime_for(pp_schedule, prefetcher) -> None:
     install_backward_slots(pp_schedule, queue)
 
 
-def dep_vision_stages() -> int:
+_VISION_STAGES: int | None = None
+"""The resolved vision-stage count, so every caller reads back one answer."""
+
+
+def dep_vision_stages(num_virtual_stages: int | None = None) -> int:
     """How many stages the vision tower occupies.
 
-    * Vision stages come OUT of the text budget (total must stay divisible by
-      ``pp_degree``), so growing this trades text stages for vision stages.
+    * Vision stages come OUT of the text budget (the total must stay divisible
+      by ``pp_degree``), so growing this trades text stages for vision stages
+      and at least one text stage has to remain.
     * Above 1 the tower spans stages (report sec 5.2.3 clause 2). The split is
       NOT by FQN: ``_split_module`` descends only into a ModuleDict or ModuleList
       that is a direct child, so ``vision_encoder`` is kept or nulled whole. Each
       vision chunk therefore keeps the whole tower and runs only the block range
       its role names -- see ``KimiK3ViTStage`` and ``_install_dep_vision_shares``.
+
+    Pass the pipeline's stage count to RESOLVE the number; call it bare to read
+    the resolved one back. The FQN split, the share markers and the engagement
+    assertion all have to agree, and recomputing from the config in each of them
+    would let a shortened pipeline wire a different count than it split.
     """
-    return max(1, topology().vit_dep_stages)
+    global _VISION_STAGES
+    if num_virtual_stages is None:
+        if _VISION_STAGES is None:
+            return max(1, topology().vit_dep_stages)
+        return _VISION_STAGES
+
+    requested = max(1, topology().vit_dep_stages)
+    # Shorten rather than raise. The default asks for two, and pp=2 -- the debug
+    # shape, and the unit tests' -- has only two stages to give: refusing to run
+    # there would make the default unusable on the smallest pipeline that has a
+    # tower at all. It is still not what the config asked for, so say so.
+    allowed = max(1, num_virtual_stages - 1)
+    if requested > allowed:
+        logger.warning(
+            "vit_dep_stages=%d leaves no text stage in a %d-stage pipeline; "
+            "the tower takes %d instead. Raise pipeline_parallel_degree to "
+            "give it the requested share.",
+            requested,
+            num_virtual_stages,
+            allowed,
+        )
+        requested = allowed
+    _VISION_STAGES = requested
+    return requested
 
 
 def _install_dep_vision_shares(model: nn.Module, kwargs: dict) -> None:
@@ -1190,8 +1224,11 @@ def _install_dep_vision_shares(model: nn.Module, kwargs: dict) -> None:
     already the model it needs to be -- tower, embedding and no decoder layers --
     and its own forward does the encode and the splice.
     """
-    n_vit = dep_vision_stages()
-    for i in range(n_vit):
+    # The markers go on before the pipeline's shape is known, so lay down the
+    # REQUESTED count as an upper bound. A marker no stage names is nulled by
+    # _split_module like any other unclaimed child, so over-providing costs
+    # nothing and a shortened tower simply leaves the tail ones unused.
+    for i in range(max(1, topology().vit_dep_stages)):
         model.add_module(f"{_DEP_VISION_FQN}{i}", nn.Module())
 
     # The stage's payload capacity comes from the config HERE, because the
@@ -1209,6 +1246,10 @@ def _install_dep_vision_shares(model: nn.Module, kwargs: dict) -> None:
         share = _dep_vision_share_index(part)
         if share is None:
             return inner_parallelize(part, **pk)
+        # Read the count back here, not above: this runs after the FQN split has
+        # resolved it against the pipeline's shape, which may be fewer stages
+        # than the config asked for.
+        n_vit = dep_vision_stages()
         stage = KimiK3ViTStage.promote(part, patch_capacity=capacity)
         # Every share holds the whole tower, so every share computes the same
         # bounds and reads its own row out. Deriving them from the share index
@@ -1265,18 +1306,19 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         stages_per_rank = 1 if issubclass(schedule_class, PipelineScheduleSingle) else 2
         num_virtual_stages = pp * stages_per_rank
 
-    n_vit = dep_vision_stages() if dep_enabled() else 0
-    if n_vit:
-        # Taken out of the text budget, not added on top: the schedule asserts
-        # num_stages % pp_degree == 0, so appending would break pp=2 at the first
-        # vision stage.
-        if num_virtual_stages - n_vit < 1:
-            raise ValueError(
-                f"DEP wants {n_vit} vision stage(s) but only {num_virtual_stages} "
-                "stages exist; raise pipeline_parallel_degree or lower "
-                "vit_dep_stages"
-            )
-        num_virtual_stages -= n_vit
+    # Resolve the vision-stage count here, where the pipeline's shape is known;
+    # every other caller reads that answer back. Taken out of the text budget,
+    # not added on top: the schedule asserts num_stages % pp_degree == 0, so
+    # appending would break pp=2 at the first vision stage.
+    # Gated on the model actually HAVING a tower, not on DEP alone: a text model
+    # has no vision stage to give the budget to, and charging it one leaves the
+    # text stack a stage short.
+    n_vit = (
+        dep_vision_stages(num_virtual_stages)
+        if dep_enabled() and hasattr(model, "vision_encoder")
+        else 0
+    )
+    num_virtual_stages -= n_vit
 
     fqns = _kimi_llm_fqns(num_virtual_stages, num_layers, input_weight, output_weight)
     # ``_kimi_llm_fqns`` emits this folder's historical spellings; map them
@@ -1333,19 +1375,13 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         )
         embed_stage.append("vision_encoder")
 
-    if dep_enabled() and not hasattr(model, "vision_encoder"):
-        # Marker-based split for the wrapper layout, where the tower is a
-        # sibling of the language model. The ViT stage FQN matches NOTHING on
-        # purpose: core's _split_module yields a zero-parameter chunk, which
-        # parallelize_fn replaces with the ViT stage module -- no core change.
-        # The vision stage owns embed_tokens too: PP's metadata inference pushes
-        # dummy values through the pipe and indexing an embedding with them
-        # asserts, so the pipe carries the spliced EMBEDDING stream and the
-        # first text stage must NOT keep embed_tokens.
-        fqns[0] = [f for f in fqns[0] if f != "embed_tokens"]
-        vision = [[f"{_DEP_VISION_FQN}{i}"] for i in range(n_vit)]
-        vision[0].append("embed_tokens")
-        fqns = vision + fqns
+    # A DEP branch for a model with no ``vision_encoder`` child used to sit here,
+    # carried over from the reference tree's wrapper layout (the tower a sibling
+    # of a ``language_model`` child). That layout is rejected outright by
+    # _unwrap_multimodal_for_pp, so the only model reaching it now is a TEXT one,
+    # and it would hand the text stack a vision stage whose FQN matches no child
+    # -- moving the embedding onto a stage that does not exist. It was
+    # unreachable only while DEP was off by default.
     parallelism.module_fqns_per_model_part = fqns
 
 

@@ -393,11 +393,12 @@ class KimiK3Model(Decoder):
         # Smallest image worth partitioning across CP ranks. Below it the
         # replicated encode is cheaper: splitting buys one gather per layer.
         dynamic_cp_min_patches: int = 256
-        # DEP (report sec 5.2.3): the vision tower gets a pipeline stage of its
+        # DEP (report sec 5.2.3): the vision tower gets pipeline stages of its
         # own ahead of the text stages, so its compute leaves the critical path
-        # of the stage that owns the embedding. Opt-in: it changes the stage
-        # count, which the schedule and the checkpoint layout both see.
-        vit_dep: bool = False
+        # of the stage that owns the embedding. Only reachable under pipeline
+        # parallelism, where it is what the tower should do; a single-stage run
+        # never sees it.
+        vit_dep: bool = True
         # How many stages the tower is split across. More than one by default:
         # on a single stage the tower's whole forward still serializes against
         # one text stage, which is the imbalance report sec 5.2.3 clause 2
