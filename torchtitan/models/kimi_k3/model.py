@@ -398,11 +398,12 @@ class KimiK3Model(Decoder):
         # of the stage that owns the embedding. Opt-in: it changes the stage
         # count, which the schedule and the checkpoint layout both see.
         vit_dep: bool = False
-        # How many stages the tower is split across. 1 is the tower on its own
-        # stage; more than 1 needs the split to address vision_encoder.layers,
-        # which _split_module cannot reach, and raises rather than silently
-        # falling back to 1.
-        vit_dep_stages: int = 1
+        # How many stages the tower is split across. More than one by default:
+        # on a single stage the tower's whole forward still serializes against
+        # one text stage, which is the imbalance report sec 5.2.3 clause 2
+        # exists to remove. Vision stages come OUT of the text budget, so a
+        # pipeline with no stage to spare raises rather than dropping to 1.
+        vit_dep_stages: int = 2
         # How many micro-batches ahead the tower's encode is issued. 0 keeps
         # the encode inline, which is the measured-nothing default.
         vit_prefetch: int = 0

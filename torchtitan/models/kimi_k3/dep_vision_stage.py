@@ -28,8 +28,13 @@ class KimiK3ViTStage(KimiK3Model):
     """
 
     @classmethod
-    def promote(cls, part: KimiK3Model) -> "KimiK3ViTStage":
+    def promote(cls, part: KimiK3Model, *, patch_capacity: int) -> "KimiK3ViTStage":
         """Re-class a split chunk as a vision stage, in place.
+
+        ``patch_capacity`` is handed in rather than read back off the config:
+        this model keeps no reference to the Config it was built from, so the
+        caller -- which does have it -- computes the payload size once and every
+        share is then sized by the same number.
 
         The reference tree has ``from_parts`` here instead, which assembles the
         multimodal WRAPPER from a tower and a language model. That exists because
@@ -42,8 +47,10 @@ class KimiK3ViTStage(KimiK3Model):
         if not isinstance(part, KimiK3Model):
             raise TypeError(f"expected a KimiK3Model chunk, got {type(part)!r}")
         part.__class__ = cls
+        part._dep_capacity = patch_capacity
         return part  # pyrefly: ignore [bad-return]
 
+    _dep_capacity: int = 0
     _dep_role: str = "both"
     _dep_bounds: tuple[int, int] | None = None
     _dep_num_shares: int = 1
@@ -83,12 +90,7 @@ class KimiK3ViTStage(KimiK3Model):
         return si.grid_for(mb)
 
     def _dep_patch_capacity(self) -> int:
-        from torchtitan.models.kimi_k3.vit_cp_plan import stage_patch_capacity
-
-        cfg = self.config
-        return stage_patch_capacity(
-            cfg.dep_max_grid_h, cfg.dep_max_grid_w, cfg.dep_max_images
-        )
+        return self._dep_capacity
 
     def _dep_reject_cp(self) -> None:
         group = getattr(self, "_cp_group", None)
@@ -177,6 +179,19 @@ class KimiK3ViTStage(KimiK3Model):
             sentinel_mask,
         )
 
+    @staticmethod
+    def _dep_tail_output(embeds_TD: torch.Tensor):
+        """What the last vision share hands the first text stage.
+
+        A text stage receives the hidden state AND the accumulated block
+        residual: the carrier travels on every hop, so a stage that dropped it
+        would train a different model. The tail opens it empty, which is exactly
+        what a zero-layer KimiK3Model does for a tower on one stage -- keeping
+        the two DEP forms interchangeable at this boundary.
+        """
+        num_tokens, dim = embeds_TD.shape
+        return embeds_TD, embeds_TD.new_zeros(num_tokens, 0, dim)
+
     def _dep_forward_later(
         self, patches_padded, text_embeds, sentinel_mask, grid_thw=None
     ):
@@ -199,7 +214,7 @@ class KimiK3ViTStage(KimiK3Model):
             return (
                 (patches_padded, text_embeds, sentinel_mask)
                 if self._dep_role == "body"
-                else text_embeds
+                else self._dep_tail_output(text_embeds)
             )
 
         grid = grid_thw if grid_thw is not None else self._dep_grid_for_current_mb()
@@ -233,7 +248,9 @@ class KimiK3ViTStage(KimiK3Model):
             # this rank skips a gradient reduction its peers issue.
             from torchtitan.distributed.fsdp import add_zero_valued_dependency
 
-            return add_zero_valued_dependency(text_embeds, feats)
+            return self._dep_tail_output(
+                add_zero_valued_dependency(text_embeds, feats)
+            )
         if num_sentinels != feats.size(0):
             raise ValueError(
                 f"{num_sentinels} sentinel(s) but {feats.size(0)} visual token(s): "
@@ -241,7 +258,9 @@ class KimiK3ViTStage(KimiK3Model):
                 "convention, where the sequence length is already correct"
             )
         mask = (sentinel_mask > 0.5).unsqueeze(-1).expand_as(text_embeds)
-        return text_embeds.masked_scatter(mask, feats.to(text_embeds.dtype))
+        return self._dep_tail_output(
+            text_embeds.masked_scatter(mask, feats.to(text_embeds.dtype))
+        )
 
     def forward(self, *args, **kwargs):
         """Dispatch on the role. Untyped ``*args`` for one specific reason.
@@ -258,9 +277,14 @@ class KimiK3ViTStage(KimiK3Model):
                 patches, text_embeds, sentinel_mask, grid_thw=kwargs.get("grid_thw")
             )
 
+        # This model's signature is ``(tokens, block_residual_TND, *,
+        # pixel_values, grid_thw, ...)``: the second POSITIONAL is the
+        # block-residual carrier, so the image inputs arrive by keyword only.
+        # The reference tree read them from ``args[1:]`` because its model took
+        # them positionally; doing that here would feed the carrier to the tower.
         tokens = args[0] if args else kwargs["tokens"]
-        pixel_values = args[1] if len(args) > 1 else kwargs.get("pixel_values")
-        grid_thw = args[2] if len(args) > 2 else kwargs.get("grid_thw")
+        pixel_values = kwargs.get("pixel_values")
+        grid_thw = kwargs.get("grid_thw")
         if self._dep_role == "head":
             return self._dep_forward_head(
                 tokens, pixel_values, grid_thw, kwargs.get("special_tokens")

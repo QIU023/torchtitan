@@ -29,7 +29,10 @@ class TopologyKnobs:
     """Resolved topology."""
 
     vit_dep: bool = False
-    vit_dep_stages: int = 1
+    # Splitting the tower is the default form of DEP; one vision stage still
+    # serializes the whole tower against one text stage. Must track the model
+    # Config field of the same name.
+    vit_dep_stages: int = 2
     vit_prefetch: int = 0
     # Run the planned encodes in the schedule's idle intervals on the MAIN stream,
     # rather than ahead of time on a side stream. The two are alternatives, not
