@@ -434,6 +434,7 @@ class CrossStageCacheAdapter(nn.Module):
         *,
         stage_id: int,
         num_stages: int,
+        first_delta_stage: int = 0,
         group: "dist.ProcessGroup | None" = None,
         stage_to_rank: dict[int, int] | None = None,
         pp_rank: int | None = None,
@@ -443,6 +444,10 @@ class CrossStageCacheAdapter(nn.Module):
         self.wrapped = wrapped
         self.stage_id = stage_id
         self.num_stages = num_stages
+        # Where the delta chain starts. Stage 0 normally, but DEP puts vision
+        # stages ahead of every decoder layer and they carry no adapter, so the
+        # first text stage is the one with nothing upstream to receive from.
+        self.first_delta_stage = first_delta_stage
         self._group = group
         self._stage_to_rank = stage_to_rank or {i: i for i in range(num_stages)}
         if pp_rank is None:
@@ -579,7 +584,7 @@ class CrossStageCacheAdapter(nn.Module):
         layout = self._layout
         assert layout is not None, "_forward_delta called without layout tables"
 
-        if self.stage_id == 0:
+        if self.stage_id == self.first_delta_stage:
             partial_out, new_blocks_tensor = self.wrapped(*args, **kwargs)
             return self._finish_forward(
                 mb,
@@ -1385,6 +1390,31 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     parallelism.module_fqns_per_model_part = fqns
 
 
+def _layer_to_stage_from_fqns(parallelism) -> dict[int, int] | None:
+    """The global layer-id -> stage-id map, read off the split we asked for.
+
+    ``module_fqns_per_model_part`` is the whole pipeline, not this rank's share,
+    so it answers what the live stages cannot: where every layer went. It also
+    needs no assumption about the split being contiguous or even -- DEP puts
+    vision stages ahead of layer 0, and a stage count that does not divide the
+    layer count leaves stages of unequal width.
+
+    Returns None when there is nothing to read, which leaves the caller on its
+    contiguous default.
+    """
+    fqns = getattr(parallelism, "module_fqns_per_model_part", None)
+    if not fqns:
+        return None
+    layer_to_stage: dict[int, int] = {}
+    for stage_idx, stage in enumerate(fqns):
+        for fqn in stage:
+            name, _, index = fqn.partition(".")
+            if name != "layers" or not index.isdigit():
+                continue
+            layer_to_stage[int(index)] = stage_idx
+    return layer_to_stage or None
+
+
 def _holds_vision_tower(module) -> bool:
     """Whether this stage owns the vision tower, through any wrapper.
 
@@ -1601,6 +1631,7 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
             num_blocks=num_blocks,
             n_layers=n_layers_total,
             layers_per_block=layers_per_block,
+            layer_to_stage=_layer_to_stage_from_fqns(kwargs.get("parallelism")),
         )
     except ValueError:
         # An unsupported configuration, not a rank-local mishap: falling back
@@ -1614,12 +1645,21 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
         )
         return passthrough
 
+    # Under DEP the first n_vit stages carry the tower and no decoder layer, so
+    # they neither commit a block nor forward a carrier -- their forward returns
+    # the tower's own tuple. Wrapping them would hand that tuple to the delta
+    # protocol, and the first TEXT stage is what heads the chain instead.
+    first_delta_stage = dep_vision_stages() if dep_enabled() else 0
+
     installed_adapters: list[CrossStageCacheAdapter] = []
     for i, stage in enumerate(stages):
+        if stage.stage_index < first_delta_stage:
+            continue
         adapter = CrossStageCacheAdapter(
             stage.submod,
             stage_id=stage.stage_index,
             num_stages=num_stages,
+            first_delta_stage=first_delta_stage,
             group=getattr(stage, "group", None),
             stage_to_rank=stage_to_rank,
             pp_rank=getattr(stage, "group_rank", None),

@@ -218,15 +218,23 @@ def _infer_block_layout_tables_from_stages(
     num_blocks: int,
     n_layers: int,
     layers_per_block: int,
+    layer_to_stage: dict[int, int] | None = None,
 ) -> BlockLayoutTables:
     """Build :class:`BlockLayoutTables` from live ``PipelineStage`` objects.
 
-    The layout itself is the contiguous default (layer ``ell`` on stage
+    Pass ``layer_to_stage`` when the caller knows the whole split -- the FQN
+    lists it handed to core are exactly that -- and it is adopted as given. The
+    local stages then only CHECK it, which is worth doing because the two are
+    derived independently: the map comes from the names, the check from the
+    modules that survived the split.
+
+    Without it the layout is the contiguous default (layer ``ell`` on stage
     ``ell // layers_per_stage``). ``stages`` holds only the local rank's stages,
-    so a complete layer-id -> stage-id map is not obtainable here without a
-    collective; what the local stages DO expose is used to verify the default
-    instead. A non-contiguous split raises rather than producing a layout that
-    is wrong in a way only the gradients would show.
+    so a complete map is not obtainable here without a collective; what the
+    local stages DO expose verifies the default instead. A non-contiguous split
+    then raises rather than producing a layout that is wrong in a way only the
+    gradients would show -- which is what DEP hits, because its vision stages
+    sit ahead of layer 0 and shift every decoder layer off the default.
 
     Stages that expose no ``layers`` attribute (CPU unit tests) leave nothing to
     verify, which is not an error.
@@ -239,7 +247,7 @@ def _infer_block_layout_tables_from_stages(
     V = num_local_stages
     num_stages = pp_size * V
 
-    layer_to_stage: dict[int, int] = {}
+    observed: dict[int, int] = {}
     for stage in stages:
         submod = getattr(stage, "submod", None)
         inner = getattr(submod, "wrapped", submod)
@@ -254,25 +262,39 @@ def _infer_block_layout_tables_from_stages(
                 layer_id = int(key)
             except (TypeError, ValueError):
                 continue
-            layer_to_stage[layer_id] = stage_idx
+            observed[layer_id] = stage_idx
 
-    # Verify, do not adopt: the map above covers this rank's layers only.
-    # BlockLayoutTables raises on its own if the layer count is not divisible,
-    # and its message is the clearer one, so leave that case to it.
-    if layer_to_stage and n_layers % num_stages == 0:
+    if layer_to_stage is not None:
+        # Given map: check it against what the split actually produced. A
+        # disagreement means the names and the modules describe different
+        # pipelines, and the deltas would be routed by the wrong one.
+        for layer_id, stage_idx in sorted(observed.items()):
+            expected = layer_to_stage.get(layer_id)
+            if expected != stage_idx:
+                raise ValueError(
+                    f"layer {layer_id} sits on stage {stage_idx}, but the "
+                    f"split the caller described puts it on stage {expected}. "
+                    "The module FQNs and the stage modules disagree; the "
+                    "cross-stage cache would route block deltas to the wrong "
+                    "stages."
+                )
+    elif observed and n_layers % num_stages == 0:
+        # No map: verify the contiguous default, do not adopt what this rank
+        # happens to see -- the map above covers its own layers only.
+        # BlockLayoutTables raises on its own if the layer count is not
+        # divisible, and its message is the clearer one, so leave that to it.
         layers_per_stage = n_layers // num_stages
-        for layer_id, stage_idx in sorted(layer_to_stage.items()):
+        for layer_id, stage_idx in sorted(observed.items()):
             expected = layer_id // layers_per_stage
             if stage_idx != expected:
                 raise ValueError(
                     f"layer {layer_id} sits on stage {stage_idx}, but the "
                     f"contiguous layout this adapter assumes puts it on stage "
                     f"{expected} (n_layers={n_layers}, num_stages={num_stages}). "
-                    "A non-contiguous pipeline split is not supported: the "
-                    "cross-stage cache would route block deltas to the wrong "
-                    "stages."
+                    "A non-contiguous pipeline split is not supported unless "
+                    "the caller passes the split it used: the cross-stage cache "
+                    "would route block deltas to the wrong stages."
                 )
-    layer_to_stage = None  # type: ignore[assignment]
 
     return BlockLayoutTables(
         pp_size=pp_size,
