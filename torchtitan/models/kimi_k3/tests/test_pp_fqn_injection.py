@@ -55,7 +55,7 @@ class _TextModel(_Model):
         self.vision_encoder = None
 
 
-def _kwargs(num_layers: int):
+def _kwargs(num_layers: int, pp: int = 2):
     parallelism = SimpleNamespace(
         module_fqns_per_model_part=None,
         pipeline_parallel_first_stage_less_layers=1,
@@ -68,8 +68,15 @@ def _kwargs(num_layers: int):
     return {
         "parallelism": parallelism,
         "model_config": model_config,
-        "parallel_dims": SimpleNamespace(pp=2),
+        "parallel_dims": SimpleNamespace(pp=pp),
     }
+
+
+# DEP is on by default and splits the tower over two stages, which come out of
+# the text budget: a multimodal split needs three stages, and the schedule wants
+# the total divisible by pp_degree, so four is the smallest that runs. Text
+# models have no tower and stay at two.
+MM_PP = 4
 
 
 class TestFQNInjection(unittest.TestCase):
@@ -100,17 +107,35 @@ class TestFQNInjection(unittest.TestCase):
                 self.assertIn(root, children, f"{fqn} matches no child")
 
 
-    def test_the_vision_tower_gets_a_stage(self):
-        """Vision features are spliced into the embeddings, so the tower rides
-        with whichever stage kept the embedding. Left unnamed it is None on
-        every stage, and the first multimodal batch reports "pixel_values were
-        provided without a vision encoder"."""
-        kwargs = _kwargs(8)
+    def test_the_vision_tower_gets_its_own_stages(self):
+        """Every share names the tower, and the first one carries the embedding.
+
+        Left unnamed the tower is None on every stage and the first multimodal
+        batch reports "pixel_values were provided without a vision encoder". The
+        embedding rides with the head share because the splice needs the token
+        ids, and pipelining hands positional args to the first stage only.
+        """
+        kwargs = _kwargs(8, pp=MM_PP)
         _inject_kimi_k3_fqns(_MultimodalModel(), kwargs)
         fqns = kwargs["parallelism"].module_fqns_per_model_part
         owner = [s for s in fqns if "vision_encoder" in s]
-        self.assertEqual(len(owner), 1, "the tower must land on exactly one stage")
+        self.assertEqual(len(owner), 2, "both shares must name the tower")
+        self.assertEqual(owner, fqns[:2], "vision stages come before the text ones")
         self.assertIn("tok_embeddings", owner[0])
+        self.assertNotIn("tok_embeddings", owner[1])
+        for stage in fqns[2:]:
+            self.assertNotIn("tok_embeddings", stage)
+
+    def test_a_pipeline_too_short_for_the_tower_says_so(self):
+        """Two stages cannot hold a two-stage tower and a text stage.
+
+        Shortening the tower's share to fit would report one pipeline shape and
+        train another, and the stage count is visible in both the schedule and
+        the checkpoint layout -- so this is the error, not a warning.
+        """
+        with self.assertRaises(ValueError) as caught:
+            _inject_kimi_k3_fqns(_MultimodalModel(), _kwargs(8, pp=2))
+        self.assertIn("vit_dep_stages", str(caught.exception))
 
 
     def test_a_text_model_is_untouched_by_dep(self):

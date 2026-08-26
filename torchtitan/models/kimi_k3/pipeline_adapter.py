@@ -1189,21 +1189,21 @@ def dep_vision_stages(num_virtual_stages: int | None = None) -> int:
         return _VISION_STAGES
 
     requested = max(1, topology().vit_dep_stages)
-    # Shorten rather than raise. The default asks for two, and pp=2 -- the debug
-    # shape, and the unit tests' -- has only two stages to give: refusing to run
-    # there would make the default unusable on the smallest pipeline that has a
-    # tower at all. It is still not what the config asked for, so say so.
-    allowed = max(1, num_virtual_stages - 1)
-    if requested > allowed:
-        logger.warning(
-            "vit_dep_stages=%d leaves no text stage in a %d-stage pipeline; "
-            "the tower takes %d instead. Raise pipeline_parallel_degree to "
-            "give it the requested share.",
-            requested,
-            num_virtual_stages,
-            allowed,
+    # Raise rather than shorten. Quietly handing the tower fewer stages than the
+    # config asked for would report one pipeline shape and train another, and
+    # the stage count is visible in the schedule and in the checkpoint layout.
+    # The default of two therefore needs at least three stages, and the schedule
+    # asserts num_stages % pp_degree == 0, so the smallest pipeline that runs it
+    # is pp=4 (or pp=2 with two virtual stages per rank).
+    if requested >= num_virtual_stages:
+        raise ValueError(
+            f"vit_dep_stages={requested} leaves no text stage in a "
+            f"{num_virtual_stages}-stage pipeline. Vision stages come out of "
+            "the text budget, so this needs at least "
+            f"{requested + 1} stages: raise pipeline_parallel_degree (or the "
+            "virtual stages per rank), or set vit_dep_stages lower -- 1 keeps "
+            "the tower whole on a stage of its own."
         )
-        requested = allowed
     _VISION_STAGES = requested
     return requested
 
