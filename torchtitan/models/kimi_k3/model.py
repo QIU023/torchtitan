@@ -913,6 +913,22 @@ class KimiK3Model(Decoder):
 
         pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
         vision_embeds = self._encode_images(pixel_values, grid_thw)
+        # With the bubble runtime on, splice a detached stand-in and let the
+        # tower's backward be replayed at a planned slot instead of running
+        # inside this stage's backward. Placed before the CP-shard selection so
+        # the cut sees the tower's OWN output, not a sliced view of it --
+        # replaying a gradient into a slice would train the tower on part of its
+        # batch.
+        grad_queue = getattr(self, "_vision_grad_queue", None)
+        microbatch = getattr(self, "_dep_current_mb", None)
+        if grad_queue is not None and microbatch is not None:
+            from torchtitan.models.kimi_k3.dep_bubble_backward import (
+                cut_for_deferred_backward,
+            )
+
+            vision_embeds = cut_for_deferred_backward(
+                vision_embeds, grad_queue, microbatch
+            )
         # MoonViT collapses time and merges spatially, so the text-side token
         # count per item is (h/kh)*(w/kw), independent of t.
         kernel_h, kernel_w = self.vision_encoder.merge_kernel_size

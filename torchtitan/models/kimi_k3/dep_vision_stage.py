@@ -242,6 +242,18 @@ class KimiK3ViTStage(KimiK3Model):
             )
 
         feats = self.vision_encoder(x, grid_thw=grid, part="tail", from_block=lo)
+        # Cut the graph so the tower's backward can be replayed in a bubble, the
+        # same seam the single-stage path uses. Cut on the TAIL share: that is
+        # where the encode finishes, and cutting on head or body would replay
+        # only a prefix.
+        grad_queue = getattr(self, "_vision_grad_queue", None)
+        microbatch = getattr(self, "_dep_current_mb", None)
+        if grad_queue is not None and microbatch is not None:
+            from torchtitan.models.kimi_k3.dep_bubble_backward import (
+                cut_for_deferred_backward,
+            )
+
+            feats = cut_for_deferred_backward(feats, grad_queue, microbatch)
         num_sentinels = int(sentinel_mask.sum().item())
         if num_sentinels == 0:
             # Keep the tower in the loss graph even with nothing to splice, or
