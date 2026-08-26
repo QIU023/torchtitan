@@ -1315,7 +1315,7 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     # text stack a stage short.
     n_vit = (
         dep_vision_stages(num_virtual_stages)
-        if dep_enabled() and hasattr(model, "vision_encoder")
+        if dep_enabled() and getattr(model, "vision_encoder", None) is not None
         else 0
     )
     num_virtual_stages -= n_vit
@@ -1341,7 +1341,7 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     # features splice into the embeddings, so nothing vision-side crosses a
     # stage boundary. It must be NAMED -- core sets every child not named by
     # some stage to None. DEP is the exception and gets its own stage below.
-    if dep_enabled() and hasattr(model, "vision_encoder"):
+    if dep_enabled() and getattr(model, "vision_encoder", None) is not None:
         # DEP (report sec 5.2.3): the tower gets its own stage ahead of the text
         # stages, so its compute hides in pipeline bubbles; forward already
         # treats missing tok_embeddings as "input IS the hidden state". It rides
@@ -1364,7 +1364,7 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
         else:
             vision = [[embed, "vision_encoder"]]
         fqns = vision + fqns
-    elif hasattr(model, "vision_encoder"):
+    elif getattr(model, "vision_encoder", None) is not None:
         embed_stage = next(
             (
                 stage

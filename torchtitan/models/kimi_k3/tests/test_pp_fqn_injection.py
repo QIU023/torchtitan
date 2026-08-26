@@ -43,6 +43,18 @@ class _MultimodalModel(_Model):
         self.vision_encoder = nn.Linear(4, 4)
 
 
+class _TextModel(_Model):
+    """A text model as the real one is built: the attribute EXISTS and is None.
+
+    ``_Model`` omits it entirely, so a ``hasattr`` test passes there and fails
+    here -- which is the whole point of testing this shape separately.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.vision_encoder = None
+
+
 def _kwargs(num_layers: int):
     parallelism = SimpleNamespace(
         module_fqns_per_model_part=None,
@@ -99,6 +111,27 @@ class TestFQNInjection(unittest.TestCase):
         owner = [s for s in fqns if "vision_encoder" in s]
         self.assertEqual(len(owner), 1, "the tower must land on exactly one stage")
         self.assertIn("tok_embeddings", owner[0])
+
+
+    def test_a_text_model_is_untouched_by_dep(self):
+        """DEP is on by default, and a text model has no tower to give a stage.
+
+        The failure this pins is silent: ``vision_encoder`` is None rather than
+        absent, so a ``hasattr`` gate charged the text stack a vision stage and
+        emitted an FQN matching no child. pp=2 then trained with the embedding
+        alone on stage 0 and every layer on stage 1 -- a legal run, a wrong
+        pipeline, and nothing in the loss to show for it.
+        """
+        text, mm = _kwargs(8), _kwargs(8)
+        _inject_kimi_k3_fqns(_TextModel(), text)
+        _inject_kimi_k3_fqns(_Model(), mm)
+        fqns = text["parallelism"].module_fqns_per_model_part
+        self.assertEqual(
+            fqns,
+            mm["parallelism"].module_fqns_per_model_part,
+            "a None tower must split exactly like no tower at all",
+        )
+        self.assertNotIn("vision_encoder", [f for stage in fqns for f in stage])
 
 
 if __name__ == "__main__":
