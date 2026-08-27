@@ -40,10 +40,6 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            # Tensor parallel: declarations are in place but the forward does
-            # not yet run end to end -- the latent MoE's second input path is
-            # not named by the declaration. Paused on maintainer request.
-            ("tensor parallel", parallel_dims.tp_enabled),
 
 
         )
