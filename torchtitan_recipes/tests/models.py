@@ -326,6 +326,15 @@ def kimi_k2_5_debugmodel_seed_checkpoint() -> Trainer.Config:
     return config
 
 
+def kimi_k3_debugmodel_mm_fsdp2_ep2() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+
+    config = kimi_k3_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+
 def muse_glimmer_debugmodel_fsdp8() -> Trainer.Config:
     from torchtitan.models.muse_glimmer.config_registry import muse_glimmer_debugmodel
 
