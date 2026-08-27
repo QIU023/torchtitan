@@ -16,7 +16,7 @@ from torch.distributed.fsdp import (
     fully_shard,
     MixedPrecisionPolicy,
 )
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.tools.logging import logger
@@ -187,7 +187,21 @@ def add_zero_valued_dependency(
         output: the tensor the caller actually wants to return.
         unused_output: a tensor produced by the module being kept alive.
     """
-    return output + unused_output.sum().to(output.dtype) * 0.0
+    dep = unused_output.sum()
+    # The edge must live in ``output``'s domain: adding a plain scalar to a
+    # DTensor sends a DTensor gradient into the plain producer in backward
+    # (mixed-type add), and vice versa. The value is zeroed either way, so
+    # the wrap/unwrap only carries the graph edge, never data.
+    if isinstance(output, DTensor) and not isinstance(dep, DTensor):
+        dep = DTensor.from_local(
+            dep,
+            output.device_mesh,
+            [Replicate()] * len(output.placements),
+            run_check=False,
+        )
+    elif isinstance(dep, DTensor) and not isinstance(output, DTensor):
+        dep = dep.to_local()
+    return output + dep.to(output.dtype) * 0.0
 
 
 def apply_fsdp_to_decoder(

@@ -605,15 +605,13 @@ def clip_grad_norm_(
         Total norm of the parameter gradients (viewed as a single vector).
 
     """
-    if ep_enabled:
-        return _clip_grad_norm_with_ep(
-            parameters,
-            max_norm,
-            norm_type,
-            error_if_nonfinite,
-            foreach,
-            pp_mesh,
-        )
+    # ep_enabled needs no special path: expert params live on a mesh with an
+    # "ep" axis, so the mesh grouping below separates them from the dense
+    # params exactly as the former _clip_grad_norm_with_ep did -- same
+    # two-group combine, keyed by mesh instead of by role. Under TP with
+    # undeclared (replicated) modules the dense side itself splits into
+    # several meshes, which the role split could not represent.
+    del ep_enabled
 
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
@@ -674,9 +672,7 @@ def clip_grad_norm_(
             total_norm **= 1.0 / norm_type
 
     if len(by_mesh) <= 1:
-        torch.nn.utils.clip_grads_with_norm_(
-            parameters, max_norm, total_norm, foreach
-        )
+        torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     else:
         # Same scale for every group -- the clip is grad * (max_norm /
         # total_norm) with ONE total_norm -- so applying it group by group is
@@ -685,72 +681,4 @@ def clip_grad_norm_(
             torch.nn.utils.clip_grads_with_norm_(
                 group_params, max_norm, total_norm, foreach
             )
-    return total_norm
-
-
-@torch.no_grad()
-def _clip_grad_norm_with_ep(
-    parameters: torch.Tensor | Iterable[torch.Tensor],
-    max_norm: float,
-    norm_type: float,
-    error_if_nonfinite: bool,
-    foreach: bool | None,
-    pp_mesh: DeviceMesh | None,
-) -> torch.Tensor:
-    ep_params = []
-    non_ep_params = []
-    ep_grads = []
-    non_ep_grads = []
-
-    for p in parameters:
-        if p.grad is None:
-            continue
-        assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
-        mesh_dim_names = p.device_mesh.mesh_dim_names
-        assert mesh_dim_names is not None
-        if "ep" in mesh_dim_names:
-            ep_params.append(p)
-            ep_grads.append(p.grad)
-        else:
-            non_ep_params.append(p)
-            non_ep_grads.append(p.grad)
-
-    # Either list can be empty depending on the parallelization strategy:
-    # - In torchtitan with separate dense/sparse meshes, both lists are typically non-empty
-    # - In autoparallel, all params may live on a single sparse mesh with "ep" dimension,
-    #   so non_ep_grads would be empty
-    # - In PP + EP setups, certain PP ranks may only own EP or non-EP layers
-    ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        ep_grads, norm_type, error_if_nonfinite, foreach
-    )
-    # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
-    if isinstance(ep_grads_total_norm, DTensor):
-        ep_grads_total_norm = ep_grads_total_norm.full_tensor()
-
-    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        non_ep_grads, norm_type, error_if_nonfinite, foreach
-    )
-    # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
-    if isinstance(non_ep_grads_total_norm, DTensor):
-        non_ep_grads_total_norm = non_ep_grads_total_norm.full_tensor()
-
-    if math.isinf(norm_type):
-        total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
-    else:
-        total_norm = (
-            ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
-        )
-        total_norm **= 1.0 / norm_type
-
-    if pp_mesh is not None:
-        if math.isinf(norm_type):
-            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
-        else:
-            total_norm **= norm_type
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type
-
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
-
     return total_norm
