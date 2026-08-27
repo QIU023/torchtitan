@@ -27,6 +27,7 @@ from torchtitan.protocols.sharding import ShardingConfig
 
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import (
+    set_gqa_inner_attention_local_map,
     colwise_config,
     dense_activation_placement,
     dense_param_placement,
@@ -194,6 +195,11 @@ def _set_mla_sharding(attention_cfg) -> None:
     attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
     attention_cfg.q_norm.sharding_config = norm_config(enable_sp=False)
     attention_cfg.kv_norm.sharding_config = norm_config(enable_sp=False)
+    # The kernel boundary: FlexAttention indexes plain mask tensors, so the
+    # declared q/k/v drop to locals inside a local_map region -- the same
+    # helper qwen3_5's full-attention layers use, and the same (T, N, H)
+    # activation family.
+    set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
 
 
 def _set_kda_sharding(delta_attention_cfg) -> None:
@@ -490,6 +496,17 @@ class KimiK3Model(Decoder):
                 set_expert_parallel_sharding_config(self)
                 return
             set_decoder_sharding_config(self, enable_sp=False)
+            if enable_tp:
+                # The FINAL aggregation pair, same treatment as the per-layer
+                # ones below: both sit on the block stream, which TP does not
+                # split, and _apply_attention_residual multiplies their weights
+                # together -- one declared and one not is a mixed mul.
+                if self.output_res_norm is not None:
+                    self.output_res_norm.sharding_config = norm_config(
+                        enable_sp=False
+                    )
+                if self.output_res_proj is not None:
+                    self.output_res_proj.sharding_config = _tp_replicate_config()
             attn_x_layout = dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
             for layer in self.layers:
                 if enable_tp:
