@@ -131,6 +131,36 @@ def kimi_k3_debugmodel_text_32l_naive() -> Trainer.Config:
 
 
 
+def kimi_k3_debugmodel_k3recipe() -> Trainer.Config:
+    """The report's training recipe on the multimodal debug model.
+
+    Report sec 2.5 and 2.3.3: Muon on the matrix parameters with the per-head
+    refinement on the attention projections, AdamW on everything else, and
+    Quantile Balancing replacing the sign rule for the MoE router bias. One
+    recipe flavor rather than a knob per piece: the pieces were validated
+    together (GB200, "Muon + Quantile Balancing"), and the optimizer's
+    param-group structure has no CLI form.
+
+    Per-head tagging needs no model-config field here: the Kimi optimizer
+    container re-derives the tags from the attention modules immediately
+    before grouping, which is also what makes them survive parallelization.
+
+    Known interaction: QB's histogram update changes the op sequence between
+    forward and recompute, so selective activation checkpointing raises
+    "encountered during backward but not found in storage". Run with
+    ``activation-checkpoint:none`` until the hook gets a recompute guard;
+    verified 3 steps clean that way, loss 12.51 -> 10.52.
+    """
+    from torchtitan.components.quantile_balance import register_quantile_balancing
+
+    from torchtitan.models.kimi_k3.muon import default_muon
+
+    config = kimi_k3_debugmodel()
+    config.optimizer = default_muon()
+    config.model_spec.post_optimizer_build_fn = register_quantile_balancing
+    return config
+
+
 def kimi_k3_debugmodel_lora() -> Trainer.Config:
     """The multimodal debug model with LoRA adapters on the attention output.
 
