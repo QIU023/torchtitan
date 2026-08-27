@@ -1507,7 +1507,12 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     # first and unconditionally under DEP -- patching it here too would wrap
     # forward_one_chunk twice.
     for stage in _iter_schedule_stages(pp_schedule):
-        if not isinstance(getattr(stage, "submod", None), KimiK3ViTStage):
+        submod = getattr(stage, "submod", None)
+        # Holds a tower, rather than is a particular class: with the tower on
+        # ONE stage the folded layout never constructs KimiK3ViTStage, so a
+        # type-keyed confirmation stayed silent on exactly the runs it was
+        # meant to confirm -- "installed" and "not installed" read the same.
+        if not (isinstance(submod, KimiK3ViTStage) or _holds_vision_tower(submod)):
             continue
         logger.info(
             "DEP vision prefetch installed: depth=%d on stage %s",

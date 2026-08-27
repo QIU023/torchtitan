@@ -912,7 +912,23 @@ class KimiK3Model(Decoder):
             raise ValueError("special_tokens are required for multimodal inputs.")
 
         pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
-        vision_embeds = self._encode_images(pixel_values, grid_thw)
+        # DEP run-ahead: take this micro-batch's features if a previous action
+        # already encoded them on the vision stream, and start the next ones.
+        # The depth is a mesh property (micro-batch count), never a data one,
+        # so every rank issues the same encodes in the same order. This read is
+        # the prefetcher's ONLY consumer: installing it without this line is
+        # silent, which is how it shipped inert.
+        prefetcher = getattr(self, "_vision_prefetcher", None)
+        microbatch_idx = getattr(self, "_dep_current_mb", None)
+        vision_embeds = None
+        if prefetcher is not None and microbatch_idx is not None:
+            vision_embeds = prefetcher.take(microbatch_idx)
+        if vision_embeds is None:
+            vision_embeds = self._encode_images(pixel_values, grid_thw)
+        if prefetcher is not None and microbatch_idx is not None:
+            from torchtitan.models.kimi_k3.vit_prefetch import prefetch_depth
+
+            prefetcher.advance(microbatch_idx, prefetch_depth())
         # With the bubble runtime on, splice a detached stand-in and let the
         # tower's backward be replayed at a planned slot instead of running
         # inside this stage's backward. Placed before the CP-shard selection so
