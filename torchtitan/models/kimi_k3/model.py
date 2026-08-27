@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 from torch import nn
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
@@ -976,6 +976,21 @@ class KimiK3Model(Decoder):
             num_tokens_per_item,
             special_tokens["image_id"],
         )
+        if isinstance(embeddings_TD, DTensor) and not isinstance(
+            vision_embeds, DTensor
+        ):
+            # Under TP the embedding's output is a DTensor while the tower --
+            # replicated, hence undeclared and inert -- returns a plain tensor,
+            # and the splice's copy_ refuses the mix. The tower's output IS
+            # Replicate-consistent across the mesh (replicated weights, same
+            # pixels on every rank), so saying so is a wrap, not a transfer.
+            # from_local's backward hands back the local gradient, which is
+            # what a replicated consumer produces.
+            vision_embeds = DTensor.from_local(
+                vision_embeds,
+                embeddings_TD.device_mesh,
+                [Replicate()] * len(embeddings_TD.placements),
+            )
         return scatter_vision_embeds(
             embeddings_TD,
             vision_embeds=vision_embeds,
