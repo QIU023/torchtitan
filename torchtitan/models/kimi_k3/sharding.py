@@ -27,6 +27,8 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 
 from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
+from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
+from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.common.attention import (
     create_attention_mask,
     get_causal_mask_mod,
@@ -273,9 +275,6 @@ def set_expert_parallel_sharding_config(config) -> None:
     model.py -- with TP on, tp becomes a token axis inside the MoE region and
     the two cannot be declared independently.
     """
-    from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
-    from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-
     set_decoder_sharding_config(config, enable_sp=False)
     for layer in config.layers:
         if layer.moe is not None:
