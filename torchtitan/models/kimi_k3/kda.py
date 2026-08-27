@@ -12,9 +12,11 @@ import torch
 import torch.nn.functional as F
 from fla.ops.kda import chunk_kda
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.kimi_k3.dtensor_ops import to_local_if_dtensor
 from torchtitan.protocols.module import Module
 
 # Shape suffixes:
@@ -159,15 +161,22 @@ class KimiDeltaAttention(Module):
         )
         beta_TH = self.beta(x_TD).float()
 
+        # The kernel is fla triton and does not dispatch through DTensor: under
+        # TP these arrive wrapped and it fails illegibly, so unwrap at the call
+        # site and re-wrap the result to the module's declared output layout.
         out_THV = self.kernel(
-            q_THK.unsqueeze(0),
-            k_THK.unsqueeze(0),
-            v_THV.unsqueeze(0),
-            forget_THK.unsqueeze(0),
-            beta_TH.unsqueeze(0),
-            self.A_log,
-            self.dt_bias,
+            to_local_if_dtensor(q_THK).unsqueeze(0),
+            to_local_if_dtensor(k_THK).unsqueeze(0),
+            to_local_if_dtensor(v_THV).unsqueeze(0),
+            to_local_if_dtensor(forget_THK).unsqueeze(0),
+            to_local_if_dtensor(beta_TH).unsqueeze(0),
+            to_local_if_dtensor(self.A_log),
+            to_local_if_dtensor(self.dt_bias),
         ).squeeze(0)
+        if isinstance(q_THK, DTensor):
+            out_THV = DTensor.from_local(
+                out_THV, q_THK.device_mesh, q_THK.placements, run_check=False
+            )
         output_gate_THV = self.output_gate(x_TD).view(
             num_tokens, self.num_heads, self.head_dim
         )

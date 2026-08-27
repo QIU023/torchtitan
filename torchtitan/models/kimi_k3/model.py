@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 
@@ -28,6 +29,7 @@ from torchtitan.protocols.module import Module
 
 from .kda import KimiDeltaAttention
 from .moe import KimiFeedForward, KimiLatentMoE
+from .sharding import set_tensor_parallel_sharding_config
 from .vision_encoder import KimiK3VisionEncoder
 
 # Shape suffixes:
@@ -273,6 +275,8 @@ class KimiK3Model(Decoder):
             # and KDA recurrent states at document boundaries.
             if isinstance(dataset, MMSamplePackingConfig):
                 raise ValueError("Kimi K3 does not yet support sample packing.")
+            if config.parallelism.tensor_parallel_degree > 1:
+                set_tensor_parallel_sharding_config(self)
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
@@ -339,6 +343,21 @@ class KimiK3Model(Decoder):
             num_tokens_per_item,
             special_tokens["image_id"],
         )
+        if isinstance(embeddings_TD, DTensor) and not isinstance(
+            vision_embeds, DTensor
+        ):
+            # Under TP the embedding's output is a DTensor while the tower --
+            # replicated, hence undeclared and inert -- returns a plain tensor,
+            # and the splice's copy_ refuses the mix. The tower's output IS
+            # Replicate-consistent across the mesh (replicated weights, same
+            # pixels on every rank), so saying so is a wrap, not a transfer.
+            # from_local's backward hands back the local gradient, which is
+            # what a replicated consumer produces.
+            vision_embeds = DTensor.from_local(
+                vision_embeds,
+                embeddings_TD.device_mesh,
+                [Replicate()] * len(embeddings_TD.placements),
+            )
         return scatter_vision_embeds(
             embeddings_TD,
             vision_embeds=vision_embeds,

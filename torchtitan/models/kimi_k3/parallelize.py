@@ -36,7 +36,6 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
             ("context parallel", parallel_dims.cp_enabled),
             ("expert parallel", parallel_dims.ep_enabled),
@@ -62,6 +61,9 @@ def parallelize_kimi_k3(
     dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
 
     assert isinstance(model, KimiK3Model)
+    if parallel_dims.tp_enabled:
+        model.parallelize(parallel_dims)
+
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
         ac_policy.apply(model)
