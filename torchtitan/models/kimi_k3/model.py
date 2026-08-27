@@ -925,6 +925,11 @@ class KimiK3Model(Decoder):
             vision_embeds = prefetcher.take(microbatch_idx)
         if vision_embeds is None:
             vision_embeds = self._encode_images(pixel_values, grid_thw)
+        elif isinstance(vision_embeds, list):
+            # The prefetcher stores per-image feature lists, the reference
+            # layout's convention; this layout's splice takes the concatenated
+            # stream. Same cat the reference consumer performs.
+            vision_embeds = torch.cat(vision_embeds, dim=0)
         if prefetcher is not None and microbatch_idx is not None:
             from torchtitan.models.kimi_k3.vit_prefetch import prefetch_depth
 
