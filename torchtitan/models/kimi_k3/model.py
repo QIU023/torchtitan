@@ -984,6 +984,15 @@ class KimiK3Model(Decoder):
             local_mask = tokens == special_tokens["image_id"]
             counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
             mine = self._select_cp_shard(vision_embeds, counts)
+            if isinstance(embeddings_TD, DTensor) and not isinstance(mine, DTensor):
+                # Same lift as the non-CP splice below: under TP the embedding
+                # stream is a DTensor and the tower's slice is plain, and
+                # masked_scatter refuses the mix. Replicate-consistent for the
+                # same reason -- replicated tower, same pixels everywhere.
+                mesh = embeddings_TD.device_mesh
+                reps = [Replicate()] * len(embeddings_TD.placements)
+                mine = DTensor.from_local(mine, mesh, reps)
+                local_mask = DTensor.from_local(local_mask, mesh, reps)
             embeddings_TD = embeddings_TD.masked_scatter(
                 local_mask.unsqueeze(-1), mine.to(embeddings_TD.dtype)
             )
