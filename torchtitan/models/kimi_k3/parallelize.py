@@ -37,14 +37,7 @@ def parallelize_kimi_k3(
 ) -> nn.Module:
     """Apply FSDP2 to the Kimi K3 decoder and vision encoder."""
 
-    unsupported_parallelisms = [
-        name
-        for name, enabled in (
-
-
-        )
-        if enabled
-    ]
+    unsupported_parallelisms = [name for name, enabled in () if enabled]
     if unsupported_parallelisms:
         raise NotImplementedError(
             "Kimi K3 currently supports FSDP2 data parallelism "
@@ -175,6 +168,12 @@ def apply_cp_kimi_k3(
     for module in kda_modules:
         module._cp_group = cp_group
     if num_mla + len(kda_modules) == 0:
+        if any(getattr(m, "vision_encoder", None) is not None for m in model.modules()):
+            # A DEP vision stage: the chunk holds the tower and no decoder
+            # layer, so there is nothing to wire and nothing wrong. The raise
+            # below is for a text chunk, where zero attention layers means the
+            # walk missed them.
+            return
         raise ValueError(
             "context parallel is enabled but no attention layer was found to "
             "wire it onto."

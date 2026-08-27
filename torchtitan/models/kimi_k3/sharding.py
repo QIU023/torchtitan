@@ -25,15 +25,20 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
-from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
-from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.common.attention import (
     create_attention_mask,
     get_causal_mask_mod,
 )
-from torchtitan.models.kimi_k3.dtensor_ops import to_local_partial_grad
+from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
+from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+
+from torchtitan.models.kimi_k3.dtensor_ops import (
+    to_local_if_dtensor,
+    to_local_partial_grad,
+)
 
 
 __all__ = [
@@ -218,6 +223,20 @@ def mla_ulysses_attention(
     * Shape suffixes beyond the legend: L local sequence (T/cp), G this rank's
       head count, W packed channel width, R rotary width.
     """
+    # The two all-to-alls are raw functional collectives with no DTensor
+    # sharding strategy, so under TP the stream drops to locals here and the
+    # output re-wraps on the way out. The activations are head-sharded on the
+    # TP axis: each rank's local gradient is its own shard's gradient, so
+    # ``to_local``'s default grad placement (same as forward) is correct.
+    # Unwrap BEFORE the shape reads -- a DTensor reports its GLOBAL head
+    # count, which would inflate ``h_cp``.
+    stream_placements = None
+    if isinstance(q_LHQ, DTensor):
+        stream_mesh = q_LHQ.device_mesh
+        stream_placements = q_LHQ.placements
+        q_LHQ = q_LHQ.to_local()
+        kv_LHC = to_local_if_dtensor(kv_LHC)
+
     cp_size = dist.get_world_size(cp_group)
     t_loc = q_LHQ.shape[0]
     t_full = t_loc * cp_size
@@ -261,9 +280,19 @@ def mla_ulysses_attention(
         scale=attn.scale,
     )
     out_src_dim, out_dst_dim = ULYSSES.out_dims()
-    return cp_all_to_all_headseq(
-        out_TGV.contiguous(), cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
+    # inner_attention runs under local_map, which re-wraps its output as a
+    # DTensor -- drop it back to locals for the return all-to-all.
+    out_LHV = cp_all_to_all_headseq(
+        to_local_if_dtensor(out_TGV).contiguous(),
+        cp_group,
+        src_dim=out_src_dim,
+        dst_dim=out_dst_dim,
     )
+    if stream_placements is not None:
+        out_LHV = DTensor.from_local(
+            out_LHV, stream_mesh, stream_placements, run_check=False
+        )
+    return out_LHV
 
 
 def set_expert_parallel_sharding_config(config) -> None:

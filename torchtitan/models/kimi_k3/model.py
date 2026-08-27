@@ -6,28 +6,27 @@
 
 from dataclasses import dataclass, field
 
+import spmd_types as spmd
+
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, Replicate
 from torch import nn
-
-from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.distributed.fsdp import add_zero_valued_dependency
+
+from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
+
+from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexAttention,
 )
-import spmd_types as spmd
-
-from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
-from torchtitan.protocols.sharding import ShardingConfig
 
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import (
-    set_gqa_inner_attention_local_map,
     colwise_config,
     dense_activation_placement,
     dense_param_placement,
@@ -35,6 +34,7 @@ from torchtitan.models.common.decoder_sharding import (
     rowwise_config,
     set_decoder_sharding_config,
     set_dense_ffn_sharding,
+    set_gqa_inner_attention_local_map,
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.common.multimodal import (
@@ -42,13 +42,15 @@ from torchtitan.models.common.multimodal import (
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.kimi_k3.dtensor_ops import to_local_if_dtensor
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
+from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
 
 from .kda import KimiDeltaAttention
-from .sharding import mla_ulysses_attention, set_expert_parallel_sharding_config
 from .moe import KimiFeedForward, KimiLatentMoE
+from .sharding import mla_ulysses_attention, set_expert_parallel_sharding_config
 from .vision_encoder import KimiK3VisionEncoder
 
 # Shape suffixes: T = packed tokens, D = model dimension, H = heads,
@@ -147,9 +149,7 @@ class KimiMLAAttention(BaseAttention):
 
         cp_group = self._cp_group
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            out_THV = mla_ulysses_attention(
-                self, q_THK, kv_THC, k_rope_TK, cp_group
-            )
+            out_THV = mla_ulysses_attention(self, q_THK, kv_THC, k_rope_TK, cp_group)
         else:
             out_THV = self.inner_attention(
                 q_THK,
@@ -174,9 +174,7 @@ def _tp_replicate_config() -> ShardingConfig:
     ``rowwise_config`` leave those boundaries None for the same reason; this is
     the replicated member of that family, which core does not have.
     """
-    return ShardingConfig(
-        state_shardings={"weight": dense_param_placement(tp=spmd.R)}
-    )
+    return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
 def _set_mla_sharding(attention_cfg) -> None:
@@ -222,9 +220,7 @@ def _set_kda_sharding(delta_attention_cfg) -> None:
         "output_gate",
         "output_proj",
     ):
-        getattr(delta_attention_cfg, name).sharding_config = (
-            _tp_replicate_config()
-        )
+        getattr(delta_attention_cfg, name).sharding_config = _tp_replicate_config()
     delta_attention_cfg.output_norm.sharding_config = norm_config(enable_sp=False)
     # A_log and dt_bias are the module's OWN parameters, so only a
     # module-level declaration reaches them.
@@ -234,6 +230,7 @@ def _set_kda_sharding(delta_attention_cfg) -> None:
             "dt_bias": SpmdLayout({MeshAxisName.DP: spmd.R, MeshAxisName.TP: spmd.I}),
         }
     )
+
 
 def _apply_attention_residual(
     prefix_sum_TD: torch.Tensor,
@@ -444,7 +441,6 @@ class KimiK3Model(Decoder):
         dep_max_grid_h: int = 64
         dep_max_grid_w: int = 64
 
-
         def _validate_cp_backend(self, parallelism) -> None:
             """This model's CP is not ShardingConfig-driven -- the KDA kernels
             are fla triton and never see a DTensor -- so the spmd_types
@@ -502,9 +498,7 @@ class KimiK3Model(Decoder):
                 # split, and _apply_attention_residual multiplies their weights
                 # together -- one declared and one not is a mixed mul.
                 if self.output_res_norm is not None:
-                    self.output_res_norm.sharding_config = norm_config(
-                        enable_sp=False
-                    )
+                    self.output_res_norm.sharding_config = norm_config(enable_sp=False)
                 if self.output_res_proj is not None:
                     self.output_res_proj.sharding_config = _tp_replicate_config()
             attn_x_layout = dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
@@ -541,22 +535,23 @@ class KimiK3Model(Decoder):
                         # The latent pair is Kimi's addition to core's MoE, so
                         # set_moe_sharding_config does not know it. It stays
                         # whole: it compresses to a rank, not heads or experts.
-                        layer.moe.routed_down.sharding_config = (
-                            _tp_replicate_config()
-                        )
-                        layer.moe.routed_up.sharding_config = (
-                            _tp_replicate_config()
-                        )
+                        layer.moe.routed_down.sharding_config = _tp_replicate_config()
+                        layer.moe.routed_up.sharding_config = _tp_replicate_config()
+                        # The latent trio sits INSIDE the MoE region: under
+                        # ep+tp that region runs sequence-parallel (see
+                        # enable_sp below), so the norm's boundary must follow
+                        # the internal layout, not the Replicate stream.
                         layer.moe.routed_norm.sharding_config = norm_config(
-                            enable_sp=False
+                            enable_sp=enable_ep
                         )
                     set_moe_sharding_config(
                         layer.moe,
                         enable_ep=enable_ep,
-                        # Not a constant: with EP on, tp becomes a token axis
-                        # inside the MoE region (the sparse mesh folds it into
-                        # efsdp), so SP must be declared when both are on or
-                        # DTensor rejects S(1) -> P(sum).
+                        # SP for the INTERNALS: without it the routed path
+                        # dies redistributing S(0) to P(sum), exactly as the
+                        # original note warned. The boundary assertions are
+                        # overridden just below, because the arriving stream
+                        # is Replicate -- one flag cannot say both.
                         enable_sp=enable_ep and enable_tp,
                         expert_param_layout={
                             "w1_EFD": spmd.S(1),
@@ -564,6 +559,16 @@ class KimiK3Model(Decoder):
                             "w3_EFD": spmd.S(1),
                         },
                     )
+                    if enable_ep and enable_tp:
+                        # The stream ARRIVES Replicate and must LEAVE Replicate
+                        # (no SP anywhere else in this model's declaration);
+                        # inside, ep+tp wants the sequence-sharded layout. src
+                        # and dst carry that difference: redistribute in at the
+                        # boundary, redistribute back out.
+                        stream = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+                        cfg = layer.moe.sharding_config
+                        cfg.in_src_shardings["x_TD"] = stream
+                        cfg.out_dst_shardings = stream
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
@@ -600,7 +605,6 @@ class KimiK3Model(Decoder):
         self.dynamic_cp_min_patches = config.dynamic_cp_min_patches
         self._dyncp_logged = False
 
-
     def _tower_needs_collectives(self) -> bool:
         """Is the tower wrapped in something that issues per-forward collectives?
 
@@ -634,7 +638,6 @@ class KimiK3Model(Decoder):
 
     def _device(self) -> torch.device:
         return next(self.parameters()).device
-
 
     def encode_images(self, pixel_values, grid_thw):
         """Public entry the DEP prefetcher calls.
@@ -780,24 +783,30 @@ class KimiK3Model(Decoder):
         group_all = self._cp_group
         cp_size = dist.get_world_size(group_all) if group_all is not None else 1
         if not subgroups or cp_size <= 1:
-            return torch.cat([_replicated(list(range(len(counts))))[i]
-                              for i in range(len(counts))], dim=0)
+            return torch.cat(
+                [_replicated(list(range(len(counts))))[i] for i in range(len(counts))],
+                dim=0,
+            )
 
         large = classify(counts, cp_size, min_patches=self.dynamic_cp_min_patches)
         # Grid heights must divide the merge kernel for a partition to be legal.
         # An image that fails it is left replicated instead of being cut unsafely.
         large = [i for i in large if grids[i][1] % kh == 0]
         if not large:
-            return torch.cat([_replicated(list(range(len(counts))))[i]
-                              for i in range(len(counts))], dim=0)
+            return torch.cat(
+                [_replicated(list(range(len(counts))))[i] for i in range(len(counts))],
+                dim=0,
+            )
 
         n_sub, g = subgroup_layout(len(large), cp_size)
         group = subgroups.get(n_sub)
         if group is None or g <= 1:
             # No usable sub-group of size > 1 means there is nothing to partition
             # across.
-            return torch.cat([_replicated(list(range(len(counts))))[i]
-                              for i in range(len(counts))], dim=0)
+            return torch.cat(
+                [_replicated(list(range(len(counts))))[i] for i in range(len(counts))],
+                dim=0,
+            )
 
         cp_rank = dist.get_rank(group_all)
         my_sub = cp_rank // g
@@ -810,7 +819,11 @@ class KimiK3Model(Decoder):
             logger.info(
                 "Dynamic CP: %d large image(s) of %d over %d sub-CP group(s) of "
                 "%d rank(s); min_patches=%d.",
-                len(large), len(counts), n_sub, g, self.dynamic_cp_min_patches,
+                len(large),
+                len(counts),
+                n_sub,
+                g,
+                self.dynamic_cp_min_patches,
             )
 
         out: dict[int, torch.Tensor] = {}
@@ -860,9 +873,7 @@ class KimiK3Model(Decoder):
                 for a, b in sh.ranges:
                     pieces.append(flat[a:b])
                     if pad_rows:
-                        pieces.append(
-                            flat.new_zeros(pad_rows * w, *flat.shape[1:])
-                        )
+                        pieces.append(flat.new_zeros(pad_rows * w, *flat.shape[1:]))
                 local = torch.cat(pieces, dim=0)
                 local_grid = torch.tensor(
                     [[t, band, w]], dtype=grid_thw.dtype, device=grid_thw.device
@@ -983,19 +994,29 @@ class KimiK3Model(Decoder):
             # get_vision_positions needs whole visual items, which a shard lacks.
             local_mask = tokens == special_tokens["image_id"]
             counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
-            mine = self._select_cp_shard(vision_embeds, counts)
-            if isinstance(embeddings_TD, DTensor) and not isinstance(mine, DTensor):
-                # Same lift as the non-CP splice below: under TP the embedding
-                # stream is a DTensor and the tower's slice is plain, and
-                # masked_scatter refuses the mix. Replicate-consistent for the
-                # same reason -- replicated tower, same pixels everywhere.
+            # The shard is spliced on LOCALS below, so its gradient arrives
+            # plain -- slicing a DTensor here would mix the two in
+            # SliceBackward. Every TP rank splices the same Replicate data,
+            # so to_local's default grad placement (same as forward) holds.
+            mine = self._select_cp_shard(to_local_if_dtensor(vision_embeds), counts)
+            if isinstance(embeddings_TD, DTensor):
+                # DTensor has no sharding strategy for masked_scatter at all
+                # (lifting both operands just moves the failure into the op),
+                # so the splice runs on locals. The stream is Replicate under
+                # this TP scheme and the tower's slice is replicate-consistent,
+                # so to_local/from_local is a balanced pair and to_local's
+                # default Replicate grad placement is the right one.
                 mesh = embeddings_TD.device_mesh
-                reps = [Replicate()] * len(embeddings_TD.placements)
-                mine = DTensor.from_local(mine, mesh, reps)
-                local_mask = DTensor.from_local(local_mask, mesh, reps)
-            embeddings_TD = embeddings_TD.masked_scatter(
-                local_mask.unsqueeze(-1), mine.to(embeddings_TD.dtype)
-            )
+                placements = embeddings_TD.placements
+                local_TD = embeddings_TD.to_local()
+                local_TD = local_TD.masked_scatter(
+                    local_mask.unsqueeze(-1), mine.to(local_TD.dtype)
+                )
+                embeddings_TD = DTensor.from_local(local_TD, mesh, placements)
+            else:
+                embeddings_TD = embeddings_TD.masked_scatter(
+                    local_mask.unsqueeze(-1), mine.to(embeddings_TD.dtype)
+                )
             return add_zero_valued_dependency(embeddings_TD, vision_embeds)
         vision_positions = get_vision_positions(
             tokens,

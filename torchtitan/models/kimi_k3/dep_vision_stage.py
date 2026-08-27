@@ -14,6 +14,7 @@ class adapted to the Config-tree model.
 """
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.tools.logging import logger
@@ -201,8 +202,10 @@ class KimiK3ViTStage(KimiK3Model):
         three parameters carry the patch stream, the text embeddings and the
         sentinel mask here -- not ids, pixels and grid.
         """
-        from torchtitan.models.kimi_k3.vit_cp_plan import unpack_stage_patches
-        from torchtitan.models.kimi_k3.vit_cp_plan import pack_stage_patches
+        from torchtitan.models.kimi_k3.vit_cp_plan import (
+            pack_stage_patches,
+            unpack_stage_patches,
+        )
 
         self._dep_reject_cp()
         lo, hi = self._dep_bounds
@@ -260,19 +263,31 @@ class KimiK3ViTStage(KimiK3Model):
             # this rank skips a gradient reduction its peers issue.
             from torchtitan.distributed.fsdp import add_zero_valued_dependency
 
-            return self._dep_tail_output(
-                add_zero_valued_dependency(text_embeds, feats)
-            )
+            return self._dep_tail_output(add_zero_valued_dependency(text_embeds, feats))
         if num_sentinels != feats.size(0):
             raise ValueError(
                 f"{num_sentinels} sentinel(s) but {feats.size(0)} visual token(s): "
                 "a tower split across stages supports only the per-token collator "
                 "convention, where the sequence length is already correct"
             )
-        mask = (sentinel_mask > 0.5).unsqueeze(-1).expand_as(text_embeds)
-        return self._dep_tail_output(
-            text_embeds.masked_scatter(mask, feats.to(text_embeds.dtype))
-        )
+        mask_T1 = (sentinel_mask > 0.5).unsqueeze(-1)
+        if isinstance(text_embeds, DTensor):
+            # Under TP the text stream is a DTensor while the tower's features
+            # are plain, and masked_scatter has no DTensor sharding strategy:
+            # splice on locals, balanced to_local/from_local pair (same
+            # convention as the non-PP splice in model.py).
+            mesh = text_embeds.device_mesh
+            placements = text_embeds.placements
+            local_TD = text_embeds.to_local(grad_placements=placements)
+            local_TD = local_TD.masked_scatter(
+                mask_T1.expand_as(local_TD), feats.to(local_TD.dtype)
+            )
+            spliced_TD = DTensor.from_local(local_TD, mesh, placements, run_check=False)
+        else:
+            spliced_TD = text_embeds.masked_scatter(
+                mask_T1.expand_as(text_embeds), feats.to(text_embeds.dtype)
+            )
+        return self._dep_tail_output(spliced_TD)
 
     def forward(self, *args, **kwargs):
         """Dispatch on the role. Untyped ``*args`` for one specific reason.

@@ -11,9 +11,9 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 from fla.ops.kda import chunk_kda
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import AttentionMasksType
@@ -101,14 +101,25 @@ def conv_with_halo(conv, x_local, cp_context, activation: str | None = None):
     ``causal_conv1d_cp`` exchanges the previous rank's tail as a fixed-size
     halo. ``activation`` defaults to ``conv.activation`` (fla's
     ``ShortConvolution`` carries one; a plain ``nn.Conv1d`` does not). The
-    weight and bias unwrap to local first: under TP they are
-    DTensor(Replicate), and fla's kernel dies illegibly on a DTensor."""
+    input, weight and bias unwrap to local first: under TP they arrive as
+    DTensor (Replicate on the TP axis), and while aten ops tolerate that by
+    implicit replication, the halo exchange's raw ``c10d._allgather_base_``
+    refuses to mix DTensor and plain tensors -- and fla's triton kernel dies
+    illegibly on a DTensor anyway. The compute is TP-invariant (replicated
+    weights, identical per-rank math), so the local gradient IS the full
+    gradient: ``grad_placements`` matches the input placements, and the
+    output re-wraps to the same layout."""
     from einops import rearrange
     from fla.modules.conv.cp.ops import causal_conv1d_cp
 
     weight = to_local_if_dtensor(conv.weight)
     bias = conv.bias if conv.bias is None else to_local_if_dtensor(conv.bias)
-    return causal_conv1d_cp(
+    in_placements = None
+    if isinstance(x_local, DTensor):
+        in_mesh = x_local.device_mesh
+        in_placements = x_local.placements
+        x_local = x_local.to_local(grad_placements=in_placements)
+    y = causal_conv1d_cp(
         x=x_local,
         weight=rearrange(weight, "d 1 w -> d w"),
         bias=bias,
@@ -117,6 +128,9 @@ def conv_with_halo(conv, x_local, cp_context, activation: str | None = None):
         else activation,
         cp_context=cp_context,
     )
+    if in_placements is not None:
+        y = DTensor.from_local(y, in_mesh, in_placements, run_check=False)
+    return y
 
 
 def build_kcp_context(
@@ -203,7 +217,6 @@ class KimiDeltaAttention(Module):
             raise NotImplementedError(
                 "Kimi K3 reference KDA does not support packed-document masks."
             )
-
         cp_group = self._cp_group
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
             return self._forward_kcp(x_TD, cp_group)
@@ -291,16 +304,23 @@ class KimiDeltaAttention(Module):
         )
         beta_TH = self.beta(x_TD).float()
 
+        # Same unwrap/re-wrap pair as the flat path's kernel call: the chunk
+        # kernel is fla triton, and its KCP state exchange is a raw c10d
+        # all-gather -- neither may see a DTensor.
         out_THV = self.kernel(
-            q_THK.unsqueeze(0),
-            k_THK.unsqueeze(0),
-            v_THV.unsqueeze(0),
-            forget_THK.unsqueeze(0),
-            beta_TH.unsqueeze(0),
-            self.A_log,
-            self.dt_bias,
+            to_local_if_dtensor(q_THK).unsqueeze(0),
+            to_local_if_dtensor(k_THK).unsqueeze(0),
+            to_local_if_dtensor(v_THV).unsqueeze(0),
+            to_local_if_dtensor(forget_THK).unsqueeze(0),
+            to_local_if_dtensor(beta_TH).unsqueeze(0),
+            to_local_if_dtensor(self.A_log),
+            to_local_if_dtensor(self.dt_bias),
             cp_context=ctx,
         ).squeeze(0)
+        if isinstance(q_THK, DTensor):
+            out_THV = DTensor.from_local(
+                out_THV, q_THK.device_mesh, q_THK.placements, run_check=False
+            )
         output_gate_THV = self.output_gate(x_TD).view(
             t_loc, self.num_heads, self.head_dim
         )
