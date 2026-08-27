@@ -145,11 +145,6 @@ def kimi_k3_debugmodel_k3recipe() -> Trainer.Config:
     container re-derives the tags from the attention modules immediately
     before grouping, which is also what makes them survive parallelization.
 
-    Known interaction: QB's histogram update changes the op sequence between
-    forward and recompute, so selective activation checkpointing raises
-    "encountered during backward but not found in storage". Run with
-    ``activation-checkpoint:none`` until the hook gets a recompute guard;
-    verified 3 steps clean that way, loss 12.51 -> 10.52.
     """
     from torchtitan.components.quantile_balance import register_quantile_balancing
 

@@ -265,6 +265,17 @@ class QuantileBalancer:
             key = id(moe)
             self._moes[key] = moe
             self._top_k[key] = moe.router.top_k
+            # Allocated HERE, not lazily in the hook: a first-call branch means
+            # the hook runs different ops on the first forward than on an
+            # activation-checkpoint recompute of it, and selective AC then dies
+            # with "encountered during backward but not found in storage". With
+            # the buffer pre-allocated the hook is one add_ every pass.
+            self._counts[key] = torch.zeros(
+                moe.expert_bias_E.numel(),
+                self.num_bins,
+                dtype=torch.int32,
+                device=moe.expert_bias_E.device,
+            )
             self._handles.append(moe.router.register_forward_hook(self._make_hook(key)))
 
     @staticmethod
@@ -303,15 +314,19 @@ class QuantileBalancer:
                     lo=self.lo,
                     hi=self.hi,
                 ).to(torch.int32)
-                prev = self._counts.get(key)
-                self._counts[key] = counts if prev is None else prev + counts
+                self._counts[key].add_(counts)
+            # Python state, not a tensor op, so it cannot desynchronise the
+            # checkpoint op sequence. A recompute re-adds the same counts; the
+            # histogram scales uniformly and quantile boundaries are rank
+            # fractions, invariant under that scaling.
+            self._armed = True
 
         return hook
 
     @torch.no_grad()
     def step(self) -> None:
         """Solve for and install each layer's bias. Call once per optimizer step."""
-        if not self._counts:
+        if not getattr(self, "_armed", False):
             return  # no forward ran since the last step (e.g. step 0 resume)
         import torch.distributed as dist
 
@@ -337,7 +352,7 @@ class QuantileBalancer:
             stacked = torch.stack([self._counts[k] for k in keys])
             dist.all_reduce(stacked, group=self.loss_group, op=dist.ReduceOp.SUM)
             for i, key in enumerate(keys):
-                self._counts[key] = stacked[i]
+                self._counts[key].copy_(stacked[i])
 
         for key, counts in self._counts.items():
             bias = quantile_balance_bias_histogram(
@@ -348,7 +363,11 @@ class QuantileBalancer:
                 target.to_local().copy_(bias.to(target.dtype))
             else:
                 target.copy_(bias.to(target.dtype))
-        self._counts.clear()
+        # Zero in place rather than clear: the hook must find the same
+        # buffer on every pass to stay branch-free under recompute.
+        for counts in self._counts.values():
+            counts.zero_()
+        self._armed = False
 
     def remove(self) -> None:
         for h in self._handles:
