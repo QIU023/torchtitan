@@ -262,3 +262,30 @@ def mla_ulysses_attention(
     return cp_all_to_all_headseq(
         out_TGV.contiguous(), cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
     )
+
+
+def set_expert_parallel_sharding_config(config) -> None:
+    """Declare the sharding expert parallel acts on, with TP off.
+
+    Shared with the EP review branch verbatim: the routed experts shard on the
+    expert axis and the decoder-level distribution makes the activations at the
+    MoE boundary redistributable. The combined ep+tp declaration stays inline in
+    model.py -- with TP on, tp becomes a token axis inside the MoE region and
+    the two cannot be declared independently.
+    """
+    from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
+    from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+
+    set_decoder_sharding_config(config, enable_sp=False)
+    for layer in config.layers:
+        if layer.moe is not None:
+            set_moe_sharding_config(
+                layer.moe,
+                enable_ep=True,
+                enable_sp=False,
+                expert_param_layout={
+                    "w1_EFD": spmd.S(1),
+                    "w2_EDF": spmd.S(2),
+                    "w3_EFD": spmd.S(1),
+                },
+            )

@@ -485,6 +485,15 @@ class KimiK3Model(Decoder):
             """
             if not (enable_ep or enable_tp):
                 return
+            if enable_ep and not enable_tp:
+                # The EP-only declaration is shared with the EP review branch;
+                # see sharding.set_expert_parallel_sharding_config.
+                from torchtitan.models.kimi_k3.sharding import (
+                    set_expert_parallel_sharding_config,
+                )
+
+                set_expert_parallel_sharding_config(self)
+                return
             set_decoder_sharding_config(self, enable_sp=False)
             attn_x_layout = dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
             for layer in self.layers:
