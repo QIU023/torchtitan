@@ -12,14 +12,13 @@ import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.models.common import Conv1d, Embedding, Linear
-from torchtitan.models.common.config_utils import get_attention_config
+from torchtitan.models.common.config_utils import (
+    get_attention_config,
+    make_token_dispatcher_config,
+)
 from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.nn_modules import GELU, RMSNorm
-from torchtitan.models.common.config_utils import make_token_dispatcher_config
-from torchtitan.models.common.vision_encoder import (
-    VisionMLP,
-    VisionTransformerBlock,
-)
+from torchtitan.models.common.vision_encoder import VisionMLP, VisionTransformerBlock
 from torchtitan.models.kimi_k2_7.vision_encoder import VisionRotaryEmbedding2D
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
@@ -28,6 +27,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .kda import KimiDeltaAttention, KimiKDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
+from .moon_ep_dispatcher import MoonEPTokenDispatcher
 from .parallelize import parallelize_kimi_k3
 from .pipeline_adapter import pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
@@ -255,11 +255,22 @@ def _latent_moe_config(
                 },
             ),
             # core's dispatcher factory: standard (PyTorch all-to-all), deepep,
-            # hybridep or minimal_async_ep, chosen per spec as deepseek_v3 does.
-            token_dispatcher=make_token_dispatcher_config(
-                num_experts=num_experts,
-                top_k=top_k,
-                comm_backend=comm_backend,
+            # hybridep or minimal_async_ep, chosen per spec as deepseek_v3
+            # does. "moonep" is K3's own (report sec 5.2.1) and stays in the
+            # model folder, like fla: the routed experts consume the LATENT
+            # stream, so its buffer is sized by latent_dim, not dim.
+            token_dispatcher=(
+                MoonEPTokenDispatcher.Config(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_dim=latent_dim,
+                )
+                if comm_backend == "moonep"
+                else make_token_dispatcher_config(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    comm_backend=comm_backend,
+                )
             ),
         ),
         routed_norm=_norm(latent_dim),
