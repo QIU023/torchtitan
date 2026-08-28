@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
@@ -317,6 +318,157 @@ def _get_lora_cls(parent_cls: type) -> type:
     return LoRALinear
 
 
+_EXPERT_WEIGHT_NAMES = ("w1_EFD", "w2_EDF", "w3_EFD")
+_mxfp4_experts_cls_cache: dict[type, type] = {}
+
+
+class MXFP4ExpertsBase:
+    """Marker base of every packed-experts class (see LoRALinearBase)."""
+
+
+def _get_mxfp4_experts_cls(parent_cls: type) -> type:
+    """Get or create an MXFP4 split-storage subclass of a grouped-experts class.
+
+    Same build-time pack-then-shard order as the LoRA linear's mxfp4 path: the
+    3-D ``[E, A, B]`` weights become ``(E*A, B/2)`` uint8 qdata plus
+    ``(E*A, B/32)`` e8m0-as-uint8 scale at __init__, so FSDP2 shards packed
+    bytes. MX blocks run along the last dim, so flattening the leading dims is
+    exact and every expert boundary falls on a block boundary. The logical
+    names become dequant properties -- the forward reads ``self.w1_EFD`` and
+    casts to bf16 anyway, so it is unchanged.
+    """
+    if parent_cls in _mxfp4_experts_cls_cache:
+        return _mxfp4_experts_cls_cache[parent_cls]
+
+    parent_config_cls = parent_cls.Config
+
+    def _make_fget(name: str):
+        def fget(self):
+            from torch.distributed.tensor import DTensor
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            if name not in self._mxfp4_shapes:
+                # This weight's last dim did not divide the MX block: it
+                # stayed a plain bf16 param, which the class property must
+                # hand through.
+                return self._parameters[name]
+            qdata = self._parameters[name + "_qdata"]
+            scale = self._parameters[name + "_scale"]
+            if isinstance(qdata, DTensor):
+                # Pre-unshard access (outside FSDP's forward window): gather
+                # explicitly. During forward FSDP2 exposes plain unsharded
+                # tensors.
+                qdata = qdata.full_tensor()
+                scale = scale.full_tensor()
+            mx = MXTensor.__tensor_unflatten__(
+                {"qdata": qdata, "scale": scale.view(self._mx_scale_dtype)},
+                self._mx_ctx,
+                None,
+                None,
+            )
+            return mx.dequantize().view(self._mxfp4_shapes[name])
+
+        return fget
+
+    class MXFP4Experts(parent_cls, MXFP4ExpertsBase):  # type: ignore[valid-type, misc]
+        @dataclass(kw_only=True, slots=True)
+        class Config(parent_config_cls):  # type: ignore[misc]
+            pass
+
+        def __init__(self, config) -> None:
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            super().__init__(config)
+            dummy = MXTensor.to_mx(
+                torch.zeros(1, 32, dtype=torch.bfloat16),
+                elem_dtype=torch.float4_e2m1fn_x2,
+                block_size=32,
+            )
+            _, self._mx_ctx = dummy.__tensor_flatten__()
+            self._mx_scale_dtype = dummy.scale.dtype
+            self._mxfp4_shapes: dict[str, tuple[int, ...]] = {}
+            for name in _EXPERT_WEIGHT_NAMES:
+                p = self._parameters.get(name)
+                if p is None or p.shape[-1] % 32 != 0:
+                    continue
+                self._mxfp4_shapes[name] = tuple(p.shape)
+                rows = p.numel() // p.shape[-1]
+                cols = p.shape[-1]
+                if p.is_meta:
+                    qdata = torch.empty(
+                        rows, cols // 2, dtype=torch.uint8, device="meta"
+                    )
+                    scale = torch.empty(
+                        rows, cols // 32, dtype=torch.uint8, device="meta"
+                    )
+                else:
+                    mx = MXTensor.to_mx(
+                        p.data.reshape(rows, cols).to(torch.bfloat16),
+                        elem_dtype=torch.float4_e2m1fn_x2,
+                        block_size=32,
+                    )
+                    qdata = mx.qdata.contiguous()
+                    scale = mx.scale.view(torch.uint8).contiguous()
+                del self._parameters[name]
+                self.register_parameter(
+                    name + "_qdata", nn.Parameter(qdata, requires_grad=False)
+                )
+                self.register_parameter(
+                    name + "_scale", nn.Parameter(scale, requires_grad=False)
+                )
+
+        def init_states(self, **kwargs) -> None:
+            # Config.build installs _param_init after __init__; rewrite here,
+            # before the parent's dict-driven init would raise on the packed
+            # names. Placeholder zeros first, real values drawn just below.
+            self._mx_weight_inits = {}
+            if self._param_init is not None:
+                new_init = dict(self._param_init)
+                for name in self._mxfp4_shapes:
+                    self._mx_weight_inits[name] = new_init.pop(name, None)
+                    new_init[name + "_qdata"] = nn.init.zeros_
+                    new_init[name + "_scale"] = nn.init.zeros_
+                self._param_init = new_init
+            super().init_states(**kwargs)
+            self._init_packed_values()
+
+        def _init_packed_values(self) -> None:
+            """From-scratch values: MX block-32 is row-blockwise, so each rank
+            draws ITS rows in bf16 with the weight's init fn and quantizes
+            locally (commutes with Shard(0))."""
+            from torch.distributed.tensor import DTensor
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            for name, shape in self._mxfp4_shapes.items():
+                init_fn = self._mx_weight_inits.get(name) or (
+                    lambda w: nn.init.trunc_normal_(w, std=0.02)
+                )
+                qdata = self._parameters[name + "_qdata"]
+                scale = self._parameters[name + "_scale"]
+                q_local = qdata.to_local() if isinstance(qdata, DTensor) else qdata
+                s_local = scale.to_local() if isinstance(scale, DTensor) else scale
+                w_rows = torch.empty(
+                    q_local.shape[0],
+                    q_local.shape[1] * 2,
+                    dtype=torch.bfloat16,
+                    device=q_local.device,
+                )
+                init_fn(w_rows)
+                mx = MXTensor.to_mx(
+                    w_rows, elem_dtype=torch.float4_e2m1fn_x2, block_size=32
+                )
+                with torch.no_grad():
+                    q_local.copy_(mx.qdata)
+                    s_local.copy_(mx.scale.view(torch.uint8))
+
+    for name in _EXPERT_WEIGHT_NAMES:
+        setattr(MXFP4Experts, name, property(_make_fget(name)))
+    MXFP4Experts.__name__ = f"MXFP4{parent_cls.__name__}"
+    MXFP4Experts.__qualname__ = f"MXFP4{parent_cls.__name__}"
+    _mxfp4_experts_cls_cache[parent_cls] = MXFP4Experts
+    return MXFP4Experts
+
+
 def _get_frozen_config_cls(
     config_cls: type[Module.Config],
 ) -> type[Module.Config]:
@@ -368,6 +520,12 @@ class LoRAConverter(ModelConfigConverter):
         """Module names to apply LoRA to (matched against the last segment of the FQN).
         None means all Linear layers. An empty list means no layers."""
 
+        quantize_experts: str | None = None
+        """Pack frozen grouped-expert weights to MXFP4 split storage at build
+        (the experts are a MoE model's parameter bulk, so this is where the
+        QLoRA memory and FSDP all-gather win mostly lives). Same
+        pack-then-shard order as quantize_base='mxfp4'."""
+
         quantize_base: str | None = None
         """Pack frozen base weights at init ('nf4', via torchao). QLoRA:
         lossy by design, ~4x memory cut on the bases. Library-level for now:
@@ -385,6 +543,11 @@ class LoRAConverter(ModelConfigConverter):
         self.target_modules = (
             set(config.target_modules) if config.target_modules is not None else None
         )
+        if config.quantize_experts not in (None, "mxfp4"):
+            raise ValueError(
+                f"quantize_experts must be None or 'mxfp4', got "
+                f"{config.quantize_experts!r}"
+            )
         if self.target_modules is None:
             logger.info(
                 f"LoRA training active with rank={self.rank}, alpha={self.alpha} "
@@ -428,6 +591,19 @@ class LoRAConverter(ModelConfigConverter):
             if is_target:
                 new_cfg = self._make_lora_config(cfg)
                 matched.add(last_segment)
+            elif (
+                self.config.quantize_experts == "mxfp4"
+                and isinstance(cfg, GroupedExperts.Config)
+                and cfg.dim % 32 == 0
+                and cfg.hidden_dim % 32 == 0
+            ):
+                # The packed subclass creates its params frozen; no frozen
+                # wrap needed on top.
+                assert cfg._owner is not None
+                experts_cls = _get_mxfp4_experts_cls(cfg._owner)
+                new_cfg = experts_cls.Config(
+                    **{f.name: getattr(cfg, f.name) for f in fields(cfg) if f.init}
+                )
             else:
                 new_cfg = _make_frozen_config(cfg)
 
@@ -519,6 +695,11 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         for name, module in model.named_modules()
         if isinstance(module, LoRALinearBase)
     ]
+    packed_experts = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, MXFP4ExpertsBase)
+    ]
     # The merged weight goes in as a NEW Parameter object and the original is
     # re-bound afterwards. Swapping the object (rather than copy_ into the
     # storage) keeps the returned dict from aliasing anything that gets
@@ -543,6 +724,14 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
                 (base_w.float() + delta).to(base_w.dtype).contiguous(),
                 requires_grad=False,
             )
+        for _, module in packed_experts:
+            for wname, shape in module._mxfp4_shapes.items():
+                # The property dequantizes; register the dense weight as a
+                # temporary param so state_dict emits the ORIGINAL key.
+                dense = getattr(module, wname).contiguous()
+                # Straight into _parameters: register_parameter refuses the
+                # name because the class dequant property answers hasattr.
+                module._parameters[wname] = nn.Parameter(dense, requires_grad=False)
     try:
         sd = dict(model.state_dict())
     finally:
@@ -551,6 +740,16 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
                 del module._parameters["weight"]
             else:
                 module.weight = original
+        for _, module in packed_experts:
+            for wname in module._mxfp4_shapes:
+                del module._parameters[wname]
+    for mod_name, module in packed_experts:
+        stripped = ".".join(
+            part for part in mod_name.split(".") if part not in _WRAPPER_SEGMENTS
+        )
+        for wname in module._mxfp4_shapes:
+            for suffix in ("_qdata", "_scale"):
+                sd.pop(f"{stripped}.{wname}{suffix}", None)
     for mod_name, _ in lora_modules:
         # named_modules() and state_dict() disagree once a wrapper is in the
         # path.

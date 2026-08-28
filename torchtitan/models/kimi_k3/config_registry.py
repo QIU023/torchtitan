@@ -164,7 +164,9 @@ def kimi_k3_debugmodel_lora() -> Trainer.Config:
     return config
 
 
-def _kimi_k3_lora_converter(*, quantize_base: str | None = None):
+def _kimi_k3_lora_converter(
+    *, quantize_base: str | None = None, quantize_experts: str | None = None
+):
     from torchtitan.components.lora import LoRAConverter
 
     return LoRAConverter.Config(
@@ -186,6 +188,7 @@ def _kimi_k3_lora_converter(*, quantize_base: str | None = None):
             "routed_up",
         ],
         quantize_base=quantize_base,
+        quantize_experts=quantize_experts,
     )
 
 
@@ -201,6 +204,8 @@ def kimi_k3_debugmodel_qlora_mxfp4() -> Trainer.Config:
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry(
         "debugmodel",
-        converters=[_kimi_k3_lora_converter(quantize_base="mxfp4")],
+        converters=[
+            _kimi_k3_lora_converter(quantize_base="mxfp4", quantize_experts="mxfp4")
+        ],
     )
     return config
