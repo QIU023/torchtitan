@@ -274,3 +274,11 @@ def kimi_k3_debugmodel_mtp() -> Trainer.Config:
         ),
     )
     return config
+
+
+def kimi_k3_debugmodel_moonep() -> Trainer.Config:
+    """MoonEP dispatch + [E+B] expert tables (report sec 5.2.1); needs the
+    moonep package, an NVLink-mapped EP group and dp_shard == ep."""
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel", moe_comm_backend="moonep")
+    return config
