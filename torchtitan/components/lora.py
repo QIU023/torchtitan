@@ -103,12 +103,6 @@ def _get_lora_cls(parent_cls: type) -> type:
                     f"{config.quantize_base!r}"
                 )
             self._quantize_base_requested = config.quantize_base
-            if config.quantize_base == "mxfp4":
-                # BUILD-time swap, before any parallelize: FSDP2 then shards
-                # the packed bytes natively (pack-then-shard), which is the
-                # order the nf4 path cannot reach. Works on meta too -- the
-                # packed LAYOUT registers now, values arrive at init or load.
-                self._swap_in_packed_mxfp4_layout()
             lora_a_sharding, lora_b_sharding = _lora_adapter_sharding(
                 config.sharding_config
             )
@@ -128,6 +122,15 @@ def _get_lora_cls(parent_cls: type) -> type:
                 sharding_config=lora_b_sharding,
                 param_init={"weight": nn.init.zeros_},
             ).build()
+            if config.quantize_base == "mxfp4":
+                # BUILD-time swap, before any parallelize: FSDP2 then shards
+                # the packed bytes natively (pack-then-shard), which is the
+                # order the nf4 path cannot reach. Works on meta too -- the
+                # packed LAYOUT registers now, values arrive at init or load.
+                # AFTER the adapter derivation above: the swap rewrites the
+                # sharding_config's weight entry for the packed pair.
+                self._config_sharding = config.sharding_config
+                self._swap_in_packed_mxfp4_layout()
 
         _quantize_base: str | None = None
 
@@ -172,6 +175,31 @@ def _get_lora_cls(parent_cls: type) -> type:
             self.base_qdata = nn.Parameter(qdata, requires_grad=False)
             self.base_scale = nn.Parameter(scale, requires_grad=False)
             del self._parameters["weight"]
+            sharding = getattr(self, "_config_sharding", None)
+            base_weight_sharding = (
+                sharding.state_shardings.get("weight") if sharding else None
+            )
+            if base_weight_sharding is not None:
+                replicated = dense_param_placement(tp=spmd.R)
+                if base_weight_sharding != replicated:
+                    # A TP-SHARDED packed base needs the packed-TP forward
+                    # (local dequant + local matmul + the collective the
+                    # declaration implies), which is not wired yet. Leaving
+                    # the pair undeclared instead would fail later with a
+                    # placement error, or worse, compute a full output where
+                    # the contract expects a shard.
+                    raise NotImplementedError(
+                        "quantize_base='mxfp4' does not support a TP-sharded "
+                        "base yet: this linear's weight is declared "
+                        "colwise/rowwise. Run QLoRA without TP on the packed "
+                        "bases, or drop quantize_base."
+                    )
+                # The declarative system requires a placement for every
+                # param once a sharding_config exists: the packed pair
+                # replicates with its base.
+                sharding.state_shardings["base_qdata"] = replicated
+                sharding.state_shardings["base_scale"] = replicated
+                del sharding.state_shardings["weight"]
             self._quantize_base = "mxfp4"
 
         def _init_packed_mxfp4_values(self) -> None:
