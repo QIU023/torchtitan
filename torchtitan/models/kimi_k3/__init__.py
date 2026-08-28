@@ -228,6 +228,7 @@ def _latent_moe_config(
     num_experts: int,
     top_k: int,
     num_shared_experts: int,
+    comm_backend: str,
 ) -> KimiLatentMoE.Config:
     return KimiLatentMoE.Config(
         num_experts=num_experts,
@@ -253,13 +254,12 @@ def _latent_moe_config(
                     "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
                 },
             ),
-            # core's dispatcher factory, pinned to the standard all-to-all; it
-            # falls back to local dispatch when the ep mesh is None, so EP=1 is
-            # unchanged. MoonEP is out of scope and deliberately not a choice.
+            # core's dispatcher factory: standard (PyTorch all-to-all), deepep,
+            # hybridep or minimal_async_ep, chosen per spec as deepseek_v3 does.
             token_dispatcher=make_token_dispatcher_config(
                 num_experts=num_experts,
                 top_k=top_k,
-                comm_backend="standard",
+                comm_backend=comm_backend,
             ),
         ),
         routed_norm=_norm(latent_dim),
@@ -379,6 +379,7 @@ def _kimi_k3_config(
     num_shared_experts: int,
     vision_encoder: KimiK3VisionEncoder.Config,
     attn_backend: str,
+    moe_comm_backend: str,
 ) -> KimiK3Model.Config:
     """Assemble a Kimi K3 config from the released topology's free parameters.
 
@@ -432,6 +433,7 @@ def _kimi_k3_config(
                         num_experts=num_experts,
                         top_k=top_k,
                         num_shared_experts=num_shared_experts,
+                        comm_backend=moe_comm_backend,
                     )
                 ),
                 attention_norm=_norm(dim),
@@ -468,6 +470,7 @@ def _kimi_k3_config(
 
 def _debugmodel(
     attn_backend: str,
+    moe_comm_backend: str,
     *,
     num_layers: int = 24,
     full_attention_layers: set[int] | None = None,
@@ -507,10 +510,11 @@ def _debugmodel(
             init_pos_emb_width=32,
         ),
         attn_backend=attn_backend,
+        moe_comm_backend=moe_comm_backend,
     )
 
 
-def _debugmodel_32l(attn_backend: str) -> KimiK3Model.Config:
+def _debugmodel_32l(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     """The debug model at 32 layers, for the pipeline x virtual-stage matrix.
 
     The 24-layer flavor cannot express every pp x vp product: 24 is not
@@ -521,6 +525,7 @@ def _debugmodel_32l(attn_backend: str) -> KimiK3Model.Config:
     """
     config = _debugmodel(
         attn_backend,
+        moe_comm_backend,
         num_layers=32,
         full_attention_layers=set(range(3, 32, 4)),
         attn_res_block_size=16,
@@ -528,7 +533,7 @@ def _debugmodel_32l(attn_backend: str) -> KimiK3Model.Config:
     return config
 
 
-def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
+def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
         dim=dim,
@@ -561,6 +566,7 @@ def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
             init_pos_emb_width=64,
         ),
         attn_backend=attn_backend,
+        moe_comm_backend=moe_comm_backend,
     )
 
 
@@ -574,9 +580,12 @@ kimi_k3_configs = {
 def model_registry(
     flavor: str,
     attn_backend: str = "flex",
+    moe_comm_backend: str = "standard",
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    config = kimi_k3_configs[flavor](attn_backend=attn_backend)
+    config = kimi_k3_configs[flavor](
+        attn_backend=attn_backend, moe_comm_backend=moe_comm_backend
+    )
     if converters is not None:
         validate_converter_order(converters)
         for converter in converters:
