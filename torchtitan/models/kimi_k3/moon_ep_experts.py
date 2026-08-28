@@ -46,7 +46,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import torch
-import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
 from torchtitan.models.kimi_k3.moe import _situ_glu, KimiGroupedExperts

@@ -35,31 +35,33 @@ class FakePlan:
 
 
 class _Collective:
-    """deposit -> barrier -> rank 0 computes -> barrier -> read."""
+    """deposit -> barrier -> rank 0 computes -> barrier -> read.
+
+    Every rank makes the same sequence of calls, so a per-rank call counter
+    is a shared generation number; keying the exchange by it means nothing is
+    ever cleared under a faster rank's next deposit.
+    """
 
     def __init__(self, world_size: int):
         self.world_size = world_size
         self._lock = threading.Lock()
         self._barrier = threading.Barrier(world_size)
-        self._inputs: dict = {}
-        self._outputs: dict = {}
+        self._inputs: dict[int, dict] = {}
+        self._outputs: dict[int, dict] = {}
+        self._calls: dict[int, int] = {}
 
     def run(self, rank: int, payload, compute):
         with self._lock:
-            self._inputs[rank] = payload
+            gen = self._calls.get(rank, 0)
+            self._calls[rank] = gen + 1
+            self._inputs.setdefault(gen, {})[rank] = payload
         self._barrier.wait()
         if rank == 0:
-            outs = compute(self._inputs)
+            outs = compute(self._inputs[gen])
             with self._lock:
-                self._outputs = outs
+                self._outputs[gen] = outs
         self._barrier.wait()
-        result = self._outputs[rank]
-        self._barrier.wait()  # nobody clears before everyone read
-        if rank == 0:
-            with self._lock:
-                self._inputs = {}
-                self._outputs = {}
-        return result
+        return self._outputs[gen][rank]
 
 
 class FakeMoonEPWorld:
