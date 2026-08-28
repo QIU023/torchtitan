@@ -395,20 +395,14 @@ def _get_lora_cls(parent_cls: type) -> type:
                     out_loc, tp_mesh, [Shard(out_loc.dim() - 1)], run_check=False
                 )
             # Rowwise: local outputs are partial sums over the in/tp shards.
-            out = DTensor.from_local(out_loc, tp_mesh, [Partial()], run_check=False)
-            out = out.redistribute(tp_mesh, [Replicate()])
-            # Rowwise does NOT shard the output: the bias adds AFTER the
-            # partial sums reduce -- on out_loc it would apply once per rank.
+            # The declared contract expects Partial(sum) out -- the module
+            # boundary owns the reduction. The bias therefore adds LOCALLY as
+            # bias/tp (the same convention as common Linear's forward), so
+            # the reduction sums it back to exactly one bias.
             if bias is not None:
-                b = (
-                    bias
-                    if isinstance(bias, DTensor)
-                    else DTensor.from_local(
-                        bias, tp_mesh, [Replicate()], run_check=False
-                    )
-                )
-                out = out + b.to(out.dtype)
-            return out
+                b = bias.to_local() if isinstance(bias, DTensor) else bias
+                out_loc = out_loc + b.to(out_loc.dtype) / tp_mesh.size()
+            return DTensor.from_local(out_loc, tp_mesh, [Partial()], run_check=False)
 
         def forward(self, input: torch.Tensor) -> torch.Tensor:
             if (
@@ -563,16 +557,19 @@ def _get_mxfp4_experts_cls(parent_cls: type) -> type:
                     # contiguous row blocks in the (E*A, B) flatten); a shard
                     # on an inner dim does not survive the flatten and needs
                     # the packed expert-TP unit.
-                    if any(
-                        isinstance(t, spmd.Shard) and t.dim != 0
-                        for t in entry.axis_types.values()
-                    ):
+                    from torchtitan.distributed.parallel_dims import MeshAxisName
+
+                    tp_type = entry.axis_types.get(MeshAxisName.TP)
+                    if isinstance(tp_type, spmd.Shard) and tp_type.dim != 0:
                         raise NotImplementedError(
                             f"quantize_experts='mxfp4': {name} is declared "
-                            "sharded on an inner dim, which the packed "
+                            "TP-sharded on an inner dim, which the packed "
                             "flatten cannot express yet. Run without "
-                            "TP/EP-sharded experts, or drop quantize_experts."
+                            "expert-TP, or drop quantize_experts."
                         )
+                    # Entries for axes absent from the mesh (e.g. the EP axis
+                    # in a TP-only run) are ignored at resolve time and pass
+                    # through; packed experts UNDER EP are not validated yet.
                     sharding.state_shardings[name + "_qdata"] = entry
                     sharding.state_shardings[name + "_scale"] = entry
 

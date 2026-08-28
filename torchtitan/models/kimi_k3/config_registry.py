@@ -192,6 +192,21 @@ def _kimi_k3_lora_converter(
     )
 
 
+def kimi_k3_debugmodel_qlora_mxfp4_linear() -> Trainer.Config:
+    """QLoRA with only the base LINEARS packed (experts stay bf16).
+
+    The packed-TP forward covers colwise/rowwise linears; packed experts
+    under expert-TP need a shape-preserving layout and refuse -- this
+    flavor is the TP-composable subset.
+    """
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[_kimi_k3_lora_converter(quantize_base="mxfp4")],
+    )
+    return config
+
+
 def kimi_k3_debugmodel_mx_qat() -> Trainer.Config:
     """The debug model under MXFP4-weight / MXFP8-activation fake-quant QAT.
 
