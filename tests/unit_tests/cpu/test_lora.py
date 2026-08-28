@@ -275,6 +275,7 @@ def test_merge_lora_state_dict_folds_the_delta():
     """After perturbing an adapter pair, merged W == W_base + (alpha/rank) B @ A,
     and a plain linear loaded with the merged weight reproduces the LoRA
     module's forward."""
+    torch.manual_seed(0)
     from torchtitan.components.lora import LoRALinearBase, merge_lora_state_dict
 
     model = _lora_llama_model(rank=4, alpha=8.0)
@@ -311,6 +312,7 @@ def test_merge_lora_state_dict_respects_serialization_hooks():
     """The fused attention linear exports split wq/wk/wv keys through a
     state-dict hook; the merged delta must land in THOSE keys, not a composed
     wqkv.weight nothing recognises."""
+    torch.manual_seed(0)
     from torchtitan.components.lora import LoRALinearBase, merge_lora_state_dict
 
     model = _lora_llama_model(rank=4, alpha=8.0)
@@ -351,3 +353,38 @@ def test_merge_lora_state_dict_sees_through_wrappers():
     assert not any("lora_a" in k or "lora_b" in k for k in merged)
     assert not any("_checkpoint_wrapped_module" in k for k in merged)
     assert any(k.startswith("layers.0.") for k in merged)
+
+
+def test_qlora_nf4_pack_forward_merge():
+    """Packed bases: forward runs on NF4, and with zero-init lora_b the merge
+    equals the DEQUANTIZED base exactly (QLoRA is lossy vs bf16 by design)."""
+    torch.manual_seed(0)
+    pytest.importorskip("torchao.dtypes.nf4tensor")
+    from torchao.dtypes.nf4tensor import NF4Tensor
+
+    from torchtitan.components.lora import (
+        LoRALinearBase,
+        merge_lora_state_dict,
+        quantize_lora_bases,
+    )
+
+    model = _lora_llama_model(rank=4, alpha=8.0)
+    packed = quantize_lora_bases(model)
+    assert packed > 0
+    quantized = [
+        (n, m)
+        for n, m in model.named_modules()
+        if isinstance(m, LoRALinearBase) and isinstance(m.weight, NF4Tensor)
+    ]
+    assert len(quantized) == packed
+
+    name, module = next((n, m) for n, m in quantized if n.endswith("wo"))
+    x = torch.randn(3, module.lora_a.weight.shape[1])
+    y = module(x)
+    assert y.shape == (3, module.lora_b.weight.shape[0])
+
+    merged = merge_lora_state_dict(model)
+    dequant = module.weight.get_original_weight()
+    torch.testing.assert_close(merged[f"{name}.weight"], dequant, rtol=0, atol=0)
+    # The NF4 param object is back in place after the export.
+    assert isinstance(module.weight, NF4Tensor)

@@ -111,8 +111,46 @@ def _get_lora_cls(parent_cls: type) -> type:
                 param_init={"weight": nn.init.zeros_},
             ).build()
 
+        _quantize_base: str | None = None
+
+        @torch.no_grad()
+        def quantize_base_nf4(self) -> bool:
+            """Pack the frozen base to NF4 (torchao). Idempotent.
+
+            QLoRA is lossy by design: it trades exactness for a ~4x cut in
+            memory and, on comms-bound fabrics, in FSDP all-gather traffic.
+            Call AFTER weights load (quantizing at build packs init noise)
+            and BEFORE fully_shard, so FSDP shards the packed bytes.
+
+            torchao NF4 double-quant requires numel divisible by
+            block_size(64) * scaler_block_size(256) = 16384; dims that do
+            not divide stay bf16 (returns False).
+            """
+            from torchao.dtypes.nf4tensor import NF4Tensor, to_nf4
+
+            if isinstance(self.weight, NF4Tensor):
+                self._quantize_base = "nf4"
+                return True
+            if self.weight.numel() % 16384 != 0:
+                return False
+            self.weight = nn.Parameter(
+                to_nf4(self.weight.data.to(torch.bfloat16)),
+                requires_grad=False,
+            )
+            self._quantize_base = "nf4"
+            return True
+
         def forward(self, input: torch.Tensor) -> torch.Tensor:
-            base_out = super().forward(input)
+            if self._quantize_base == "nf4":
+                from torchao.dtypes.nf4tensor import linear_nf4
+
+                # linear_nf4 takes the weight only; a bias is added here,
+                # exactly as the unquantized branch's F.linear would.
+                base_out = linear_nf4(input, self.weight)
+                if getattr(self, "bias", None) is not None:
+                    base_out = base_out + self.bias
+            else:
+                base_out = super().forward(input)
             lora_out = self.lora_b(self.lora_a(input))
             return base_out + self._lora_scaling * lora_out
 
@@ -315,25 +353,30 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         for name, module in model.named_modules()
         if isinstance(module, LoRALinearBase)
     ]
-    originals = [module.weight.data.clone() for _, module in lora_modules]
+    # The merged weight goes in as a NEW Parameter object and the original is
+    # re-bound afterwards. Swapping the object (rather than copy_ into the
+    # storage) keeps the returned dict from aliasing anything that gets
+    # reverted, and never writes THROUGH a quantized tensor -- copy_ into an
+    # NF4 base would silently re-quantize the merged value.
+    originals = [module.weight for _, module in lora_modules]
     with torch.no_grad():
         for _, module in lora_modules:
+            base_w = module.weight
+            if module._quantize_base == "nf4":
+                base_w = base_w.get_original_weight()
             # fp32 delta for deployable precision, cast back to the base dtype.
             delta = module._lora_scaling * (
                 module.lora_b.weight.float() @ module.lora_a.weight.float()
             )
-            module.weight.data.copy_(
-                (module.weight.data.float() + delta).to(module.weight.dtype)
+            module.weight = nn.Parameter(
+                (base_w.float() + delta).to(base_w.dtype).contiguous(),
+                requires_grad=False,
             )
     try:
-        # state_dict() values ALIAS the live parameter storage (hook-split
-        # views included), so the restore below would silently revert them in
-        # the returned dict too: clone while the merge is in place.
-        sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        sd = dict(model.state_dict())
     finally:
-        with torch.no_grad():
-            for (_, module), original in zip(lora_modules, originals):
-                module.weight.data.copy_(original)
+        for (_, module), original in zip(lora_modules, originals):
+            module.weight = original
     for mod_name, _ in lora_modules:
         # named_modules() and state_dict() disagree once a wrapper is in the
         # path.
@@ -341,3 +384,19 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         for suffix in (".lora_a.weight", ".lora_b.weight"):
             sd.pop(f"{prefix}{suffix}", None)
     return sd
+
+
+def quantize_lora_bases(model: nn.Module) -> int:
+    """Post-load QLoRA hook: pack every LoRA base weight to NF4.
+
+    The trainer's meta-first flow builds, then materializes real weights
+    (init or checkpoint), THEN quantizes -- packing at build time would
+    quantize init noise, not the loaded checkpoint. Call AFTER load and
+    BEFORE fully_shard so FSDP shards the packed bytes. Idempotent; returns
+    the number of bases packed. Dims torchao cannot block-quantize stay bf16.
+    """
+    packed = 0
+    for module in model.modules():
+        if isinstance(module, LoRALinearBase):
+            packed += int(module.quantize_base_nf4())
+    return packed
