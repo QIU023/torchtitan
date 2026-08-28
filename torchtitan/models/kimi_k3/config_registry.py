@@ -178,3 +178,18 @@ def kimi_k3_debugmodel_qlora_mxfp4() -> Trainer.Config:
         ],
     )
     return config
+
+
+def kimi_k3_debugmodel_qb() -> Trainer.Config:
+    """The debug model with quantile balancing on the MoE router bias.
+
+    K3 runs sparsity (report sec 2.3) beyond where the auxiliary-loss-free
+    bias NUDGE still balances; quantile balancing SOLVES for the bias from
+    the accumulated per-expert load histograms instead. The hook replaces
+    the default load-balancing hook on the optimizer.
+    """
+    from torchtitan.components.quantile_balance import register_quantile_balancing
+
+    config = kimi_k3_debugmodel()
+    config.model_spec.post_optimizer_build_fn = register_quantile_balancing
+    return config
