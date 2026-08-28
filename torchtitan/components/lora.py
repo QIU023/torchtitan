@@ -54,6 +54,16 @@ def _lora_adapter_sharding(
         return lora_a_sharding, replicated_weight
 
 
+class LoRALinearBase:
+    """Marker base of every dynamically created LoRA linear class.
+
+    ``_get_lora_cls`` builds one subclass per parent linear class, so there is
+    no single concrete class to isinstance against; this empty base is baked
+    into each of them and is the stable way to find LoRA modules on a built
+    model (``merge_lora_state_dict`` walks it).
+    """
+
+
 _lora_class_cache: dict[type, type] = {}
 _frozen_config_class_cache: dict[type, type] = {}
 
@@ -70,7 +80,7 @@ def _get_lora_cls(parent_cls: type) -> type:
 
     parent_config_cls = parent_cls.Config  # pyrefly: ignore [missing-attribute]
 
-    class LoRALinear(parent_cls):  # type: ignore[valid-type, misc]
+    class LoRALinear(parent_cls, LoRALinearBase):  # type: ignore[valid-type, misc]
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             rank: int
@@ -233,3 +243,101 @@ class LoRAConverter(ModelConfigConverter):
                 f"Linear.Config in the model config tree."
             )
         return converted_root
+
+
+def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """The adapter-only checkpoint payload: every parameter left trainable.
+
+    Under LoRA that is the adapters (plus anything a model deliberately
+    unfroze); shipping only these is what makes adapter checkpoints and
+    trainer-to-rollout weight syncs light.
+    """
+    return {name: p for name, p in model.named_parameters() if p.requires_grad}
+
+
+# Wrapper segments that appear in ``named_modules()`` paths but NOT in
+# ``state_dict()`` keys, because each wrapper installs a hook that strips its
+# own prefix. Activation checkpointing, FSDP and torch.compile all do this.
+_WRAPPER_SEGMENTS = frozenset(
+    {"_checkpoint_wrapped_module", "_fsdp_wrapped_module", "_orig_mod"}
+)
+
+
+def _state_dict_prefix(mod_name: str, sd: dict) -> str:
+    """The state-dict prefix for a module reached at ``mod_name``.
+
+    The two namings differ once anything wraps the module: activation
+    checkpointing turns ``layers.0.feed_forward.w1`` into
+    ``layers.0._checkpoint_wrapped_module.feed_forward.w1`` in
+    ``named_modules()``, while ``state_dict()`` strips it back out. Composing
+    keys from the module path then writes a name nothing else recognises AND
+    leaves the adapter keys in place, because the pops miss too.
+
+    An unknown wrapper raises rather than guessing: a wrong name here is a
+    weight that never reaches the consumer, which is not a failure that
+    announces itself.
+    """
+    stripped = ".".join(p for p in mod_name.split(".") if p not in _WRAPPER_SEGMENTS)
+    for candidate in (stripped, mod_name):
+        if f"{candidate}.lora_a.weight" in sd:
+            return candidate
+    raise KeyError(
+        f"LoRA module at {mod_name!r} has no matching state_dict entry (tried "
+        f"{stripped!r}); an unrecognised module wrapper is in the path, and "
+        "merging under a guessed name would ship weights nothing can load"
+    )
+
+
+def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Fold LoRA adapters into base weights and return a state dict keyed by
+    ORIGINAL param names (no ``lora_a``/``lora_b``). The model is unchanged
+    when this returns.
+
+    For each LoRA linear, ``W_merged = W_base + (alpha / rank) * (B @ A)``.
+    This is the deployable/exportable form: a state-dict adapter can convert
+    it exactly as it converts the unadapted model's, whereas the raw state
+    dict carries adapter keys nothing downstream recognises.
+
+    The merge happens IN the modules (temporarily, restored from clones on
+    the way out) rather than in the returned dict, because a base linear's
+    serialization is not necessarily ``<fqn>.weight``: the fused attention
+    linear exports split ``wq``/``wk``/``wv`` keys through a state-dict hook,
+    and writing composed key names would miss every such hook. Taking
+    ``state_dict()`` with the merged weights in place lets each module's own
+    serialization produce the right keys.
+
+    Under TP nothing needs materializing: the adapter shardings mirror the
+    base (``_lora_adapter_sharding``), so ``B @ A`` composes to the base
+    weight's placement and the add dispatches as DTensors.
+    """
+    lora_modules = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, LoRALinearBase)
+    ]
+    originals = [module.weight.data.clone() for _, module in lora_modules]
+    with torch.no_grad():
+        for _, module in lora_modules:
+            # fp32 delta for deployable precision, cast back to the base dtype.
+            delta = module._lora_scaling * (
+                module.lora_b.weight.float() @ module.lora_a.weight.float()
+            )
+            module.weight.data.copy_(
+                (module.weight.data.float() + delta).to(module.weight.dtype)
+            )
+    try:
+        # state_dict() values ALIAS the live parameter storage (hook-split
+        # views included), so the restore below would silently revert them in
+        # the returned dict too: clone while the merge is in place.
+        sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    finally:
+        with torch.no_grad():
+            for (_, module), original in zip(lora_modules, originals):
+                module.weight.data.copy_(original)
+    for mod_name, _ in lora_modules:
+        # named_modules() and state_dict() disagree once a wrapper is in the
+        # path.
+        prefix = _state_dict_prefix(mod_name, sd)
+        for suffix in (".lora_a.weight", ".lora_b.weight"):
+            sd.pop(f"{prefix}{suffix}", None)
+    return sd
