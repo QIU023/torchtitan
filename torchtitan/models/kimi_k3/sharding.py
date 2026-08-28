@@ -32,7 +32,6 @@ from torchtitan.models.common.attention import (
     create_attention_mask,
     get_causal_mask_mod,
 )
-from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 
 from torchtitan.models.kimi_k3.dtensor_ops import (
@@ -295,29 +294,28 @@ def mla_ulysses_attention(
     return out_LHV
 
 
-def set_expert_parallel_sharding_config(config) -> None:
+def set_expert_parallel_sharding_config(
+    config, *, enable_sp: bool = False
+) -> None:
     """Declare the sharding expert parallel acts on, with TP off.
 
-    Shared with the EP review branch verbatim: the routed experts shard on the
-    expert axis and the decoder-level distribution makes the activations at the
-    MoE boundary redistributable. The combined ep+tp declaration stays inline in
-    model.py -- with TP on, tp becomes a token axis inside the MoE region and
-    the two cannot be declared independently.
+    Shared with the EP review branch: the routed experts shard on the expert
+    axis, and set_moe_sharding_config's input boundary lifts the plain
+    incoming activations itself -- no decoder-level declaration is needed
+    (ablated: removing it changes nothing to every printed digit). The
+    combined ep+tp declaration stays inline in model.py -- with TP on, tp
+    becomes a token axis inside the MoE region and the two cannot be
+    declared independently.
     """
-    # The decoder-level distribution is what makes the activations reaching
-    # the MoE boundary DTensors this declaration can redistribute onto the
-    # expert mesh; without it the routed path sees plain tensors and the EP
-    # redistribution has nothing to act on. enable_sp=False because sequence
-    # parallel is not part of this PR.
-    set_decoder_sharding_config(config, enable_sp=False)
     for layer in config.layers:
         if layer.moe is not None:
             set_moe_sharding_config(
                 layer.moe,
                 enable_ep=True,
-                # TODO: enable TP/SP here once the tensor-parallel PR lands;
-                # with EP alone the internals run without sequence parallel.
-                enable_sp=False,
+                # TODO: flip to True from the caller once the
+                # tensor-parallel PR lands; with EP alone the internals run
+                # without sequence parallel.
+                enable_sp=enable_sp,
                 expert_param_layout={
                     "w1_EFD": spmd.S(1),
                     "w2_EDF": spmd.S(2),
