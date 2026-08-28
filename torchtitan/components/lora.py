@@ -179,26 +179,25 @@ def _get_lora_cls(parent_cls: type) -> type:
             base_weight_sharding = (
                 sharding.state_shardings.get("weight") if sharding else None
             )
+            self._packed_tp_style = None
             if base_weight_sharding is not None:
-                replicated = dense_param_placement(tp=spmd.R)
-                if base_weight_sharding != replicated:
-                    # A TP-SHARDED packed base needs the packed-TP forward
-                    # (local dequant + local matmul + the collective the
-                    # declaration implies), which is not wired yet. Leaving
-                    # the pair undeclared instead would fail later with a
-                    # placement error, or worse, compute a full output where
-                    # the contract expects a shard.
-                    raise NotImplementedError(
-                        "quantize_base='mxfp4' does not support a TP-sharded "
-                        "base yet: this linear's weight is declared "
-                        "colwise/rowwise. Run QLoRA without TP on the packed "
-                        "bases, or drop quantize_base."
-                    )
-                # The declarative system requires a placement for every
-                # param once a sharding_config exists: the packed pair
-                # replicates with its base.
-                sharding.state_shardings["base_qdata"] = replicated
-                sharding.state_shardings["base_scale"] = replicated
+                # The declarative system requires a placement for every param
+                # once a sharding_config exists. The packed pair mirrors the
+                # base weight's TP layout: colwise (S(0)) shards packed ROWS,
+                # exact because MX block-32 is row-blockwise; rowwise (S(1))
+                # shards packed columns, exact only when the local in-features
+                # stay block-divisible -- checked at first dequant, when the
+                # actual shard is known. Replicate replicates.
+                if base_weight_sharding == dense_param_placement(tp=spmd.S(0)):
+                    pair = dense_param_placement(tp=spmd.S(0))
+                    self._packed_tp_style = "colwise"
+                elif base_weight_sharding == dense_param_placement(tp=spmd.S(1)):
+                    pair = dense_param_placement(tp=spmd.S(1))
+                    self._packed_tp_style = "rowwise"
+                else:
+                    pair = dense_param_placement(tp=spmd.R)
+                sharding.state_shardings["base_qdata"] = pair
+                sharding.state_shardings["base_scale"] = pair
                 del sharding.state_shardings["weight"]
             self._quantize_base = "mxfp4"
 
@@ -237,10 +236,23 @@ def _get_lora_cls(parent_cls: type) -> type:
             from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
             qdata, scale = self.base_qdata, self.base_scale
-            if hasattr(qdata, "full_tensor"):
-                qdata = qdata.full_tensor()
-            if hasattr(scale, "full_tensor"):
-                scale = scale.full_tensor()
+            if getattr(self, "_packed_tp_style", None) is not None:
+                # TP-sharded packed base: dequantize this rank's LOCAL shard;
+                # the packed-TP forward does the local matmul + collective.
+                qdata = qdata.to_local() if hasattr(qdata, "to_local") else qdata
+                scale = scale.to_local() if hasattr(scale, "to_local") else scale
+                if scale.shape[-1] * 32 != qdata.shape[-1] * 2:
+                    raise ValueError(
+                        "packed-MXFP4 rowwise TP shard is not MX-block "
+                        f"aligned: local qdata {tuple(qdata.shape)} vs scale "
+                        f"{tuple(scale.shape)}. in_features per TP rank must "
+                        "be a multiple of 32."
+                    )
+            else:
+                if hasattr(qdata, "full_tensor"):
+                    qdata = qdata.full_tensor()
+                if hasattr(scale, "full_tensor"):
+                    scale = scale.full_tensor()
             mx = MXTensor.__tensor_unflatten__(
                 {"qdata": qdata, "scale": scale.view(self._mx_scale_dtype)},
                 self._mx_ctx,
@@ -315,7 +327,97 @@ def _get_lora_cls(parent_cls: type) -> type:
             self._quantize_base = "nf4"
             return True
 
+        def _forward_packed_tp(self, x: torch.Tensor) -> torch.Tensor:
+            """TP forward for the packed base: local dequant + local matmul,
+            DTensor only at the boundary.
+
+            Colwise: x replicated; each rank computes its out/tp columns;
+            returns DTensor(Shard(-1)). Rowwise: x is the in/tp shard; local
+            partial matmul, ONE reduction over tp for base+adapters combined
+            (linearity: the sum commutes), returns DTensor redistributed to
+            Replicate.
+
+            Backward: explicit grad_placements make the tp reductions happen
+            -- operands used identically by all ranks (colwise x and lora_a,
+            rowwise lora_b) carry Partial gradients that must all-reduce; a
+            bare to_local() would silently skip it.
+            """
+            import torch.nn.functional as F
+            from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+
+            colwise = self._packed_tp_style == "colwise"
+            qdata = self.base_qdata
+            assert isinstance(qdata, DTensor)
+            tp_mesh = qdata.device_mesh
+
+            if isinstance(x, DTensor):
+                if not colwise and all(p.is_replicate() for p in x.placements):
+                    # A rowwise input can arrive replicated (an attention
+                    # output all-gathered before the projection); the
+                    # unquantized path never notices because the base linear
+                    # redistributes for itself. Here the weight dequantizes
+                    # into a local tensor, so the shapes must agree first.
+                    x = x.redistribute(tp_mesh, [Shard(x.dim() - 1)])
+                grad_pl = (Partial(),) if colwise else None
+                x_loc = x.to_local(grad_placements=grad_pl)
+            else:
+                x_loc = x
+
+            w_loc = self._dequant_base_mxfp4().to(x_loc.dtype)
+            la = self.lora_a.weight
+            lb = self.lora_b.weight
+            if colwise:
+                # lora_a Replicate (grads sum over tp), lora_b Shard(0) local.
+                if isinstance(la, DTensor):
+                    la = la.to_local(grad_placements=(Partial(),))
+                if isinstance(lb, DTensor):
+                    lb = lb.to_local()
+            else:
+                # lora_a Shard(1) local, lora_b Replicate (grads sum over tp).
+                if isinstance(la, DTensor):
+                    la = la.to_local()
+                if isinstance(lb, DTensor):
+                    lb = lb.to_local(grad_placements=(Partial(),))
+            la = la.to(x_loc.dtype)
+            lb = lb.to(x_loc.dtype)
+
+            out_loc = F.linear(x_loc, w_loc) + self._lora_scaling * F.linear(
+                F.linear(x_loc, la), lb
+            )
+            bias = getattr(self, "bias", None)
+            if colwise:
+                # Colwise shards the OUTPUT features: this rank's bias slice
+                # matches its output slice and adds locally.
+                if bias is not None:
+                    b = bias.to_local() if isinstance(bias, DTensor) else bias
+                    out_loc = out_loc + b.to(out_loc.dtype)
+                return DTensor.from_local(
+                    out_loc, tp_mesh, [Shard(out_loc.dim() - 1)], run_check=False
+                )
+            # Rowwise: local outputs are partial sums over the in/tp shards.
+            out = DTensor.from_local(out_loc, tp_mesh, [Partial()], run_check=False)
+            out = out.redistribute(tp_mesh, [Replicate()])
+            # Rowwise does NOT shard the output: the bias adds AFTER the
+            # partial sums reduce -- on out_loc it would apply once per rank.
+            if bias is not None:
+                b = (
+                    bias
+                    if isinstance(bias, DTensor)
+                    else DTensor.from_local(
+                        bias, tp_mesh, [Replicate()], run_check=False
+                    )
+                )
+                out = out + b.to(out.dtype)
+            return out
+
         def forward(self, input: torch.Tensor) -> torch.Tensor:
+            if (
+                self._quantize_base == "mxfp4"
+                and getattr(self, "_packed_tp_style", None) is not None
+                and isinstance(self.base_qdata, torch.Tensor)
+                and hasattr(self.base_qdata, "device_mesh")
+            ):
+                return self._forward_packed_tp(input)
             if self._quantize_base == "mxfp4":
                 from torch.distributed.tensor import DTensor, Replicate
 
@@ -448,6 +550,31 @@ def _get_mxfp4_experts_cls(parent_cls: type) -> type:
                 self.register_parameter(
                     name + "_scale", nn.Parameter(scale, requires_grad=False)
                 )
+                sharding = getattr(config, "sharding_config", None)
+                entry = (
+                    sharding.state_shardings.pop(name, None)
+                    if sharding and sharding.state_shardings
+                    else None
+                )
+                if entry is not None:
+                    # Translate the declared 3-D placement to the flattened
+                    # packed pair. Replicate/invariant carries over; a shard
+                    # on the EXPERT dim maps to row-shard (experts are
+                    # contiguous row blocks in the (E*A, B) flatten); a shard
+                    # on an inner dim does not survive the flatten and needs
+                    # the packed expert-TP unit.
+                    if any(
+                        isinstance(t, spmd.Shard) and t.dim != 0
+                        for t in entry.axis_types.values()
+                    ):
+                        raise NotImplementedError(
+                            f"quantize_experts='mxfp4': {name} is declared "
+                            "sharded on an inner dim, which the packed "
+                            "flatten cannot express yet. Run without "
+                            "TP/EP-sharded experts, or drop quantize_experts."
+                        )
+                    sharding.state_shardings[name + "_qdata"] = entry
+                    sharding.state_shardings[name + "_scale"] = entry
 
         def init_states(self, **kwargs) -> None:
             # Config.build installs _param_init after __init__; rewrite here,
