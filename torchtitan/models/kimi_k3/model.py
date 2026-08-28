@@ -23,8 +23,9 @@ from torchtitan.models.common.multimodal import (
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.kimi_k3.mtp import KimiK3MTPLayer, put_mtp_logits
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
-from torchtitan.protocols.module import Module
+from torchtitan.protocols.module import Module, ModuleDict
 
 from .kda import KimiDeltaAttention
 from .moe import KimiFeedForward, KimiLatentMoE
@@ -266,6 +267,7 @@ class KimiK3Model(Decoder):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        mtp_layers: list[KimiK3MTPLayer.Config] = field(default_factory=list)
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
@@ -300,6 +302,11 @@ class KimiK3Model(Decoder):
         super().__init__(config)
         self.output_res_norm = config.output_res_norm.build()
         self.output_res_proj = config.output_res_proj.build()
+        self.mtp_layers = (
+            ModuleDict({str(i): cfg.build() for i, cfg in enumerate(config.mtp_layers)})
+            if config.mtp_layers
+            else None
+        )
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
@@ -385,7 +392,55 @@ class KimiK3Model(Decoder):
             self.output_res_proj,
             self.output_res_norm,
         )
+        h_pre_norm_TD = h_TD
         h_TD = self.norm(h_TD) if self.norm is not None else h_TD
+        if self.mtp_layers is not None and self.lm_head is not None:
+            if self._skip_lm_head:
+                # Raised rather than skipped: skipping would leave
+                # take_mtp_logits() empty and the run would LOOK like it
+                # trains MTP while it does not. MTP needs full-vocab logits
+                # per depth, which is exactly the allocation chunked loss
+                # exists to avoid; combining them means per-chunk MTP logits,
+                # a change to the loss, not a guard here.
+                raise ValueError(
+                    "MTP and chunked loss cannot be combined yet: use a "
+                    "non-chunked loss for MTP flavors."
+                )
+            put_mtp_logits(self._compute_mtp_logits(tokens, h_pre_norm_TD))
         if self._skip_lm_head:
             return h_TD
         return self.lm_head(h_TD) if self.lm_head is not None else h_TD
+
+    def _compute_mtp_logits(
+        self, tokens: torch.Tensor, h_pre_norm_TD: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Logits for each MTP depth; depth k predicts the token k+1 ahead.
+
+        The depth-k input fuses the backbone's final PRE-norm hidden state
+        (the reference feeds hnorm the unnormalised state; normalising twice
+        is not an identity and breaks parity against official MTP weights)
+        with the embedding of the token k+1 ahead. The last k+1 positions
+        have no target and are dropped rather than padded -- padding would
+        invent supervision. The folded stream has one token axis, hence the
+        [T]-shaped slicing; the multimodal splice is length-preserving here,
+        so shift-by-k stays aligned and the visual positions already carry
+        IGNORE_INDEX in the labels.
+        """
+        if self.tok_embeddings is None:
+            raise RuntimeError(
+                "MTP needs tok_embeddings and lm_head together, and "
+                "tok_embeddings is None -- PP has split them across stages. "
+                "Keep the embedding and the head on one stage for MTP."
+            )
+        assert self.mtp_layers is not None and self.lm_head is not None
+        out = []
+        for k in range(len(self.mtp_layers)):
+            shift = k + 1
+            ahead_T = tokens[shift:]
+            emb_TD = self.tok_embeddings(ahead_T)
+            h_TD = h_pre_norm_TD[: ahead_T.shape[0]]
+            hidden_TD = self.mtp_layers[str(k)](h_TD, emb_TD)
+            if self.norm is not None:
+                hidden_TD = self.norm(hidden_TD)
+            out.append(self.lm_head(hidden_TD))
+        return out
