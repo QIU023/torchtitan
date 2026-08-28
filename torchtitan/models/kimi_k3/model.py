@@ -501,10 +501,15 @@ class KimiK3Model(Decoder):
                 enable_tp=parallelism.tensor_parallel_degree > 1,
                 # SP shards the token axis on the TP mesh; CP owns that axis
                 # in this model, so the two do not compose yet.
+                # Sequence ownership when TP-SP and CP stack: CP owns the
+                # OUTER split of the token axis (out-of-band, data-level);
+                # TP-SP owns the INNER one (in-band Shard(0) on the cp-local
+                # stream). The MLA/KDA in_dst declarations state the meeting
+                # point: gather the TP axis, leave the CP shard in place for
+                # Ulysses/KCP.
                 enable_sp=(
                     parallelism.tensor_parallel_degree > 1
                     and parallelism.enable_sequence_parallel
-                    and parallelism.context_parallel_degree == 1
                 ),
             )
             # MoonEP's S is a static shape: the per-rank token count of every
@@ -1075,11 +1080,30 @@ class KimiK3Model(Decoder):
                 # default Replicate grad placement is the right one.
                 mesh = embeddings_TD.device_mesh
                 placements = embeddings_TD.placements
-                local_TD = embeddings_TD.to_local()
-                local_TD = local_TD.masked_scatter(
-                    local_mask.unsqueeze(-1), mine.to(local_TD.dtype)
-                )
-                embeddings_TD = DTensor.from_local(local_TD, mesh, placements)
+                if any(p.is_shard() for p in placements):
+                    # TP-SP inner split: the splice is a token-indexed seam
+                    # and must see the FULL cp-local stream -- slicing the
+                    # mask per tp rank instead would hand the replicated
+                    # tower disjoint partial gradients that nothing reduces
+                    # over the tp axis. Redistribute is differentiable both
+                    # ways (gather in, slice out; grads mirror).
+                    unsharded = tuple(
+                        Replicate() if p.is_shard() else p for p in placements
+                    )
+                    embeddings_TD = embeddings_TD.redistribute(placements=unsharded)
+                    local_TD = embeddings_TD.to_local()
+                    local_TD = local_TD.masked_scatter(
+                        local_mask.unsqueeze(-1), mine.to(local_TD.dtype)
+                    )
+                    embeddings_TD = DTensor.from_local(
+                        local_TD, mesh, unsharded
+                    ).redistribute(placements=placements)
+                else:
+                    local_TD = embeddings_TD.to_local()
+                    local_TD = local_TD.masked_scatter(
+                        local_mask.unsqueeze(-1), mine.to(local_TD.dtype)
+                    )
+                    embeddings_TD = DTensor.from_local(local_TD, mesh, placements)
             else:
                 embeddings_TD = embeddings_TD.masked_scatter(
                     local_mask.unsqueeze(-1), mine.to(embeddings_TD.dtype)
