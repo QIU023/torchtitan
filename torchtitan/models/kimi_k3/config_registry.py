@@ -255,3 +255,22 @@ def kimi_k3_debugmodel_qb() -> Trainer.Config:
     config = kimi_k3_debugmodel()
     config.model_spec.post_optimizer_build_fn = register_quantile_balancing
     return config
+
+
+def kimi_k3_debugmodel_mtp() -> Trainer.Config:
+    """The debug model with one multi-token-prediction layer (report sec 3.3).
+
+    Plain (non-chunked) cross entropy: MTP needs full-vocab logits per depth,
+    which is exactly the allocation chunked loss exists to avoid -- the model
+    raises on the combination rather than silently skipping depths.
+    """
+    from torchtitan.models.kimi_k3.mtp import KimiMTPLoss
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel", num_mtp_layers=1)
+    config.loss = KimiMTPLoss.Config(
+        loss_fn=CrossEntropyLoss.Config(
+            global_vocab_size=decoder_vocab_size(config.model_spec),
+        ),
+    )
+    return config

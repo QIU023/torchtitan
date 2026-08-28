@@ -24,6 +24,9 @@ from dataclasses import dataclass, field
 import torch
 
 from torchtitan.components.loss import BaseLoss, CrossEntropyLoss, IGNORE_INDEX
+from torchtitan.models.common import Linear
+from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.protocols.module import Module
 
 # Rank-local hand-off from the model's forward to the loss. Written by
 # KimiK3Model.forward when MTP layers are configured, taken (and cleared) here.
@@ -106,9 +109,7 @@ class KimiMTPLoss(BaseLoss):
                 target = torch.where(
                     same_doc, target, torch.full_like(target, IGNORE_INDEX)
                 )
-            depth_loss, _ = self.inner(
-                logits[..., :n, :], target, global_valid_tokens
-            )
+            depth_loss, _ = self.inner(logits[..., :n, :], target, global_valid_tokens)
             depth_losses.append(depth_loss)
 
         if not depth_losses:
@@ -117,3 +118,46 @@ class KimiMTPLoss(BaseLoss):
         mtp_mean = torch.stack(depth_losses).mean()
         metrics = {**metrics, "loss/mtp": mtp_mean.detach()}
         return main_loss + self.mtp_weight * mtp_mean, metrics
+
+
+class KimiK3MTPLayer(Module):
+    """One multi-token-prediction layer, mirroring a backbone block.
+
+    Report sec 3.3: the MTP layer "mirrors the structure of a backbone
+    block"; Table 1 lists one, and the released config ships zero -- so it
+    builds only when configured. The depth-k input fuses the backbone's
+    final PRE-norm hidden state with the embedding of the token k+1 ahead,
+    each RMSNormed, concatenated, projected back to the model width, and run
+    through one block with a backbone layer's structure. Embedding and head
+    are shared with the backbone.
+
+    The mirrored block is KDA-typed with ``layer_id=0``: it opens its own
+    (empty) block stack rather than joining the backbone's AttnRes depth
+    mixing, and KDA consumes the shortened sequence directly -- an MLA
+    mirror would need a FlexAttention mask rebuilt per depth length, which
+    is the known TODO, not a silent fallback.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        enorm: "RMSNorm.Config"
+        hnorm: "RMSNorm.Config"
+        eh_proj: "Linear.Config"
+        block: "Module.Config"
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.enorm = config.enorm.build()
+        self.hnorm = config.hnorm.build()
+        self.eh_proj = config.eh_proj.build()
+        self.block = config.block.build()
+
+    def forward(self, h_TD: torch.Tensor, emb_TD: torch.Tensor) -> torch.Tensor:
+        fused_TD = self.eh_proj(
+            torch.cat([self.hnorm(h_TD), self.enorm(emb_TD)], dim=-1)
+        )
+        # An MTP layer has no incoming block stack: it mirrors one block's
+        # structure, not the AttnRes depth-mixing across the backbone.
+        empty_residual = fused_TD.new_zeros(fused_TD.shape[0], 0, fused_TD.shape[1])
+        out_TD, _ = self.block(fused_TD, empty_residual, None, None)
+        return out_TD

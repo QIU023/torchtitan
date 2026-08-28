@@ -29,6 +29,7 @@ from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
 from .moon_ep_dispatcher import MoonEPTokenDispatcher
 from .moon_ep_experts import MoonEPGroupedExperts
+from .mtp import KimiK3MTPLayer
 from .parallelize import parallelize_kimi_k3
 from .pipeline_adapter import pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
@@ -246,7 +247,9 @@ def _latent_moe_config(
             # MoonEP computes experts over its [E+B] tables, so it needs the
             # expert module as well as the dispatcher.
             inner_experts=(
-                MoonEPGroupedExperts.Config if comm_backend == "moonep" else KimiGroupedExperts.Config
+                MoonEPGroupedExperts.Config
+                if comm_backend == "moonep"
+                else KimiGroupedExperts.Config
             )(
                 dim=latent_dim,
                 hidden_dim=expert_hidden_dim,
@@ -396,6 +399,7 @@ def _kimi_k3_config(
     vision_encoder: KimiK3VisionEncoder.Config,
     attn_backend: str,
     moe_comm_backend: str,
+    num_mtp_layers: int = 0,
 ) -> KimiK3Model.Config:
     """Assemble a Kimi K3 config from the released topology's free parameters.
 
@@ -463,9 +467,41 @@ def _kimi_k3_config(
             )
         )
 
+    mtp_layers = [
+        KimiK3MTPLayer.Config(
+            enorm=_norm(dim),
+            hnorm=_norm(dim),
+            eh_proj=_linear(2 * dim, dim),
+            # KDA-typed mirror block with layer_id=0: it opens its own empty
+            # block stack, and KDA consumes the depth-shortened sequence
+            # directly (an MLA mirror would need per-depth mask rebuilds).
+            block=KimiK3TransformerBlock.Config(
+                layer_id=0,
+                attn_res_block_size=attn_res_block_size,
+                attention=None,
+                delta_attention=_kda_config(
+                    dim=dim,
+                    num_heads=num_heads,
+                    head_dim=kda_head_dim,
+                    conv_kernel_size=conv_kernel_size,
+                ),
+                feed_forward=_feed_forward_config(dim=dim, hidden_dim=dense_hidden_dim),
+                moe=None,
+                attention_norm=_norm(dim),
+                ffn_norm=_norm(dim),
+                attention_res_norm=None,
+                attention_res_proj=None,
+                ffn_res_norm=_norm(dim),
+                ffn_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
+            ),
+        )
+        for _ in range(num_mtp_layers)
+    ]
+
     return KimiK3Model.Config(
         dim=dim,
         vocab_size=vocab_size,
+        mtp_layers=mtp_layers,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
@@ -488,6 +524,7 @@ def _debugmodel(
     attn_backend: str,
     moe_comm_backend: str,
     *,
+    num_mtp_layers: int = 0,
     num_layers: int = 24,
     full_attention_layers: set[int] | None = None,
     attn_res_block_size: int = 12,
@@ -496,6 +533,7 @@ def _debugmodel(
     if full_attention_layers is None:
         full_attention_layers = {3, 7, 11, 15, 19, 23}
     return _kimi_k3_config(
+        num_mtp_layers=num_mtp_layers,
         dim=dim,
         vocab_size=163840,
         num_layers=num_layers,
@@ -598,9 +636,11 @@ def model_registry(
     attn_backend: str = "flex",
     moe_comm_backend: str = "standard",
     converters: list[ModelConfigConverter.Config] | None = None,
+    num_mtp_layers: int = 0,
 ) -> ModelSpec:
+    kwargs = {"num_mtp_layers": num_mtp_layers} if num_mtp_layers else {}
     config = kimi_k3_configs[flavor](
-        attn_backend=attn_backend, moe_comm_backend=moe_comm_backend
+        attn_backend=attn_backend, moe_comm_backend=moe_comm_backend, **kwargs
     )
     if converters is not None:
         validate_converter_order(converters)
