@@ -251,6 +251,9 @@ class FakeTableBackend:
     def __init__(self, world: FakeMoonEPWorld, rank: int):
         self.world, self.rank = world, rank
 
+    def configure(self, *, num_experts: int, num_slots: int) -> None:
+        assert (num_experts, num_slots) == (self.world.E, self.world.B)
+
     def alloc_weight_table(self, name, rows, in_dim, out_dim):
         t = torch.zeros(rows, in_dim, out_dim, dtype=torch.bfloat16)
         self.world._tables[(self.rank, name)] = t

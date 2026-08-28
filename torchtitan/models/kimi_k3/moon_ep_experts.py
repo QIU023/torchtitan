@@ -59,6 +59,10 @@ _PROJECTIONS = ("gate", "up", "down")
 class MoonEPTableBackend(Protocol):
     """Allocates the tables MoonEP addresses across ranks."""
 
+    def configure(self, *, num_experts: int, num_slots: int) -> None:
+        """``E`` and ``B``: how the ``rows`` of every table split."""
+        ...
+
     def alloc_weight_table(
         self, name: str, rows: int, in_dim: int, out_dim: int
     ) -> torch.Tensor:
@@ -190,6 +194,7 @@ class MoonEPGroupedExperts(KimiGroupedExperts):
         )
         self._dispatcher = dispatcher
         self._backend = backend
+        backend.configure(num_experts=self.num_experts, num_slots=self.num_prefetch_slots)
         rows = self.num_experts + self.num_prefetch_slots
         D, F = self.w1_EFD.shape[-1], self.w1_EFD.shape[-2]
         self._tables = {
@@ -302,10 +307,12 @@ class MoonEPTableBackendNVLink:
             mapped.append(t[:rows])
         return mapped
 
+    def configure(self, *, num_experts: int, num_slots: int) -> None:
+        self.num_experts, self.num_slots = num_experts, num_slots
+
     def _num_slots(self, rows: int) -> int:
-        # rows = E + B with B = E / R in training, so E = rows * R / (R + 1).
-        num_experts = rows * self.size // (self.size + 1)
-        return rows - num_experts
+        assert rows == self.num_experts + self.num_slots, (rows, self.num_experts, self.num_slots)
+        return self.num_slots
 
     def alloc_weight_table(self, name, rows, in_dim, out_dim):
         num_slots = self._num_slots(rows)
