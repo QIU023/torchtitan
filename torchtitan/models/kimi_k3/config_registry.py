@@ -194,3 +194,18 @@ def kimi_k3_debugmodel_qb() -> Trainer.Config:
     assert config.model_spec is not None
     config.model_spec.post_optimizer_build_fn = register_quantile_balancing
     return config
+
+
+def kimi_k3_debugmodel_mx_qat() -> Trainer.Config:
+    """The debug model under MXFP4-weight / MXFP8-activation fake-quant QAT.
+
+    K3's official quantization scope: the routed experts only, bf16 masters
+    training underneath. Fake-quant is bf16 compute, so this runs on any GPU.
+    """
+    from torchtitan.components.quantization.mx_qat import MXFP4QATConverter
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel", converters=[MXFP4QATConverter.Config()]
+    )
+    return config
