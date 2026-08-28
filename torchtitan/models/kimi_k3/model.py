@@ -30,6 +30,7 @@ from torchtitan.models.common.decoder_sharding import (
     colwise_config,
     dense_activation_placement,
     dense_param_placement,
+    dense_sequence_parallel_placement,
     norm_config,
     rowwise_config,
     set_decoder_sharding_config,
@@ -179,18 +180,28 @@ def _tp_replicate_config() -> ShardingConfig:
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
-def _set_mla_sharding(attention_cfg) -> None:
+def _set_mla_sharding(attention_cfg, *, enable_sp: bool = False) -> None:
     """Head-parallel TP for MLA.
 
     Not ``set_gqa_attention_sharding``: that one asserts a GQAttention.Config,
     and this attention has no fused qkv linear. The shape is the same though --
     the projections that produce or consume the head axis split on it, the two
     compressions stay whole because they are rank-sized rather than head-sized.
+    Under SP the module boundary gathers the sequence shard to Replicate on
+    the way in (the attention core needs the full sequence) and ``wo``
+    reduce-scatters back to Shard(0), exactly the GQA pattern.
     """
+    if enable_sp:
+        attention_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={"x_TD": dense_sequence_parallel_placement()},
+            in_dst_shardings={
+                "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+            },
+        )
     attention_cfg.wq_b.sharding_config = colwise_config()
     attention_cfg.wkv_b.sharding_config = colwise_config()
     attention_cfg.gate.sharding_config = colwise_config()
-    attention_cfg.wo.sharding_config = rowwise_config()
+    attention_cfg.wo.sharding_config = rowwise_config(output_sp=enable_sp)
     attention_cfg.wq_a.sharding_config = _tp_replicate_config()
     attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
     attention_cfg.q_norm.sharding_config = norm_config(enable_sp=False)
@@ -202,7 +213,7 @@ def _set_mla_sharding(attention_cfg) -> None:
     set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
 
 
-def _set_kda_sharding(delta_attention_cfg) -> None:
+def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool = False) -> None:
     """KDA is invariant at TP, and has to be.
 
     Its kernels are fla triton and never see a DTensor, so nothing declared
@@ -226,12 +237,28 @@ def _set_kda_sharding(delta_attention_cfg) -> None:
     delta_attention_cfg.output_norm.sharding_config = norm_config(enable_sp=False)
     # A_log and dt_bias are the module's OWN parameters, so only a
     # module-level declaration reaches them.
-    delta_attention_cfg.sharding_config = ShardingConfig(
+    kda_module_config = ShardingConfig(
         state_shardings={
             "A_log": SpmdLayout({MeshAxisName.DP: spmd.R, MeshAxisName.TP: spmd.I}),
             "dt_bias": SpmdLayout({MeshAxisName.DP: spmd.R, MeshAxisName.TP: spmd.I}),
         }
     )
+    if enable_sp:
+        # The delta recurrence consumes the WHOLE sequence, so SP gathers at
+        # the module boundary on the way in and slices back to Shard(0) on
+        # the way out. The memory saving of SP therefore does not extend
+        # into KDA bodies -- that is the recurrence, not a choice.
+        kda_module_config.in_src_shardings = {
+            "x_TD": dense_sequence_parallel_placement()
+        }
+        kda_module_config.in_dst_shardings = {
+            "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+        }
+        kda_module_config.out_src_shardings = dense_activation_placement(
+            tp=spmd.R, cp=spmd.S(0)
+        )
+        kda_module_config.out_dst_shardings = dense_sequence_parallel_placement()
+    delta_attention_cfg.sharding_config = kda_module_config
 
 
 def _apply_attention_residual(
@@ -472,6 +499,13 @@ class KimiK3Model(Decoder):
             self._set_sharding_config(
                 enable_ep=parallelism.expert_parallel_degree > 1,
                 enable_tp=parallelism.tensor_parallel_degree > 1,
+                # SP shards the token axis on the TP mesh; CP owns that axis
+                # in this model, so the two do not compose yet.
+                enable_sp=(
+                    parallelism.tensor_parallel_degree > 1
+                    and parallelism.enable_sequence_parallel
+                    and parallelism.context_parallel_degree == 1
+                ),
             )
             # MoonEP's S is a static shape: the per-rank token count of every
             # dispatch, after CP and TP/SP have sharded the token axis. Core
@@ -492,7 +526,9 @@ class KimiK3Model(Decoder):
                     )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
-        def _set_sharding_config(self, *, enable_ep: bool, enable_tp: bool) -> None:
+        def _set_sharding_config(
+            self, *, enable_ep: bool, enable_tp: bool, enable_sp: bool = False
+        ) -> None:
             """Declare the sharding the SPMD backends act on.
 
             Sequence parallel is not offered: the sequence is already the axis
@@ -511,17 +547,23 @@ class KimiK3Model(Decoder):
                 # The EP-only declaration is shared with the EP PR branch.
                 set_expert_parallel_sharding_config(self)
                 return
-            set_decoder_sharding_config(self, enable_sp=False)
+            set_decoder_sharding_config(self, enable_sp=enable_sp)
             if enable_tp:
                 # The FINAL aggregation pair, same treatment as the per-layer
                 # ones below: both sit on the block stream, which TP does not
                 # split, and _apply_attention_residual multiplies their weights
                 # together -- one declared and one not is a mixed mul.
                 if self.output_res_norm is not None:
-                    self.output_res_norm.sharding_config = norm_config(enable_sp=False)
+                    self.output_res_norm.sharding_config = norm_config(
+                        enable_sp=enable_sp
+                    )
                 if self.output_res_proj is not None:
                     self.output_res_proj.sharding_config = _tp_replicate_config()
-            attn_x_layout = dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+            attn_x_layout = (
+                dense_sequence_parallel_placement()
+                if enable_sp
+                else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+            )
             for layer in self.layers:
                 if enable_tp:
                     # Every norm and the residual projections stay whole: they
@@ -535,20 +577,20 @@ class KimiK3Model(Decoder):
                     ):
                         cfg = getattr(layer, name, None)
                         if cfg is not None:
-                            cfg.sharding_config = norm_config(enable_sp=False)
+                            cfg.sharding_config = norm_config(enable_sp=enable_sp)
                     for name in ("attention_res_proj", "ffn_res_proj"):
                         cfg = getattr(layer, name, None)
                         if cfg is not None:
                             cfg.sharding_config = _tp_replicate_config()
                     if layer.attention is not None:
-                        _set_mla_sharding(layer.attention)
+                        _set_mla_sharding(layer.attention, enable_sp=enable_sp)
                     if layer.delta_attention is not None:
-                        _set_kda_sharding(layer.delta_attention)
+                        _set_kda_sharding(layer.delta_attention, enable_sp=enable_sp)
                     if layer.feed_forward is not None:
                         set_dense_ffn_sharding(
                             layer.feed_forward,
                             attn_x_layout=attn_x_layout,
-                            enable_sp=False,
+                            enable_sp=enable_sp,
                         )
                 if layer.moe is not None:
                     if enable_tp:
@@ -562,7 +604,7 @@ class KimiK3Model(Decoder):
                         # enable_sp below), so the norm's boundary must follow
                         # the internal layout, not the Replicate stream.
                         layer.moe.routed_norm.sharding_config = norm_config(
-                            enable_sp=enable_ep
+                            enable_sp=enable_ep or enable_sp
                         )
                     set_moe_sharding_config(
                         layer.moe,
@@ -572,14 +614,14 @@ class KimiK3Model(Decoder):
                         # original note warned. The boundary assertions are
                         # overridden just below, because the arriving stream
                         # is Replicate -- one flag cannot say both.
-                        enable_sp=enable_ep and enable_tp,
+                        enable_sp=(enable_ep and enable_tp) or enable_sp,
                         expert_param_layout={
                             "w1_EFD": spmd.S(1),
                             "w2_EDF": spmd.S(2),
                             "w3_EFD": spmd.S(1),
                         },
                     )
-                    if enable_ep and enable_tp:
+                    if enable_ep and enable_tp and not enable_sp:
                         # The stream ARRIVES Replicate and must LEAVE Replicate
                         # (no SP anywhere else in this model's declaration);
                         # inside, ep+tp wants the sequence-sharded layout. src
