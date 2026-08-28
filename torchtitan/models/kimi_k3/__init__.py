@@ -28,6 +28,7 @@ from .kda import KimiDeltaAttention, KimiKDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
 from .moon_ep_dispatcher import MoonEPTokenDispatcher
+from .moon_ep_experts import MoonEPGroupedExperts
 from .parallelize import parallelize_kimi_k3
 from .pipeline_adapter import pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
@@ -242,7 +243,11 @@ def _latent_moe_config(
         ),
         routed_down=_linear(dim, latent_dim),
         routed_experts=RoutedExperts.Config(
-            inner_experts=KimiGroupedExperts.Config(
+            # MoonEP computes experts over its [E+B] tables, so it needs the
+            # expert module as well as the dispatcher.
+            inner_experts=(
+                MoonEPGroupedExperts.Config if comm_backend == "moonep" else KimiGroupedExperts.Config
+            )(
                 dim=latent_dim,
                 hidden_dim=expert_hidden_dim,
                 num_experts=num_experts,

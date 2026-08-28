@@ -25,21 +25,13 @@ dispatch/combine half of an integration, written against ``moonep/api.py``:
   in autograd, so the router's gradient takes the same path it takes with the
   standard dispatcher; MoonEP's own combine-side weighting is not used.
 
-What is NOT here, and why a run with EP > 1 refuses to start: MoonEP balances
-by duplicating hot experts onto other ranks (``B = E/R`` prefetch slots in
-training), which requires every expert projection to live in one contiguous
-symmetric-memory ``[E+B, H, H']`` tensor with the same layout on every rank,
-a grouped GEMM that addresses experts by row through ``cu_seqlens``,
-``prefetch_weight`` before the GEMM and ``reduce_grad`` in the backward.
-torchtitan's ``RoutedExperts`` holds EP/FSDP-sharded DTensor weights and runs
-its GEMM over the local experts only, so that expert-side unit does not exist
-yet; ``init_buffer`` raises until it does. The dispatch/combine pair is still
-callable directly, which is what a standalone parity experiment against
-``AllToAllTokenDispatcher`` needs.
-
-Verification order once that unit and NVLink hardware exist: token
-conservation on identical inputs (including a zero-token expert), then the
-gradient of ``combine`` reaching ``dispatch``'s input.
+The expert side -- the ``[E+B]`` weight tables, ``prefetch_weight`` before
+the grouped GEMM and ``reduce_grad`` in the backward -- is
+``moon_ep_experts.MoonEPGroupedExperts``; the MoE's parallelize attaches it
+to this dispatcher, and it reads the plan of the dispatch in flight through
+``current_plan``. The whole unit is exercised on CPU through the in-process
+double in ``tests/moonep_fake.py``; what remains for NVLink hardware is the
+table allocation over MoonEP's VMM primitives and the kernels themselves.
 """
 
 from __future__ import annotations
@@ -184,6 +176,18 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
         self.num_sms = config.num_sms
         self.token_padding = config.token_padding
         self._buffer = None
+        self._current: tuple[object, torch.Tensor] | None = None
+
+    def _buffer_factory(self, **kwargs):
+        """``moonep.Buffer`` by default; the tests substitute their double."""
+        return _import_moonep().Buffer(**kwargs)
+
+    def current_plan(self) -> tuple[object, torch.Tensor]:
+        """The plan and ``cu_seqlens`` of the dispatch in flight, for the
+        expert side."""
+        if self._current is None:
+            raise RuntimeError("MoonEP experts ran before a dispatch in this step.")
+        return self._current
 
     def wire_meshes(self, *, ep_mesh) -> None:
         # Unlike MinimalAsyncEP this does not REQUIRE an EP mesh: with EP off
@@ -191,33 +195,15 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
         super().wire_meshes(ep_mesh=ep_mesh)
 
     def init_buffer(self) -> None:
-        """Refuse with the reason, until the expert-side unit exists.
-
-        See the module docstring: MoonEP's dispatch only balances because
-        experts are duplicated across ranks, and that needs the ``[E+B]``
-        symmetric weight buffer, prefetch and grad reduce on the expert side.
-        ``RoutedExperts`` does not have it, so a run here would compute
-        duplicated experts' tokens against weights this rank does not hold.
-        ``allocate_buffer`` is the piece that IS ready, for a standalone
-        parity harness.
-        """
-        if self.ep_mesh is None:
-            return
-        raise NotImplementedError(
-            "moe_comm_backend='moonep' needs the expert-side unit MoonEP "
-            "requires (one contiguous [E+B, H, H'] symmetric-memory weight "
-            "tensor per projection, prefetch_weight before the grouped GEMM "
-            "and reduce_grad in the backward); torchtitan's RoutedExperts "
-            "does not provide it yet. Use comm_backend='standard'."
-        )
-
-    def allocate_buffer(self) -> None:
         """Allocate MoonEP's persistent buffer on the EP group.
 
         Collective: every rank has to reach it the same number of times in
-        the same order, so once, never per step.
+        the same order, so once, from ``wire_meshes``, never per step. The
+        expert side (``MoonEPGroupedExperts``) is attached by the MoE's
+        parallelize and reads the plan back through ``current_plan``.
         """
-        assert self.ep_mesh is not None
+        if self.ep_mesh is None:
+            return
         if self.hidden_dim is None or self.num_max_tokens_per_rank is None:
             raise ValueError(
                 "MoonEPTokenDispatcher.Config needs hidden_dim (the dispatched "
@@ -225,9 +211,8 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
                 "S, the per-rank token count of every dispatch) before the "
                 "buffer can be allocated."
             )
-        moonep = _import_moonep()
         ep_size = self.ep_mesh.size()
-        self._buffer = moonep.Buffer(
+        self._buffer = self._buffer_factory(
             S=self.num_max_tokens_per_rank,
             H=self.hidden_dim,
             K=self.top_k,
@@ -274,8 +259,8 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
             )
         if self._buffer is None:
             raise RuntimeError(
-                "MoonEP dispatcher used before allocate_buffer(); the buffer "
-                "is allocated collectively on the EP group first."
+                "MoonEP dispatcher used before wire_meshes(); the buffer is "
+                "allocated collectively on the EP group first."
             )
         if x_TD.shape[0] != self.num_max_tokens_per_rank:
             raise ValueError(
@@ -303,6 +288,7 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
             weights_nvs=weights_nvs,
             input_dtype=x_TD.dtype,
         )
+        self._current = (plan_box[0], cu_seqlens)
         return hidden_nvsh, num_tokens_per_row, metadata
 
     # pyrefly: ignore [bad-override]
