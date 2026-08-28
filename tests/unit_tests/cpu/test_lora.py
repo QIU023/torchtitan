@@ -410,3 +410,53 @@ def test_qlora_config_packs_at_init():
     model.init_states()
     mods = [m for _, m in model.named_modules() if isinstance(m, LoRALinearBase)]
     assert mods and all(isinstance(m.weight, NF4Tensor) for m in mods)
+
+
+def test_qlora_mxfp4_packs_at_build_and_merges():
+    """quantize_base='mxfp4' swaps the base for split storage AT BUILD (the
+    pack-then-shard order), the forward dequantizes, and the merge emits the
+    original weight key with the packed keys gone."""
+    pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
+    torch.manual_seed(0)
+
+    from torchtitan.components.lora import LoRALinearBase, merge_lora_state_dict
+
+    model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(
+                rank=4, alpha=8.0, target_modules=["wo"], quantize_base="mxfp4"
+            ),
+        ],
+    )
+    model = model_spec.model.build()
+    model.init_states()
+
+    mods = [(n, m) for n, m in model.named_modules() if isinstance(m, LoRALinearBase)]
+    assert mods
+    for _, m in mods:
+        assert "weight" not in m._parameters
+        assert m.base_qdata.dtype == torch.uint8
+        assert m.base_scale.dtype == torch.uint8
+        assert m.base_qdata.shape[1] * 2 == m.lora_a.weight.shape[1]
+
+    name, module = mods[0]
+    x = torch.randn(3, module.lora_a.weight.shape[1])
+    y = module(x)
+    assert y.shape == (3, module.lora_b.weight.shape[0])
+    # The packed base is not all zeros after init.
+    assert module.base_qdata.abs().sum() > 0
+
+    merged = merge_lora_state_dict(model)
+    assert f"{name}.weight" in merged
+    assert f"{name}.base_qdata" not in merged
+    assert f"{name}.base_scale" not in merged
+    # lora_b is zero-initialized, so merged == the dequantized base exactly,
+    # and the packed layout is back in place afterwards.
+    torch.testing.assert_close(
+        merged[f"{name}.weight"],
+        module._dequant_base_mxfp4().to(merged[f"{name}.weight"].dtype),
+        rtol=0,
+        atol=0,
+    )
+    assert "weight" not in module._parameters

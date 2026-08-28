@@ -164,7 +164,7 @@ def kimi_k3_debugmodel_lora() -> Trainer.Config:
     return config
 
 
-def _kimi_k3_lora_converter():
+def _kimi_k3_lora_converter(*, quantize_base: str | None = None):
     from torchtitan.components.lora import LoRAConverter
 
     return LoRAConverter.Config(
@@ -185,4 +185,22 @@ def _kimi_k3_lora_converter():
             "routed_down",
             "routed_up",
         ],
+        quantize_base=quantize_base,
     )
+
+
+def kimi_k3_debugmodel_qlora_mxfp4() -> Trainer.Config:
+    """The LoRA debug model with MXFP4-packed bases (QLoRA, K3's native
+    weight format).
+
+    The packing swaps the base for split storage AT BUILD, before
+    parallelize, so FSDP2 shards the packed bytes -- this is the
+    pack-then-shard order the nf4 path cannot reach, and the flavor trains
+    under the normal sharded flow.
+    """
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[_kimi_k3_lora_converter(quantize_base="mxfp4")],
+    )
+    return config

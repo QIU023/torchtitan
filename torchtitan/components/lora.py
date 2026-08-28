@@ -92,12 +92,18 @@ def _get_lora_cls(parent_cls: type) -> type:
             for param in nn.Module.parameters(self):
                 param.requires_grad_(False)
             self._lora_scaling = config.alpha / config.rank
-            if config.quantize_base not in (None, "nf4"):
+            if config.quantize_base not in (None, "nf4", "mxfp4"):
                 raise ValueError(
-                    f"quantize_base must be None or 'nf4', got "
-                    f"{config.quantize_base!r} (mxfp4 is not ported yet)"
+                    f"quantize_base must be None, 'nf4' or 'mxfp4', got "
+                    f"{config.quantize_base!r}"
                 )
             self._quantize_base_requested = config.quantize_base
+            if config.quantize_base == "mxfp4":
+                # BUILD-time swap, before any parallelize: FSDP2 then shards
+                # the packed bytes natively (pack-then-shard), which is the
+                # order the nf4 path cannot reach. Works on meta too -- the
+                # packed LAYOUT registers now, values arrive at init or load.
+                self._swap_in_packed_mxfp4_layout()
             lora_a_sharding, lora_b_sharding = _lora_adapter_sharding(
                 config.sharding_config
             )
@@ -120,8 +126,115 @@ def _get_lora_cls(parent_cls: type) -> type:
 
         _quantize_base: str | None = None
 
+        def _swap_in_packed_mxfp4_layout(self) -> None:
+            """Replace the base weight with MXFP4 split storage (torchao MX,
+            block 32): ``base_qdata`` [out, in/2] uint8 and ``base_scale``
+            [out, in/32] e8m0-bytes-as-uint8, both plain contiguous frozen
+            params. MXTensor itself cannot be a param -- its packed qdata
+            makes the logical view non-contiguous and FSDP2 rejects it -- so
+            the tensor is reconstructed via ``__tensor_unflatten__`` at use.
+            The scale is stored viewed as uint8 because FSDP2's all-gather
+            has no float8_e8m0fnu copy kernel. block_size 32 needs
+            in_features % 32 == 0; other dims stay bf16.
+            """
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            w = self._parameters.get("weight")
+            if w is None or w.shape[-1] % 32 != 0:
+                self._quantize_base_requested = None
+                return
+            # The flatten ctx carries no shape or data, so a dummy reproduces
+            # it exactly; this also works while w is still on meta.
+            dummy = MXTensor.to_mx(
+                torch.zeros(1, 32, dtype=torch.bfloat16),
+                elem_dtype=torch.float4_e2m1fn_x2,
+                block_size=32,
+            )
+            _, self._mx_ctx = dummy.__tensor_flatten__()
+            self._mx_scale_dtype = dummy.scale.dtype
+            out_f, in_f = w.shape
+            if w.is_meta:
+                qdata = torch.empty(out_f, in_f // 2, dtype=torch.uint8, device="meta")
+                scale = torch.empty(out_f, in_f // 32, dtype=torch.uint8, device="meta")
+            else:
+                mx = MXTensor.to_mx(
+                    w.data.to(torch.bfloat16),
+                    elem_dtype=torch.float4_e2m1fn_x2,
+                    block_size=32,
+                )
+                qdata = mx.qdata.contiguous()
+                scale = mx.scale.view(torch.uint8).contiguous()
+            self.base_qdata = nn.Parameter(qdata, requires_grad=False)
+            self.base_scale = nn.Parameter(scale, requires_grad=False)
+            del self._parameters["weight"]
+            self._quantize_base = "mxfp4"
+
+        def _init_packed_mxfp4_values(self) -> None:
+            """Materialize from-scratch values for the packed base.
+
+            MX block-32 quantization is row-blockwise, so it commutes with
+            FSDP2's Shard(0) row sharding: each rank draws ITS rows in bf16
+            with the parent's weight init and quantizes them locally.
+            """
+            from torch.distributed.tensor import DTensor
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            init_fn = self._mx_weight_init or (
+                lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            )
+            qdata, scale = self.base_qdata, self.base_scale
+            q_local = qdata.to_local() if isinstance(qdata, DTensor) else qdata
+            s_local = scale.to_local() if isinstance(scale, DTensor) else scale
+            rows = q_local.shape[0]
+            w_rows = torch.empty(
+                rows,
+                q_local.shape[1] * 2,
+                dtype=torch.bfloat16,
+                device=q_local.device,
+            )
+            init_fn(w_rows)
+            mx = MXTensor.to_mx(
+                w_rows, elem_dtype=torch.float4_e2m1fn_x2, block_size=32
+            )
+            with torch.no_grad():
+                q_local.copy_(mx.qdata)
+                s_local.copy_(mx.scale.view(torch.uint8))
+
+        def _dequant_base_mxfp4(self) -> torch.Tensor:
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            qdata, scale = self.base_qdata, self.base_scale
+            if hasattr(qdata, "full_tensor"):
+                qdata = qdata.full_tensor()
+            if hasattr(scale, "full_tensor"):
+                scale = scale.full_tensor()
+            mx = MXTensor.__tensor_unflatten__(
+                {"qdata": qdata, "scale": scale.view(self._mx_scale_dtype)},
+                self._mx_ctx,
+                None,
+                None,
+            )
+            return mx.dequantize()
+
         def init_states(self, **kwargs) -> None:
+            if self._quantize_base == "mxfp4":
+                # Config.build installs _param_init AFTER __init__, so the
+                # swap could not rewrite it there. The parent's per-param
+                # dict raises on names it does not know: hand it placeholder
+                # zeros for the packed pair (real values land just below)
+                # and keep the weight's init fn for that draw. New dict --
+                # the config's may be shared.
+                self._mx_weight_init = (self._param_init or {}).get("weight")
+                if self._param_init is not None:
+                    self._param_init = {
+                        k: v for k, v in self._param_init.items() if k != "weight"
+                    }
+                    self._param_init["base_qdata"] = nn.init.zeros_
+                    self._param_init["base_scale"] = nn.init.zeros_
             super().init_states(**kwargs)
+            if self._quantize_base == "mxfp4":
+                self._init_packed_mxfp4_values()
+                return
             if self._quantize_base_requested is None:
                 return
             from torch.distributed.tensor import DTensor
@@ -170,7 +283,22 @@ def _get_lora_cls(parent_cls: type) -> type:
             return True
 
         def forward(self, input: torch.Tensor) -> torch.Tensor:
-            if self._quantize_base == "nf4":
+            if self._quantize_base == "mxfp4":
+                from torch.distributed.tensor import DTensor, Replicate
+
+                # No weight-only MXFP4 linear in torchao yet: dequantize,
+                # then matmul. The memory and FSDP all-gather win from the
+                # packed base still holds -- the dense weight is transient.
+                w = self._dequant_base_mxfp4().to(input.dtype)
+                if isinstance(input, DTensor):
+                    mesh = input.device_mesh
+                    w = DTensor.from_local(
+                        w, mesh, [Replicate()] * mesh.ndim, run_check=False
+                    )
+                base_out = torch.nn.functional.linear(input, w)
+                if getattr(self, "bias", None) is not None:
+                    base_out = base_out + self.bias
+            elif self._quantize_base == "nf4":
                 from torchao.dtypes.nf4tensor import linear_nf4
 
                 # linear_nf4 takes the weight only; a bias is added here,
@@ -396,10 +524,15 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     # storage) keeps the returned dict from aliasing anything that gets
     # reverted, and never writes THROUGH a quantized tensor -- copy_ into an
     # NF4 base would silently re-quantize the merged value.
-    originals = [module.weight for _, module in lora_modules]
+    originals = [module._parameters.get("weight") for _, module in lora_modules]
     with torch.no_grad():
         for _, module in lora_modules:
-            base_w = module.weight
+            if module._quantize_base == "mxfp4":
+                # No weight param exists on a packed module: the merged
+                # weight goes in as a fresh one and the restore removes it.
+                base_w = module._dequant_base_mxfp4()
+            else:
+                base_w = module.weight
             if module._quantize_base == "nf4":
                 base_w = base_w.get_original_weight()
             # fp32 delta for deployable precision, cast back to the base dtype.
@@ -414,12 +547,20 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         sd = dict(model.state_dict())
     finally:
         for (_, module), original in zip(lora_modules, originals):
-            module.weight = original
+            if original is None:
+                del module._parameters["weight"]
+            else:
+                module.weight = original
     for mod_name, _ in lora_modules:
         # named_modules() and state_dict() disagree once a wrapper is in the
         # path.
         prefix = _state_dict_prefix(mod_name, sd)
-        for suffix in (".lora_a.weight", ".lora_b.weight"):
+        for suffix in (
+            ".lora_a.weight",
+            ".lora_b.weight",
+            ".base_qdata",
+            ".base_scale",
+        ):
             sd.pop(f"{prefix}{suffix}", None)
     return sd
 
