@@ -265,8 +265,8 @@ def _latent_moe_config(
             # core's dispatcher factory: standard (PyTorch all-to-all), deepep,
             # hybridep or minimal_async_ep, chosen per spec as deepseek_v3
             # does. "moonep" is K3's own (report sec 5.2.1) and stays in the
-            # model folder, like fla: the routed experts consume the LATENT
-            # stream, so its buffer is sized by latent_dim, not dim.
+            # model folder, like fla. The routed experts consume the LATENT
+            # stream, so every backend's buffer is sized by latent_dim.
             token_dispatcher=(
                 MoonEPTokenDispatcher.Config(
                     num_experts=num_experts,
@@ -278,6 +278,7 @@ def _latent_moe_config(
                     num_experts=num_experts,
                     top_k=top_k,
                     comm_backend=comm_backend,
+                    hidden_dim=latent_dim,
                 )
             ),
         ),

@@ -304,12 +304,19 @@ def set_expert_parallel_sharding_config(config) -> None:
     model.py -- with TP on, tp becomes a token axis inside the MoE region and
     the two cannot be declared independently.
     """
+    # The decoder-level distribution is what makes the activations reaching
+    # the MoE boundary DTensors this declaration can redistribute onto the
+    # expert mesh; without it the routed path sees plain tensors and the EP
+    # redistribution has nothing to act on. enable_sp=False because sequence
+    # parallel is not part of this PR.
     set_decoder_sharding_config(config, enable_sp=False)
     for layer in config.layers:
         if layer.moe is not None:
             set_moe_sharding_config(
                 layer.moe,
                 enable_ep=True,
+                # TODO: enable TP/SP here once the tensor-parallel PR lands;
+                # with EP alone the internals run without sequence parallel.
                 enable_sp=False,
                 expert_param_layout={
                     "w1_EFD": spmd.S(1),
