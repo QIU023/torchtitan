@@ -388,3 +388,25 @@ def test_qlora_nf4_pack_forward_merge():
     torch.testing.assert_close(merged[f"{name}.weight"], dequant, rtol=0, atol=0)
     # The NF4 param object is back in place after the export.
     assert isinstance(module.weight, NF4Tensor)
+
+
+def test_qlora_config_packs_at_init():
+    """quantize_base='nf4' on the converter packs the bases when init_states
+    runs (unparallelized build; FSDP-managed bases are refused by design)."""
+    pytest.importorskip("torchao.dtypes.nf4tensor")
+    from torchao.dtypes.nf4tensor import NF4Tensor
+
+    from torchtitan.components.lora import LoRALinearBase
+
+    model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(
+                rank=4, alpha=8.0, target_modules=["wo"], quantize_base="nf4"
+            ),
+        ],
+    )
+    model = model_spec.model.build()
+    model.init_states()
+    mods = [m for _, m in model.named_modules() if isinstance(m, LoRALinearBase)]
+    assert mods and all(isinstance(m.weight, NF4Tensor) for m in mods)

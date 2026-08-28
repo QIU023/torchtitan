@@ -85,12 +85,19 @@ def _get_lora_cls(parent_cls: type) -> type:
         class Config(parent_config_cls):  # type: ignore[misc]
             rank: int
             alpha: float
+            quantize_base: str | None = None
 
         def __init__(self, config: Config) -> None:
             super().__init__(config)
             for param in nn.Module.parameters(self):
                 param.requires_grad_(False)
             self._lora_scaling = config.alpha / config.rank
+            if config.quantize_base not in (None, "nf4"):
+                raise ValueError(
+                    f"quantize_base must be None or 'nf4', got "
+                    f"{config.quantize_base!r} (mxfp4 is not ported yet)"
+                )
+            self._quantize_base_requested = config.quantize_base
             lora_a_sharding, lora_b_sharding = _lora_adapter_sharding(
                 config.sharding_config
             )
@@ -112,6 +119,28 @@ def _get_lora_cls(parent_cls: type) -> type:
             ).build()
 
         _quantize_base: str | None = None
+
+        def init_states(self, **kwargs) -> None:
+            super().init_states(**kwargs)
+            if self._quantize_base_requested is None:
+                return
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(self.weight, DTensor):
+                # A DTensor base here means the module is FSDP/TP-managed, and
+                # FSDP2's lazy_init re-reads the sharded param it registered
+                # (reset_sharded_param): swapping in packed bytes after the
+                # fact breaks it even on a 1-rank mesh, in two tested ways
+                # (plain NF4 param: no _local_tensor; NF4 inside the DTensor
+                # shell: invalid storage). NF4 under FSDP needs the
+                # pack-then-shard order via split-storage params, which the
+                # MXFP4 port will bring; refusing beats a broken lazy_init.
+                raise NotImplementedError(
+                    "quantize_base='nf4' does not support FSDP/TP-managed "
+                    "base weights yet: build without parallelize (library "
+                    "use), or drop quantize_base."
+                )
+            self.quantize_base_nf4()
 
         @torch.no_grad()
         def quantize_base_nf4(self) -> bool:
@@ -211,6 +240,14 @@ class LoRAConverter(ModelConfigConverter):
         """Module names to apply LoRA to (matched against the last segment of the FQN).
         None means all Linear layers. An empty list means no layers."""
 
+        quantize_base: str | None = None
+        """Pack frozen base weights at init ('nf4', via torchao). QLoRA:
+        lossy by design, ~4x memory cut on the bases. Library-level for now:
+        the packing refuses FSDP/TP-managed bases (FSDP2's lazy_init cannot
+        take a post-hoc packed param) until the split-storage port lands, so
+        it fits models built without parallelize; adapting a LOADED
+        checkpoint uses quantize_lora_bases after the load instead."""
+
     def __init__(self, config: Config, **kwargs):
         if config.rank <= 0:
             raise ValueError(f"LoRA rank must be positive, got {config.rank}")
@@ -239,6 +276,7 @@ class LoRAConverter(ModelConfigConverter):
             **{f.name: getattr(cfg, f.name) for f in fields(cfg) if f.init},
             rank=self.rank,
             alpha=self.alpha,
+            quantize_base=self.config.quantize_base,
         )
 
     def convert(self, model_config: Module.Config) -> Module.Config:

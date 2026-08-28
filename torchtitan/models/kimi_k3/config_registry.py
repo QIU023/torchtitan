@@ -26,8 +26,6 @@ from torchtitan.trainer import Trainer
 from . import KIMI_K3_SPECIAL_TOKENS, model_registry
 
 
-
-
 def _kimi_k3_multimodal_dataloader(
     dataset: SingleDatasetConfig,
 ) -> GrainDataLoader.Config:
@@ -98,7 +96,6 @@ def kimi_k3_debugmodel() -> Trainer.Config:
     )
 
 
-
 def kimi_k3_debugmodel_32l() -> Trainer.Config:
     """The debug model at 32 layers, for the pipeline x virtual-stage matrix."""
     config = kimi_k3_debugmodel()
@@ -116,7 +113,6 @@ def kimi_k3_debugmodel_32l_naive() -> Trainer.Config:
     config = kimi_k3_debugmodel_32l()
     config.model_spec.model.attn_res_cache = False
     return config
-
 
 
 def kimi_k3_debugmodel_k3recipe() -> Trainer.Config:
@@ -161,31 +157,32 @@ def kimi_k3_debugmodel_lora() -> Trainer.Config:
     last-segment matching cannot separate them -- adding it would silently adapt
     the routers too. Left out rather than guessed.
     """
-    from torchtitan.components.lora import LoRAConverter
-
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry(
-        "debugmodel",
-        converters=[
-            LoRAConverter.Config(
-                rank=8,
-                alpha=16.0,
-                target_modules=[
-                    # MLA
-                    "wq_a",
-                    "wq_b",
-                    "wkv_a",
-                    "wkv_b",
-                    "wo",
-                    # dense FFN and shared experts
-                    "w1",
-                    "w2",
-                    "w3",
-                    # latent MoE down/up projections
-                    "routed_down",
-                    "routed_up",
-                ],
-            )
-        ],
+        "debugmodel", converters=[_kimi_k3_lora_converter()]
     )
     return config
+
+
+def _kimi_k3_lora_converter():
+    from torchtitan.components.lora import LoRAConverter
+
+    return LoRAConverter.Config(
+        rank=8,
+        alpha=16.0,
+        target_modules=[
+            # MLA
+            "wq_a",
+            "wq_b",
+            "wkv_a",
+            "wkv_b",
+            "wo",
+            # dense FFN and shared experts
+            "w1",
+            "w2",
+            "w3",
+            # latent MoE down/up projections
+            "routed_down",
+            "routed_up",
+        ],
+    )
