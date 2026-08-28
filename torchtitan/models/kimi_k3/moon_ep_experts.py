@@ -69,8 +69,19 @@ class MoonEPTableBackend(Protocol):
     def alloc_grad_table(
         self, name: str, rows: int, in_dim: int, out_dim: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """fp32 ``[rows, in, out]`` plus the ``[R, B, in, out]`` view of every
-        rank's slot rows that ``reduce_grad`` reads."""
+        """fp32 ``[rows, in, out]`` plus this rank's ``[B, in, out]`` reduce
+        buffer, the one other ranks read the slot grads from."""
+        ...
+
+    def prefetch(self, plan, tables: dict[str, torch.Tensor]) -> None:
+        """Fill rows ``[E, E+B)`` of every table with the experts the plan
+        copied onto this rank, reading them from their home ranks."""
+        ...
+
+    def reduce_grad(
+        self, plan, grads: dict[str, tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        """Add every rank's slot grads for OUR experts into our local rows."""
         ...
 
 
@@ -101,12 +112,7 @@ class _MoonEPExpertFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, experts, x_RD, w1_l, w2_l, w3_l, cu_seqlens, plan):
         experts._refresh_local_rows(w1_l, w2_l, w3_l)
-        experts._dispatcher._buffer.prefetch_weight(
-            plan=plan,
-            full_gate_weight=experts._tables["gate"],
-            full_up_weight=experts._tables["up"],
-            full_down_weight=experts._tables["down"],
-        )
+        experts._backend.prefetch(plan, experts._tables)
         with torch.no_grad():
             out_RD = experts._compute(x_RD, experts._tables, cu_seqlens)
         ctx.experts = experts
@@ -136,15 +142,7 @@ class _MoonEPExpertFunction(torch.autograd.Function):
             full_grad.zero_()
             full_grad[lo:hi].copy_(table_grads[name][lo:hi])
             full_grad[E : E + B].copy_(table_grads[name][E : E + B])
-        experts._dispatcher._buffer.reduce_grad(
-            plan=ctx.plan,
-            full_gate_grad=experts._grad_tables["gate"][0],
-            full_up_grad=experts._grad_tables["up"][0],
-            full_down_grad=experts._grad_tables["down"][0],
-            gate_reduce_buffer=experts._grad_tables["gate"][1],
-            up_reduce_buffer=experts._grad_tables["up"][1],
-            down_reduce_buffer=experts._grad_tables["down"][1],
-        )
+        experts._backend.reduce_grad(ctx.plan, experts._grad_tables)
         # Back to parameter orientation: tables are [row, in, out], the
         # parameters are w1_EFD/w3_EFD = [E, F, D] and w2_EDF = [E, D, F].
         grad_w1 = experts._grad_tables["gate"][0][lo:hi].transpose(-2, -1)
@@ -248,32 +246,115 @@ def check_moonep_mesh(parallel_dims) -> None:
 
 
 class MoonEPTableBackendNVLink:
-    """The hardware allocator, over ``moonep.buffer``'s VMM primitives.
+    """The hardware allocator, over ``moonep.buffer``'s public primitives.
 
-    ON-BOX. MoonEP's contract needs, per projection, ONE contiguous virtual
-    range of ``E + B`` rows in which chunk ``r`` of the first ``E`` rows is
-    rank ``r``'s physical memory mapped everywhere and the last ``B`` rows are
-    local slot pages; ``prefetch_weight`` slices that single tensor. MoonEP's
-    own e2e test fakes it with a local ``torch.empty`` because it only tests
-    the communication, and ``create_nvl_dist_tensor`` maps equal chunks
-    without a slot tail, so the composition is the one allocation this unit
-    still has to establish against the installed package -- either a
-    ``create_nvl_dist_tensor`` chunk of ``E/R (padded) + B`` rows with the
-    plan's row numbering adjusted, or a VMM reserve that maps the ``R`` chunks
-    and the slot pages back to back. Until then this raises with that note
-    rather than guessing a layout the GEMM would silently misaddress.
+    MoonEP's own ``prefetch_weight`` / ``reduce_grad`` want each projection as
+    ONE contiguous VMM range of ``E + B`` rows with the expert chunks
+    remote-mapped in place, which ``moonep.buffer`` does not hand out ready
+    made. This backend keeps MoonEP's row convention in an ordinary local
+    table and does the two cross-rank moves itself with the primitive its e2e
+    test uses, ``create_nvl_single_owner_tensor``: every rank owns an
+    NVLink-mapped copy of its expert chunk (bf16) and of its slot grads (fp32),
+    and maps every other rank's. ``plan.experts_to_copy`` ([R, B] int32, the
+    global expert id in rank r's slot b, negative when empty) says what to
+    copy where. A plain barrier on the EP group orders the writes before the
+    remote reads -- two per MoE layer per step, the price of not using
+    MoonEP's fused kernels; swap them in once the composite range exists.
+
+    ON-BOX: the ``.tolist()`` on ``experts_to_copy`` is a device sync per
+    layer, and ``pad_dim0_for_alignment`` decides the mapped chunk's padded
+    row count -- both taken from MoonEP's e2e test, neither run here.
     """
 
     def __init__(self, ep_mesh):
         self.ep_mesh = ep_mesh
+        self.rank, self.size = _ep_coords(ep_mesh)
+        self.group = ep_mesh.get_group()
+        self._owned: dict[str, torch.Tensor] = {}
+        self._mapped: dict[str, list[torch.Tensor]] = {}
+        self._reduce_owned: dict[str, torch.Tensor] = {}
+        self._reduce_mapped: dict[str, list[torch.Tensor]] = {}
+        self._rows: dict[str, tuple[int, int]] = {}
+
+    def _map_all_owners(self, rows: int, in_dim: int, out_dim: int, dtype):
+        """One mapped tensor per owner, allocated collectively in rank order
+        exactly as MoonEP's e2e test does it."""
+        import torch.distributed as dist
+        from moonep.buffer import (  # type: ignore[import-not-found]
+            create_nvl_single_owner_tensor,
+            pad_dim0_for_alignment,
+        )
+
+        padded = pad_dim0_for_alignment([rows, in_dim, out_dim], dtype)
+        mapped = []
+        for owner in range(self.size):
+            t = create_nvl_single_owner_tensor(
+                [padded, in_dim, out_dim],
+                dtype,
+                owner_rank=owner,
+                local_rank=self.rank,
+                group=self.group,
+            )
+            if owner == self.rank:
+                t.zero_()
+            torch.cuda.synchronize()
+            dist.barrier(group=self.group)
+            mapped.append(t[:rows])
+        return mapped
+
+    def _num_slots(self, rows: int) -> int:
+        # rows = E + B with B = E / R in training, so E = rows * R / (R + 1).
+        num_experts = rows * self.size // (self.size + 1)
+        return rows - num_experts
 
     def alloc_weight_table(self, name, rows, in_dim, out_dim):
-        raise NotImplementedError(
-            "MoonEP weight tables need one contiguous VMM range of E + B rows "
-            "(remote-mapped expert chunks followed by local slot pages); build "
-            "it over moonep.buffer's primitives on NVLink hardware. The unit is "
-            "exercised end to end on CPU through tests/moonep_fake.py."
+        num_slots = self._num_slots(rows)
+        local = (rows - num_slots) // self.size
+        self._mapped[name] = self._map_all_owners(local, in_dim, out_dim, torch.bfloat16)
+        self._owned[name] = self._mapped[name][self.rank]
+        self._rows[name] = (local, num_slots)
+        return torch.zeros(
+            rows, in_dim, out_dim, dtype=torch.bfloat16, device=self._owned[name].device
         )
 
     def alloc_grad_table(self, name, rows, in_dim, out_dim):
-        raise NotImplementedError("see alloc_weight_table")
+        num_slots = self._num_slots(rows)
+        self._reduce_mapped[name] = self._map_all_owners(num_slots, in_dim, out_dim, torch.float32)
+        self._reduce_owned[name] = self._reduce_mapped[name][self.rank]
+        full = torch.zeros(
+            rows, in_dim, out_dim, dtype=torch.float32, device=self._reduce_owned[name].device
+        )
+        return full, self._reduce_owned[name]
+
+    def prefetch(self, plan, tables):
+        import torch.distributed as dist
+
+        local, num_slots = next(iter(self._rows.values()))
+        num_experts = local * self.size
+        # Publish this rank's chunk, then read what the plan copied onto us.
+        for name, table in tables.items():
+            self._owned[name].copy_(table[self.rank * local : (self.rank + 1) * local])
+        dist.barrier(group=self.group)
+        for b, e in enumerate(plan.experts_to_copy[self.rank].tolist()):
+            if e < 0:
+                continue
+            home, row = divmod(int(e), local)
+            for name, table in tables.items():
+                table[num_experts + b].copy_(self._mapped[name][home][row])
+
+    def reduce_grad(self, plan, grads):
+        import torch.distributed as dist
+
+        local, num_slots = next(iter(self._rows.values()))
+        num_experts = local * self.size
+        for name, (full_grad, _) in grads.items():
+            self._reduce_owned[name].copy_(full_grad[num_experts : num_experts + num_slots])
+        dist.barrier(group=self.group)
+        experts_to_copy = plan.experts_to_copy.tolist()
+        for r in range(self.size):
+            for b, e in enumerate(experts_to_copy[r]):
+                if e >= 0 and int(e) // local == self.rank:
+                    for name, (full_grad, _) in grads.items():
+                        full_grad[int(e)].add_(self._reduce_mapped[name][r][b])
+        # Nobody overwrites a reduce buffer another rank is still reading.
+        dist.barrier(group=self.group)
