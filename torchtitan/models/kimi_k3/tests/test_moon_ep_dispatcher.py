@@ -8,7 +8,7 @@
 
 MoonEP itself needs NVLink hardware and its package; nothing here touches
 either. What CAN be established on CPU: the spec selects the dispatcher, the
-buffer is sized by the LATENT width, EP=1 never imports moon_ep, and the
+buffer is sized by the LATENT width, EP=1 never imports moonep, and the
 import guard names the package.
 """
 
@@ -17,7 +17,7 @@ import torch
 
 from torchtitan.models.kimi_k3 import model_registry
 from torchtitan.models.kimi_k3.moon_ep_dispatcher import (
-    _import_moon_ep,
+    _import_moonep,
     MoonEPTokenDispatcher,
 )
 
@@ -41,7 +41,7 @@ def test_moonep_spec_selects_dispatcher_sized_by_latent():
 
 
 def test_moonep_ep1_falls_back_to_local_dispatch():
-    """With no EP mesh the local fallback runs and moon_ep is never imported:
+    """With no EP mesh the local fallback runs and moonep is never imported:
     dispatch/combine round-trips on CPU like the standard dispatcher's EP=1
     path."""
     spec = model_registry("debugmodel", moe_comm_backend="moonep")
@@ -66,10 +66,10 @@ def test_moonep_ep1_falls_back_to_local_dispatch():
 
 def test_moonep_import_guard_names_the_package():
     try:
-        import moon_ep  # noqa: F401
+        import moonep  # noqa: F401
     except ImportError:
         pass
     else:
-        pytest.skip("moon_ep installed; the guard has nothing to raise")
+        pytest.skip("moonep installed; the guard has nothing to raise")
     with pytest.raises(ImportError, match="MoonshotAI/MoonEP"):
-        _import_moon_ep()
+        _import_moonep()
