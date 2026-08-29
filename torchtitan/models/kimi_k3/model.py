@@ -636,6 +636,36 @@ class KimiK3Model(Decoder):
                         cfg = layer.moe.sharding_config
                         cfg.in_src_shardings["x_TD"] = stream
                         cfg.out_dst_shardings = stream
+            if self.mtp_layers and enable_tp:
+                if enable_sp:
+                    raise ValueError(
+                        "MTP does not yet compose with sequence parallelism: "
+                        "the depth-shifted slice indexes tokens on the "
+                        "sequence-sharded stream. Pass "
+                        "--parallelism.no-enable-sequence-parallel with tp>1."
+                    )
+                # The mirror layer follows the backbone declarations: KDA
+                # invariant, dense FFN sharded, everything on the block
+                # stream replicated.
+                for mtp_cfg in self.mtp_layers:
+                    mtp_cfg.enorm.sharding_config = norm_config(enable_sp=False)
+                    mtp_cfg.hnorm.sharding_config = norm_config(enable_sp=False)
+                    mtp_cfg.eh_proj.sharding_config = _tp_replicate_config()
+                    blk = mtp_cfg.block
+                    for name in ("attention_norm", "ffn_norm", "ffn_res_norm"):
+                        cfg = getattr(blk, name, None)
+                        if cfg is not None:
+                            cfg.sharding_config = norm_config(enable_sp=False)
+                    if blk.ffn_res_proj is not None:
+                        blk.ffn_res_proj.sharding_config = _tp_replicate_config()
+                    _set_kda_sharding(blk.delta_attention, enable_sp=False)
+                    set_dense_ffn_sharding(
+                        blk.feed_forward,
+                        attn_x_layout=dense_activation_placement(
+                            tp=spmd.I, cp=spmd.S(0)
+                        ),
+                        enable_sp=False,
+                    )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
