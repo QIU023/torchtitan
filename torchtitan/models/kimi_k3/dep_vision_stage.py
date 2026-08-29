@@ -14,7 +14,7 @@ class adapted to the Config-tree model.
 """
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.tools.logging import logger
@@ -278,11 +278,32 @@ class KimiK3ViTStage(KimiK3Model):
             # convention as the non-PP splice in model.py).
             mesh = text_embeds.device_mesh
             placements = text_embeds.placements
-            local_TD = text_embeds.to_local(grad_placements=placements)
-            local_TD = local_TD.masked_scatter(
-                mask_T1.expand_as(local_TD), feats.to(local_TD.dtype)
-            )
-            spliced_TD = DTensor.from_local(local_TD, mesh, placements, run_check=False)
+            if any(p.is_shard() for p in placements):
+                # TP-SP inner split: the splice is a token-indexed seam and
+                # must see the FULL stream at this stage's boundary --
+                # slicing the mask per tp rank instead would hand the tower
+                # disjoint partial gradients that nothing reduces over the
+                # tp axis (same seam and fix as the non-PP splice in
+                # model.py). Redistribute is differentiable both ways.
+                unsharded = tuple(
+                    Replicate() if p.is_shard() else p for p in placements
+                )
+                full = text_embeds.redistribute(placements=unsharded)
+                local_TD = full.to_local()
+                local_TD = local_TD.masked_scatter(
+                    mask_T1.expand_as(local_TD), feats.to(local_TD.dtype)
+                )
+                spliced_TD = DTensor.from_local(
+                    local_TD, mesh, unsharded, run_check=False
+                ).redistribute(placements=placements)
+            else:
+                local_TD = text_embeds.to_local(grad_placements=placements)
+                local_TD = local_TD.masked_scatter(
+                    mask_T1.expand_as(local_TD), feats.to(local_TD.dtype)
+                )
+                spliced_TD = DTensor.from_local(
+                    local_TD, mesh, placements, run_check=False
+                )
         else:
             spliced_TD = text_embeds.masked_scatter(
                 mask_T1.expand_as(text_embeds), feats.to(text_embeds.dtype)

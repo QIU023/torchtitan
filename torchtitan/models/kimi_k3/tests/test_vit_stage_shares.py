@@ -66,6 +66,12 @@ class TestViTStageShares(unittest.TestCase):
     def _assert_shares_match(self, num_shares):
         tower = _tower()
         x, grid = _batch(tower)
+        # Bitwise equality across the two passes: oneDNN's thread
+        # partitioning can shift under host load and change reduction
+        # order, so pin to one thread for the comparison.
+        saved_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, saved_threads)
         with torch.no_grad():
             want = tower(x, grid_thw=grid)
             bounds = tower.block_bounds(num_shares)

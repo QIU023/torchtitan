@@ -24,6 +24,7 @@ import warnings
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor, Replicate
 import torch.nn as nn
 
 from torch.distributed.pipelining.schedules import (
@@ -778,6 +779,13 @@ class CrossStageCacheAdapter(nn.Module):
         if prev_recv_tensor is None:
             return payload
         touch = 0.0 * prev_recv_tensor.sum()
+        if isinstance(touch, DTensor) and any(p.is_partial() for p in touch.placements):
+            # A global sum of a Shard(0) carrier is a Partial(sum) scalar,
+            # and payload + Partial would relabel the loss input. The touch
+            # is zero-valued, so reducing it is free of numerics.
+            touch = touch.redistribute(
+                placements=[Replicate()] * len(touch.placements)
+            )
         if isinstance(payload, tuple):
             head, *tail = payload
             return (head + touch, *tail)
