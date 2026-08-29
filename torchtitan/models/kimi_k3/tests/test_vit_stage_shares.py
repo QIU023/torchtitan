@@ -24,6 +24,11 @@ def _tower():
     cfg = spec.model.vision_encoder
     torch.manual_seed(0)
     tower = cfg.build()
+    # build() leaves delayed-init parameters (e.g. pos_embed) as
+    # uninitialized torch.empty storage; without init_states the test
+    # computes on allocator garbage and only passes while that garbage
+    # happens to be finite.
+    tower.init_states()
     tower.eval()
     return tower
 
