@@ -276,7 +276,10 @@ class KimiK3Model(Decoder):
             if isinstance(dataset, MMSamplePackingConfig):
                 raise ValueError("Kimi K3 does not yet support sample packing.")
             if config.parallelism.tensor_parallel_degree > 1:
-                set_tensor_parallel_sharding_config(self)
+                set_tensor_parallel_sharding_config(
+                    self,
+                    enable_sp=config.parallelism.enable_sequence_parallel,
+                )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
@@ -343,6 +346,21 @@ class KimiK3Model(Decoder):
             num_tokens_per_item,
             special_tokens["image_id"],
         )
+        sp_placements = None
+        if isinstance(embeddings_TD, DTensor) and any(
+            p.is_shard() for p in embeddings_TD.placements
+        ):
+            # SP inner split: the splice is a token-indexed seam and must see
+            # the FULL stream -- vision_positions index the global token axis,
+            # and slicing them per tp rank instead would hand the replicated
+            # tower disjoint partial gradients that nothing reduces over the
+            # tp axis. Redistribute is differentiable both ways.
+            sp_placements = embeddings_TD.placements
+            embeddings_TD = embeddings_TD.redistribute(
+                placements=tuple(
+                    Replicate() if p.is_shard() else p for p in sp_placements
+                )
+            )
         if isinstance(embeddings_TD, DTensor) and not isinstance(
             vision_embeds, DTensor
         ):
@@ -358,11 +376,14 @@ class KimiK3Model(Decoder):
                 embeddings_TD.device_mesh,
                 [Replicate()] * len(embeddings_TD.placements),
             )
-        return scatter_vision_embeds(
+        spliced_TD = scatter_vision_embeds(
             embeddings_TD,
             vision_embeds=vision_embeds,
             vision_positions=vision_positions,
         )
+        if sp_placements is not None and isinstance(spliced_TD, DTensor):
+            spliced_TD = spliced_TD.redistribute(placements=sp_placements)
+        return spliced_TD
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
