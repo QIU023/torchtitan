@@ -401,6 +401,7 @@ def _kimi_k3_config(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     num_mtp_layers: int = 0,
+    first_k_dense: int = 1,
 ) -> KimiK3Model.Config:
     """Assemble a Kimi K3 config from the released topology's free parameters.
 
@@ -441,12 +442,12 @@ def _kimi_k3_config(
                 ),
                 feed_forward=(
                     _feed_forward_config(dim=dim, hidden_dim=dense_hidden_dim)
-                    if layer_idx == 0
+                    if layer_idx < first_k_dense
                     else None
                 ),
                 moe=(
                     None
-                    if layer_idx == 0
+                    if layer_idx < first_k_dense
                     else _latent_moe_config(
                         dim=dim,
                         latent_dim=latent_dim,
@@ -642,6 +643,7 @@ def _debugmodel_rl(
     return _kimi_k3_config(
         num_mtp_layers=num_mtp_layers,
         moe_comm_backend=moe_comm_backend,
+        first_k_dense=12,
         dim=dim,
         vocab_size=163840,
         num_layers=12,
