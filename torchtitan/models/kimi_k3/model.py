@@ -474,6 +474,12 @@ class KimiK3Model(Decoder):
         dep_max_images: int = 8
         dep_max_grid_h: int = 64
         dep_max_grid_w: int = 64
+        # Under selective AC, checkpoint only each block's MoE/feed-forward and
+        # keep attention and the residual math outside, so their activations
+        # are reused in backward: the KDA kernel is an opaque autograd.Function
+        # the per-op policy cannot save, and a whole-block wrap re-runs it.
+        # Trades activation memory for not re-running the attention kernels.
+        ac_reuse_attention: bool = False
 
         def _validate_cp_backend(self, parallelism) -> None:
             """This model's CP is not ShardingConfig-driven -- the KDA kernels

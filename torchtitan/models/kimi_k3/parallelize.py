@@ -78,7 +78,10 @@ def parallelize_kimi_k3(
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
-        ac_policy.apply(model)
+        if getattr(model.config, "ac_reuse_attention", False):
+            _apply_ac_outside_attention(ac_policy, model)
+        else:
+            ac_policy.apply(model)
         if model.vision_encoder is not None:
             ac_policy.apply(model.vision_encoder)
 
@@ -110,6 +113,29 @@ def parallelize_kimi_k3(
     )
 
     return model
+
+
+def _apply_ac_outside_attention(ac_policy, model: nn.Module) -> None:
+    """Checkpoint only each block's MoE/feed-forward; attention stays outside.
+
+    fla's KDA kernel is an opaque autograd.Function, so the per-op selective
+    policy cannot save its output and a whole-block wrap re-runs the kernel in
+    backward. Wrapping just the FFN keeps the mm save/recompute balance where
+    the parameter memory is, while attention and the residual math keep their
+    activations and are reused in backward.
+    """
+    for name, block in model.layers.named_children():
+        inner_name = (
+            "moe" if getattr(block, "moe", None) is not None else "feed_forward"
+        )
+        inner = getattr(block, inner_name)
+        wrapped = ac_policy._wrap_block(inner, base_fqn=f"layers.{name}.{inner_name}")
+        block.register_module(inner_name, wrapped)
+    logger.info(
+        "Applied activation checkpointing to the MoE/feed-forward of %d block(s); "
+        "attention and the residual math stay outside (ac_reuse_attention).",
+        len(model.layers),
+    )
 
 
 def apply_cp_kimi_k3(
