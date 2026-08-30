@@ -478,7 +478,9 @@ class KimiK3Model(Decoder):
             preconditions at wiring time."""
 
         def update_from_config(self, *, config, **kwargs) -> None:
-            dataset = config.dataloader.dataset
+            # A dataloader config without a dataset field (e.g. an external
+            # trainer's no-op loader) has nothing to check for packing.
+            dataset = getattr(config.dataloader, "dataset", None)
             # TODO: Support sample packing by resetting the Q/K/V causal-convolution
             # and KDA recurrent states at document boundaries.
             if isinstance(dataset, MMSamplePackingConfig):
