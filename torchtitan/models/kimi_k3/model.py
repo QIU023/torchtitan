@@ -468,6 +468,12 @@ class KimiK3Model(Decoder):
         # fallback. Engages only on Interleaved1F1B with an even split;
         # anything else warns and passes through.
         attn_res_cache: bool = True
+        # Park own-rank cached commits on pinned host memory between the
+        # producing stage's forward and their same-rank consumers' forwards.
+        # Value-identical: their consumer linkage routes through the
+        # Capture/Augment slot bridge, never through shared storage. Relayed
+        # blocks stay on device (attached for SEND_B).
+        attn_res_cache_offload: bool = False
         # DEP (report sec 5.2.3): a patch stream crossing a stage boundary
         # needs a static shape -- pipelining sizes its buffers once. These
         # bound the padded payload; exceeding them raises, never truncates.

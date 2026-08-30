@@ -48,6 +48,12 @@ class TopologyKnobs:
     vit_bubble_max_pending: int = 0
     vit_tp_heads: bool = True
     attn_res_cache: bool = False
+    # Park each own-rank cached commit on pinned host memory between the
+    # producing stage's forward and its same-rank consumers' forwards. Only
+    # own commits move: their consumer linkage already routes through the
+    # Capture/Augment slot bridge, so a host round-trip is value-identical;
+    # relayed blocks stay attached for SEND_B and stay on device.
+    attn_res_cache_offload: bool = False
 
 
 _TOPOLOGY: TopologyKnobs | None = None
@@ -79,6 +85,11 @@ def register_topology(config) -> TopologyKnobs:
         vit_tp_heads=bool(getattr(config, "vit_tp_heads", defaults.vit_tp_heads)),
         attn_res_cache=bool(
             getattr(text_cfg, "attn_res_cache", defaults.attn_res_cache)
+        ),
+        attn_res_cache_offload=bool(
+            getattr(
+                text_cfg, "attn_res_cache_offload", defaults.attn_res_cache_offload
+            )
         ),
     )
     if _TOPOLOGY is not None and _TOPOLOGY != resolved:
