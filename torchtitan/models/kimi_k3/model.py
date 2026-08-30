@@ -416,6 +416,10 @@ class _PlainGradBoundary(torch.autograd.Function):
 
 
 class KimiK3Model(Decoder):
+    # The model consumes ONE folded token axis ([T], batch folded in);
+    # external trainers that batch-major their streams read this to fold.
+    folded_token_stream = True
+
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         layers: list[KimiK3TransformerBlock.Config]
