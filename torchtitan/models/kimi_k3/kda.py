@@ -95,20 +95,21 @@ class KimiKDAKernel(Module):
 
 
 def conv_with_halo(conv, x_local, cp_context, activation: str | None = None):
-    """Depthwise causal conv on a sequence-sharded input, exactly: the CP op
-    exchanges the previous rank's tail as a fixed-size halo. ``activation``
-    defaults to ``conv.activation`` (fla's ``ShortConvolution`` carries one;
-    a plain ``nn.Conv1d`` does not)."""
-    from attn_gym.linear.kda.fla_cp import causal_conv1d_cp
+    """Depthwise causal conv on a sequence-sharded input, exactly: fla's
+    ``causal_conv1d_cp`` exchanges the previous rank's tail as a fixed-size
+    halo. ``activation`` defaults to ``conv.activation`` (fla's
+    ``ShortConvolution`` carries one; a plain ``nn.Conv1d`` does not)."""
+    from einops import rearrange
+    from fla.modules.conv.cp.ops import causal_conv1d_cp
 
     return causal_conv1d_cp(
-        x_local,
-        conv.weight,
-        conv.bias,
-        cp_context,
+        x=x_local,
+        weight=rearrange(conv.weight, "d 1 w -> d w"),
+        bias=conv.bias,
         activation=getattr(conv, "activation", None)
         if activation is None
         else activation,
+        cp_context=cp_context,
     )
 
 
@@ -119,18 +120,18 @@ def build_kcp_context(
     conv1d_kernel_size: int | None = None,
     cu_seqlens=None,
 ):
-    """CP context for one evenly split sequence. ``cu_seqlens`` must be
+    """fla CP context for one evenly split sequence. ``cu_seqlens`` must be
     GLOBAL boundaries of the packed sequence; the default is one document
     spanning the whole sequence, matching the non-CP call sites, which also
     pass no boundaries."""
-    from attn_gym.linear.kda.fla_cp import build_fla_cp_context
+    from fla.ops.cp.context import build_cp_context
 
-    return build_fla_cp_context(
-        seq_len_local,
-        group,
-        device,
-        conv1d_kernel_size=conv1d_kernel_size,
-        cu_seqlens=cu_seqlens,
+    if cu_seqlens is None:
+        world = dist.get_world_size(group)
+        total = seq_len_local * world
+        cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=device)
+    return build_cp_context(
+        cu_seqlens, group=group, conv1d_kernel_size=conv1d_kernel_size
     )
 
 
