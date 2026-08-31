@@ -505,6 +505,15 @@ class KimiK3Model(Decoder):
         # Capture/Augment slot bridge, never through shared storage. Relayed
         # blocks stay on device (attached for SEND_B).
         attn_res_cache_offload: bool = False
+        # Balancing activation memory across PP ranks: the listed PP ranks
+        # park the tensors autograd saves for backward in a pool on
+        # pp_balance_dest_rank's GPU, via the Mooncake Transfer Engine.
+        # Copies are exact, so the loss is bitwise the unbalanced run.
+        pp_balance_source_ranks: list[int] = field(default_factory=list)
+        pp_balance_dest_rank: int = -1
+        pp_balance_pool_gib: float = 2.0
+        pp_balance_staging_mib: int = 256
+        pp_balance_min_tensor_mib: int = 1
         # DEP (report sec 5.2.3): a patch stream crossing a stage boundary
         # needs a static shape -- pipelining sizes its buffers once. These
         # bound the padded payload; exceeding them raises, never truncates.

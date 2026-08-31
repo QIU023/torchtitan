@@ -54,6 +54,15 @@ class TopologyKnobs:
     # Capture/Augment slot bridge, so a host round-trip is value-identical;
     # relayed blocks stay attached for SEND_B and stay on device.
     attn_res_cache_offload: bool = False
+    # Balancing activation memory across PP ranks: the listed PP ranks park
+    # the tensors autograd saves for backward in a pool on
+    # pp_balance_dest_rank's GPU, via the Mooncake Transfer Engine (RDMA
+    # where an HCA exists, TCP where one does not). Empty means off.
+    pp_balance_source_ranks: tuple[int, ...] = ()
+    pp_balance_dest_rank: int = -1
+    pp_balance_pool_gib: float = 2.0
+    pp_balance_staging_mib: int = 256
+    pp_balance_min_tensor_mib: int = 1
 
 
 _TOPOLOGY: TopologyKnobs | None = None
@@ -89,6 +98,27 @@ def register_topology(config) -> TopologyKnobs:
         attn_res_cache_offload=bool(
             getattr(
                 text_cfg, "attn_res_cache_offload", defaults.attn_res_cache_offload
+            )
+        ),
+        pp_balance_source_ranks=tuple(
+            getattr(
+                config, "pp_balance_source_ranks", defaults.pp_balance_source_ranks
+            )
+        ),
+        pp_balance_dest_rank=int(
+            getattr(config, "pp_balance_dest_rank", defaults.pp_balance_dest_rank)
+        ),
+        pp_balance_pool_gib=float(
+            getattr(config, "pp_balance_pool_gib", defaults.pp_balance_pool_gib)
+        ),
+        pp_balance_staging_mib=int(
+            getattr(config, "pp_balance_staging_mib", defaults.pp_balance_staging_mib)
+        ),
+        pp_balance_min_tensor_mib=int(
+            getattr(
+                config,
+                "pp_balance_min_tensor_mib",
+                defaults.pp_balance_min_tensor_mib,
             )
         ),
     )

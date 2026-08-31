@@ -1619,6 +1619,15 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
                 "passes activations through unprocessed and reports no error"
             )
         _install_vision_prefetch(pp_schedule, model_parts)
+    if topology().pp_balance_source_ranks:
+        from torchtitan.models.kimi_k3.pp_balance import install_pp_balance
+
+        pp_group = kwargs["parallel_dims"].get_mesh("pp").get_group()
+        # Keep the engine alive for the schedule's lifetime: it owns the
+        # registered pool/staging buffers and the transfer sessions.
+        pp_schedule._pp_balance_engine = install_pp_balance(
+            pp_schedule, pp_group, topology()
+        )
     passthrough = (pp_schedule, model_parts, has_first_stage, has_last_stage)
 
     if not adapter_enabled():
