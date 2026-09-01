@@ -74,7 +74,7 @@ def parallelize_kimi_k3(
         model.parallelize(parallel_dims)
 
     if parallel_dims.cp_enabled:
-        apply_cp_kimi_k3(model, parallel_dims, training.max_context_length)
+        apply_cp_kimi_k3(model, parallel_dims)
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
@@ -141,7 +141,6 @@ def _apply_ac_outside_attention(ac_policy, model: nn.Module) -> None:
 def apply_cp_kimi_k3(
     model: nn.Module,
     parallel_dims: ParallelDims,
-    max_context_length: int | None = None,
 ) -> None:
     """Wire context parallelism: KCP on the KDA layers, Ulysses on the MLA layers.
 
@@ -154,16 +153,11 @@ def apply_cp_kimi_k3(
     cp_degree, tp_degree = parallel_dims.cp, parallel_dims.tp
     model._cp_group = cp_group
     model._cp_subgroups = _build_cp_subgroups(cp_group)
-    # The CP mask rebuild is causal-only, so the layers get the context window
-    # to reject a folded stream holding several documents. It comes from the
-    # training config: K3's MLA is nope, so the RoPE-derived length would raise.
-    max_ctx = max_context_length
 
     num_mla = 0
     kda_modules = []
     for module in model.modules():
         if isinstance(module, KimiMLAAttention):
-            module._cp_max_context_length = max_ctx
             # Under TP the head axis is already tp-sharded, so Ulysses splits
             # what TP left: heads must divide by tp*cp, not by cp.
             if module.n_heads % (tp_degree * cp_degree) != 0:

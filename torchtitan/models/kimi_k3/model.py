@@ -91,7 +91,6 @@ class KimiMLAAttention(BaseAttention):
     # Ulysses under either KDA CP mode -- KCP describes a recurrence that MLA
     # does not have.
     _cp_group = None
-    _cp_mask = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -119,7 +118,6 @@ class KimiMLAAttention(BaseAttention):
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del positions
 
         num_tokens = x_TD.shape[0]
         # Head count DERIVED from the projection width, not self.n_heads: the
@@ -152,7 +150,9 @@ class KimiMLAAttention(BaseAttention):
 
         cp_group = self._cp_group
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            out_THV = mla_ulysses_attention(self, q_THK, kv_THC, k_rope_TK, cp_group)
+            out_THV = mla_ulysses_attention(
+                self, q_THK, kv_THC, k_rope_TK, cp_group, positions
+            )
         else:
             out_THV = self.inner_attention(
                 q_THK,
