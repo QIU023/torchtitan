@@ -75,6 +75,15 @@ class _TopologyKnobs:
     # Capture/Augment slot bridge, so a host round-trip is value-identical;
     # relayed blocks stay attached for SEND_B and stay on device.
     attn_res_cache_offload: bool = False
+    # Balancing activation memory across PP ranks: the listed PP ranks park
+    # the tensors autograd saves for backward in a pool on
+    # pp_balance_dest_rank's GPU, via the Mooncake Transfer Engine (RDMA
+    # where an HCA exists, TCP where one does not). Empty means off.
+    pp_balance_source_ranks: tuple[int, ...] = ()
+    pp_balance_dest_rank: int = -1
+    pp_balance_pool_gib: float = 2.0
+    pp_balance_staging_mib: int = 256
+    pp_balance_min_tensor_mib: int = 1
 
 
 _TOPOLOGY: _TopologyKnobs | None = None
@@ -93,6 +102,23 @@ def _register_topology(config) -> _TopologyKnobs:
         attn_res_cache=bool(getattr(config, "attn_res_cache", defaults.attn_res_cache)),
         attn_res_cache_offload=bool(
             getattr(config, "attn_res_cache_offload", defaults.attn_res_cache_offload)
+        ),
+        pp_balance_source_ranks=tuple(
+            getattr(config, "pp_balance_source_ranks", defaults.pp_balance_source_ranks)
+        ),
+        pp_balance_dest_rank=int(
+            getattr(config, "pp_balance_dest_rank", defaults.pp_balance_dest_rank)
+        ),
+        pp_balance_pool_gib=float(
+            getattr(config, "pp_balance_pool_gib", defaults.pp_balance_pool_gib)
+        ),
+        pp_balance_staging_mib=int(
+            getattr(config, "pp_balance_staging_mib", defaults.pp_balance_staging_mib)
+        ),
+        pp_balance_min_tensor_mib=int(
+            getattr(
+                config, "pp_balance_min_tensor_mib", defaults.pp_balance_min_tensor_mib
+            )
         ),
     )
     if _TOPOLOGY is not None and _TOPOLOGY != resolved:
@@ -1133,7 +1159,7 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     parallelism.module_fqns_per_model_part = fqns
 
 
-def pipeline_kimi_k3(model: nn.Module, **kwargs):
+def _pipeline_kimi_k3_adapter(model: nn.Module, **kwargs):
     """``pipelining_fn`` for Kimi Linear (baseline + AttnRes variants).
 
     Behavior:
@@ -1257,3 +1283,19 @@ def pipeline_kimi_k3(model: nn.Module, **kwargs):
     )
 
     return pp_schedule, model_parts, has_first_stage, has_last_stage
+
+
+def pipeline_kimi_k3(model: nn.Module, **kwargs):
+    """Split the model into stages, wire the block transport, then balance."""
+    result = _pipeline_kimi_k3_adapter(model, **kwargs)
+    if _topology().pp_balance_source_ranks:
+        from torchtitan.models.kimi_k3.pp_balance import install_pp_balance
+
+        pp_schedule = result[0]
+        pp_group = kwargs["parallel_dims"].get_mesh("pp").get_group()
+        # Keep the engine alive for the schedule's lifetime: it owns the
+        # registered pool/staging buffers and the transfer sessions.
+        pp_schedule._pp_balance_engine = install_pp_balance(
+            pp_schedule, pp_group, _topology()
+        )
+    return result
