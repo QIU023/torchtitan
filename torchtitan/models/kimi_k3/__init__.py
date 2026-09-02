@@ -637,13 +637,15 @@ def _debugmodel_rl(
     vLLM's MLA prefill kernels accept only the released head profile
     (nope 128 / rope 64 / v 128); this flavor carries those head dims at
     debug scale, 12 layers, so the same checkpoint loads on both sides
-    of an RL loop.
+    of an RL loop. The MoE stack is the released shape (one dense layer,
+    the rest latent MoE): the routed experts are what K3 quantizes, so a
+    rollout model without them cannot exercise that path.
     """
     dim = 1024
     return _kimi_k3_config(
         num_mtp_layers=num_mtp_layers,
         moe_comm_backend=moe_comm_backend,
-        first_k_dense=12,
+        first_k_dense=1,
         dim=dim,
         vocab_size=163840,
         num_layers=12,

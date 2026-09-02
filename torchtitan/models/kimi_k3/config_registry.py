@@ -223,6 +223,23 @@ def kimi_k3_debugmodel_mx_qat() -> Trainer.Config:
     return config
 
 
+def kimi_k3_debugmodel_rl_mx_qat() -> Trainer.Config:
+    """The rollout-shaped debug model under the report's QAT scope.
+
+    Same fake-quant as ``kimi_k3_debugmodel_mx_qat`` -- MXFP4 weights and
+    MXFP8 activations on the routed experts, bf16 masters underneath -- on the
+    flavor an RL loop uses, so post-training can carry QAT the way the report
+    describes rather than only pretraining-shaped runs.
+    """
+    from torchtitan.components.quantization.mx_qat import MXFP4QATConverter
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel_rl", converters=[MXFP4QATConverter.Config()]
+    )
+    return config
+
+
 def kimi_k3_debugmodel_qlora_mxfp4() -> Trainer.Config:
     """The LoRA debug model with MXFP4-packed bases (QLoRA, K3's native
     weight format).
@@ -281,6 +298,9 @@ def kimi_k3_debugmodel_moonep() -> Trainer.Config:
     moonep package, an NVLink-mapped EP group and dp_shard == ep."""
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry("debugmodel", moe_comm_backend="moonep")
+    return config
+
+
 def kimi_k3_debugmodel_deepep() -> Trainer.Config:
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry("debugmodel", moe_comm_backend="deepep")
