@@ -69,6 +69,12 @@ class _TopologyKnobs:
     """Resolved topology."""
 
     attn_res_cache: bool = False
+    # Park each own-rank cached commit on pinned host memory between the
+    # producing stage's forward and its same-rank consumers' forwards. Only
+    # own commits move: their consumer linkage already routes through the
+    # Capture/Augment slot bridge, so a host round-trip is value-identical;
+    # relayed blocks stay attached for SEND_B and stay on device.
+    attn_res_cache_offload: bool = False
 
 
 _TOPOLOGY: _TopologyKnobs | None = None
@@ -85,6 +91,9 @@ def _register_topology(config) -> _TopologyKnobs:
     defaults = _TopologyKnobs()
     resolved = _TopologyKnobs(
         attn_res_cache=bool(getattr(config, "attn_res_cache", defaults.attn_res_cache)),
+        attn_res_cache_offload=bool(
+            getattr(config, "attn_res_cache_offload", defaults.attn_res_cache_offload)
+        ),
     )
     if _TOPOLOGY is not None and _TOPOLOGY != resolved:
         logger.warning(
@@ -149,7 +158,15 @@ class RankLocalCache:
     track on the backward path.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, offload_own_commits: bool = False) -> None:
+        # Park own-rank commits on pinned host memory between the producing
+        # stage's forward and their same-rank consumers' forwards. Safe only
+        # for OWN commits: their consumer linkage routes through the
+        # Capture/Augment slot bridge, never through shared storage, so a host
+        # round-trip is value-identical. Relayed blocks must stay attached on
+        # device or SEND_B stops draining their grads.
+        self._offload_own_commits = offload_own_commits and torch.cuda.is_available()
+        self._offload_device: torch.device | None = None
         self._blocks: dict[int, list[torch.Tensor]] = {}
         self._producer_meta: dict[int, list[tuple[int, int, int]]] = {}
         # Every backward marks its mb here so the step-end drop sweep
@@ -173,12 +190,29 @@ class RankLocalCache:
         mb_index: int,
         block: torch.Tensor,
         meta: tuple[int, int, int],
+        *,
+        offload_ok: bool = False,
     ) -> None:
+        if self._offload_own_commits and offload_ok and block.is_cuda:
+            self._offload_device = block.device
+            host = torch.empty_like(block, device="cpu", pin_memory=True)
+            # Async D2H onto the current stream; the H2D in get_blocks runs on
+            # the same stream later, so stream order alone serializes them.
+            host.copy_(block, non_blocking=True)
+            block = host
         self._blocks.setdefault(mb_index, []).append(block)
         self._producer_meta.setdefault(mb_index, []).append(meta)
 
     def get_blocks(self, mb_index: int) -> list[torch.Tensor]:
-        return self._blocks.get(mb_index, [])
+        blocks = self._blocks.get(mb_index, [])
+        if self._offload_device is None:
+            return blocks
+        return [
+            b.to(self._offload_device, non_blocking=True)
+            if b.device.type == "cpu"
+            else b
+            for b in blocks
+        ]
 
     def get_meta(self, mb_index: int) -> list[tuple[int, int, int]]:
         return self._producer_meta.get(mb_index, [])
@@ -300,7 +334,9 @@ def _get_or_create_rank_cache(pp_rank: int) -> RankLocalCache:
     with _rank_caches_lock:
         cache = _rank_caches.get(pp_rank)
         if cache is None:
-            cache = RankLocalCache()
+            cache = RankLocalCache(
+                offload_own_commits=_topology().attn_res_cache_offload
+            )
             _rank_caches[pp_rank] = cache
         return cache
 
@@ -778,6 +814,7 @@ class CrossStageCacheAdapter(nn.Module):
                 mb,
                 blk.detach(),
                 (self.pp_rank, self.stage_id, local_idx),
+                offload_ok=True,
             )
         # `new_blocks_list` (attached) is used below for the outgoing
         # delta. Keep the name alias for readability vs. the previous

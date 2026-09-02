@@ -277,6 +277,12 @@ class KimiK3Model(Decoder):
         # fallback. Engages only on Interleaved1F1B with an even split;
         # anything else warns and passes through.
         attn_res_cache: bool = True
+        # Park own-rank cached commits on pinned host memory between the
+        # producing stage's forward and their same-rank consumers' forwards.
+        # Value-identical: their consumer linkage routes through the
+        # Capture/Augment slot bridge, never through shared storage. Relayed
+        # blocks stay on device (attached for SEND_B).
+        attn_res_cache_offload: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
