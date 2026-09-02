@@ -201,8 +201,9 @@ def set_tensor_parallel_sharding_config(
                 layer.feed_forward, attn_x_layout=attn_x_layout, enable_sp=enable_sp
             )
         if layer.moe is not None:
-            # The MoE module boundary gathers the sequence shard under SP
-            # without EP, so the latent pair and its norm see the whole stream.
+            # routed_down runs on the stream the MoE boundary gathered; the
+            # experts hand their output back sequence-sharded under SP, so the
+            # norm after them and routed_up run on the shard.
             layer.moe.routed_down.sharding_config = _tp_replicate_config()
             layer.moe.routed_up.sharding_config = _tp_replicate_config()
-            layer.moe.routed_norm.sharding_config = norm_config(enable_sp=False)
+            layer.moe.routed_norm.sharding_config = norm_config(enable_sp=enable_sp)
