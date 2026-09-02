@@ -15,7 +15,19 @@ from typing import TYPE_CHECKING
 
 import spmd_types as spmd
 
+from torchtitan.models.common.decoder_sharding import (
+    attention_activation_placement,
+    colwise_config,
+    dense_activation_placement,
+    dense_param_placement,
+    norm_config,
+    rowwise_config,
+    set_decoder_sharding_config,
+    set_dense_ffn_sharding,
+    set_gqa_inner_attention_local_map,
+)
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan.models.kimi_k3.model import KimiK3Model
@@ -45,3 +57,118 @@ def set_kimi_k3_sharding_config(
                     "w3_EFD": spmd.S(1),
                 },
             )
+
+
+def _tp_replicate_config() -> ShardingConfig:
+    """Weight replicated on the TP axis, with no activation boundary declared.
+
+    The replicated member of the colwise/rowwise family, which core does not
+    have: declaring the activation boundaries would lift the input to a
+    DTensor while ``Linear.forward`` unwraps its own weight to local.
+    """
+    return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
+
+
+def _set_mla_sharding(attention_cfg) -> None:
+    """Head-parallel TP for MLA.
+
+    The projections that produce or consume the head axis split on it; the
+    two compressions stay whole because they are rank-sized, not head-sized.
+    """
+    attention_cfg.wq_b.sharding_config = colwise_config()
+    attention_cfg.wkv_b.sharding_config = colwise_config()
+    attention_cfg.gate.sharding_config = colwise_config()
+    attention_cfg.wo.sharding_config = rowwise_config()
+    attention_cfg.wq_a.sharding_config = _tp_replicate_config()
+    attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
+    attention_cfg.q_norm.sharding_config = norm_config(enable_sp=False)
+    attention_cfg.kv_norm.sharding_config = norm_config(enable_sp=False)
+    set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
+
+
+def _set_kda_sharding(delta_attention_cfg) -> None:
+    """Head-parallel TP for KDA.
+
+    The delta rule is independent per head, so the projections that produce
+    or consume the head axis split on it, the per-head state (``A_log``,
+    ``dt_bias``, the depthwise convolutions) shards with the heads, and the
+    kernel runs on the local heads behind a ``local_map`` on ``inner_kda``.
+    The one low-rank compression, ``forget_a``, is rank-sized and stays whole.
+    """
+    for name in ("q_proj", "k_proj", "v_proj", "forget_b", "beta", "output_gate"):
+        getattr(delta_attention_cfg, name).sharding_config = colwise_config()
+    delta_attention_cfg.forget_a.sharding_config = _tp_replicate_config()
+    delta_attention_cfg.output_proj.sharding_config = rowwise_config()
+    head_param = dense_param_placement(tp=spmd.S(0))
+    for name in ("q_conv", "k_conv", "v_conv"):
+        getattr(delta_attention_cfg, name).sharding_config = ShardingConfig(
+            state_shardings={"weight": head_param}
+        )
+    delta_attention_cfg.output_norm.sharding_config = ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.R)}
+    )
+    delta_attention_cfg.sharding_config = ShardingConfig(
+        state_shardings={"A_log": head_param, "dt_bias": head_param}
+    )
+    features = dense_activation_placement(tp=spmd.S(-1), cp=spmd.S(0))
+    heads = attention_activation_placement()
+    inputs = {
+        "query_TC": features,
+        "key_TC": features,
+        "value_TC": features,
+        "raw_gate_THK": heads,
+        "raw_beta_TH": features,
+        "conv_q_weight_C1W": head_param,
+        "conv_k_weight_C1W": head_param,
+        "conv_v_weight_C1W": head_param,
+        "A_log_H": head_param,
+        "dt_bias_HK": head_param,
+        # Packed-document boundaries, the same on every tp rank (None under flex).
+        "cu_seqlens": dense_activation_placement(tp=spmd.I, cp=spmd.V),
+    }
+    delta_attention_cfg.inner_kda.sharding_config = ShardingConfig(
+        in_src_shardings=inputs,
+        in_dst_shardings=inputs,
+        out_src_shardings=heads,
+        local_map=LocalMapConfig(in_grad_placements=tuple(inputs.values())),
+    )
+
+
+def set_tensor_parallel_sharding_config(config: "KimiK3Model.Config") -> None:
+    """Declare the sharding tensor parallel acts on.
+
+    The stream stays whole on the TP axis and only head and feature axes
+    shard; sequence parallel is not offered here. The MoE internals are
+    declared by ``set_kimi_k3_sharding_config``; this adds the latent
+    projections around them.
+    """
+    set_decoder_sharding_config(config, enable_sp=False)
+    config.output_res_norm.sharding_config = norm_config(enable_sp=False)
+    config.output_res_proj.sharding_config = _tp_replicate_config()
+    attn_x_layout = dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+    for layer in config.layers:
+        for name in (
+            "attention_norm",
+            "ffn_norm",
+            "attention_res_norm",
+            "ffn_res_norm",
+        ):
+            cfg = getattr(layer, name, None)
+            if cfg is not None:
+                cfg.sharding_config = norm_config(enable_sp=False)
+        for name in ("attention_res_proj", "ffn_res_proj"):
+            cfg = getattr(layer, name, None)
+            if cfg is not None:
+                cfg.sharding_config = _tp_replicate_config()
+        if layer.attention is not None:
+            _set_mla_sharding(layer.attention)
+        if layer.delta_attention is not None:
+            _set_kda_sharding(layer.delta_attention)
+        if layer.feed_forward is not None:
+            set_dense_ffn_sharding(
+                layer.feed_forward, attn_x_layout=attn_x_layout, enable_sp=False
+            )
+        if layer.moe is not None:
+            layer.moe.routed_down.sharding_config = _tp_replicate_config()
+            layer.moe.routed_up.sharding_config = _tp_replicate_config()
+            layer.moe.routed_norm.sharding_config = norm_config(enable_sp=False)
