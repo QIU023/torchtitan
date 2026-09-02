@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import cast
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
@@ -132,13 +133,13 @@ class KimiMLAAttention(BaseAttention):
         return self.wo(out_TD)
 
 
-def _apply_attention_residual(
+def _attention_residual_math(
     prefix_sum_TD: torch.Tensor,
     block_residual_TND: torch.Tensor,
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
-    """Apply Kimi's block-level attention residual in FP32.
+    """The block-level attention residual in FP32, unwrapped.
 
     TODO: Add TP Support. The current implementation assumes that the input tensors are on a single device.
     """
@@ -153,6 +154,35 @@ def _apply_attention_residual(
     probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
     output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
     return output_TD.to(values_TND.dtype)
+
+
+def _apply_attention_residual(
+    prefix_sum_TD: torch.Tensor,
+    block_residual_TND: torch.Tensor,
+    projection: Linear,
+    norm: RMSNorm,
+) -> torch.Tensor:
+    """Apply the attention residual with its computation wrapped in checkpointing.
+
+    The residual math upcasts the whole (N+1)-entry block stack to fp32 twice
+    per layer; saving those intermediates would make each layer's activation
+    footprint grow with the stack. Wrapping the computation recomputes them in
+    backward from the stack and the prefix sum -- both alive elsewhere -- so
+    the activations saved per layer are identical to the standard residual
+    architecture.
+    """
+    if torch.is_grad_enabled() and (
+        prefix_sum_TD.requires_grad or block_residual_TND.requires_grad
+    ):
+        return torch.utils.checkpoint.checkpoint(
+            _attention_residual_math,
+            prefix_sum_TD,
+            block_residual_TND,
+            projection,
+            norm,
+            use_reentrant=False,
+        )
+    return _attention_residual_math(prefix_sum_TD, block_residual_TND, projection, norm)
 
 
 class KimiK3TransformerBlock(Module):
