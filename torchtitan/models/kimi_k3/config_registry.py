@@ -326,3 +326,11 @@ def kimi_k3_debugmodel_rl_vit1() -> Trainer.Config:
     config.model_spec = model_registry("debugmodel_rl")
     config.model_spec.model.vit_dep_stages = 1
     return config
+
+
+def kimi_k3_debugmodel_rl_mx_qat_vit1() -> Trainer.Config:
+    """``kimi_k3_debugmodel_rl_mx_qat`` with the vision tower whole on one
+    pipeline stage, for a two-stage pipeline under QAT."""
+    config = kimi_k3_debugmodel_rl_mx_qat()
+    config.model_spec.model.vit_dep_stages = 1
+    return config
