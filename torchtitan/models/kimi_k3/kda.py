@@ -9,6 +9,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from attn_gym.linear.kda import bound_gate, chunk_kda
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
@@ -74,6 +75,8 @@ class KDAKernel(Module):
         dt_bias_NK: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
+        cp_plan=None,
+        cp_group=None,
     ) -> torch.Tensor:
         if not q_BTNK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
@@ -93,6 +96,23 @@ class KDAKernel(Module):
             lower_bound=self.lower_bound,
             impl="fused",
         )
+        if cp_plan is not None:
+            # KCP: the sequence stays sharded; attn-gym exchanges per-fragment
+            # affine state summaries so each rank scans from its true entry state.
+            from attn_gym.linear.kda import context_parallel_kda
+
+            assert cu_seqlens is not None
+            output_BTNV, _ = context_parallel_kda(
+                l2norm(q_BTNK),
+                l2norm(k_BTNK),
+                v_BTNV,
+                gate_BTNK,
+                raw_beta_BTN.float().sigmoid(),
+                cu_seqlens=cu_seqlens,
+                plan=cp_plan,
+                group=cp_group,
+            )
+            return output_BTNV
         output_BTNV, _ = chunk_kda(
             l2norm(q_BTNK),
             l2norm(k_BTNK),
@@ -117,6 +137,9 @@ class InnerKDA(Module):
                 raise ValueError(
                     "Attention Gym KDA requires head_dim=128, " f"got {self.head_dim}."
                 )
+
+    # Set by apply_cp_kimi_k3; None means the layer runs without CP.
+    _cp_group = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -148,11 +171,33 @@ class InnerKDA(Module):
             (conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W),
             dim=0,
         )
+        cp_group = self._cp_group
+        cp_plan = None
+        conv_state = None
+        if cp_group is not None and dist.get_world_size(cp_group) > 1:
+            from attn_gym.linear.context_parallel import context_parallel_conv_history
+
+            from .context_parallel import kcp_plan
+
+            if cu_seqlens is not None:
+                raise NotImplementedError(
+                    "Kimi K3 KDA context parallel runs one document per batch; "
+                    "packed-document boundaries under CP are not supported yet."
+                )
+            cp_plan = kcp_plan(mixed_qkv_BTC.shape[1], cp_group)
+            cu_seqlens = torch.tensor(
+                cp_plan.cu_seqlens, dtype=torch.int32, device=mixed_qkv_BTC.device
+            )
+            # The causal conv needs the previous rank's tail as history.
+            conv_state = context_parallel_conv_history(
+                mixed_qkv_BTC, cp_plan, cp_group, conv_weight_C1W.shape[-1] - 1
+            )
         conv_output_BTC = causal_conv1d(
             mixed_qkv_BTC,
             conv_weight_C1W[:, 0],
             activation="silu",
             cu_seqlens=cu_seqlens,
+            initial_state=conv_state,
         )
         assert isinstance(conv_output_BTC, torch.Tensor)
 
@@ -170,6 +215,8 @@ class InnerKDA(Module):
             A_log_N,
             dt_bias_NK,
             cu_seqlens=cu_seqlens,
+            cp_plan=cp_plan,
+            cp_group=cp_group,
         )
         return output_BTNV.squeeze(0)
 

@@ -18,7 +18,10 @@ from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
 )
-from .model import KimiK3Model
+from torchtitan.tools.logging import logger
+
+from .kda import InnerKDA
+from .model import KimiK3Model, KimiMLAAttention
 
 
 def parallelize_kimi_k3(
@@ -31,14 +34,11 @@ def parallelize_kimi_k3(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> nn.Module:
-    """Apply FSDP2 to the Kimi K3 decoder and vision encoder."""
+    """Apply FSDP2 and context parallelism to the Kimi K3 decoder and vision encoder."""
 
     unsupported_parallelisms = [
         name
-        for name, enabled in (
-            ("pipeline parallel", parallel_dims.pp_enabled),
-            ("context parallel", parallel_dims.cp_enabled),
-        )
+        for name, enabled in (("pipeline parallel", parallel_dims.pp_enabled),)
         if enabled
     ]
     if unsupported_parallelisms:
@@ -69,6 +69,8 @@ def parallelize_kimi_k3(
         )
 
     assert isinstance(model, KimiK3Model)
+    if parallel_dims.cp_enabled:
+        apply_cp_kimi_k3(model, parallel_dims)
     if parallel_dims.ep_enabled or parallel_dims.tp_enabled:
         # model_registry's moe_comm_backend picks the dispatcher: standard
         # (default), deepep and minimal_async_ep run on this model; hybridep
@@ -109,3 +111,62 @@ def parallelize_kimi_k3(
     )
 
     return model
+
+
+def apply_cp_kimi_k3(
+    model: nn.Module,
+    parallel_dims: ParallelDims,
+) -> None:
+    """Wire context parallelism: KCP on the KDA layers, Ulysses on the MLA layers.
+
+    Both at once, on disjoint layer kinds. Imperative rather than declared:
+    KDA's kernels are attn-gym's and never see a DTensor, so no ShardingConfig
+    can drive them (the model config overrides ``_validate_cp_backend`` for the
+    same reason).
+    """
+    cp_group = parallel_dims.get_mesh("cp").get_group()
+    cp_degree = parallel_dims.cp
+    model._cp_group = cp_group
+
+    num_mla = 0
+    kda_modules = []
+    for module in model.modules():
+        if isinstance(module, KimiMLAAttention):
+            if module.n_heads % cp_degree != 0:
+                raise ValueError(
+                    f"MLA n_heads={module.n_heads} must be divisible by "
+                    f"cp={cp_degree} for Ulysses head sharding"
+                )
+            module._cp_group = cp_group
+            num_mla += 1
+        elif isinstance(module, InnerKDA):
+            kda_modules.append(module)
+
+    if kda_modules:
+        # Checked at wiring time so the message is actionable, rather than an
+        # ImportError from inside a layer's first forward.
+        try:
+            from attn_gym.linear.context_parallel import (  # noqa: F401
+                context_parallel_conv_history,
+            )
+            from attn_gym.linear.kda import context_parallel_kda  # noqa: F401
+        except ImportError as err:
+            raise ValueError(
+                "KDA context parallelism needs attn-gym's context-parallel "
+                "recipe (attn_gym.linear.kda.context_parallel_kda and "
+                "attn_gym.linear.context_parallel.context_parallel_conv_history); "
+                f"import failed with: {err}."
+            ) from err
+
+    for module in kda_modules:
+        module._cp_group = cp_group
+    if num_mla + len(kda_modules) == 0:
+        raise ValueError(
+            "context parallel is enabled but no attention layer was found to "
+            "wire it onto."
+        )
+    logger.info(
+        "Applied context parallel to %d MLA and %d KDA layer(s).",
+        num_mla,
+        len(kda_modules),
+    )

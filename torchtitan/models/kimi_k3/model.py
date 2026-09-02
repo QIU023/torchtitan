@@ -8,8 +8,11 @@ from dataclasses import dataclass, field
 from typing import cast
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate
+
+from torchtitan.distributed.fsdp import add_zero_valued_dependency
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
@@ -34,6 +37,7 @@ from torchtitan.models.utils import (
     quadratic_attention_flops_per_token,
 )
 from torchtitan.protocols.module import Module
+from .context_parallel import mla_ulysses_attention
 
 from .kda import KDA
 from .moe import KimiFeedForward, KimiLatentMoE
@@ -71,6 +75,11 @@ class KimiMLAAttention(BaseAttention):
         wo: Linear.Config
         inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
 
+    # Set by apply_cp_kimi_k3; None means the layer runs without CP. MLA is
+    # Ulysses under either KDA CP mode -- KCP describes a recurrence that MLA
+    # does not have.
+    _cp_group = None
+
     def __init__(self, config: Config):
         super().__init__()
         self.n_heads = config.n_heads
@@ -97,12 +106,15 @@ class KimiMLAAttention(BaseAttention):
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del positions
 
         num_tokens = x_TD.shape[0]
-        q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
-            num_tokens, self.n_heads, self.q_head_dim
-        )
+        # The head count is DERIVED from the projection width, not read off
+        # self.n_heads. Ulysses splits whatever head count this rank actually
+        # holds, and the two differ once another parallelism has already split
+        # the head axis; deriving works either way and needs no branch.
+        q_proj_TE = self.wq_b(self.q_norm(self.wq_a(x_TD)))
+        h_local = q_proj_TE.shape[-1] // self.q_head_dim
+        q_THK = q_proj_TE.view(num_tokens, h_local, self.q_head_dim)
 
         compressed_kv_TC = self.wkv_a(x_TD)
         kv_latent_TC, k_rope_TK = torch.split(
@@ -112,7 +124,7 @@ class KimiMLAAttention(BaseAttention):
         )
         kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
             num_tokens,
-            self.n_heads,
+            h_local,
             self.qk_nope_head_dim + self.v_head_dim,
         )
         k_nope_THK, v_THV = torch.split(
@@ -121,18 +133,24 @@ class KimiMLAAttention(BaseAttention):
             dim=-1,
         )
         k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-            -1, self.n_heads, -1
+            -1, h_local, -1
         )
         k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
 
-        out_THV = self.inner_attention(
-            q_THK,
-            k_THK,
-            v_THV,
-            attention_masks=attention_masks,
-            scale=self.scale,
-        )
-        out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
+        cp_group = self._cp_group
+        if cp_group is not None and dist.get_world_size(cp_group) > 1:
+            out_THV = mla_ulysses_attention(
+                self, q_THK, kv_THC, k_rope_TK, cp_group, positions
+            )
+        else:
+            out_THV = self.inner_attention(
+                q_THK,
+                k_THK,
+                v_THV,
+                attention_masks=attention_masks,
+                scale=self.scale,
+            )
+        out_TD = out_THV.reshape(num_tokens, h_local * self.v_head_dim)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
 
@@ -276,12 +294,33 @@ class KimiK3Model(Decoder):
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
 
+        def _validate_cp_backend(self, parallelism) -> None:
+            """This model's CP is not ShardingConfig-driven -- the KDA kernels
+            are attn-gym's and never see a DTensor -- so the spmd_types
+            requirement does not apply; apply_cp_kimi_k3 checks its own
+            preconditions at wiring time."""
+
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
             # TODO: Support sample packing by resetting the Q/K/V causal-convolution
             # and KDA recurrent states at document boundaries.
             if isinstance(dataset, MMSamplePackingConfig):
                 raise ValueError("Kimi K3 does not yet support sample packing.")
+            parallelism = config.parallelism
+            if (
+                parallelism.context_parallel_degree > 1
+                and parallelism.context_parallel_load_balancer is not None
+            ):
+                # Both CP algorithms here read the sequence as rank-ordered
+                # contiguous chunks: the Ulysses all-to-all reassembles it in
+                # rank order, and KDA's recurrence passes state from rank r to
+                # rank r+1. A load balancer permutes tokens across ranks, which
+                # silently breaks both -- the shapes still line up.
+                raise ValueError(
+                    "Kimi K3 context parallel requires "
+                    "parallelism.context_parallel_load_balancer=None; "
+                    f"got {parallelism.context_parallel_load_balancer!r}."
+                )
             enable_sp = (
                 config.parallelism.tensor_parallel_degree > 1
                 and config.parallelism.enable_sequence_parallel
@@ -324,6 +363,9 @@ class KimiK3Model(Decoder):
                     )
             return nparams, 6 * active_nparams + attention_op_flops
 
+    # Set by apply_cp_kimi_k3 to this model's context-parallel process group.
+    _cp_group = None
+
     def __init__(self, config: Config):
         super().__init__(config)
         self.output_res_norm = config.output_res_norm.build()
@@ -362,6 +404,22 @@ class KimiK3Model(Decoder):
         num_tokens_per_item = (grid_thw[:, 1] // kernel_h) * (
             grid_thw[:, 2] // kernel_w
         )
+        if self._cp_group is not None and dist.get_world_size(self._cp_group) > 1:
+            # This rank holds a sequence shard but encoded every image: take the
+            # feature slice its placeholders correspond to and scatter that.
+            # get_vision_positions needs whole visual items, which a shard does
+            # not have -- it raises "found N contiguous run(s) ... but received M
+            # visual item(s)" as soon as a shard splits or omits an item.
+            local_mask = tokens == special_tokens["image_id"]
+            counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
+            mine = self._select_cp_shard(vision_embeds, counts)
+            embeddings_TD = embeddings_TD.masked_scatter(
+                local_mask.unsqueeze(-1), mine.to(embeddings_TD.dtype)
+            )
+            # Rows this rank did not consume still have to reach the graph, or
+            # the tower's reduce-scatter is issued by a subset of the group.
+            return add_zero_valued_dependency(embeddings_TD, vision_embeds)
+
         vision_positions = get_vision_positions(
             tokens,
             num_tokens_per_item,
@@ -400,6 +458,50 @@ class KimiK3Model(Decoder):
         if sp_placements is not None and isinstance(spliced_TD, DTensor):
             spliced_TD = spliced_TD.redistribute(placements=sp_placements)
         return spliced_TD
+
+    def _exchange_sentinel_counts(self, local: int) -> torch.Tensor:
+        """Per-rank vision-placeholder counts across the CP group.
+
+        Called whenever CP is on, including on ranks holding no placeholders:
+        the collective's participants are decided by the mesh, never by the data.
+        """
+        group = self._cp_group
+        counts = torch.zeros(
+            dist.get_world_size(group),
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
+        )
+        counts[dist.get_rank(group)] = local
+        dist.all_reduce(counts, group=group)
+        return counts
+
+    def _select_cp_shard(
+        self, vision_embeds: torch.Tensor, counts: torch.Tensor
+    ) -> torch.Tensor:
+        """Keep only the visual features belonging to this CP rank's shard.
+
+        ``prepare_context_parallel_input`` shards inputs, labels and positions
+        along the sequence but leaves ``pixel_values`` whole, so every rank
+        encodes every image while holding only a slice of the placeholders. The
+        features are ordered by sequence position and the shards are contiguous
+        and equal -- the config rejects a load balancer under CP precisely
+        because a permuting one would break that -- so this rank's slice starts
+        after however many placeholders the lower ranks hold.
+
+        This is correctness, not an optimization: the encoder still runs
+        redundantly on every CP rank.
+        """
+        num_rows = vision_embeds.shape[0]
+        if int(counts.sum().item()) != num_rows:
+            raise ValueError(
+                f"CP ranks hold {int(counts.sum().item())} vision "
+                f"placeholder(s) in total but {num_rows} visual token(s) were "
+                "encoded; the sequence shard and the image batch disagree"
+            )
+        rank = dist.get_rank(self._cp_group)
+        start = int(counts[:rank].sum().item())
+        local = int(counts[rank].item())
+        return vision_embeds[start : start + local]
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
