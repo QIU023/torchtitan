@@ -20,6 +20,7 @@ from torchtitan.models.common.decoder_sharding import (
     colwise_config,
     dense_activation_placement,
     dense_param_placement,
+    dense_sequence_parallel_placement,
     norm_config,
     rowwise_config,
     set_decoder_sharding_config,
@@ -69,7 +70,7 @@ def _tp_replicate_config() -> ShardingConfig:
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
-def _set_mla_sharding(attention_cfg) -> None:
+def _set_mla_sharding(attention_cfg, *, enable_sp: bool) -> None:
     """Head-parallel TP for MLA.
 
     The projections that produce or consume the head axis split on it; the
@@ -78,7 +79,17 @@ def _set_mla_sharding(attention_cfg) -> None:
     attention_cfg.wq_b.sharding_config = colwise_config()
     attention_cfg.wkv_b.sharding_config = colwise_config()
     attention_cfg.gate.sharding_config = colwise_config()
-    attention_cfg.wo.sharding_config = rowwise_config()
+    attention_cfg.wo.sharding_config = rowwise_config(output_sp=enable_sp)
+    if enable_sp:
+        # The module boundary gathers the sequence shard on the way in -- the
+        # attention core needs the full sequence -- and wo reduce-scatters
+        # back to Shard(0), the GQA pattern.
+        attention_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={"x_TD": dense_sequence_parallel_placement()},
+            in_dst_shardings={
+                "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+            },
+        )
     attention_cfg.wq_a.sharding_config = _tp_replicate_config()
     attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
     attention_cfg.q_norm.sharding_config = norm_config(enable_sp=False)
@@ -86,7 +97,7 @@ def _set_mla_sharding(attention_cfg) -> None:
     set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
 
 
-def _set_kda_sharding(delta_attention_cfg) -> None:
+def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool) -> None:
     """Head-parallel TP for KDA.
 
     The delta rule is independent per head, so the projections that produce
@@ -98,7 +109,9 @@ def _set_kda_sharding(delta_attention_cfg) -> None:
     for name in ("q_proj", "k_proj", "v_proj", "forget_b", "beta", "output_gate"):
         getattr(delta_attention_cfg, name).sharding_config = colwise_config()
     delta_attention_cfg.forget_a.sharding_config = _tp_replicate_config()
-    delta_attention_cfg.output_proj.sharding_config = rowwise_config()
+    delta_attention_cfg.output_proj.sharding_config = rowwise_config(
+        output_sp=enable_sp
+    )
     head_param = dense_param_placement(tp=spmd.S(0))
     for name in ("q_conv", "k_conv", "v_conv"):
         getattr(delta_attention_cfg, name).sharding_config = ShardingConfig(
@@ -107,9 +120,19 @@ def _set_kda_sharding(delta_attention_cfg) -> None:
     delta_attention_cfg.output_norm.sharding_config = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.R)}
     )
-    delta_attention_cfg.sharding_config = ShardingConfig(
+    kda_module_config = ShardingConfig(
         state_shardings={"A_log": head_param, "dt_bias": head_param}
     )
+    if enable_sp:
+        # Every projection reads the stream, so the module boundary gathers
+        # the sequence shard once; output_proj reduce-scatters back.
+        kda_module_config.in_src_shardings = {
+            "x_TD": dense_sequence_parallel_placement()
+        }
+        kda_module_config.in_dst_shardings = {
+            "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+        }
+    delta_attention_cfg.sharding_config = kda_module_config
     features = dense_activation_placement(tp=spmd.S(-1), cp=spmd.S(0))
     heads = attention_activation_placement()
     inputs = {
@@ -134,18 +157,27 @@ def _set_kda_sharding(delta_attention_cfg) -> None:
     )
 
 
-def set_tensor_parallel_sharding_config(config: "KimiK3Model.Config") -> None:
+def set_tensor_parallel_sharding_config(
+    config: "KimiK3Model.Config", *, enable_sp: bool = False
+) -> None:
     """Declare the sharding tensor parallel acts on.
 
-    The stream stays whole on the TP axis and only head and feature axes
-    shard; sequence parallel is not offered here. The MoE internals are
-    declared by ``set_kimi_k3_sharding_config``; this adds the latent
-    projections around them.
+    Head and feature axes shard. With ``enable_sp`` the token stream between
+    modules carries the TP-axis Shard(0) of sequence parallel: norms compute
+    on the shard, the attention module boundaries gather it (the cores need
+    the full sequence) and the rowwise outputs reduce-scatter back, the
+    llama3 template; without it the stream stays whole on the TP axis. The
+    MoE internals are declared by ``set_kimi_k3_sharding_config``; this adds
+    the latent projections around them.
     """
-    set_decoder_sharding_config(config, enable_sp=False)
-    config.output_res_norm.sharding_config = norm_config(enable_sp=False)
+    set_decoder_sharding_config(config, enable_sp=enable_sp)
+    config.output_res_norm.sharding_config = norm_config(enable_sp=enable_sp)
     config.output_res_proj.sharding_config = _tp_replicate_config()
-    attn_x_layout = dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+    attn_x_layout = (
+        dense_sequence_parallel_placement()
+        if enable_sp
+        else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+    )
     for layer in config.layers:
         for name in (
             "attention_norm",
@@ -155,20 +187,22 @@ def set_tensor_parallel_sharding_config(config: "KimiK3Model.Config") -> None:
         ):
             cfg = getattr(layer, name, None)
             if cfg is not None:
-                cfg.sharding_config = norm_config(enable_sp=False)
+                cfg.sharding_config = norm_config(enable_sp=enable_sp)
         for name in ("attention_res_proj", "ffn_res_proj"):
             cfg = getattr(layer, name, None)
             if cfg is not None:
                 cfg.sharding_config = _tp_replicate_config()
         if layer.attention is not None:
-            _set_mla_sharding(layer.attention)
+            _set_mla_sharding(layer.attention, enable_sp=enable_sp)
         if layer.delta_attention is not None:
-            _set_kda_sharding(layer.delta_attention)
+            _set_kda_sharding(layer.delta_attention, enable_sp=enable_sp)
         if layer.feed_forward is not None:
             set_dense_ffn_sharding(
-                layer.feed_forward, attn_x_layout=attn_x_layout, enable_sp=False
+                layer.feed_forward, attn_x_layout=attn_x_layout, enable_sp=enable_sp
             )
         if layer.moe is not None:
+            # The MoE module boundary gathers the sequence shard under SP
+            # without EP, so the latent pair and its norm see the whole stream.
             layer.moe.routed_down.sharding_config = _tp_replicate_config()
             layer.moe.routed_up.sharding_config = _tp_replicate_config()
             layer.moe.routed_norm.sharding_config = norm_config(enable_sp=False)
