@@ -9,6 +9,7 @@ from typing import cast
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
@@ -23,7 +24,10 @@ from torchtitan.models.common.multimodal import (
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.kimi_k3.sharding import set_expert_parallel_sharding_config
+from torchtitan.models.kimi_k3.sharding import (
+    set_expert_parallel_sharding_config,
+    set_tensor_parallel_sharding_config,
+)
 from torchtitan.models.utils import (
     delta_rule_flops_per_token,
     get_nparams_and_active_nparams,
@@ -281,6 +285,8 @@ class KimiK3Model(Decoder):
             set_expert_parallel_sharding_config(
                 self, enable_ep=config.parallelism.expert_parallel_degree > 1
             )
+            if config.parallelism.tensor_parallel_degree > 1:
+                set_tensor_parallel_sharding_config(self)
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
@@ -355,6 +361,19 @@ class KimiK3Model(Decoder):
             num_tokens_per_item,
             special_tokens["image_id"],
         )
+        if isinstance(embeddings_TD, DTensor) and not isinstance(
+            vision_embeds, DTensor
+        ):
+            # Under TP the embedding's output is a DTensor while the tower,
+            # replicated and undeclared, returns a plain tensor; the splice's
+            # copy_ refuses the mix. The tower's output is replicate-consistent
+            # across the mesh (replicated weights, the same pixels everywhere),
+            # so saying so is a wrap, not a transfer.
+            vision_embeds = DTensor.from_local(
+                vision_embeds,
+                embeddings_TD.device_mesh,
+                [Replicate()] * len(embeddings_TD.placements),
+            )
         return scatter_vision_embeds(
             embeddings_TD,
             vision_embeds=vision_embeds,
