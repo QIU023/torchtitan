@@ -17,12 +17,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import inspect
 import math
 import threading
 import warnings
+
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -63,6 +63,7 @@ from torchtitan.tools.logging import logger
 # where no config is in scope, so the resolved record is module-global:
 # registered once at the pipelining entry, read back below.
 
+
 @dataclass
 class _TopologyKnobs:
     """Resolved topology."""
@@ -83,9 +84,7 @@ def _register_topology(config) -> _TopologyKnobs:
 
     defaults = _TopologyKnobs()
     resolved = _TopologyKnobs(
-        attn_res_cache=bool(
-            getattr(config, "attn_res_cache", defaults.attn_res_cache)
-        ),
+        attn_res_cache=bool(getattr(config, "attn_res_cache", defaults.attn_res_cache)),
     )
     if _TOPOLOGY is not None and _TOPOLOGY != resolved:
         logger.warning(
@@ -812,9 +811,7 @@ class CrossStageCacheAdapter(nn.Module):
         out_blocks_tensor = (
             torch.stack(send_pieces, dim=1)
             if send_pieces
-            else partial_out.new_zeros(
-                (partial_out.shape[0], 0, partial_out.shape[-1])
-            )
+            else partial_out.new_zeros((partial_out.shape[0], 0, partial_out.shape[-1]))
         )
         partial_out = self._keepalive_touch(partial_out, prev_recv_tensor)
         return partial_out, out_blocks_tensor
@@ -1073,10 +1070,7 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     core_names = {"embed_tokens": "tok_embeddings", "lm_head": "lm_head"}
     present = {n for n, _ in model.named_children()}
     fqns = [
-        [
-            core_names[n] if n in core_names and n not in present else n
-            for n in stage
-        ]
+        [core_names[n] if n in core_names and n not in present else n for n in stage]
         for stage in fqns
     ]
     # Append AttnRes tail modules if present (last stage only).
