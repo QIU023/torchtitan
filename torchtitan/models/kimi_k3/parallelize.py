@@ -21,6 +21,7 @@ from torchtitan.distributed.fsdp import (
     resolve_sparse_fsdp_mesh,
 )
 from torchtitan.distributed.spmd_types import annotate_replicated_parameters
+from torchtitan.tools.logging import logger
 from .model import KimiK3Model
 
 
@@ -87,7 +88,10 @@ def parallelize_kimi_k3(
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
-        ac_policy.apply(model)
+        if model.config.ac_reuse_attention:
+            _apply_ac_outside_attention(ac_policy, model)
+        else:
+            ac_policy.apply(model)
         if model.vision_encoder is not None:
             ac_policy.apply(model.vision_encoder)
 
@@ -122,3 +126,23 @@ def parallelize_kimi_k3(
     )
 
     return model
+
+
+def _apply_ac_outside_attention(ac_policy, model: nn.Module) -> None:
+    """Checkpoint only each block's MoE/feed-forward; attention stays outside.
+
+    The KDA kernel is a custom op outside the selective policy's save set, so a
+    whole-block wrap recomputes it in backward. Wrapping just the FFN keeps the
+    mm save/recompute balance where the parameter memory is, while attention
+    and the residual math keep their activations and are reused in backward.
+    """
+    for name, block in model.layers.named_children():
+        inner_name = "moe" if block.moe is not None else "feed_forward"
+        inner = getattr(block, inner_name)
+        wrapped = ac_policy._wrap_block(inner, base_fqn=f"layers.{name}.{inner_name}")
+        block.register_module(inner_name, wrapped)
+    logger.info(
+        "Applied activation checkpointing to the MoE/feed-forward of %d block(s); "
+        "attention and the residual math stay outside (ac_reuse_attention).",
+        len(model.layers),
+    )
