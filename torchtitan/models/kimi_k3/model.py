@@ -270,6 +270,12 @@ class KimiK3Model(Decoder):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        # Under selective AC, checkpoint only each block's MoE/feed-forward and
+        # keep attention and the residual math outside, so their activations
+        # are reused in backward: the KDA kernel is a custom op outside the
+        # per-op policy's save set, so a whole-block wrap recomputes it.
+        # Trades activation memory for not re-running the attention kernels.
+        ac_reuse_attention: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
