@@ -35,9 +35,9 @@ from dataclasses import dataclass, fields
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
+from torchtitan.components.quantization import QuantizationConverter
 
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 
@@ -164,7 +164,7 @@ def _get_qat_experts_cls(parent_cls: type) -> type:
     return MXQATExperts
 
 
-class MXFP4QATConverter(ModelConfigConverter):
+class MXFP4QATConverter(QuantizationConverter):
     """MXFP4-weight / MXFP8-activation fake-quant QAT on the routed experts.
 
     Operates on the model config tree: every ``GroupedExperts.Config`` is
@@ -175,7 +175,7 @@ class MXFP4QATConverter(ModelConfigConverter):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(ModelConfigConverter.Config):
+    class Config(QuantizationConverter.Config):
         quantize_act: bool = True
         """MXFP8 fake-quant on the expert input activations."""
 
