@@ -39,7 +39,6 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
             ("context parallel", parallel_dims.cp_enabled),
         )
@@ -60,7 +59,11 @@ def parallelize_kimi_k3(
         # MoE declarations replace the expert parameters with sparse shards.
         annotate_replicated_parameters(model, parallel_dims)
 
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
+    if (
+        parallelism.spmd_backend == "spmd_types"
+        or parallel_dims.ep_enabled
+        or parallel_dims.tp_enabled
+    ):
         # model_registry's moe_comm_backend picks the dispatcher: standard
         # (default), deepep and minimal_async_ep run on this model; hybridep
         # needs GB200-class hardware.
