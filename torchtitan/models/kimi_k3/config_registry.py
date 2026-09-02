@@ -316,3 +316,13 @@ def kimi_k3_debugmodel_minimal_async_ep() -> Trainer.Config:
     # across layers), as the deepseek_v3 H100 recipe sets it.
     config.activation_checkpoint = FullAC.Config()
     return config
+
+
+def kimi_k3_debugmodel_rl_vit1() -> Trainer.Config:
+    """The rollout-shaped debug model with the vision tower kept whole on one
+    pipeline stage (``vit_dep_stages=1``), so a two-stage pipeline keeps a
+    text stage. DEP's default of two vision stages needs three or more."""
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel_rl")
+    config.model_spec.model.vit_dep_stages = 1
+    return config
