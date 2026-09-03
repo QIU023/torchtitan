@@ -7,13 +7,18 @@
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+import spmd_types as spmd
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.distributed.spmd_types import (
+    annotate_input_spmd_types,
+    current_spmd_mesh,
+)
+from torchtitan.distributed.utils import get_spmd_backend
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
@@ -50,6 +55,24 @@ from .vision_encoder import KimiK3VisionEncoder
 # T = packed tokens, D = model dimension, H = heads,
 # K = key head dimension, V = value head dimension,
 # N = attention-residual entries.
+
+
+def _local_head_split(
+    x_TE: torch.Tensor, num_tokens: int, heads: int, head_dim: int
+) -> torch.Tensor:
+    """Unflatten a TP-sharded ``[T, H*K]`` projection into ``[T, H, K]``.
+
+    spmd_types cannot propagate a shard on the feature dim through a split of
+    that dim, so the view runs in a local region and the result is re-typed as
+    head-sharded on TP, the same shape core's ``local_qkv_head_split`` uses.
+    """
+    with spmd.local():
+        x_TNH = x_TE.view(num_tokens, heads, head_dim)
+        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            spmd.assert_type(
+                x_TNH, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
+            )
+    return x_TNH
 
 
 class KimiMLAAttention(BaseAttention):
@@ -107,9 +130,12 @@ class KimiMLAAttention(BaseAttention):
         del positions
 
         num_tokens = x_TD.shape[0]
-        q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
-            num_tokens, self.n_heads, self.q_head_dim
-        )
+        # Head count derived from the projection width: under TP the colwise
+        # projections hold n_heads/tp per rank, and under spmd_types they hand
+        # back that local slice.
+        q_proj_TE = self.wq_b(self.q_norm(self.wq_a(x_TD)))
+        h_local = q_proj_TE.shape[-1] // self.q_head_dim
+        q_THK = _local_head_split(q_proj_TE, num_tokens, h_local, self.q_head_dim)
 
         compressed_kv_TC = self.wkv_a(x_TD)
         kv_latent_TC, k_rope_TK = torch.split(
@@ -117,9 +143,10 @@ class KimiMLAAttention(BaseAttention):
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
+        kv_THC = _local_head_split(
+            self.wkv_b(self.kv_norm(kv_latent_TC)),
             num_tokens,
-            self.n_heads,
+            h_local,
             self.qk_nope_head_dim + self.v_head_dim,
         )
         k_nope_THK, v_THV = torch.split(
@@ -127,10 +154,18 @@ class KimiMLAAttention(BaseAttention):
             [self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
-        k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-            -1, self.n_heads, -1
-        )
-        k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
+        # The rotary slice is headless and replicated; expanding it onto the
+        # local heads and joining it to the head-sharded nope part is a
+        # local-region op, re-typed as head-sharded on TP afterwards.
+        with spmd.local():
+            k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
+                -1, h_local, -1
+            )
+            k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                spmd.assert_type(
+                    k_THK, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
+                )
 
         out_THV = self.inner_attention(
             q_THK,
@@ -139,7 +174,7 @@ class KimiMLAAttention(BaseAttention):
             attention_masks=attention_masks,
             scale=self.scale,
         )
-        out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
+        out_TD = out_THV.reshape(num_tokens, h_local * self.v_head_dim)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
 
@@ -304,7 +339,10 @@ class KimiK3Model(Decoder):
             spmd_types = config.parallelism.spmd_backend == "spmd_types"
             if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
                 set_tensor_parallel_sharding_config(
-                    self, enable_sp=enable_sp, declare_vision_encoder=spmd_types
+                    self,
+                    enable_sp=enable_sp,
+                    declare_vision_encoder=spmd_types,
+                    spmd_types=spmd_types,
                 )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
@@ -479,6 +517,14 @@ class KimiK3Model(Decoder):
 
         num_tokens, D = h_TD.shape
         block_residual_TND = h_TD.new_zeros(num_tokens, 0, D)
+        mesh = current_spmd_mesh()
+        if mesh is not None and mesh.mesh_dim_names and "tp" in mesh.mesh_dim_names:
+            # A fresh tensor reads as replicated on TP; the block stream it
+            # opens is invariant there, and the stack concatenates the two.
+            # Forward is a no-op; the type decides how gradients reduce.
+            block_residual_TND = spmd.redistribute(
+                block_residual_TND, mesh.get_group("tp"), src=spmd.R, dst=spmd.I
+            )
         for layer in self.layers.values():
             h_TD, block_residual_TND = layer(
                 h_TD,
