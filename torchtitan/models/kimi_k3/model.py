@@ -12,8 +12,6 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate
 
-from torchtitan.distributed.fsdp import add_zero_valued_dependency
-
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
@@ -412,13 +410,33 @@ class KimiK3Model(Decoder):
             # visual item(s)" as soon as a shard splits or omits an item.
             local_mask = tokens == special_tokens["image_id"]
             counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
-            mine = self._select_cp_shard(vision_embeds, counts)
-            embeddings_TD = embeddings_TD.masked_scatter(
-                local_mask.unsqueeze(-1), mine.to(embeddings_TD.dtype)
-            )
+            mine = self._select_cp_shard(vision_embeds, counts).to(embeddings_TD.dtype)
             # Rows this rank did not consume still have to reach the graph, or
             # the tower's reduce-scatter is issued by a subset of the group.
-            return add_zero_valued_dependency(embeddings_TD, vision_embeds)
+            unused = vision_embeds.sum().to(embeddings_TD.dtype)
+            mask_T1 = local_mask.unsqueeze(-1)
+            if isinstance(embeddings_TD, DTensor):
+                # Under TP the embedding output is a DTensor whose cp axis is
+                # already Shard(0): the local rows are this rank's shard, the
+                # same rows the tower slice and the mask describe, so wrap them
+                # with the stream's own placements. A shard on the tp axis is
+                # sequence parallel, where the splice would need the whole
+                # sequence.
+                mesh = embeddings_TD.device_mesh
+                placements = embeddings_TD.placements
+                names = mesh.mesh_dim_names or ()
+                if "tp" in names and placements[names.index("tp")].is_shard():
+                    raise NotImplementedError(
+                        "Kimi K3 context parallel with sequence parallel is not "
+                        "supported: the vision splice needs the whole sequence."
+                    )
+                # masked_scatter has no DTensor sharding strategy: run it on
+                # the local shard and re-wrap with the same placements.
+                local_TD = embeddings_TD.to_local(grad_placements=placements)
+                local_TD = local_TD.masked_scatter(mask_T1, mine) + unused * 0.0
+                return DTensor.from_local(local_TD, mesh, placements)
+            embeddings_TD = embeddings_TD.masked_scatter(mask_T1, mine)
+            return embeddings_TD + unused * 0.0
 
         vision_positions = get_vision_positions(
             tokens,

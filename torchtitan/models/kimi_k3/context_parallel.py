@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 from attn_gym.linear.context_parallel import ContextParallelPlan
 from spmd_types import SpmdType
+from torch.distributed.tensor import DTensor
 from torch.nn.attention.flex_attention import and_masks
 
 from torchtitan.distributed.parallel_dims import MeshAxisName
@@ -236,6 +237,16 @@ def mla_ulysses_attention(
     * Shape suffixes beyond the legend: L local sequence (T/cp), G this rank's
       head count, W packed channel width, R rotary width.
     """
+    # Under TP the projections hand over DTensors (tp Shard on the head dim,
+    # cp Shard on the sequence). The exchange is a plain-tensor collective on
+    # exactly those local shards, so strip the shell here and put it back on
+    # the output, which keeps q's placements; the rotary slice is replicated.
+    wrap = None
+    if isinstance(q_LHQ, DTensor):
+        wrap = (q_LHQ.device_mesh, q_LHQ.placements)
+        q_LHQ = q_LHQ.to_local(grad_placements=q_LHQ.placements)
+        kv_LHC = kv_LHC.to_local(grad_placements=kv_LHC.placements)
+        k_rope_LR = k_rope_LR.to_local(grad_placements=k_rope_LR.placements)
     cp_size = dist.get_world_size(cp_group)
     t_loc = q_LHQ.shape[0]
     t_full = t_loc * cp_size
@@ -275,10 +286,16 @@ def mla_ulysses_attention(
         attention_masks=full_sequence_document_mask(attn, positions_L, cp_group),
         scale=attn.scale,
     )
+    if isinstance(out_TGV, DTensor):
+        # The attention module's TP sharding config re-wraps its output.
+        out_TGV = out_TGV.to_local(grad_placements=out_TGV.placements)
     out_src_dim, out_dst_dim = ULYSSES.out_dims()
-    return cp_all_to_all_headseq(
+    out_LHV = cp_all_to_all_headseq(
         out_TGV.contiguous(), cp_group, src_dim=out_src_dim, dst_dim=out_dst_dim
     )
+    if wrap is not None:
+        out_LHV = DTensor.from_local(out_LHV, *wrap)
+    return out_LHV
 
 
 def kcp_plan(seq_len_local: int, group) -> ContextParallelPlan:
