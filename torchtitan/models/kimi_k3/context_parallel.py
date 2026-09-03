@@ -10,16 +10,19 @@ Each kernel owns its CP collectives: the inner-attention ShardingConfig keeps
 the cp axis token-sharded on both sides of the local_map boundary and the
 kernel's ``forward`` issues whatever exchange its algorithm needs.
 
-  - MLA runs Ulysses: one all-to-all trades the token shard for a head shard on
-    the way in, the kernel attends over the full sequence for its head subset,
-    and the output trades back.
+  - MLA runs Ulysses by default: one all-to-all trades the token shard for a
+    head shard on the way in, the kernel attends over the full sequence for its
+    head subset, and the output trades back. A recipe may pick the all-gather
+    KV kernel instead (``use_kimi_k3_cp_kernels(..., mla_kernel=...)``): q stays
+    token-sharded and k/v are gathered, the CP every other model runs.
   - KDA runs Attention Gym's context-parallel recipe (KCP): the sequence stays
     sharded end to end and the recurrence hands state from rank to rank, a
     sequential dependency no placement pair describes.
 
-``ContextParallelKernel`` and the field-preserving kernel swap are copied from
-pytorch/torchtitan PR 4322 (``torchtitan/models/common/cp_attention.py`` at
-ed6dba931b), where every CP implementation is to follow this shape.
+``ContextParallelKernel``, ``AllGatherCPFlexAttention`` and the
+field-preserving kernel swap are copied from pytorch/torchtitan PR 4322
+(``torchtitan/models/common/cp_attention.py`` at ed6dba931b), where every CP
+implementation is to follow this shape.
 TODO: delete the copies and import from ``torchtitan.models.common`` once that
 PR lands.
 
@@ -34,6 +37,7 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 from attn_gym.linear.context_parallel import ContextParallelPlan
+from torch.distributed.tensor.experimental._context_parallel import flex_cp_allgather
 
 from torchtitan.distributed.spmd_types import current_spmd_mesh
 from torchtitan.models.common.attention import FlexAttention
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
     from torchtitan.models.kimi_k3.model import KimiK3Model
 
 __all__ = [
+    "AllGatherCPFlexAttention",
     "ContextParallelKernel",
     "ContextParallelInnerKDA",
     "UlyssesCPFlexAttention",
@@ -88,6 +93,28 @@ def _swap_kernel(existing: Module.Config, kernel: type[Module]) -> Module.Config
             f"{type(existing).__qualname__}."
         )
     return config_cls(**{f.name: getattr(existing, f.name) for f in fields(existing)})
+
+
+# Copied from pytorch/torchtitan PR 4322 at ed6dba931b. Pending deletion.
+class AllGatherCPFlexAttention(ContextParallelKernel, FlexAttention):
+    """FlexAttention with sharded Q and all-gathered K/V."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(FlexAttention.Config):
+        pass
+
+    def forward(
+        self,
+        q_TNH: torch.Tensor,
+        k_TNH: torch.Tensor,
+        v_TNH: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        pg_name = dist._get_process_group_name(self.cp_group)
+        k_TNH, v_TNH = flex_cp_allgather(
+            k_TNH.contiguous(), v_TNH.contiguous(), _SEQ_DIM, pg_name
+        )
+        return super().forward(q_TNH, k_TNH, v_TNH, **kwargs)
 
 
 class UlyssesCPFlexAttention(ContextParallelKernel, FlexAttention):
@@ -236,26 +263,41 @@ class ContextParallelInnerKDA(ContextParallelKernel, InnerKDA):
         )
 
 
-def use_kimi_k3_cp_kernels(config: "KimiK3Model.Config") -> None:
+def _is_cp_kernel_config(cfg: Module.Config) -> bool:
+    owner = getattr(cfg, "_owner", None)
+    return owner is not None and issubclass(owner, ContextParallelKernel)
+
+
+def use_kimi_k3_cp_kernels(
+    config: "KimiK3Model.Config",
+    *,
+    mla_kernel: type[Module] = UlyssesCPFlexAttention,
+) -> None:
     """Give every attention layer its context-parallel kernel.
 
-    The CP method is fixed by the layer kind, so no option selects it: MLA
-    layers take Ulysses, KDA layers take KCP. Ulysses is FlexAttention over
-    the full sequence, so any other inner attention is rejected here rather
-    than by a shape error inside the kernel.
+    KDA layers take KCP, the only CP the delta rule has. MLA layers take
+    ``mla_kernel``: Ulysses by default, or the all-gather KV kernel. Both are
+    FlexAttention over the full sequence (Ulysses for a head subset, all-gather
+    for a token subset), so any other inner attention is rejected here rather
+    than by a shape error inside the kernel. A layer whose kernel is already a
+    ``ContextParallelKernel`` is left alone, so a recipe may choose the MLA
+    kernel before the model's own ``update_from_config`` runs.
     """
     for layer in config.layers:
         if layer.attention is not None:
             inner = layer.attention.inner_attention
+            if _is_cp_kernel_config(inner):
+                continue
             if not isinstance(inner, FlexAttention.Config):
                 raise ValueError(
-                    "Kimi K3 context parallel runs Ulysses on FlexAttention; "
-                    f"got {type(inner).__qualname__}."
+                    "Kimi K3 context parallel runs its MLA kernels on "
+                    f"FlexAttention; got {type(inner).__qualname__}."
                 )
-            layer.attention.inner_attention = _swap_kernel(
-                inner, UlyssesCPFlexAttention
-            )
+            layer.attention.inner_attention = _swap_kernel(inner, mla_kernel)
         if layer.delta_attention is not None:
+            inner_kda = layer.delta_attention.inner_kda
+            if _is_cp_kernel_config(inner_kda):
+                continue
             layer.delta_attention.inner_kda = _swap_kernel(
-                layer.delta_attention.inner_kda, ContextParallelInnerKDA
+                inner_kda, ContextParallelInnerKDA
             )

@@ -16,6 +16,7 @@ from torchtitan.distributed.spmd_types import _per_axis_types
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.kimi_k3 import kimi_k3_configs
 from torchtitan.models.kimi_k3.context_parallel import (
+    AllGatherCPFlexAttention,
     ContextParallelInnerKDA,
     ContextParallelKernel,
     UlyssesCPFlexAttention,
@@ -47,11 +48,32 @@ class TestKimiK3CPKernels(unittest.TestCase):
             self.assertIsInstance(inner, ContextParallelInnerKDA.Config)
             self.assertEqual(inner.head_dim, 128)
 
+    def test_all_gather_kernel_is_a_choice_and_sticks(self):
+        config = kimi_k3_configs["debugmodel"]("flex", "standard")
+        use_kimi_k3_cp_kernels(config, mla_kernel=AllGatherCPFlexAttention)
+        mla = [l.attention for l in config.layers if l.attention is not None]
+        for attention in mla:
+            self.assertIsInstance(
+                attention.inner_attention, AllGatherCPFlexAttention.Config
+            )
+        # The model's own update_from_config calls this again with the
+        # default; a kernel already chosen is kept.
+        use_kimi_k3_cp_kernels(config)
+        for attention in mla:
+            self.assertIsInstance(
+                attention.inner_attention, AllGatherCPFlexAttention.Config
+            )
+        for layer in config.layers:
+            if layer.delta_attention is not None:
+                self.assertIsInstance(
+                    layer.delta_attention.inner_kda, ContextParallelInnerKDA.Config
+                )
+
     def test_ulysses_needs_flex_attention(self):
         config = kimi_k3_configs["debugmodel"]("flex", "standard")
         layer = next(l for l in config.layers if l.attention is not None)
         layer.attention.inner_attention = VarlenAttention.Config()
-        with self.assertRaisesRegex(ValueError, "Ulysses on FlexAttention"):
+        with self.assertRaisesRegex(ValueError, "MLA kernels on FlexAttention"):
             use_kimi_k3_cp_kernels(config)
 
     def test_cp_kernel_boundary_keeps_tokens_sharded(self):

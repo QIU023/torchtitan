@@ -356,10 +356,18 @@ class KimiK3Model(Decoder):
             spmd_types = config.parallelism.spmd_backend == "spmd_types"
             enable_cp = parallelism.context_parallel_degree > 1
             if enable_cp:
-                # Ulysses splits each rank's head subset across cp.
+                from .context_parallel import (
+                    UlyssesCPFlexAttention,
+                    use_kimi_k3_cp_kernels,
+                )
+
+                use_kimi_k3_cp_kernels(self)
                 attention = self.first_attention
                 if (
                     attention is not None
+                    and isinstance(
+                        attention.inner_attention, UlyssesCPFlexAttention.Config
+                    )
                     and attention.n_heads
                     % (
                         parallelism.context_parallel_degree
@@ -367,14 +375,12 @@ class KimiK3Model(Decoder):
                     )
                     != 0
                 ):
+                    # Ulysses splits each rank's head subset across cp.
                     raise ValueError(
                         f"MLA n_heads={attention.n_heads} must be divisible by "
                         f"tp x cp={config.parallelism.tensor_parallel_degree} x "
                         f"{parallelism.context_parallel_degree} for Ulysses."
                     )
-                from .context_parallel import use_kimi_k3_cp_kernels
-
-                use_kimi_k3_cp_kernels(self)
             if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
                 set_tensor_parallel_sharding_config(
                     self,
@@ -450,10 +456,19 @@ class KimiK3Model(Decoder):
         # every VLM decoder shares; the vision encoder runs per rank.
         input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
         if parallel_dims.cp_enabled:
-            # The MLA layers run Ulysses: after the head exchange each rank
-            # attends over the full sequence, so the masks stay whole instead
-            # of being cut along Q like an all-gather-KV model's.
-            attention_masks = batch.pop("attention_masks", None)
+            from .context_parallel import UlyssesCPFlexAttention
+
+            # Under Ulysses each rank attends over the full sequence after the
+            # head exchange, so the masks stay whole; the all-gather KV kernel
+            # keeps q token-sharded and takes the masks cut along Q like every
+            # other model's.
+            keep_masks_whole = isinstance(
+                self.config.first_full_attention_backend,
+                UlyssesCPFlexAttention.Config,
+            )
+            attention_masks = (
+                batch.pop("attention_masks", None) if keep_masks_whole else None
+            )
             batch = prepare_context_parallel_input(
                 batch,
                 input_sharding,

@@ -535,3 +535,20 @@ def kimi_k3_debugmodel_cp2() -> Trainer.Config:
     # spmd_types backend sets up; the debug flavor pins partial_dtensor.
     config.parallelism.spmd_backend = "spmd_types"
     return config
+
+
+def kimi_k3_debugmodel_cp2_allgather() -> Trainer.Config:
+    """The cp2 flavor with the all-gather KV kernel on the MLA layers.
+
+    The kernel is chosen on the model config before the trainer runs
+    ``update_from_config``, which otherwise picks Ulysses; KDA keeps KCP.
+    """
+    from torchtitan.models.kimi_k3.context_parallel import (
+        AllGatherCPFlexAttention,
+        use_kimi_k3_cp_kernels,
+    )
+
+    config = kimi_k3_debugmodel_cp2()
+    assert config.model_spec is not None
+    use_kimi_k3_cp_kernels(config.model_spec.model, mla_kernel=AllGatherCPFlexAttention)
+    return config
