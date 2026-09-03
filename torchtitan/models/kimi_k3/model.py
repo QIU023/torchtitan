@@ -533,6 +533,14 @@ class KimiK3Model(Decoder):
                 local_TD = embeddings_TD.to_local(grad_placements=placements)
                 local_TD = local_TD.masked_scatter(mask_T1, mine) + unused * 0.0
                 return DTensor.from_local(local_TD, mesh, placements)
+            if embeddings_TD.shape[0] != tokens.shape[0]:
+                # Under spmd_types the stream is a plain local tensor, so a
+                # sequence-parallel shard shows up as a row count that no
+                # longer matches the token shard the mask describes.
+                raise NotImplementedError(
+                    "Kimi K3 context parallel with sequence parallel is not "
+                    "supported: the vision splice needs the whole sequence."
+                )
             embeddings_TD = embeddings_TD.masked_scatter(mask_T1, mine)
             return embeddings_TD + unused * 0.0
 
