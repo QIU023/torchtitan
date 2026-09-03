@@ -20,23 +20,26 @@ if TYPE_CHECKING:
 
 DP = MeshAxisName.DP
 TP = MeshAxisName.TP
+# The tower runs per rank: its state is replicated over cp and its activations
+# are rank-local, so a cp axis in the mesh changes nothing about it.
+CP = MeshAxisName.CP
 
 
 def invariant_norm_config() -> ShardingConfig:
     """Norm whose state and activations are invariant across TP ranks."""
     return ShardingConfig(
         state_shardings={
-            "weight": SpmdLayout({DP: spmd.R, TP: spmd.I}),
-            "bias": SpmdLayout({DP: spmd.R, TP: spmd.I}),
+            "weight": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.I}),
+            "bias": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.I}),
         },
         in_src_shardings={
-            "input": SpmdLayout({DP: spmd.V, TP: spmd.I}),
+            "input": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
         },
         in_dst_shardings={
-            "input": SpmdLayout({DP: spmd.V, TP: spmd.I}),
+            "input": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
         },
-        out_src_shardings=SpmdLayout({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdLayout({DP: spmd.V, TP: spmd.I}),
+        out_src_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+        out_dst_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
     )
 
 
@@ -44,17 +47,17 @@ def vision_invariant_linear_config() -> ShardingConfig:
     """Unsharded linear whose state and activations are invariant at TP."""
     return ShardingConfig(
         state_shardings={
-            "weight": SpmdLayout({DP: spmd.R, TP: spmd.I}),
-            "bias": SpmdLayout({DP: spmd.R, TP: spmd.I}),
+            "weight": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.I}),
+            "bias": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.I}),
         },
         in_src_shardings={
-            "input": SpmdLayout({DP: spmd.V, TP: spmd.I}),
+            "input": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
         },
         in_dst_shardings={
-            "input": SpmdLayout({DP: spmd.V, TP: spmd.I}),
+            "input": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
         },
-        out_src_shardings=SpmdLayout({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdLayout({DP: spmd.V, TP: spmd.I}),
+        out_src_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+        out_dst_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
     )
 
 
@@ -64,26 +67,26 @@ def vision_colwise_config(
     """Colwise vision linear with a TP-replicated local matmul input."""
     return ShardingConfig(
         state_shardings={
-            "weight": SpmdLayout({DP: spmd.R, TP: spmd.S(0)}),
-            "bias": SpmdLayout({DP: spmd.R, TP: spmd.S(0)}),
+            "weight": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.S(0)}),
+            "bias": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.S(0)}),
         },
         in_src_shardings={
-            "input": SpmdLayout({DP: spmd.V, TP: input_tp}),
+            "input": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: input_tp}),
         },
         in_dst_shardings={
-            "input": SpmdLayout({DP: spmd.V, TP: spmd.R}),
+            "input": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.R}),
         },
-        out_src_shardings=SpmdLayout({DP: spmd.V, TP: spmd.S(-1)}),
+        out_src_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.S(-1)}),
     )
 
 
 def vision_scaled_bias_rowwise_config() -> ShardingConfig:
     """Scaled-bias rowwise vision linear returning a TP-invariant activation."""
-    input_layout = SpmdLayout({DP: spmd.V, TP: spmd.S(1)})
+    input_layout = SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.S(1)})
     return ShardingConfig(
         state_shardings={
-            "weight": SpmdLayout({DP: spmd.R, TP: spmd.S(1)}),
-            "bias": SpmdLayout({DP: spmd.R, TP: spmd.R}),
+            "weight": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.S(1)}),
+            "bias": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.R}),
         },
         in_src_shardings={
             "input": input_layout,
@@ -91,8 +94,8 @@ def vision_scaled_bias_rowwise_config() -> ShardingConfig:
         in_dst_shardings={
             "input": input_layout,
         },
-        out_src_shardings=SpmdLayout({DP: spmd.V, TP: spmd.P}),
-        out_dst_shardings=SpmdLayout({DP: spmd.V, TP: spmd.I}),
+        out_src_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.P}),
+        out_dst_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
         local_map=LocalMapConfig(in_grad_placements=(input_layout,)),
     )
 
@@ -108,11 +111,11 @@ def set_vision_transformer_block_sharding_config(
 
     block.attn.sharding_config = ShardingConfig(
         in_src_shardings={
-            "x": SpmdLayout({DP: spmd.V, TP: spmd.I}),
+            "x": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
             "rope_cache": SpmdLayout({DP: rope_cache_dp, TP: spmd.I}),
         },
         in_dst_shardings={
-            "x": SpmdLayout({DP: spmd.V, TP: spmd.R}),
+            "x": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.R}),
             "rope_cache": SpmdLayout({DP: rope_cache_dp, TP: spmd.R}),
         },
     )

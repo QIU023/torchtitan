@@ -8,6 +8,7 @@
 
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -47,6 +48,14 @@ class KimiRMSNormGated(Module):
         return (x_float * torch.sigmoid(gate.float())).to(input_dtype)
 
 
+# [1, T, N, K] kernel tensors: batch axis whole, tokens sharded over dp/cp,
+# identical on every TP rank.
+_KERNEL_STREAM_TYPE = (
+    {"dp": spmd.V, "cp": spmd.V, "tp": spmd.I},
+    spmd.PartitionSpec(None, ("dp", "cp"), None, None),
+)
+
+
 class KimiKDAKernel(Module):
     """Stateless dispatch to FLA's chunked KDA kernel."""
 
@@ -60,6 +69,13 @@ class KimiKDAKernel(Module):
         if self.lower_bound is not None and not (-5.0 <= self.lower_bound < 0.0):
             raise ValueError("KDA lower_bound must be in the safe range [-5, 0).")
 
+    # The fla kernel is opaque to spmd_types. Without a declared output type
+    # its result reads as varying on TP, and every replicated weight behind it
+    # (the KDA projections, then the block stream they feed) has its gradient
+    # summed across TP ranks -- a 2x on identical replicas. The kernel runs the
+    # same computation on every TP rank, so its output is TP-invariant and
+    # token-sharded over dp/cp, with the unsqueezed batch axis whole.
+    @spmd.no_typecheck(out_types=_KERNEL_STREAM_TYPE)
     def forward(
         self,
         q_BLHK: torch.Tensor,
@@ -223,16 +239,16 @@ class KimiDeltaAttention(Module):
 
         num_tokens = x_TD.shape[0]
         q_THK = self._causal_conv(self.q_proj(x_TD), self.q_conv).view(
-            num_tokens, self.num_heads, self.head_dim
+            num_tokens, -1, self.head_dim
         )
         k_THK = self._causal_conv(self.k_proj(x_TD), self.k_conv).view(
-            num_tokens, self.num_heads, self.head_dim
+            num_tokens, -1, self.head_dim
         )
         v_THV = self._causal_conv(self.v_proj(x_TD), self.v_conv).view(
-            num_tokens, self.num_heads, self.head_dim
+            num_tokens, -1, self.head_dim
         )
         forget_THK = self.forget_b(self.forget_a(x_TD)).view(
-            num_tokens, self.num_heads, self.head_dim
+            num_tokens, -1, self.head_dim
         )
         beta_TH = self.beta(x_TD).float()
 
@@ -252,9 +268,7 @@ class KimiDeltaAttention(Module):
             out_THV = DTensor.from_local(
                 out_THV, q_THK.device_mesh, q_THK.placements, run_check=False
             )
-        output_gate_THV = self.output_gate(x_TD).view(
-            num_tokens, self.num_heads, self.head_dim
-        )
+        output_gate_THV = self.output_gate(x_TD).view(num_tokens, -1, self.head_dim)
         out_THV = self.output_norm(out_THV, output_gate_THV)
         return self.output_proj(out_THV.reshape(num_tokens, -1))
 

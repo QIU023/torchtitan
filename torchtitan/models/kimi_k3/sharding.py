@@ -25,6 +25,7 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
+from spmd_types import SpmdType
 from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
@@ -32,12 +33,21 @@ from torchtitan.models.common.attention import (
     create_attention_mask,
     get_efficient_causal_mask_mod_for_packed_document,
 )
+from torchtitan.models.common.decoder_sharding import attention_activation_placement
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+from torchtitan.models.common.vision_encoder_sharding import (
+    invariant_norm_config,
+    set_vision_transformer_block_sharding_config,
+    vision_colwise_config,
+    vision_invariant_linear_config,
+    vision_scaled_bias_rowwise_config,
+)
 
 from torchtitan.models.kimi_k3.dtensor_ops import (
     to_local_if_dtensor,
     to_local_partial_grad,
 )
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 
 __all__ = [
@@ -49,6 +59,8 @@ __all__ = [
 ]
 
 CP = MeshAxisName.CP
+DP = MeshAxisName.DP
+TP = MeshAxisName.TP
 
 # Tensor dims of the [T, H, K] activations the contracts talk about. This model
 # carries a folded token stream with no batch axis, so the sequence is dim 0.
@@ -195,7 +207,9 @@ def full_sequence_document_mask(attn, positions_L, cp_group):
             "mask for the reassembled sequence, but the attention layer "
             "received None."
         )
-    gathered = [torch.empty_like(positions_L) for _ in range(dist.get_world_size(cp_group))]
+    gathered = [
+        torch.empty_like(positions_L) for _ in range(dist.get_world_size(cp_group))
+    ]
     dist.all_gather(gathered, positions_L.contiguous(), group=cp_group)
     positions_full = torch.cat(gathered, dim=0)
     num_tokens = positions_full.shape[0]
@@ -300,9 +314,7 @@ def mla_ulysses_attention(
     return out_LHV
 
 
-def set_expert_parallel_sharding_config(
-    config, *, enable_sp: bool = False
-) -> None:
+def set_expert_parallel_sharding_config(config, *, enable_sp: bool = False) -> None:
     """Declare the sharding expert parallel acts on, with TP off.
 
     Shared with the EP review branch: the routed experts shard on the expert
@@ -328,3 +340,70 @@ def set_expert_parallel_sharding_config(
                     "w3_EFD": spmd.S(1),
                 },
             )
+
+
+def _set_vision_encoder_sharding(ve_cfg) -> None:
+    """Invariant-activation plan for the MoonViT tower, the kimi_k2_7 shape.
+
+    Linear layers shard colwise/rowwise for memory; norms and the position
+    table stay invariant. K3's projector norms after its second linear.
+    """
+    ve_cfg.sharding_config = ShardingConfig(
+        # I: the table is read identically on every TP rank, so its gradient
+        # is already whole; R would sum the replicas. (Type checking refuses
+        # I here because MoonViT mutates the type through R; the tower is not
+        # typecheck-clean upstream either.)
+        state_shardings={"pos_embed": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
+        # Both sides invariant: the decoder stream the features splice into is
+        # invariant on TP, and an I -> R exit here would all-reduce the
+        # gradient flowing back into the tower, doubling every tower weight's
+        # gradient (identical replicas already hold the full gradient).
+        out_src_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+        out_dst_shardings=SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+    )
+    ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
+        state_shardings={"inv_freq": SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdLayout({DP: spmd.R, CP: spmd.R, TP: spmd.I}),
+    )
+    ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
+    set_vision_transformer_block_sharding_config(ve_cfg.block, rope_cache_dp=spmd.V)
+    # The shared helper shards the block's linears over TP and all-gathers its
+    # k/v over cp, the decoder's treatment. Here the tower runs whole on every
+    # rank, as it does under partial_dtensor: every linear invariant at TP, and
+    # the attention rank-local over cp with the same layout on both sides.
+    block = ve_cfg.block
+    for linear in (
+        block.attn.wq,
+        block.attn.wk,
+        block.attn.wv,
+        block.attn.proj,
+        block.mlp.fc1,
+        block.mlp.fc2,
+    ):
+        linear.sharding_config = vision_invariant_linear_config()
+    # The helper converts the attention's input I -> R on TP for its sharded
+    # plan (an all-reduce of the gradient in backward, which doubles norm1's
+    # gradient once the linears are invariant); with the whole block invariant
+    # the attention takes the stream as it is.
+    block.attn.sharding_config = ShardingConfig(
+        in_src_shardings={
+            "x": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+            "rope_cache": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+        },
+        in_dst_shardings={
+            "x": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+            "rope_cache": SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+        },
+    )
+    local = SpmdLayout({DP: spmd.V, CP: spmd.V, TP: spmd.I})
+    block.attn.inner_attention.sharding_config = ShardingConfig(
+        in_src_shardings={"q_TNH": local, "k_TNH": local, "v_TNH": local},
+        in_dst_shardings={"q_TNH": local, "k_TNH": local, "v_TNH": local},
+        out_src_shardings=local,
+        local_map=LocalMapConfig(in_grad_placements=(local, local, local)),
+    )
+    ve_cfg.final_norm.sharding_config = invariant_norm_config()
+    proj = ve_cfg.projector
+    proj.linear_1.sharding_config = vision_invariant_linear_config()
+    proj.linear_2.sharding_config = vision_invariant_linear_config()
+    proj.post_norm.sharding_config = invariant_norm_config()

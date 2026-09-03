@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import spmd_types as spmd
 
@@ -16,6 +17,8 @@ from torch.distributed.tensor import DTensor, Replicate
 from torchtitan.distributed.fsdp import add_zero_valued_dependency
 
 from torchtitan.distributed.parallel_dims import MeshAxisName, SpmdLayout
+from torchtitan.distributed.spmd_types import current_spmd_mesh
+from torchtitan.distributed.utils import get_spmd_backend
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
@@ -23,10 +26,12 @@ from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexAttention,
+    VarlenAttention,
 )
 
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import (
+    attention_activation_placement,
     colwise_config,
     dense_activation_placement,
     dense_param_placement,
@@ -47,18 +52,40 @@ from torchtitan.models.kimi_k3.dtensor_ops import to_local_if_dtensor
 from torchtitan.models.kimi_k3.mtp import KimiK3MTPLayer, put_mtp_logits
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module, ModuleDict
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 from torchtitan.tools.logging import logger
 
 from .kda import KimiDeltaAttention
 from .moe import KimiFeedForward, KimiLatentMoE
 from .moon_ep_dispatcher import MoonEPTokenDispatcher
-from .sharding import mla_ulysses_attention, set_expert_parallel_sharding_config
+from .sharding import (
+    _set_vision_encoder_sharding,
+    full_sequence_document_mask,
+    set_expert_parallel_sharding_config,
+)
 from .vision_encoder import KimiK3VisionEncoder
 
 # Shape suffixes: T = packed tokens, D = model dimension, H = heads,
 # K = key head dimension, V = value head dimension,
 # N = attention-residual entries.
+
+
+def _local_head_split(
+    x_TE: torch.Tensor, num_tokens: int, heads: int, head_dim: int
+) -> torch.Tensor:
+    """Unflatten a TP-sharded ``[T, H*K]`` projection into ``[T, H, K]``.
+
+    spmd_types cannot propagate a shard on the feature dim through a split of
+    that dim, so the view runs in a local region and the result is re-typed as
+    head-sharded on TP, the same shape core's ``local_qkv_head_split`` uses.
+    """
+    with spmd.local():
+        x_TNH = x_TE.view(num_tokens, heads, head_dim)
+        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            spmd.assert_type(
+                x_TNH, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
+            )
+    return x_TNH
 
 
 class KimiMLAAttention(BaseAttention):
@@ -125,7 +152,7 @@ class KimiMLAAttention(BaseAttention):
         # rank). Deriving holds under every DTensor backend with no branch.
         q_proj_TE = self.wq_b(self.q_norm(self.wq_a(x_TD)))
         h_local = q_proj_TE.shape[-1] // self.q_head_dim
-        q_THK = q_proj_TE.view(num_tokens, h_local, self.q_head_dim)
+        q_THK = _local_head_split(q_proj_TE, num_tokens, h_local, self.q_head_dim)
 
         compressed_kv_TC = self.wkv_a(x_TD)
         kv_latent_TC, k_rope_TK = torch.split(
@@ -133,7 +160,8 @@ class KimiMLAAttention(BaseAttention):
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
+        kv_THC = _local_head_split(
+            self.wkv_b(self.kv_norm(kv_latent_TC)),
             num_tokens,
             h_local,
             self.qk_nope_head_dim + self.v_head_dim,
@@ -143,24 +171,32 @@ class KimiMLAAttention(BaseAttention):
             [self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
-        k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-            -1, h_local, -1
-        )
-        k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
+        # The rotary slice is headless and replicated; expanding it onto the
+        # local heads and joining it to the head-sharded nope part is a
+        # local-region op, re-typed as head-sharded on TP afterwards.
+        with spmd.local():
+            k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
+                -1, h_local, -1
+            )
+            k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                spmd.assert_type(
+                    k_THK, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
+                )
 
         cp_group = self._cp_group
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            out_THV = mla_ulysses_attention(
-                self, q_THK, kv_THC, k_rope_TK, cp_group, positions
-            )
-        else:
-            out_THV = self.inner_attention(
-                q_THK,
-                k_THK,
-                v_THV,
-                attention_masks=attention_masks,
-                scale=self.scale,
-            )
+            # Ulysses is the inner attention's declaration: the boundary trades
+            # the token shard for a head shard and back. Only the mask is
+            # rebuilt here, for the full sequence the body sees.
+            attention_masks = full_sequence_document_mask(self, positions, cp_group)
+        out_THV = self.inner_attention(
+            q_THK,
+            k_THK,
+            v_THV,
+            attention_masks=attention_masks,
+            scale=self.scale,
+        )
         out_TD = out_THV.reshape(num_tokens, h_local * self.v_head_dim)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
@@ -180,7 +216,27 @@ def _tp_replicate_config() -> ShardingConfig:
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
-def _set_mla_sharding(attention_cfg, *, enable_sp: bool = False) -> None:
+def _tp_invariant_config() -> ShardingConfig:
+    """Weight invariant on the TP axis: identical replicas whose gradients are
+    identical too, so no reduction across TP. The replicated config is for
+    weights whose consumer is TP-sharded, where each rank's gradient is a
+    partial sum that spmd_types reduces; declaring those invariant would drop
+    half the gradient, declaring these replicated doubles it."""
+    return ShardingConfig(
+        state_shardings={
+            "weight": dense_param_placement(tp=spmd.I),
+            "bias": dense_param_placement(tp=spmd.I),
+        }
+    )
+
+
+def _set_mla_sharding(
+    attention_cfg,
+    *,
+    enable_sp: bool = False,
+    cp_ulysses: bool = False,
+    invariant_stream: bool = False,
+) -> None:
     """Head-parallel TP for MLA.
 
     Not ``set_gqa_attention_sharding``: that one asserts a GQAttention.Config,
@@ -198,19 +254,71 @@ def _set_mla_sharding(attention_cfg, *, enable_sp: bool = False) -> None:
                 "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
             },
         )
+    elif invariant_stream:
+        # Under spmd_types the block stream is invariant on TP while the
+        # attention body is replicated-with-sharded-heads: entering converts
+        # I -> R (no-op forward, all-reduce of the input gradient in backward,
+        # since wq_b/wkv_b are colwise); wo's rowwise boundary already hands
+        # the stream back invariant.
+        attention_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={
+                "x_TD": dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+            },
+            in_dst_shardings={
+                "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+            },
+        )
     attention_cfg.wq_b.sharding_config = colwise_config()
     attention_cfg.wkv_b.sharding_config = colwise_config()
     attention_cfg.gate.sharding_config = colwise_config()
     attention_cfg.wo.sharding_config = rowwise_config(output_sp=enable_sp)
     attention_cfg.wq_a.sharding_config = _tp_replicate_config()
     attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
-    attention_cfg.q_norm.sharding_config = norm_config(enable_sp=False)
-    attention_cfg.kv_norm.sharding_config = norm_config(enable_sp=False)
+    # Inside the replicated body the activations are R and the norms feed the
+    # colwise wq_b/wkv_b, so their weights take partial gradients: replicated,
+    # state only (norm_config's invariant [T, D] boundary is the stream's).
+    for name in ("q_norm", "kv_norm"):
+        getattr(attention_cfg, name).sharding_config = ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.R)}
+        )
     # The kernel boundary: FlexAttention indexes plain mask tensors, so the
     # declared q/k/v drop to locals inside a local_map region -- the same
     # helper qwen3_5's full-attention layers use, and the same (T, N, H)
     # activation family.
-    set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
+    if cp_ulysses:
+        _set_ulysses_inner_attention(attention_cfg.inner_attention)
+    else:
+        set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
+
+
+def _ulysses_head_placement() -> SpmdLayout:
+    """``(tokens, heads, dim)`` with the cp axis on the heads, inside TP's split."""
+    return SpmdLayout(
+        {MeshAxisName.DP: spmd.V, MeshAxisName.CP: spmd.V, MeshAxisName.TP: spmd.V},
+        partition_spec=spmd.PartitionSpec(
+            MeshAxisName.DP, (MeshAxisName.TP, MeshAxisName.CP), None
+        ),
+    )
+
+
+def _set_ulysses_inner_attention(inner_attention_cfg) -> None:
+    """Ulysses context parallel for MLA, stated as the module boundary.
+
+    The stream arrives token-sharded on the cp axis. Trading that shard for a
+    head shard on the way in is one redistribution (an all-to-all); the body
+    then sees the full sequence for its head subset and the output trades
+    back. The full-sequence mask is rebuilt by the attention module from the
+    gathered positions, since the trainer cuts the batch's masks along Q.
+    """
+    seq = attention_activation_placement()
+    heads = _ulysses_head_placement()
+    inner_attention_cfg.sharding_config = ShardingConfig(
+        in_src_shardings={"q_TNH": seq, "k_TNH": seq, "v_TNH": seq},
+        in_dst_shardings={"q_TNH": heads, "k_TNH": heads, "v_TNH": heads},
+        out_src_shardings=heads,
+        out_dst_shardings=seq,
+        local_map=LocalMapConfig(in_grad_placements=(heads, heads, heads)),
+    )
 
 
 def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool = False) -> None:
@@ -233,14 +341,32 @@ def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool = False) -> None:
         "output_gate",
         "output_proj",
     ):
-        getattr(delta_attention_cfg, name).sharding_config = _tp_replicate_config()
-    delta_attention_cfg.output_norm.sharding_config = norm_config(enable_sp=False)
+        getattr(delta_attention_cfg, name).sharding_config = _tp_invariant_config()
+    # The gated norm runs on the [T, N, H] head stack, not the [T, D] stream a
+    # norm_config describes; invariant at TP like the rest, state only.
+    delta_attention_cfg.output_norm.sharding_config = ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.I)}
+    )
     # A_log and dt_bias are the module's OWN parameters, so only a
     # module-level declaration reaches them.
     kda_module_config = ShardingConfig(
         state_shardings={
-            "A_log": SpmdLayout({MeshAxisName.DP: spmd.R, MeshAxisName.TP: spmd.I}),
-            "dt_bias": SpmdLayout({MeshAxisName.DP: spmd.R, MeshAxisName.TP: spmd.I}),
+            # Replicated over cp too: under context parallel the mesh carries
+            # that axis and spmd_types needs every parameter placed on it.
+            "A_log": SpmdLayout(
+                {
+                    MeshAxisName.DP: spmd.R,
+                    MeshAxisName.CP: spmd.R,
+                    MeshAxisName.TP: spmd.I,
+                }
+            ),
+            "dt_bias": SpmdLayout(
+                {
+                    MeshAxisName.DP: spmd.R,
+                    MeshAxisName.CP: spmd.R,
+                    MeshAxisName.TP: spmd.I,
+                }
+            ),
         }
     )
     if enable_sp:
@@ -310,9 +436,7 @@ def _apply_attention_residual(
             norm,
             use_reentrant=False,
         )
-    return _attention_residual_math(
-        prefix_sum_TD, block_residual_TND, projection, norm
-    )
+    return _attention_residual_math(prefix_sum_TD, block_residual_TND, projection, norm)
 
 
 class KimiK3TransformerBlock(Module):
@@ -557,6 +681,12 @@ class KimiK3Model(Decoder):
             self._set_sharding_config(
                 enable_ep=parallelism.expert_parallel_degree > 1,
                 enable_tp=parallelism.tensor_parallel_degree > 1,
+                enable_cp=parallelism.context_parallel_degree > 1,
+                # spmd_types consumes every declaration and needs one for
+                # every parameter, so the dense path is declared whenever it
+                # drives the model; partial_dtensor reads only the tp
+                # placements and leaves undeclared modules inert.
+                declare_all=parallelism.spmd_backend == "spmd_types",
                 # SP shards the token axis on the TP mesh; CP owns that axis
                 # in this model, so the two do not compose yet.
                 # Sequence ownership when TP-SP and CP stack: CP owns the
@@ -590,7 +720,13 @@ class KimiK3Model(Decoder):
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def _set_sharding_config(
-            self, *, enable_ep: bool, enable_tp: bool, enable_sp: bool = False
+            self,
+            *,
+            enable_ep: bool,
+            enable_tp: bool,
+            enable_sp: bool = False,
+            declare_all: bool = False,
+            enable_cp: bool = False,
         ) -> None:
             """Declare the sharding the SPMD backends act on.
 
@@ -604,14 +740,23 @@ class KimiK3Model(Decoder):
             guess -- an undeclared module is inert, a wrongly declared one is a
             silent numerics change.
             """
-            if not (enable_ep or enable_tp):
+            if not (enable_ep or enable_tp or declare_all):
                 return
-            if enable_ep and not enable_tp:
+            if enable_ep and not (enable_tp or declare_all):
                 # The EP-only declaration is shared with the EP PR branch.
                 set_expert_parallel_sharding_config(self)
                 return
+            # The dense-path declarations are TP's; under spmd_types they are
+            # issued at any TP degree. The ep+tp special cases below stay on
+            # the real TP flag.
+            dense = enable_tp or declare_all
             set_decoder_sharding_config(self, enable_sp=enable_sp)
-            if enable_tp:
+            if declare_all and self.vision_encoder is not None:
+                # Under partial_dtensor the tower stays undeclared: MoonViT's
+                # position lookup indexes the table with a plain tensor, which
+                # a DTensor table refuses.
+                _set_vision_encoder_sharding(self.vision_encoder)
+            if dense:
                 # The FINAL aggregation pair, same treatment as the per-layer
                 # ones below: both sit on the block stream, which TP does not
                 # split, and _apply_attention_residual multiplies their weights
@@ -621,14 +766,14 @@ class KimiK3Model(Decoder):
                         enable_sp=enable_sp
                     )
                 if self.output_res_proj is not None:
-                    self.output_res_proj.sharding_config = _tp_replicate_config()
+                    self.output_res_proj.sharding_config = _tp_invariant_config()
             attn_x_layout = (
                 dense_sequence_parallel_placement()
                 if enable_sp
                 else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
             )
             for layer in self.layers:
-                if enable_tp:
+                if dense:
                     # Every norm and the residual projections stay whole: they
                     # sit on the block stream, which TP does not split. Left
                     # undeclared they meet DTensor activations as plain tensors.
@@ -644,9 +789,14 @@ class KimiK3Model(Decoder):
                     for name in ("attention_res_proj", "ffn_res_proj"):
                         cfg = getattr(layer, name, None)
                         if cfg is not None:
-                            cfg.sharding_config = _tp_replicate_config()
+                            cfg.sharding_config = _tp_invariant_config()
                     if layer.attention is not None:
-                        _set_mla_sharding(layer.attention, enable_sp=enable_sp)
+                        _set_mla_sharding(
+                            layer.attention,
+                            enable_sp=enable_sp,
+                            cp_ulysses=enable_cp,
+                            invariant_stream=declare_all,
+                        )
                     if layer.delta_attention is not None:
                         _set_kda_sharding(layer.delta_attention, enable_sp=enable_sp)
                     if layer.feed_forward is not None:
@@ -656,19 +806,49 @@ class KimiK3Model(Decoder):
                             enable_sp=enable_sp,
                         )
                 if layer.moe is not None:
-                    if enable_tp:
+                    if dense:
                         # The latent pair is Kimi's addition to core's MoE, so
                         # set_moe_sharding_config does not know it. It stays
                         # whole: it compresses to a rank, not heads or experts.
+                        # routed_down feeds the TP-sharded experts, so each
+                        # rank's gradient is a partial sum: replicated.
+                        # routed_up feeds the invariant block stream from the
+                        # reduced norm output: identical gradients, invariant.
                         layer.moe.routed_down.sharding_config = _tp_replicate_config()
-                        layer.moe.routed_up.sharding_config = _tp_replicate_config()
+                        routed_up_cfg = _tp_invariant_config()
+                        if declare_all and not (enable_ep or enable_sp):
+                            # The routed path leaves routed_norm reduced (I)
+                            # while the shared experts' rowwise output is
+                            # Partial; core's MoE boundary reduces P once for
+                            # both. Re-enter the Partial domain here (zeros off
+                            # rank 0 forward, no-op backward) so the sum types
+                            # and that single reduce stays.
+                            routed_up_cfg.out_src_shardings = (
+                                dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+                            )
+                            routed_up_cfg.out_dst_shardings = (
+                                dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
+                            )
+                        layer.moe.routed_up.sharding_config = routed_up_cfg
                         # The latent trio sits INSIDE the MoE region: under
                         # ep+tp that region runs sequence-parallel (see
                         # enable_sp below), so the norm's boundary must follow
                         # the internal layout, not the Replicate stream.
-                        layer.moe.routed_norm.sharding_config = norm_config(
-                            enable_sp=enable_ep or enable_sp
-                        )
+                        routed_norm_cfg = norm_config(enable_sp=enable_ep or enable_sp)
+                        if not (enable_ep or enable_sp):
+                            # Under plain TP the routed experts hand the norm
+                            # their rowwise output, Partial on TP; nothing
+                            # between reduces it, so the norm's boundary does
+                            # (partial_dtensor's DTensor did this implicitly).
+                            # Keyed "x": nn.RMSNorm.forward names its argument
+                            # x, and a boundary keyed otherwise never binds.
+                            routed_norm_cfg.in_src_shardings = {
+                                "x": dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
+                            }
+                            routed_norm_cfg.in_dst_shardings = {
+                                "x": dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+                            }
+                        layer.moe.routed_norm.sharding_config = routed_norm_cfg
                     set_moe_sharding_config(
                         layer.moe,
                         enable_ep=enable_ep,
@@ -684,6 +864,12 @@ class KimiK3Model(Decoder):
                             "w3_EFD": spmd.S(1),
                         },
                     )
+                    if declare_all and not enable_sp:
+                        # The module's reduced output re-enters the invariant
+                        # block stream: R -> I at the exit.
+                        layer.moe.sharding_config.out_dst_shardings = (
+                            dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+                        )
                     if enable_ep and enable_tp and not enable_sp:
                         # The stream ARRIVES Replicate and must LEAVE Replicate
                         # (no SP anywhere else in this model's declaration);
@@ -1103,6 +1289,17 @@ class KimiK3Model(Decoder):
         if special_tokens is None:
             raise ValueError("special_tokens are required for multimodal inputs.")
 
+        if current_spmd_mesh() is not None:
+            # spmd_types types the token stream at the trainer; the image inputs
+            # arrive untyped. They are DP-local and TP-invariant, the layout
+            # every VLM decoder shares, and rank-local over cp.
+            image_type = {
+                MeshAxisName.DP: spmd.V,
+                MeshAxisName.CP: spmd.V,
+                MeshAxisName.TP: spmd.I,
+            }
+            spmd.assert_type(pixel_values, image_type)
+            spmd.assert_type(grid_thw, image_type)
         pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
         # DEP run-ahead: take this micro-batch's features if a previous action
         # already encoded them on the vision stream, and start the next ones.
@@ -1298,11 +1495,18 @@ class KimiK3Model(Decoder):
             h_TD = tokens
 
         num_tokens, D = h_TD.shape
-        block_residual_TND = (
-            block_residual_in
-            if block_residual_in is not None
-            else h_TD.new_zeros(num_tokens, 0, D)
-        )
+        if block_residual_in is not None:
+            block_residual_TND = block_residual_in
+        else:
+            block_residual_TND = h_TD.new_zeros(num_tokens, 0, D)
+            mesh = current_spmd_mesh()
+            if mesh is not None and mesh.mesh_dim_names and "tp" in mesh.mesh_dim_names:
+                # A fresh tensor reads as replicated on TP; the block stream it
+                # opens is invariant there, and the stack concatenates the two.
+                # Forward is a no-op; the type decides how gradients reduce.
+                block_residual_TND = spmd.redistribute(
+                    block_residual_TND, mesh.get_group("tp"), src=spmd.R, dst=spmd.I
+                )
         for layer in self.layers.values():
             h_TD, block_residual_TND = layer(
                 h_TD,
