@@ -46,32 +46,39 @@ def parallelize_kimi_k3(
             "Kimi K3 currently supports FSDP2 data parallelism "
             f"only; disable {', '.join(unsupported_parallelisms)}."
         )
-    if parallelism.spmd_backend != "partial_dtensor":
-        raise NotImplementedError(
-            "Kimi K3 FSDP2 currently supports the partial_dtensor SPMD backend "
-            "only; the config registry pins it."
-        )
     if compile_config.enable and "model" in compile_config.components:
         raise NotImplementedError("Kimi K3 does not support model compilation yet.")
 
-    dp_mesh_names = (
-        ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    )
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-    # The routed experts shard on their own data-parallel mesh, which excludes
-    # the expert axis; the same shape deepseek_v3 resolves.
+    dp_mesh_dims = None
+    edp_mesh_dims = None
     edp_mesh = None
-    if parallel_dims.ep_enabled:
-        edp_mesh = parallel_dims.get_optional_mesh(
-            ["dp_replicate", "efsdp"]
-            if parallel_dims.dp_replicate_enabled
-            else ["efsdp"]
+    if parallelism.spmd_backend == "spmd_types":
+        from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
+
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+    else:
+        dp_mesh_names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
         )
+        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+        # The routed experts shard on their own data-parallel mesh, which excludes
+        # the expert axis; the same shape deepseek_v3 resolves.
+        if parallel_dims.ep_enabled:
+            edp_mesh = parallel_dims.get_optional_mesh(
+                ["dp_replicate", "efsdp"]
+                if parallel_dims.dp_replicate_enabled
+                else ["efsdp"]
+            )
 
     assert isinstance(model, KimiK3Model)
     if parallel_dims.cp_enabled:
         apply_cp_kimi_k3(model, parallel_dims)
-    if parallel_dims.ep_enabled or parallel_dims.tp_enabled:
+    if (
+        parallelism.spmd_backend == "spmd_types"
+        or parallel_dims.ep_enabled
+        or parallel_dims.tp_enabled
+    ):
         # model_registry's moe_comm_backend picks the dispatcher: standard
         # (default), deepep and minimal_async_ep run on this model; hybridep
         # needs GB200-class hardware.
@@ -95,6 +102,7 @@ def parallelize_kimi_k3(
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             pp_enabled=False,
+            dp_mesh_dims=dp_mesh_dims,
         )
 
     apply_fsdp_to_decoder(
@@ -107,6 +115,8 @@ def parallelize_kimi_k3(
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
+        dp_mesh_dims=dp_mesh_dims,
+        edp_mesh_dims=edp_mesh_dims,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
 

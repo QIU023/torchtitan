@@ -299,10 +299,12 @@ class KDA(Module):
                 f"got {type(attention_masks).__name__}."
             )
         num_tokens = x_TD.shape[0]
+        # -1, not num_heads: under spmd_types the projections hand back the
+        # TP-local head slice (upstream's local_qkv_head_split does the same).
         raw_gate_TNK = self.forget_b(self.forget_a(x_TD)).reshape(
-            num_tokens, self.num_heads, self.head_dim
+            num_tokens, -1, self.head_dim
         )
-        raw_beta_TN = self.beta(x_TD).reshape(num_tokens, self.num_heads)
+        raw_beta_TN = self.beta(x_TD).reshape(num_tokens, -1)
         out_TNV = self.inner_kda(
             self.q_proj(x_TD),
             self.k_proj(x_TD),

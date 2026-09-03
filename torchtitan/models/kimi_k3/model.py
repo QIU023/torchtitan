@@ -328,7 +328,10 @@ class KimiK3Model(Decoder):
                 enable_ep=config.parallelism.expert_parallel_degree > 1,
                 enable_sp=enable_sp,
             )
-            if config.parallelism.tensor_parallel_degree > 1:
+            if (
+                config.parallelism.tensor_parallel_degree > 1
+                or config.parallelism.spmd_backend == "spmd_types"
+            ):
                 set_tensor_parallel_sharding_config(self, enable_sp=enable_sp)
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
@@ -371,6 +374,45 @@ class KimiK3Model(Decoder):
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
+
+    def preprocess_inputs(  # pyrefly: ignore [bad-override]
+        self,
+        input_dict,
+        *,
+        parallel_dims,
+        parallelism,
+    ):
+        """Decoder preprocessing plus SPMD layouts for the image inputs (PROBE)."""
+        from typing import Any
+
+        from torchtitan.distributed.context_parallel.api import (
+            prepare_context_parallel_input,
+        )
+        from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+        from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+        from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+        from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
+
+        batch: dict[str, Any] = dict(input_dict)
+        positions = batch.get("positions", None)
+        if positions is not None:
+            inner = self.config.first_full_attention_backend
+            if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
+                batch["attention_masks"] = self.get_attention_masks(positions=positions)
+        input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
+        if parallel_dims.cp_enabled:
+            batch = prepare_context_parallel_input(
+                batch,
+                input_sharding,
+                parallel_dims.get_mesh("cp"),
+                parallelism.context_parallel_load_balancer,
+                parallelism.context_parallel_ptrr_mask_key,
+            )
+        if parallelism.spmd_backend == "spmd_types":
+            batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
+        inputs = batch.pop("input")
+        labels = batch.pop("labels")
+        return inputs, labels, batch
 
     def _prepare_multimodal_embeds(
         self,
