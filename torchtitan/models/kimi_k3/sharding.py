@@ -74,6 +74,15 @@ def set_expert_parallel_sharding_config(
             )
 
 
+def _tp_invariant_config() -> ShardingConfig:
+    """Weight invariant on the TP axis: identical replicas whose gradients are
+    identical too, so no reduction across TP. The replicated config is for
+    weights whose consumer is TP-sharded, where each rank's gradient is a
+    partial sum that spmd_types reduces; declaring those invariant would drop
+    half the gradient, declaring these replicated doubles it."""
+    return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.I)})
+
+
 def _tp_replicate_config() -> ShardingConfig:
     """Weight replicated on the TP axis, with no activation boundary declared.
 
@@ -84,7 +93,13 @@ def _tp_replicate_config() -> ShardingConfig:
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
-def _set_mla_sharding(attention_cfg, *, enable_sp: bool, cp_ulysses: bool) -> None:
+def _set_mla_sharding(
+    attention_cfg,
+    *,
+    enable_sp: bool,
+    cp_ulysses: bool = False,
+    invariant_stream: bool = False,
+) -> None:
     """Head-parallel TP for MLA.
 
     The projections that produce or consume the head axis split on it; the
@@ -104,10 +119,29 @@ def _set_mla_sharding(attention_cfg, *, enable_sp: bool, cp_ulysses: bool) -> No
                 "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
             },
         )
+    if invariant_stream and not enable_sp:
+        # Under spmd_types the block stream is invariant on TP while the
+        # attention body is replicated with sharded heads: entering converts
+        # I -> R (no-op forward, all-reduce of the input gradient in backward,
+        # since wq_b/wkv_b are colwise); wo's rowwise boundary hands the
+        # stream back invariant.
+        attention_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={
+                "x_TD": dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+            },
+            in_dst_shardings={
+                "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+            },
+        )
     attention_cfg.wq_a.sharding_config = _tp_replicate_config()
     attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
-    attention_cfg.q_norm.sharding_config = norm_config(enable_sp=False)
-    attention_cfg.kv_norm.sharding_config = norm_config(enable_sp=False)
+    # Inside the replicated body the activations are R and the norms feed the
+    # colwise wq_b/wkv_b, so their weights take partial gradients: replicated,
+    # state only (norm_config's invariant [T, D] boundary is the stream's).
+    for name in ("q_norm", "kv_norm"):
+        getattr(attention_cfg, name).sharding_config = ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.R)}
+        )
     if cp_ulysses:
         _set_ulysses_inner_attention(attention_cfg.inner_attention)
     else:
@@ -178,6 +212,7 @@ def set_tensor_parallel_sharding_config(
     enable_sp: bool = False,
     declare_vision_encoder: bool = False,
     enable_cp: bool = False,
+    spmd_types: bool = False,
 ) -> None:
     """Declare the sharding tensor parallel acts on.
 
@@ -196,7 +231,9 @@ def set_tensor_parallel_sharding_config(
         # table with a plain tensor, which a DTensor table refuses.
         _set_vision_encoder_sharding(config.vision_encoder)
     config.output_res_norm.sharding_config = norm_config(enable_sp=enable_sp)
-    config.output_res_proj.sharding_config = _tp_replicate_config()
+    # The residual projections read and feed the invariant block stream:
+    # identical gradients on every TP rank, so invariant, not replicated.
+    config.output_res_proj.sharding_config = _tp_invariant_config()
     attn_x_layout = (
         dense_sequence_parallel_placement()
         if enable_sp
@@ -215,10 +252,13 @@ def set_tensor_parallel_sharding_config(
         for name in ("attention_res_proj", "ffn_res_proj"):
             cfg = getattr(layer, name, None)
             if cfg is not None:
-                cfg.sharding_config = _tp_replicate_config()
+                cfg.sharding_config = _tp_invariant_config()
         if layer.attention is not None:
             _set_mla_sharding(
-                layer.attention, enable_sp=enable_sp, cp_ulysses=enable_cp
+                layer.attention,
+                enable_sp=enable_sp,
+                cp_ulysses=enable_cp,
+                invariant_stream=spmd_types,
             )
         if layer.delta_attention is not None:
             _set_kda_sharding(layer.delta_attention, enable_sp=enable_sp)
@@ -230,9 +270,39 @@ def set_tensor_parallel_sharding_config(
             # routed_down runs on the stream the MoE boundary gathered; the
             # experts hand their output back sequence-sharded under SP, so the
             # norm after them and routed_up run on the shard.
+            # routed_down feeds the TP-sharded experts (partial gradients:
+            # replicated); routed_up feeds the invariant stream from the
+            # reduced norm output (identical gradients: invariant).
             layer.moe.routed_down.sharding_config = _tp_replicate_config()
-            layer.moe.routed_up.sharding_config = _tp_replicate_config()
-            layer.moe.routed_norm.sharding_config = norm_config(enable_sp=enable_sp)
+            routed_up_cfg = _tp_invariant_config()
+            routed_norm_cfg = norm_config(enable_sp=enable_sp)
+            if spmd_types and not enable_sp:
+                # The experts hand the norm their rowwise output, Partial on
+                # TP, and nothing between reduces it under spmd_types
+                # (partial_dtensor's DTensor did so implicitly): the norm's
+                # boundary reduces, keyed "x", the argument nn.RMSNorm.forward
+                # takes. routed_up re-enters the Partial domain so its sum
+                # with the shared experts' Partial output types and core's MoE
+                # exit reduces once for both; that exit then returns to the
+                # invariant stream.
+                routed_norm_cfg.in_src_shardings = {
+                    "x": dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
+                }
+                routed_norm_cfg.in_dst_shardings = {
+                    "x": dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+                }
+                routed_up_cfg.out_src_shardings = dense_activation_placement(
+                    tp=spmd.I, cp=spmd.S(0)
+                )
+                routed_up_cfg.out_dst_shardings = dense_activation_placement(
+                    tp=spmd.P, cp=spmd.S(0)
+                )
+                if layer.moe.sharding_config is not None:
+                    layer.moe.sharding_config.out_dst_shardings = (
+                        dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+                    )
+            layer.moe.routed_up.sharding_config = routed_up_cfg
+            layer.moe.routed_norm.sharding_config = routed_norm_cfg
 
 
 def _set_vision_encoder_sharding(ve_cfg) -> None:
@@ -241,10 +311,15 @@ def _set_vision_encoder_sharding(ve_cfg) -> None:
     Linear layers shard colwise/rowwise for memory; norms and the position
     table stay invariant. K3's projector norms after its second linear.
     """
+    # The tower runs whole on every rank, as under partial_dtensor: every
+    # linear invariant at TP, the attention rank-local over cp, and both exit
+    # sides invariant, since the decoder stream the features splice into is
+    # invariant and an I -> R exit would all-reduce the gradient flowing back
+    # into the tower, doubling every tower weight's gradient.
     ve_cfg.sharding_config = ShardingConfig(
         state_shardings={"pos_embed": SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
         out_src_shardings=SpmdType({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdType({DP: spmd.V, CP: spmd.V, TP: spmd.R}),
+        out_dst_shardings=SpmdType({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
     )
     ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
         state_shardings={"inv_freq": SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
@@ -252,10 +327,41 @@ def _set_vision_encoder_sharding(ve_cfg) -> None:
     )
     ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
     set_vision_transformer_block_sharding_config(ve_cfg.block, rope_cache_dp=spmd.V)
+    block = ve_cfg.block
+    for linear in (
+        block.attn.wq,
+        block.attn.wk,
+        block.attn.wv,
+        block.attn.proj,
+        block.mlp.fc1,
+        block.mlp.fc2,
+    ):
+        linear.sharding_config = vision_invariant_linear_config()
+    invariant_stream = SpmdType({DP: spmd.V, CP: spmd.V, TP: spmd.I})
+    block.attn.sharding_config = ShardingConfig(
+        in_src_shardings={"x": invariant_stream, "rope_cache": invariant_stream},
+        in_dst_shardings={"x": invariant_stream, "rope_cache": invariant_stream},
+    )
+    block.attn.inner_attention.sharding_config = ShardingConfig(
+        in_src_shardings={
+            "q_TNH": invariant_stream,
+            "k_TNH": invariant_stream,
+            "v_TNH": invariant_stream,
+        },
+        in_dst_shardings={
+            "q_TNH": invariant_stream,
+            "k_TNH": invariant_stream,
+            "v_TNH": invariant_stream,
+        },
+        out_src_shardings=invariant_stream,
+        local_map=LocalMapConfig(
+            in_grad_placements=(invariant_stream, invariant_stream, invariant_stream)
+        ),
+    )
     ve_cfg.final_norm.sharding_config = invariant_norm_config()
     proj = ve_cfg.projector
-    proj.linear_1.sharding_config = vision_colwise_config()
-    proj.linear_2.sharding_config = vision_scaled_bias_rowwise_config()
+    proj.linear_1.sharding_config = vision_invariant_linear_config()
+    proj.linear_2.sharding_config = vision_invariant_linear_config()
     proj.post_norm.sharding_config = invariant_norm_config()
 
 
