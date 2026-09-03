@@ -22,7 +22,6 @@ from torchtitan.distributed.fsdp import (
 )
 from torchtitan.tools.logging import logger
 
-from .kda import InnerKDA
 from .model import KimiK3Model
 
 
@@ -127,32 +126,13 @@ def apply_cp_kimi_k3(
     model: nn.Module,
     parallel_dims: ParallelDims,
 ) -> None:
-    """Hand the KDA layers and the vision splice the context-parallel group.
+    """Hand the vision splice the context-parallel group.
 
-    MLA needs nothing here: its inner attention declares Ulysses as a
-    redistribution on the cp axis. KDA keeps the sequence sharded and runs
-    Attention Gym's context-parallel recipe inside its local_map body, whose
-    collectives need the group.
+    The attention layers need nothing here: under CP their inner kernels are
+    ``ContextParallelKernel`` instances (Ulysses for MLA, KCP for KDA) that
+    take the group from the active SPMD mesh. The vision splice runs in the
+    model body, outside any kernel, so it is wired explicitly.
     """
-    cp_group = parallel_dims.get_mesh("cp").get_group()
-    model._cp_group = cp_group
-
-    kda_modules = [m for m in model.modules() if isinstance(m, InnerKDA)]
-    if kda_modules:
-        # Checked at wiring time so the message is actionable, rather than an
-        # ImportError from inside a layer's first forward.
-        try:
-            from attn_gym.linear.context_parallel import (  # noqa: F401
-                context_parallel_conv_history,
-            )
-            from attn_gym.linear.kda import context_parallel_kda  # noqa: F401
-        except ImportError as err:
-            raise ValueError(
-                "KDA context parallelism needs attn-gym's context-parallel "
-                "recipe (attn_gym.linear.kda.context_parallel_kda and "
-                "attn_gym.linear.context_parallel.context_parallel_conv_history); "
-                f"import failed with: {err}."
-            ) from err
-    for module in kda_modules:
-        module._cp_group = cp_group
-    logger.info("Applied context parallel to %d KDA layer(s).", len(kda_modules))
+    assert isinstance(model, KimiK3Model)
+    model._cp_group = parallel_dims.get_mesh("cp").get_group()
+    logger.info("Applied context parallel to the Kimi K3 vision splice.")

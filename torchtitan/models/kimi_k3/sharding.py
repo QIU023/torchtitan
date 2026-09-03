@@ -34,9 +34,7 @@ from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.common.vision_encoder_sharding import (
     invariant_norm_config,
     set_vision_transformer_block_sharding_config,
-    vision_colwise_config,
     vision_invariant_linear_config,
-    vision_scaled_bias_rowwise_config,
 )
 from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
@@ -97,7 +95,7 @@ def _set_mla_sharding(
     attention_cfg,
     *,
     enable_sp: bool,
-    cp_ulysses: bool = False,
+    cp_kernel: bool = False,
     invariant_stream: bool = False,
 ) -> None:
     """Head-parallel TP for MLA.
@@ -142,8 +140,8 @@ def _set_mla_sharding(
         getattr(attention_cfg, name).sharding_config = ShardingConfig(
             state_shardings={"weight": dense_param_placement(tp=spmd.R)}
         )
-    if cp_ulysses:
-        _set_ulysses_inner_attention(attention_cfg.inner_attention)
+    if cp_kernel:
+        _set_cp_kernel_local_map(attention_cfg.inner_attention)
     else:
         set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
 
@@ -257,7 +255,7 @@ def set_tensor_parallel_sharding_config(
             _set_mla_sharding(
                 layer.attention,
                 enable_sp=enable_sp,
-                cp_ulysses=enable_cp,
+                cp_kernel=enable_cp,
                 invariant_stream=spmd_types,
             )
         if layer.delta_attention is not None:
@@ -365,29 +363,28 @@ def _set_vision_encoder_sharding(ve_cfg) -> None:
     proj.post_norm.sharding_config = invariant_norm_config()
 
 
-def _ulysses_head_placement() -> SpmdType:
-    """``(tokens, heads, dim)`` with the cp axis on the heads, inside TP's split."""
-    return SpmdType(
-        {DP: spmd.V, CP: spmd.V, TP: spmd.V},
-        partition_spec=spmd.PartitionSpec(DP, (TP, CP), None),
-    )
+def _set_cp_kernel_local_map(inner_attention_cfg) -> None:
+    """Localize TNH attention inputs without changing their placements.
 
-
-def _set_ulysses_inner_attention(inner_attention_cfg) -> None:
-    """Ulysses context parallel for MLA, stated as the module boundary.
-
-    The stream arrives token-sharded on the cp axis. Trading that shard for a
-    head shard on the way in is one redistribution (an all-to-all); the body
-    then sees the full sequence for its head subset and the output trades
-    back. The full-sequence mask is supplied by ``preprocess_inputs``, which
-    keeps the masks out of the CP input sharding.
+    Under CP the inner attention is a ``ContextParallelKernel`` that issues
+    its own exchange (Ulysses for MLA), so the boundary keeps the cp axis
+    token-sharded on both sides and TP's head shard as it is; the same shape
+    as the all-gather kernel's boundary in pytorch/torchtitan PR 4322.
     """
-    seq = attention_activation_placement()
-    heads = _ulysses_head_placement()
+    placements = attention_activation_placement()
     inner_attention_cfg.sharding_config = ShardingConfig(
-        in_src_shardings={"q_TNH": seq, "k_TNH": seq, "v_TNH": seq},
-        in_dst_shardings={"q_TNH": heads, "k_TNH": heads, "v_TNH": heads},
-        out_src_shardings=heads,
-        out_dst_shardings=seq,
-        local_map=LocalMapConfig(in_grad_placements=(heads, heads, heads)),
+        in_src_shardings={
+            "q_TNH": placements,
+            "k_TNH": placements,
+            "v_TNH": placements,
+        },
+        in_dst_shardings={
+            "q_TNH": placements,
+            "k_TNH": placements,
+            "v_TNH": placements,
+        },
+        out_src_shardings=placements,
+        local_map=LocalMapConfig(
+            in_grad_placements=(placements, placements, placements)
+        ),
     )

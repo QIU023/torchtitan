@@ -9,7 +9,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from attn_gym.linear.kda import bound_gate, chunk_kda
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
@@ -138,9 +137,6 @@ class InnerKDA(Module):
                     "Attention Gym KDA requires head_dim=128, " f"got {self.head_dim}."
                 )
 
-    # Set by apply_cp_kimi_k3; None means the layer runs without CP.
-    _cp_group = None
-
     def __init__(self, config: Config):
         super().__init__()
         self.head_dim = config.head_dim
@@ -161,8 +157,34 @@ class InnerKDA(Module):
         *,
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
-        raw_gate_BTNK = raw_gate_TNK.unsqueeze(0)
-        raw_beta_BTN = raw_beta_TN.unsqueeze(0)
+        mixed_qkv_BTC, conv_weight_C1W = self._pack_inputs(
+            query_TC,
+            key_TC,
+            value_TC,
+            conv_q_weight_C1W,
+            conv_k_weight_C1W,
+            conv_v_weight_C1W,
+        )
+        return self._conv_and_scan(
+            mixed_qkv_BTC,
+            conv_weight_C1W,
+            raw_gate_TNK,
+            raw_beta_TN,
+            A_log_N,
+            dt_bias_NK,
+            cu_seqlens=cu_seqlens,
+        )
+
+    @staticmethod
+    def _pack_inputs(
+        query_TC: torch.Tensor,
+        key_TC: torch.Tensor,
+        value_TC: torch.Tensor,
+        conv_q_weight_C1W: torch.Tensor,
+        conv_k_weight_C1W: torch.Tensor,
+        conv_v_weight_C1W: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse q/k/v and their conv weights so one convolution serves all three."""
         mixed_qkv_BTC = torch.cat(
             (query_TC, key_TC, value_TC),
             dim=-1,
@@ -171,27 +193,23 @@ class InnerKDA(Module):
             (conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W),
             dim=0,
         )
-        cp_group = self._cp_group
-        cp_plan = None
-        conv_state = None
-        if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            from attn_gym.linear.context_parallel import context_parallel_conv_history
+        return mixed_qkv_BTC, conv_weight_C1W
 
-            from .context_parallel import kcp_plan
-
-            if cu_seqlens is not None:
-                raise NotImplementedError(
-                    "Kimi K3 KDA context parallel runs one document per batch; "
-                    "packed-document boundaries under CP are not supported yet."
-                )
-            cp_plan = kcp_plan(mixed_qkv_BTC.shape[1], cp_group)
-            cu_seqlens = torch.tensor(
-                cp_plan.cu_seqlens, dtype=torch.int32, device=mixed_qkv_BTC.device
-            )
-            # The causal conv needs the previous rank's tail as history.
-            conv_state = context_parallel_conv_history(
-                mixed_qkv_BTC, cp_plan, cp_group, conv_weight_C1W.shape[-1] - 1
-            )
+    def _conv_and_scan(
+        self,
+        mixed_qkv_BTC: torch.Tensor,
+        conv_weight_C1W: torch.Tensor,
+        raw_gate_TNK: torch.Tensor,
+        raw_beta_TN: torch.Tensor,
+        A_log_N: torch.Tensor,
+        dt_bias_NK: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None,
+        conv_state: torch.Tensor | None = None,
+        cp_plan=None,
+        cp_group=None,
+    ) -> torch.Tensor:
+        """Causal conv then the delta-rule scan; the CP kernel passes its plan."""
         conv_output_BTC = causal_conv1d(
             mixed_qkv_BTC,
             conv_weight_C1W[:, 0],
@@ -210,8 +228,8 @@ class InnerKDA(Module):
             q_BTNK,
             k_BTNK,
             v_BTNV,
-            raw_gate_BTNK,
-            raw_beta_BTN,
+            raw_gate_TNK.unsqueeze(0),
+            raw_beta_TN.unsqueeze(0),
             A_log_N,
             dt_bias_NK,
             cu_seqlens=cu_seqlens,

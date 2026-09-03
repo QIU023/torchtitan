@@ -167,8 +167,8 @@ class KimiMLAAttention(BaseAttention):
                     k_THK, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
                 )
 
-        # Under CP the inner attention's declaration trades the token shard
-        # for a head shard on the way in and back on the way out (Ulysses).
+        # Under CP the inner attention is the Ulysses kernel, which trades the
+        # token shard for a head shard on the way in and back on the way out.
         out_THV = self.inner_attention(
             q_THK,
             k_THK,
@@ -372,6 +372,9 @@ class KimiK3Model(Decoder):
                         f"tp x cp={config.parallelism.tensor_parallel_degree} x "
                         f"{parallelism.context_parallel_degree} for Ulysses."
                     )
+                from .context_parallel import use_kimi_k3_cp_kernels
+
+                use_kimi_k3_cp_kernels(self)
             if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
                 set_tensor_parallel_sharding_config(
                     self,
@@ -412,7 +415,7 @@ class KimiK3Model(Decoder):
             return nparams, 6 * active_nparams + attention_op_flops
 
     # Set by apply_cp_kimi_k3 to this model's context-parallel process group.
-    _cp_group = None
+    _cp_group: dist.ProcessGroup | None = None
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -422,7 +425,7 @@ class KimiK3Model(Decoder):
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
 
-    def preprocess_inputs(  # pyrefly: ignore [bad-override]
+    def preprocess_inputs(
         self,
         input_dict: dict[str, torch.Tensor],
         *,

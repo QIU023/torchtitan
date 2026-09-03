@@ -531,7 +531,7 @@ def kimi_k3_debugmodel_cp2() -> Trainer.Config:
     config = kimi_k3_debugmodel()
     config.parallelism.context_parallel_degree = 2
     config.parallelism.context_parallel_load_balancer = None
-    # CP is declared (Ulysses on the MLA inner attention), which only the
-    # spmd_types backend drives; the debug flavor pins partial_dtensor.
+    # The CP kernels take their group from the SPMD mesh, which only the
+    # spmd_types backend sets up; the debug flavor pins partial_dtensor.
     config.parallelism.spmd_backend = "spmd_types"
     return config
