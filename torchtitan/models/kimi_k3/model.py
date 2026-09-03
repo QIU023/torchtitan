@@ -366,20 +366,6 @@ class KimiK3Model(Decoder):
             if isinstance(dataset, MMSamplePackingConfig):
                 raise ValueError("Kimi K3 does not yet support sample packing.")
             parallelism = config.parallelism
-            if (
-                parallelism.context_parallel_degree > 1
-                and parallelism.context_parallel_load_balancer is not None
-            ):
-                # Both CP algorithms here read the sequence as rank-ordered
-                # contiguous chunks: the Ulysses all-to-all reassembles it in
-                # rank order, and KDA's recurrence passes state from rank r to
-                # rank r+1. A load balancer permutes tokens across ranks, which
-                # silently breaks both -- the shapes still line up.
-                raise ValueError(
-                    "Kimi K3 context parallel requires "
-                    "parallelism.context_parallel_load_balancer=None; "
-                    f"got {parallelism.context_parallel_load_balancer!r}."
-                )
             enable_sp = (
                 config.parallelism.tensor_parallel_degree > 1
                 and config.parallelism.enable_sequence_parallel
@@ -393,39 +379,27 @@ class KimiK3Model(Decoder):
             # declarations are issued whenever it drives the model, not only
             # at tp > 1; partial_dtensor reads only their tp placements.
             spmd_types = config.parallelism.spmd_backend == "spmd_types"
-            enable_cp = parallelism.context_parallel_degree > 1
-            if enable_cp:
-                from .context_parallel import (
-                    UlyssesCPFlexAttention,
-                    use_kimi_k3_cp_kernels,
-                )
+            if parallelism.context_parallel_degree > 1:
+                from .context_parallel import ContextParallelInnerKDA
 
-                use_kimi_k3_cp_kernels(self)
-                attention = self.first_attention
-                if (
-                    attention is not None
-                    and isinstance(
-                        attention.inner_attention, UlyssesCPFlexAttention.Config
-                    )
-                    and attention.n_heads
-                    % (
-                        parallelism.context_parallel_degree
-                        * config.parallelism.tensor_parallel_degree
-                    )
-                    != 0
-                ):
-                    # Ulysses splits each rank's head subset across cp.
-                    raise ValueError(
-                        f"MLA n_heads={attention.n_heads} must be divisible by "
-                        f"tp x cp={config.parallelism.tensor_parallel_degree} x "
-                        f"{parallelism.context_parallel_degree} for Ulysses."
-                    )
+                # The MLA kernels are validated upstream (validate_context_parallel);
+                # the KDA layers are not attention configs, so their kernel is
+                # checked here. Both are installed by the recipe's transforms.
+                for layer in self.layers:
+                    kda = layer.delta_attention
+                    if kda is not None and not isinstance(
+                        kda.inner_kda, ContextParallelInnerKDA.Config
+                    ):
+                        raise ValueError(
+                            "Kimi K3 context parallel needs the KCP kernel on every "
+                            "KDA layer; apply torchtitan_recipes.kimi_k3."
+                            "KimiK3DeltaContextParallelTransform."
+                        )
             if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
                 set_tensor_parallel_sharding_config(
                     self,
                     enable_sp=enable_sp,
                     declare_vision_encoder=spmd_types,
-                    enable_cp=enable_cp,
                     spmd_types=spmd_types,
                 )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
@@ -490,9 +464,9 @@ class KimiK3Model(Decoder):
         )
 
         batch: dict[str, Any] = dict(input_dict)
+        inner = self.config.first_full_attention_backend
         positions = batch.get("positions", None)
         if positions is not None:
-            inner = self.config.first_full_attention_backend
             if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
                 batch["attention_masks"] = self.get_attention_masks(positions=positions)
 
@@ -503,28 +477,15 @@ class KimiK3Model(Decoder):
             **multimodal_input_sharding(include_cp_axis=True),
         }
         if parallel_dims.cp_enabled:
-            from .context_parallel import UlyssesCPFlexAttention
-
-            # Under Ulysses each rank attends over the full sequence after the
-            # head exchange, so the masks stay whole; the all-gather KV kernel
-            # keeps q token-sharded and takes the masks cut along Q like every
-            # other model's.
-            keep_masks_whole = isinstance(
-                self.config.first_full_attention_backend,
-                UlyssesCPFlexAttention.Config,
-            )
-            attention_masks = (
-                batch.pop("attention_masks", None) if keep_masks_whole else None
-            )
             batch = prepare_context_parallel_input(
                 batch,
                 input_sharding,
                 parallel_dims.get_mesh("cp"),
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
+                # The kernel declares whether it needs a local or global mask.
+                shard_attention_mask=getattr(inner, "shard_attention_mask", True),
             )
-            if attention_masks is not None:
-                batch["attention_masks"] = attention_masks
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 

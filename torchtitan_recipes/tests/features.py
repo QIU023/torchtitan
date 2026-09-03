@@ -557,36 +557,22 @@ def llama3_debugmodel_seed_checkpoint() -> Trainer.Config:
 def kimi_k3_debugmodel_cp2() -> Trainer.Config:
     """Kimi K3 text decoder with context parallel over two ranks.
 
-    KCP on the KDA layers and Ulysses on the MLA layers; the load balancer is
-    rejected under CP because both paths assume contiguous, equal shards.
+    The packed Ulysses kernel on the MLA layers, KCP on the KDA layers.
     """
     from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
 
-    config = kimi_k3_debugmodel()
-    config.parallelism.context_parallel_degree = 2
-    config.parallelism.context_parallel_load_balancer = None
-    # The CP kernels take their group from the SPMD mesh, which only the
-    # spmd_types backend sets up; the debug flavor pins partial_dtensor.
-    config.parallelism.spmd_backend = "spmd_types"
-    return config
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    return kimi_k3_context_parallel(kimi_k3_debugmodel(), cp_degree=2)
 
 
 def kimi_k3_debugmodel_cp2_allgather() -> Trainer.Config:
-    """The cp2 flavor with the all-gather KV kernel on the MLA layers.
+    """The cp2 flavor with the packed all-gather KV kernel on the MLA layers."""
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan.models.kimi_k3.context_parallel import MLAAllGatherCPFlexAttention
 
-    The kernel is chosen on the model config before the trainer runs
-    ``update_from_config``, which otherwise picks Ulysses; KDA keeps KCP.
-    """
-    from torchtitan.models.kimi_k3.context_parallel import (
-        AllGatherCPFlexAttention,
-        use_kimi_k3_cp_kernels,
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    return kimi_k3_context_parallel(
+        kimi_k3_debugmodel(), cp_degree=2, mla_kernel=MLAAllGatherCPFlexAttention
     )
-
-    from torchtitan.models.kimi_k3.model import KimiK3Model
-
-    config = kimi_k3_debugmodel_cp2()
-    assert config.model_spec is not None
-    model = config.model_spec.model
-    assert isinstance(model, KimiK3Model.Config)
-    use_kimi_k3_cp_kernels(model, mla_kernel=AllGatherCPFlexAttention)
-    return config

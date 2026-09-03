@@ -95,7 +95,6 @@ def _set_mla_sharding(
     attention_cfg,
     *,
     enable_sp: bool,
-    cp_kernel: bool = False,
     invariant_stream: bool = False,
 ) -> None:
     """Head-parallel TP for MLA.
@@ -140,10 +139,8 @@ def _set_mla_sharding(
         getattr(attention_cfg, name).sharding_config = ShardingConfig(
             state_shardings={"weight": dense_param_placement(tp=spmd.R)}
         )
-    if cp_kernel:
-        _set_cp_kernel_local_map(attention_cfg.inner_attention)
-    else:
-        set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
+    # An identity boundary on the cp axis: a CP kernel issues its own exchange.
+    set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
 
 
 def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool) -> None:
@@ -211,7 +208,6 @@ def set_tensor_parallel_sharding_config(
     *,
     enable_sp: bool = False,
     declare_vision_encoder: bool = False,
-    enable_cp: bool = False,
     spmd_types: bool = False,
 ) -> None:
     """Declare the sharding tensor parallel acts on.
@@ -257,7 +253,6 @@ def set_tensor_parallel_sharding_config(
             _set_mla_sharding(
                 layer.attention,
                 enable_sp=enable_sp,
-                cp_kernel=enable_cp,
                 invariant_stream=spmd_types,
             )
         if layer.delta_attention is not None:
@@ -367,31 +362,3 @@ def _set_vision_encoder_sharding(ve_cfg) -> None:
     proj.linear_1.sharding_config = vision_invariant_linear_config(include_cp_axis=True)
     proj.linear_2.sharding_config = vision_invariant_linear_config(include_cp_axis=True)
     proj.post_norm.sharding_config = invariant_norm_config(include_cp_axis=True)
-
-
-
-def _set_cp_kernel_local_map(inner_attention_cfg) -> None:
-    """Localize the attention inputs without changing their placements.
-
-    Under CP the inner attention is a ``ContextParallelKernel`` that issues
-    its own exchange (Ulysses for MLA), so the boundary keeps the cp axis
-    token-sharded on both sides and TP's head shard as it is; the same shape
-    as the all-gather kernel's boundary in pytorch/torchtitan PR 4322.
-    """
-    placements = attention_activation_placement()
-    inner_attention_cfg.sharding_config = ShardingConfig(
-        in_src_shardings={
-            "q_THK": placements,
-            "k_THK": placements,
-            "v_THV": placements,
-        },
-        in_dst_shardings={
-            "q_THK": placements,
-            "k_THK": placements,
-            "v_THV": placements,
-        },
-        out_src_shardings=placements,
-        local_map=LocalMapConfig(
-            in_grad_placements=(placements, placements, placements)
-        ),
-    )

@@ -6,102 +6,79 @@
 
 """Context-parallel kernels for the Kimi K3 attention layers.
 
-Each kernel owns its CP collectives: the inner-attention ShardingConfig keeps
-the cp axis token-sharded on both sides of the local_map boundary and the
-kernel's ``forward`` issues whatever exchange its algorithm needs.
+Each kernel owns its CP collectives, the shape of
+``torchtitan.models.common.cp_attention``: the inner-attention boundary keeps
+the cp axis token-sharded on both sides and the kernel's ``forward`` issues the
+exchange its algorithm needs.
 
-  - MLA runs Ulysses by default: one all-to-all trades the token shard for a
-    head shard on the way in, the kernel attends over the full sequence for its
-    head subset, and the output trades back. A recipe may pick the all-gather
-    KV kernel instead (``use_kimi_k3_cp_kernels(..., mla_kernel=...)``): q stays
-    token-sharded and k/v are gathered, the CP every other model runs.
-  - KDA runs Attention Gym's context-parallel recipe (KCP): the sequence stays
-    sharded end to end and the recurrence hands state from rank to rank, a
-    sequential dependency no placement pair describes.
+  - MLA: the generic Ulysses and all-gather kernels specialised to MLA's key.
+    MLA expands one rotary vector per token onto every head before the kernel,
+    so the expanded key carries ``H`` copies of it; these kernels split the key
+    back, move the nope part packed with q and v (Ulysses) or with v (all-gather),
+    move the rotary slice once, and expand after the exchange.
+  - KDA: Attention Gym's context-parallel delta rule (KCP). The sequence stays
+    sharded end to end and the recurrence hands its state from rank to rank.
 
-``ContextParallelKernel``, ``AllGatherCPFlexAttention`` and the
-field-preserving kernel swap are copied from pytorch/torchtitan PR 4322
-(``torchtitan/models/common/cp_attention.py`` at ed6dba931b), where every CP
-implementation is to follow this shape.
-TODO: delete the copies and import from ``torchtitan.models.common`` once that
-PR lands.
-
-Tensor suffixes: ``THK`` / ``THV`` = tokens, heads, key / value head dimension.
+Tensor suffixes: ``T`` tokens, ``H`` heads, ``K = N + R`` the qk head dim (nope
+and rope), ``V`` the v head dim, ``W`` a packed width.
 """
 
-from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 import spmd_types as spmd
 
 import torch
 import torch.distributed as dist
 from attn_gym.linear.context_parallel import ContextParallelPlan
-from torch.distributed.tensor.experimental._context_parallel import flex_cp_allgather
 
-from torchtitan.distributed.spmd_types import current_spmd_mesh
 from torchtitan.models.common.attention import FlexAttention
-from torchtitan.protocols.module import Module
+from torchtitan.models.common.cp_attention import (
+    AllGatherCPFlexAttention,
+    ContextParallelKernel,
+    UlyssesCPFlexAttention,
+)
 
 from .kda import InnerKDA
 
-if TYPE_CHECKING:
-    from torchtitan.models.kimi_k3.model import KimiK3Model
-
 __all__ = [
-    "AllGatherCPFlexAttention",
-    "ContextParallelKernel",
     "ContextParallelInnerKDA",
-    "UlyssesCPFlexAttention",
+    "MLAAllGatherCPFlexAttention",
+    "MLAUlyssesCPFlexAttention",
     "kcp_plan",
-    "use_kimi_k3_cp_kernels",
 ]
 
 _SEQ_DIM = 0
 _HEAD_DIM = 1
 
 
-# Copied from pytorch/torchtitan PR 4322 at ed6dba931b. Pending deletion.
-class ContextParallelKernel:
-    """Mixin for attention kernels that own their CP collectives."""
-
-    @property
-    def cp_group(self) -> dist.ProcessGroup:
-        """Return the active multi-rank CP process group."""
-        mesh = current_spmd_mesh()
-        if mesh is None:
-            raise RuntimeError(
-                f"{type(self).__name__} requires an active SPMD mesh context."
-            )
-        mesh_axis_names = mesh.mesh_dim_names or ()
-        cp_group = mesh.get_group("cp") if "cp" in mesh_axis_names else None
-        if cp_group is None or cp_group.size() == 1:
-            raise RuntimeError(f"{type(self).__name__} requires an active CP mesh.")
-        return cp_group
+def _split_rope(
+    k_THK: torch.Tensor, rope_head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The nope part ``[T, H, N]`` and the headless rope slice ``[T, R]``."""
+    nope_head_dim = k_THK.shape[-1] - rope_head_dim
+    k_nope_THN, k_rope_THR = k_THK.split([nope_head_dim, rope_head_dim], dim=-1)
+    # MLA expands one rope vector per token onto every head; head 0 carries it.
+    return k_nope_THN, k_rope_THR[:, 0]
 
 
-# Copied from pytorch/torchtitan PR 4322 at ed6dba931b (``use_cp_kernel``),
-# minus the model traversal: K3 picks a kernel per layer kind. Pending deletion.
-def _swap_kernel(existing: Module.Config, kernel: type[Module]) -> Module.Config:
-    """Replace a kernel config with ``kernel``'s, preserving its fields."""
-    config_cls = kernel.Config
-    if not issubclass(kernel, ContextParallelKernel):
-        raise ValueError(f"{kernel.__qualname__} must inherit ContextParallelKernel.")
-    if not issubclass(config_cls, type(existing)):
-        raise ValueError(
-            f"{kernel.__qualname__}.Config must inherit "
-            f"{type(existing).__qualname__}."
-        )
-    return config_cls(**{f.name: getattr(existing, f.name) for f in fields(existing)})
+def _expand_rope(k_nope_THN: torch.Tensor, k_rope_TR: torch.Tensor) -> torch.Tensor:
+    """Rebuild the expanded key from its nope part and the rope slice."""
+    k_rope_THR = k_rope_TR.unsqueeze(1).expand(-1, k_nope_THN.shape[1], -1)
+    return torch.cat((k_nope_THN, k_rope_THR), dim=-1)
 
 
-# Copied from pytorch/torchtitan PR 4322 at ed6dba931b. Pending deletion.
-class AllGatherCPFlexAttention(ContextParallelKernel, FlexAttention):
-    """FlexAttention with sharded Q and all-gathered K/V."""
+class MLAUlyssesCPFlexAttention(UlyssesCPFlexAttention):
+    """Ulysses for MLA: one all-to-all for q, the nope key and v; the rope
+    slice is all-gathered along the sequence and expanded on the local heads."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(FlexAttention.Config):
-        pass
+    class Config(UlyssesCPFlexAttention.Config):
+        rope_head_dim: int
+        """Width of the rope slice at the end of the qk head dim."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.rope_head_dim = config.rope_head_dim
 
     def forward(
         self,
@@ -110,27 +87,50 @@ class AllGatherCPFlexAttention(ContextParallelKernel, FlexAttention):
         v_THV: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        pg_name = dist._get_process_group_name(self.cp_group)
-        k_THK, v_THV = flex_cp_allgather(
-            k_THK.contiguous(), v_THV.contiguous(), _SEQ_DIM, pg_name
+        cp_group = self.cp_group
+        k_nope_THN, k_rope_TR = _split_rope(k_THK, self.rope_head_dim)
+        widths = (q_THK.shape[-1], k_nope_THN.shape[-1], v_THV.shape[-1])
+        # (T/cp, H, W) -> (T, H/cp, W) in one exchange.
+        packed_THW = torch.cat((q_THK, k_nope_THN, v_THV), dim=-1)
+        packed_THW = self._reshard(packed_THW, cp_group, src=_SEQ_DIM, dst=_HEAD_DIM)
+        q_THK, k_nope_THN, v_THV = packed_THW.split(widths, dim=-1)
+        # (T/cp, R) -> (T, R): the same vector on every head, so it never
+        # travels expanded. Its backward is a reduce-scatter.
+        k_rope_TR = spmd.redistribute(
+            k_rope_TR.contiguous(),
+            cp_group,
+            src=spmd.S(_SEQ_DIM),
+            dst=spmd.R,
+            backward_options={"op_dtype": k_rope_TR.dtype},
         )
-        return super().forward(q_THK, k_THK, v_THV, **kwargs)
+        out_THV = FlexAttention.forward(
+            self, q_THK, _expand_rope(k_nope_THN, k_rope_TR), v_THV, **kwargs
+        )
+        # (T, H/cp, V) -> (T/cp, H, V).
+        return self._reshard(out_THV, cp_group, src=_HEAD_DIM, dst=_SEQ_DIM)
 
 
-class UlyssesCPFlexAttention(ContextParallelKernel, FlexAttention):
-    """FlexAttention over the full sequence for this rank's head subset.
-
-    q/k/v arrive token-sharded on the cp axis. One all-to-all per tensor
-    trades that shard for a head shard, the kernel runs over the full sequence
-    with the whole packed-document mask (``preprocess_inputs`` keeps the masks
-    out of the CP input sharding), and the output trades back. The heads a
-    rank sees are its TP slice split again by cp, so ``n_heads`` must divide
-    by tp x cp.
-    """
+class MLAAllGatherCPFlexAttention(AllGatherCPFlexAttention):
+    """All-gather KV for MLA: the nope key and v travel packed, the rope slice
+    travels once; q and the mask stay token-sharded."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(FlexAttention.Config):
-        pass
+    class Config(AllGatherCPFlexAttention.Config):
+        rope_head_dim: int
+        """Width of the rope slice at the end of the qk head dim."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.rope_head_dim = config.rope_head_dim
+
+    def _gather(self, x: torch.Tensor, cp_group: dist.ProcessGroup) -> torch.Tensor:
+        return spmd.redistribute(
+            x,
+            cp_group,
+            src=spmd.S(_SEQ_DIM),
+            dst=spmd.R,
+            backward_options={"op_dtype": self.reduce_dtype or x.dtype},
+        )
 
     def forward(
         self,
@@ -139,39 +139,23 @@ class UlyssesCPFlexAttention(ContextParallelKernel, FlexAttention):
         v_THV: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        group = self.cp_group
-        q_THK, k_THK, v_THV = (
-            _all_to_all(x, group, src_dim=_SEQ_DIM, dst_dim=_HEAD_DIM)
-            for x in (q_THK, k_THK, v_THV)
+        cp_group = self.cp_group
+        k_nope_THN, k_rope_TR = _split_rope(k_THK, self.rope_head_dim)
+        widths = (k_nope_THN.shape[-1], v_THV.shape[-1])
+        packed_THW = self._gather(torch.cat((k_nope_THN, v_THV), dim=-1), cp_group)
+        k_rope_TR = self._gather(k_rope_TR.contiguous(), cp_group)
+        k_nope_THN, v_THV = packed_THW.split(widths, dim=-1)
+        return FlexAttention.forward(
+            self, q_THK, _expand_rope(k_nope_THN, k_rope_TR), v_THV, **kwargs
         )
-        out_THV = super().forward(q_THK, k_THK, v_THV, **kwargs)
-        return _all_to_all(out_THV, group, src_dim=_HEAD_DIM, dst_dim=_SEQ_DIM)
-
-
-def _all_to_all(
-    x: torch.Tensor, group: dist.ProcessGroup, *, src_dim: int, dst_dim: int
-) -> torch.Tensor:
-    """Move the cp shard of ``x`` from ``src_dim`` to ``dst_dim``.
-
-    The same redistribution the module boundary would issue for a
-    ``S(src_dim) -> S(dst_dim)`` declaration on the cp axis, so the backward is
-    the reverse all-to-all in the activation dtype.
-    """
-    return spmd.redistribute(
-        x,
-        group,
-        src=spmd.S(src_dim),
-        dst=spmd.S(dst_dim),
-        backward_options={"op_dtype": x.dtype},
-    )
 
 
 def kcp_plan(seq_len_local: int, group: dist.ProcessGroup) -> ContextParallelPlan:
     """attn-gym routing plan for one sequence split into equal contiguous shards.
 
-    Every rank owns ``[rank * L, (rank + 1) * L)`` of one document; the config
-    rejects a load balancer under CP so this table is the sharding the trainer
-    actually applied. Host-only, so it costs nothing to rebuild per call.
+    Every rank owns ``[rank * L, (rank + 1) * L)`` of one document; CP rejects a
+    load balancer so this table is the sharding the trainer actually applied.
+    Host-only, so it costs nothing to rebuild per call.
     """
     world = dist.get_world_size(group)
     ranges = [[(r * seq_len_local, (r + 1) * seq_len_local)] for r in range(world)]
@@ -260,43 +244,3 @@ class ContextParallelInnerKDA(ContextParallelKernel, InnerKDA):
             cp_plan=cp_plan,
             cp_group=group,
         )
-
-
-def _is_cp_kernel_config(cfg: Module.Config) -> bool:
-    owner = getattr(cfg, "_owner", None)
-    return owner is not None and issubclass(owner, ContextParallelKernel)
-
-
-def use_kimi_k3_cp_kernels(
-    config: "KimiK3Model.Config",
-    *,
-    mla_kernel: type[Module] = UlyssesCPFlexAttention,
-) -> None:
-    """Give every attention layer its context-parallel kernel.
-
-    KDA layers take KCP, the only CP the delta rule has. MLA layers take
-    ``mla_kernel``: Ulysses by default, or the all-gather KV kernel. Both are
-    FlexAttention over the full sequence (Ulysses for a head subset, all-gather
-    for a token subset), so any other inner attention is rejected here rather
-    than by a shape error inside the kernel. A layer whose kernel is already a
-    ``ContextParallelKernel`` is left alone, so a recipe may choose the MLA
-    kernel before the model's own ``update_from_config`` runs.
-    """
-    for layer in config.layers:
-        if layer.attention is not None:
-            inner = layer.attention.inner_attention
-            if _is_cp_kernel_config(inner):
-                continue
-            if not isinstance(inner, FlexAttention.Config):
-                raise ValueError(
-                    "Kimi K3 context parallel runs its MLA kernels on "
-                    f"FlexAttention; got {type(inner).__qualname__}."
-                )
-            layer.attention.inner_attention = _swap_kernel(inner, mla_kernel)
-        if layer.delta_attention is not None:
-            inner_kda = layer.delta_attention.inner_kda
-            if _is_cp_kernel_config(inner_kda):
-                continue
-            layer.delta_attention.inner_kda = _swap_kernel(
-                inner_kda, ContextParallelInnerKDA
-            )
