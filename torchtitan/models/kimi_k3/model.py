@@ -484,7 +484,7 @@ class KimiK3Model(Decoder):
         positions: torch.Tensor | None = None,
         attention_masks: KimiK3AttentionMaskDict | None = None,
         padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
         # Under pipeline parallel a middle stage receives its predecessor's
