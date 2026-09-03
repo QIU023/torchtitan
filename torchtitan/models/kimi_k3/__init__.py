@@ -30,7 +30,7 @@ from .kda import KimiDeltaAttention, KimiKDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
 from .parallelize import parallelize_kimi_k3
-from .pipeline_adapter import pipeline_kimi_k3
+from .pipeline import pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import KimiK3VisionEncoder, KimiK3VisionProjector
 
