@@ -384,6 +384,7 @@ def pipeline_llm(
     parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
     stage_args_factory: Callable[[int, int], tuple[Any, Any]] | None = None,
+    stage_class: type[PipelineStage] = PipelineStage,
 ) -> PipelineResult:
     """Build a pipeline for a decoder model.
 
@@ -405,6 +406,9 @@ def pipeline_llm(
 
     Returns:
         The schedule, local model parts, stage ownership, and runtime hooks.
+        ``stage_class`` lets a model run its stages on a ``PipelineStage``
+        subclass, for a stage protocol the plain one does not cover (an
+        activation consumed by more than the next stage, say).
     """
     pp_mesh = parallel_dims.get_mesh("pp")
 
@@ -432,6 +436,7 @@ def pipeline_llm(
         module_names_per_stage,
         get_mesh=get_mesh_cb,
         static_stage_args=stage_args_factory,
+        stage_class=stage_class,
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -686,7 +691,6 @@ def _build_pipeline_schedule(
             "Only PipelineScheduleSingle (single stage), PipelineScheduleMulti (multistage), "
             "and _PipelineScheduleRuntime support csv schedules"
         )
-        # pyrefly: ignore [missing-attribute]
         schedule._load_csv(pp_schedule_csv)
 
     return schedule
@@ -915,6 +919,7 @@ def _pipeline_module_split(
     module_names_per_stage: list[list[str]],
     get_mesh: Callable | None = None,
     static_stage_args: Callable[[int, int], tuple[Any, Any]] | None = None,
+    stage_class: type[PipelineStage] = PipelineStage,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """Create pipeline stages based on specified module names for each stage.
 
@@ -967,7 +972,7 @@ def _pipeline_module_split(
             if static_stage_args is not None
             else (None, None)
         )
-        stage = PipelineStage(
+        stage = stage_class(
             model_chunk,
             stage_idx,
             num_stages,
