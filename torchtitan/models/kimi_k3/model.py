@@ -5,11 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate
+
+from torchtitan.config import ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
@@ -17,13 +21,16 @@ from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexAttention,
+    VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.kimi_k3.sharding import (
     set_expert_parallel_sharding_config,
     set_tensor_parallel_sharding_config,
@@ -291,8 +298,14 @@ class KimiK3Model(Decoder):
                 enable_ep=config.parallelism.expert_parallel_degree > 1,
                 enable_sp=enable_sp,
             )
-            if config.parallelism.tensor_parallel_degree > 1:
-                set_tensor_parallel_sharding_config(self, enable_sp=enable_sp)
+            # spmd_types consumes every declaration, so the dense-path
+            # declarations are issued whenever it drives the model, not only
+            # at tp > 1; partial_dtensor reads only their tp placements.
+            spmd_types = config.parallelism.spmd_backend == "spmd_types"
+            if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
+                set_tensor_parallel_sharding_config(
+                    self, enable_sp=enable_sp, declare_vision_encoder=spmd_types
+                )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
@@ -331,6 +344,45 @@ class KimiK3Model(Decoder):
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
+
+    def preprocess_inputs(  # pyrefly: ignore [bad-override]
+        self,
+        input_dict: dict[str, torch.Tensor],
+        *,
+        parallel_dims: ParallelDims,
+        parallelism: ParallelismConfig,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Decoder preprocessing plus SPMD layouts for the image inputs."""
+        # Function-local import avoids a circular import
+        # (context_parallel.api -> models.common -> decoder).
+        from torchtitan.distributed.context_parallel.api import (
+            prepare_context_parallel_input,
+        )
+
+        batch: dict[str, Any] = dict(input_dict)
+        positions = batch.get("positions", None)
+        if positions is not None:
+            inner = self.config.first_full_attention_backend
+            if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
+                batch["attention_masks"] = self.get_attention_masks(positions=positions)
+
+        # pixel_values and grid_thw are DP-local and TP-invariant, the layout
+        # every VLM decoder shares; the vision encoder runs per rank.
+        input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
+        if parallel_dims.cp_enabled:
+            batch = prepare_context_parallel_input(
+                batch,
+                input_sharding,
+                parallel_dims.get_mesh("cp"),
+                parallelism.context_parallel_load_balancer,
+                parallelism.context_parallel_ptrr_mask_key,
+            )
+        if parallelism.spmd_backend == "spmd_types":
+            batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
+
+        inputs = batch.pop("input")
+        labels = batch.pop("labels")
+        return inputs, labels, batch
 
     def _prepare_multimodal_embeds(
         self,
