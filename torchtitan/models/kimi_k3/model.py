@@ -128,7 +128,6 @@ class KimiMLAAttention(BaseAttention):
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del positions
 
         num_tokens = x_TD.shape[0]
         # Head count derived from the projection width: under TP the colwise
@@ -168,6 +167,8 @@ class KimiMLAAttention(BaseAttention):
                     k_THK, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
                 )
 
+        # Under CP the inner attention is the Ulysses kernel, which trades the
+        # token shard for a head shard on the way in and back on the way out.
         out_THV = self.inner_attention(
             q_THK,
             k_THK,
@@ -364,6 +365,21 @@ class KimiK3Model(Decoder):
             # and KDA recurrent states at document boundaries.
             if isinstance(dataset, MMSamplePackingConfig):
                 raise ValueError("Kimi K3 does not yet support sample packing.")
+            parallelism = config.parallelism
+            if (
+                parallelism.context_parallel_degree > 1
+                and parallelism.context_parallel_load_balancer is not None
+            ):
+                # Both CP algorithms here read the sequence as rank-ordered
+                # contiguous chunks: the Ulysses all-to-all reassembles it in
+                # rank order, and KDA's recurrence passes state from rank r to
+                # rank r+1. A load balancer permutes tokens across ranks, which
+                # silently breaks both -- the shapes still line up.
+                raise ValueError(
+                    "Kimi K3 context parallel requires "
+                    "parallelism.context_parallel_load_balancer=None; "
+                    f"got {parallelism.context_parallel_load_balancer!r}."
+                )
             enable_sp = (
                 config.parallelism.tensor_parallel_degree > 1
                 and config.parallelism.enable_sequence_parallel
@@ -377,11 +393,39 @@ class KimiK3Model(Decoder):
             # declarations are issued whenever it drives the model, not only
             # at tp > 1; partial_dtensor reads only their tp placements.
             spmd_types = config.parallelism.spmd_backend == "spmd_types"
+            enable_cp = parallelism.context_parallel_degree > 1
+            if enable_cp:
+                from .context_parallel import (
+                    UlyssesCPFlexAttention,
+                    use_kimi_k3_cp_kernels,
+                )
+
+                use_kimi_k3_cp_kernels(self)
+                attention = self.first_attention
+                if (
+                    attention is not None
+                    and isinstance(
+                        attention.inner_attention, UlyssesCPFlexAttention.Config
+                    )
+                    and attention.n_heads
+                    % (
+                        parallelism.context_parallel_degree
+                        * config.parallelism.tensor_parallel_degree
+                    )
+                    != 0
+                ):
+                    # Ulysses splits each rank's head subset across cp.
+                    raise ValueError(
+                        f"MLA n_heads={attention.n_heads} must be divisible by "
+                        f"tp x cp={config.parallelism.tensor_parallel_degree} x "
+                        f"{parallelism.context_parallel_degree} for Ulysses."
+                    )
             if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
                 set_tensor_parallel_sharding_config(
                     self,
                     enable_sp=enable_sp,
                     declare_vision_encoder=spmd_types,
+                    enable_cp=enable_cp,
                     spmd_types=spmd_types,
                 )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
@@ -414,6 +458,9 @@ class KimiK3Model(Decoder):
                         v_head_dim=delta_attention.head_dim,
                     )
             return nparams, 6 * active_nparams + attention_op_flops
+
+    # Set by apply_cp_kimi_k3 to this model's context-parallel process group.
+    _cp_group: dist.ProcessGroup | None = None
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -456,6 +503,19 @@ class KimiK3Model(Decoder):
             **multimodal_input_sharding(include_cp_axis=True),
         }
         if parallel_dims.cp_enabled:
+            from .context_parallel import UlyssesCPFlexAttention
+
+            # Under Ulysses each rank attends over the full sequence after the
+            # head exchange, so the masks stay whole; the all-gather KV kernel
+            # keeps q token-sharded and takes the masks cut along Q like every
+            # other model's.
+            keep_masks_whole = isinstance(
+                self.config.first_full_attention_backend,
+                UlyssesCPFlexAttention.Config,
+            )
+            attention_masks = (
+                batch.pop("attention_masks", None) if keep_masks_whole else None
+            )
             batch = prepare_context_parallel_input(
                 batch,
                 input_sharding,
@@ -463,6 +523,8 @@ class KimiK3Model(Decoder):
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
             )
+            if attention_masks is not None:
+                batch["attention_masks"] = attention_masks
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 
@@ -500,6 +562,47 @@ class KimiK3Model(Decoder):
         num_tokens_per_item = (grid_thw[:, 1] // kernel_h) * (
             grid_thw[:, 2] // kernel_w
         )
+        if self._cp_group is not None and dist.get_world_size(self._cp_group) > 1:
+            if self._sp_group is not None:
+                raise NotImplementedError(
+                    "Kimi K3 context parallel with sequence parallel is not "
+                    "supported: the vision splice needs the whole sequence."
+                )
+            # This rank holds a sequence shard but encoded every image: take the
+            # feature slice its placeholders correspond to and scatter that.
+            # get_vision_positions needs whole visual items, which a shard does
+            # not have -- it raises "found N contiguous run(s) ... but received M
+            # visual item(s)" as soon as a shard splits or omits an item.
+            local_mask = tokens == special_tokens["image_id"]
+            counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
+            mine = self._select_cp_shard(vision_embeds, counts).to(embeddings_TD.dtype)
+            # Rows this rank did not consume still have to reach the graph, or
+            # the tower's reduce-scatter is issued by a subset of the group.
+            unused = vision_embeds.sum().to(embeddings_TD.dtype)
+            mask_T1 = local_mask.unsqueeze(-1)
+            if isinstance(embeddings_TD, DTensor):
+                # Under TP the embedding output is a DTensor whose cp axis is
+                # already Shard(0): the local rows are this rank's shard, the
+                # same rows the tower slice and the mask describe, so wrap them
+                # with the stream's own placements. A shard on the tp axis is
+                # sequence parallel, where the splice would need the whole
+                # sequence.
+                mesh = embeddings_TD.device_mesh
+                placements = embeddings_TD.placements
+                names = mesh.mesh_dim_names or ()
+                if "tp" in names and placements[names.index("tp")].is_shard():
+                    raise NotImplementedError(
+                        "Kimi K3 context parallel with sequence parallel is not "
+                        "supported: the vision splice needs the whole sequence."
+                    )
+                # masked_scatter has no DTensor sharding strategy: run it on
+                # the local shard and re-wrap with the same placements.
+                local_TD = embeddings_TD.to_local(grad_placements=placements)
+                local_TD = local_TD.masked_scatter(mask_T1, mine) + unused * 0.0
+                return DTensor.from_local(local_TD, mesh, placements)
+            embeddings_TD = embeddings_TD.masked_scatter(mask_T1, mine)
+            return embeddings_TD + unused * 0.0
+
         sp_group = self._sp_group
         if sp_group is not None and not isinstance(embeddings_TD, DTensor):
             return _splice_under_sequence_parallel(
@@ -548,6 +651,50 @@ class KimiK3Model(Decoder):
         if sp_placements is not None and isinstance(spliced_TD, DTensor):
             spliced_TD = spliced_TD.redistribute(placements=sp_placements)
         return spliced_TD
+
+    def _exchange_sentinel_counts(self, local: int) -> torch.Tensor:
+        """Per-rank vision-placeholder counts across the CP group.
+
+        Called whenever CP is on, including on ranks holding no placeholders:
+        the collective's participants are decided by the mesh, never by the data.
+        """
+        group = self._cp_group
+        counts = torch.zeros(
+            dist.get_world_size(group),
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
+        )
+        counts[dist.get_rank(group)] = local
+        dist.all_reduce(counts, group=group)
+        return counts
+
+    def _select_cp_shard(
+        self, vision_embeds: torch.Tensor, counts: torch.Tensor
+    ) -> torch.Tensor:
+        """Keep only the visual features belonging to this CP rank's shard.
+
+        ``prepare_context_parallel_input`` shards inputs, labels and positions
+        along the sequence but leaves ``pixel_values`` whole, so every rank
+        encodes every image while holding only a slice of the placeholders. The
+        features are ordered by sequence position and the shards are contiguous
+        and equal -- the config rejects a load balancer under CP precisely
+        because a permuting one would break that -- so this rank's slice starts
+        after however many placeholders the lower ranks hold.
+
+        This is correctness, not an optimization: the encoder still runs
+        redundantly on every CP rank.
+        """
+        num_rows = vision_embeds.shape[0]
+        if int(counts.sum().item()) != num_rows:
+            raise ValueError(
+                f"CP ranks hold {int(counts.sum().item())} vision "
+                f"placeholder(s) in total but {num_rows} visual token(s) were "
+                "encoded; the sequence shard and the image batch disagree"
+            )
+        rank = dist.get_rank(self._cp_group)
+        start = int(counts[:rank].sum().item())
+        local = int(counts[rank].item())
+        return vision_embeds[start : start + local]
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
