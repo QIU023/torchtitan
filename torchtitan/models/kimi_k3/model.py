@@ -22,6 +22,7 @@ from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexAttention,
+    VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
@@ -41,7 +42,6 @@ from torchtitan.models.utils import (
     quadratic_attention_flops_per_token,
 )
 from torchtitan.protocols.module import Module
-from .context_parallel import mla_ulysses_attention
 
 from .kda import KDA
 from .moe import KimiFeedForward, KimiLatentMoE
@@ -78,11 +78,6 @@ class KimiMLAAttention(BaseAttention):
         gate: Linear.Config
         wo: Linear.Config
         inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
-
-    # Set by apply_cp_kimi_k3; None means the layer runs without CP. MLA is
-    # Ulysses under either KDA CP mode -- KCP describes a recurrence that MLA
-    # does not have.
-    _cp_group = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -141,19 +136,15 @@ class KimiMLAAttention(BaseAttention):
         )
         k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
 
-        cp_group = self._cp_group
-        if cp_group is not None and dist.get_world_size(cp_group) > 1:
-            out_THV = mla_ulysses_attention(
-                self, q_THK, kv_THC, k_rope_TK, cp_group, positions
-            )
-        else:
-            out_THV = self.inner_attention(
-                q_THK,
-                k_THK,
-                v_THV,
-                attention_masks=attention_masks,
-                scale=self.scale,
-            )
+        # Under CP the inner attention's declaration trades the token shard
+        # for a head shard on the way in and back on the way out (Ulysses).
+        out_THV = self.inner_attention(
+            q_THK,
+            k_THK,
+            v_THV,
+            attention_masks=attention_masks,
+            scale=self.scale,
+        )
         out_TD = out_THV.reshape(num_tokens, h_local * self.v_head_dim)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
@@ -298,12 +289,6 @@ class KimiK3Model(Decoder):
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
 
-        def _validate_cp_backend(self, parallelism) -> None:
-            """This model's CP is not ShardingConfig-driven -- the KDA kernels
-            are attn-gym's and never see a DTensor -- so the spmd_types
-            requirement does not apply; apply_cp_kimi_k3 checks its own
-            preconditions at wiring time."""
-
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
             # TODO: Support sample packing by resetting the Q/K/V causal-convolution
@@ -338,9 +323,30 @@ class KimiK3Model(Decoder):
             # declarations are issued whenever it drives the model, not only
             # at tp > 1; partial_dtensor reads only their tp placements.
             spmd_types = config.parallelism.spmd_backend == "spmd_types"
+            enable_cp = parallelism.context_parallel_degree > 1
+            if enable_cp:
+                # Ulysses splits each rank's head subset across cp.
+                attention = self.first_attention
+                if (
+                    attention is not None
+                    and attention.n_heads
+                    % (
+                        parallelism.context_parallel_degree
+                        * config.parallelism.tensor_parallel_degree
+                    )
+                    != 0
+                ):
+                    raise ValueError(
+                        f"MLA n_heads={attention.n_heads} must be divisible by "
+                        f"tp x cp={config.parallelism.tensor_parallel_degree} x "
+                        f"{parallelism.context_parallel_degree} for Ulysses."
+                    )
             if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
                 set_tensor_parallel_sharding_config(
-                    self, enable_sp=enable_sp, declare_vision_encoder=spmd_types
+                    self,
+                    enable_sp=enable_sp,
+                    declare_vision_encoder=spmd_types,
+                    enable_cp=enable_cp,
                 )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
@@ -409,6 +415,10 @@ class KimiK3Model(Decoder):
         # every VLM decoder shares; the vision encoder runs per rank.
         input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
         if parallel_dims.cp_enabled:
+            # The MLA layers run Ulysses: after the head exchange each rank
+            # attends over the full sequence, so the masks stay whole instead
+            # of being cut along Q like an all-gather-KV model's.
+            attention_masks = batch.pop("attention_masks", None)
             batch = prepare_context_parallel_input(
                 batch,
                 input_sharding,
@@ -416,6 +426,8 @@ class KimiK3Model(Decoder):
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
             )
+            if attention_masks is not None:
+                batch["attention_masks"] = attention_masks
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 

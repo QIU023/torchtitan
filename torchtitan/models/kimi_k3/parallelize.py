@@ -23,7 +23,7 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.tools.logging import logger
 
 from .kda import InnerKDA
-from .model import KimiK3Model, KimiMLAAttention
+from .model import KimiK3Model
 
 
 def parallelize_kimi_k3(
@@ -127,31 +127,17 @@ def apply_cp_kimi_k3(
     model: nn.Module,
     parallel_dims: ParallelDims,
 ) -> None:
-    """Wire context parallelism: KCP on the KDA layers, Ulysses on the MLA layers.
+    """Hand the KDA layers and the vision splice the context-parallel group.
 
-    Both at once, on disjoint layer kinds. Imperative rather than declared:
-    KDA's kernels are attn-gym's and never see a DTensor, so no ShardingConfig
-    can drive them (the model config overrides ``_validate_cp_backend`` for the
-    same reason).
+    MLA needs nothing here: its inner attention declares Ulysses as a
+    redistribution on the cp axis. KDA keeps the sequence sharded and runs
+    Attention Gym's context-parallel recipe inside its local_map body, whose
+    collectives need the group.
     """
     cp_group = parallel_dims.get_mesh("cp").get_group()
-    cp_degree = parallel_dims.cp
     model._cp_group = cp_group
 
-    num_mla = 0
-    kda_modules = []
-    for module in model.modules():
-        if isinstance(module, KimiMLAAttention):
-            if module.n_heads % cp_degree != 0:
-                raise ValueError(
-                    f"MLA n_heads={module.n_heads} must be divisible by "
-                    f"cp={cp_degree} for Ulysses head sharding"
-                )
-            module._cp_group = cp_group
-            num_mla += 1
-        elif isinstance(module, InnerKDA):
-            kda_modules.append(module)
-
+    kda_modules = [m for m in model.modules() if isinstance(m, InnerKDA)]
     if kda_modules:
         # Checked at wiring time so the message is actionable, rather than an
         # ImportError from inside a layer's first forward.
@@ -167,16 +153,6 @@ def apply_cp_kimi_k3(
                 "attn_gym.linear.context_parallel.context_parallel_conv_history); "
                 f"import failed with: {err}."
             ) from err
-
     for module in kda_modules:
         module._cp_group = cp_group
-    if num_mla + len(kda_modules) == 0:
-        raise ValueError(
-            "context parallel is enabled but no attention layer was found to "
-            "wire it onto."
-        )
-    logger.info(
-        "Applied context parallel to %d MLA and %d KDA layer(s).",
-        num_mla,
-        len(kda_modules),
-    )
+    logger.info("Applied context parallel to %d KDA layer(s).", len(kda_modules))

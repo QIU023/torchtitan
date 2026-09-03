@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 DP = MeshAxisName.DP
 TP = MeshAxisName.TP
+CP = MeshAxisName.CP
 
 
 def set_expert_parallel_sharding_config(
@@ -83,7 +84,7 @@ def _tp_replicate_config() -> ShardingConfig:
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
-def _set_mla_sharding(attention_cfg, *, enable_sp: bool) -> None:
+def _set_mla_sharding(attention_cfg, *, enable_sp: bool, cp_ulysses: bool) -> None:
     """Head-parallel TP for MLA.
 
     The projections that produce or consume the head axis split on it; the
@@ -107,7 +108,10 @@ def _set_mla_sharding(attention_cfg, *, enable_sp: bool) -> None:
     attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
     attention_cfg.q_norm.sharding_config = norm_config(enable_sp=False)
     attention_cfg.kv_norm.sharding_config = norm_config(enable_sp=False)
-    set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
+    if cp_ulysses:
+        _set_ulysses_inner_attention(attention_cfg.inner_attention)
+    else:
+        set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
 
 
 def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool) -> None:
@@ -173,6 +177,7 @@ def set_tensor_parallel_sharding_config(
     *,
     enable_sp: bool = False,
     declare_vision_encoder: bool = False,
+    enable_cp: bool = False,
 ) -> None:
     """Declare the sharding tensor parallel acts on.
 
@@ -212,7 +217,9 @@ def set_tensor_parallel_sharding_config(
             if cfg is not None:
                 cfg.sharding_config = _tp_replicate_config()
         if layer.attention is not None:
-            _set_mla_sharding(layer.attention, enable_sp=enable_sp)
+            _set_mla_sharding(
+                layer.attention, enable_sp=enable_sp, cp_ulysses=enable_cp
+            )
         if layer.delta_attention is not None:
             _set_kda_sharding(layer.delta_attention, enable_sp=enable_sp)
         if layer.feed_forward is not None:
@@ -235,13 +242,13 @@ def _set_vision_encoder_sharding(ve_cfg) -> None:
     table stay invariant. K3's projector norms after its second linear.
     """
     ve_cfg.sharding_config = ShardingConfig(
-        state_shardings={"pos_embed": SpmdType({DP: spmd.R, TP: spmd.I})},
-        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
+        state_shardings={"pos_embed": SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
+        out_dst_shardings=SpmdType({DP: spmd.V, CP: spmd.V, TP: spmd.R}),
     )
     ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
-        state_shardings={"inv_freq": SpmdType({DP: spmd.R, TP: spmd.I})},
-        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
+        state_shardings={"inv_freq": SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I}),
     )
     ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
     set_vision_transformer_block_sharding_config(ve_cfg.block, rope_cache_dp=spmd.V)
@@ -250,3 +257,31 @@ def _set_vision_encoder_sharding(ve_cfg) -> None:
     proj.linear_1.sharding_config = vision_colwise_config()
     proj.linear_2.sharding_config = vision_scaled_bias_rowwise_config()
     proj.post_norm.sharding_config = invariant_norm_config()
+
+
+def _ulysses_head_placement() -> SpmdType:
+    """``(tokens, heads, dim)`` with the cp axis on the heads, inside TP's split."""
+    return SpmdType(
+        {DP: spmd.V, CP: spmd.V, TP: spmd.V},
+        partition_spec=spmd.PartitionSpec(DP, (TP, CP), None),
+    )
+
+
+def _set_ulysses_inner_attention(inner_attention_cfg) -> None:
+    """Ulysses context parallel for MLA, stated as the module boundary.
+
+    The stream arrives token-sharded on the cp axis. Trading that shard for a
+    head shard on the way in is one redistribution (an all-to-all); the body
+    then sees the full sequence for its head subset and the output trades
+    back. The full-sequence mask is supplied by ``preprocess_inputs``, which
+    keeps the masks out of the CP input sharding.
+    """
+    seq = attention_activation_placement()
+    heads = _ulysses_head_placement()
+    inner_attention_cfg.sharding_config = ShardingConfig(
+        in_src_shardings={"q_TNH": seq, "k_TNH": seq, "v_TNH": seq},
+        in_dst_shardings={"q_TNH": heads, "k_TNH": heads, "v_TNH": heads},
+        out_src_shardings=heads,
+        out_dst_shardings=seq,
+        local_map=LocalMapConfig(in_grad_placements=(heads, heads, heads)),
+    )
