@@ -14,6 +14,9 @@ Module protocol. Nothing here touches a mesh or a device.
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
+from spmd_types import SpmdType
+
+from torchtitan.distributed.parallel_dims import MeshAxisName
 
 from torchtitan.models.common.decoder_sharding import (
     attention_activation_placement,
@@ -28,10 +31,20 @@ from torchtitan.models.common.decoder_sharding import (
     set_gqa_inner_attention_local_map,
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+from torchtitan.models.common.vision_encoder_sharding import (
+    invariant_norm_config,
+    set_vision_transformer_block_sharding_config,
+    vision_colwise_config,
+    vision_invariant_linear_config,
+    vision_scaled_bias_rowwise_config,
+)
 from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan.models.kimi_k3.model import KimiK3Model
+
+DP = MeshAxisName.DP
+TP = MeshAxisName.TP
 
 
 def set_kimi_k3_sharding_config(
@@ -158,7 +171,10 @@ def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool) -> None:
 
 
 def set_tensor_parallel_sharding_config(
-    config: "KimiK3Model.Config", *, enable_sp: bool = False
+    config: "KimiK3Model.Config",
+    *,
+    enable_sp: bool = False,
+    declare_vision_encoder: bool = False,
 ) -> None:
     """Declare the sharding tensor parallel acts on.
 
@@ -171,6 +187,11 @@ def set_tensor_parallel_sharding_config(
     the latent projections around them.
     """
     set_decoder_sharding_config(config, enable_sp=enable_sp)
+    if declare_vision_encoder and config.vision_encoder is not None:
+        # Under spmd_types every parameter needs a layout. Under partial_dtensor
+        # the tower stays undeclared: MoonViT's position lookup indexes the
+        # table with a plain tensor, which a DTensor table refuses.
+        _set_vision_encoder_sharding(config.vision_encoder)
     config.output_res_norm.sharding_config = norm_config(enable_sp=enable_sp)
     config.output_res_proj.sharding_config = _tp_replicate_config()
     attn_x_layout = (
@@ -207,3 +228,27 @@ def set_tensor_parallel_sharding_config(
             layer.moe.routed_down.sharding_config = _tp_replicate_config()
             layer.moe.routed_up.sharding_config = _tp_replicate_config()
             layer.moe.routed_norm.sharding_config = norm_config(enable_sp=enable_sp)
+
+
+def _set_vision_encoder_sharding(ve_cfg) -> None:
+    """Invariant-activation plan for the MoonViT tower, the kimi_k2_7 shape.
+
+    Linear layers shard colwise/rowwise for memory; norms and the position
+    table stay invariant. K3's projector norms after its second linear.
+    """
+    ve_cfg.sharding_config = ShardingConfig(
+        state_shardings={"pos_embed": SpmdType({DP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
+        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
+    )
+    ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
+        state_shardings={"inv_freq": SpmdType({DP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
+    )
+    ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
+    set_vision_transformer_block_sharding_config(ve_cfg.block, rope_cache_dp=spmd.V)
+    ve_cfg.final_norm.sharding_config = invariant_norm_config()
+    proj = ve_cfg.projector
+    proj.linear_1.sharding_config = vision_colwise_config()
+    proj.linear_2.sharding_config = vision_scaled_bias_rowwise_config()
+    proj.post_norm.sharding_config = invariant_norm_config()
