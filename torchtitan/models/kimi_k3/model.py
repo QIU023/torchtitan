@@ -5,11 +5,16 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate
+
+from torchtitan.config import ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
@@ -17,13 +22,16 @@ from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexAttention,
+    VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.kimi_k3.sharding import (
     set_kimi_k3_sharding_config,
     set_tensor_parallel_sharding_config,
@@ -268,6 +276,45 @@ class KimiK3TransformerBlock(Module):
         return prefix_sum_TD + h_TD, block_residual_TND
 
 
+def _splice_under_sequence_parallel(
+    embeddings_TD: torch.Tensor,
+    tokens: torch.Tensor,
+    *,
+    vision_embeds: torch.Tensor,
+    num_tokens_per_item: torch.Tensor,
+    image_id: int,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Splice vision features into a sequence-parallel shard of the stream.
+
+    Sequence parallel shards the embedding's output, not the tokens: under
+    spmd_types the stream is a plain tensor holding this rank's shard while
+    ``tokens`` is the whole sequence, and a placeholder run can cross the
+    shard boundary. So the stream is gathered (a reduce-scatter backward),
+    spliced on the whole sequence, and handed back as this rank's shard (an
+    all-gather backward).
+    """
+    embeddings_full = spmd.redistribute(
+        embeddings_TD.contiguous(),
+        group,
+        src=spmd.S(0),
+        dst=spmd.R,
+        backward_options={"op_dtype": embeddings_TD.dtype},
+    )
+    if embeddings_full.shape[0] != tokens.shape[0]:
+        raise ValueError(
+            f"Sequence parallel splice: the gathered stream has "
+            f"{embeddings_full.shape[0]} rows but the tokens {tokens.shape[0]}; "
+            "the tokens are expected whole and the stream sharded on the tp axis."
+        )
+    spliced_full = scatter_vision_embeds(
+        embeddings_full,
+        vision_embeds=vision_embeds,
+        vision_positions=get_vision_positions(tokens, num_tokens_per_item, image_id),
+    )
+    return spmd.redistribute(spliced_full, group, src=spmd.R, dst=spmd.S(0))
+
+
 class KimiK3Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
@@ -291,8 +338,14 @@ class KimiK3Model(Decoder):
                 enable_ep=config.parallelism.expert_parallel_degree > 1,
                 enable_sp=enable_sp,
             )
-            if config.parallelism.tensor_parallel_degree > 1:
-                set_tensor_parallel_sharding_config(self, enable_sp=enable_sp)
+            # spmd_types consumes every declaration, so the dense-path
+            # declarations are issued whenever it drives the model, not only
+            # at tp > 1; partial_dtensor reads only their tp placements.
+            spmd_types = config.parallelism.spmd_backend == "spmd_types"
+            if config.parallelism.tensor_parallel_degree > 1 or spmd_types:
+                set_tensor_parallel_sharding_config(
+                    self, enable_sp=enable_sp, declare_vision_encoder=spmd_types
+                )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
@@ -332,6 +385,50 @@ class KimiK3Model(Decoder):
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
 
+    # Set by parallelize_kimi_k3 under sequence parallel on spmd_types: the tp
+    # group whose Shard(0) the stream carries, which the multimodal splice
+    # needs since a placeholder run can cross the shard boundary.
+    _sp_group: dist.ProcessGroup | None = None
+
+    def preprocess_inputs(  # pyrefly: ignore [bad-override]
+        self,
+        input_dict: dict[str, torch.Tensor],
+        *,
+        parallel_dims: ParallelDims,
+        parallelism: ParallelismConfig,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Decoder preprocessing plus SPMD layouts for the image inputs."""
+        # Function-local import avoids a circular import
+        # (context_parallel.api -> models.common -> decoder).
+        from torchtitan.distributed.context_parallel.api import (
+            prepare_context_parallel_input,
+        )
+
+        batch: dict[str, Any] = dict(input_dict)
+        positions = batch.get("positions", None)
+        if positions is not None:
+            inner = self.config.first_full_attention_backend
+            if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
+                batch["attention_masks"] = self.get_attention_masks(positions=positions)
+
+        # pixel_values and grid_thw are DP-local and TP-invariant, the layout
+        # every VLM decoder shares; the vision encoder runs per rank.
+        input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
+        if parallel_dims.cp_enabled:
+            batch = prepare_context_parallel_input(
+                batch,
+                input_sharding,
+                parallel_dims.get_mesh("cp"),
+                parallelism.context_parallel_load_balancer,
+                parallelism.context_parallel_ptrr_mask_key,
+            )
+        if parallelism.spmd_backend == "spmd_types":
+            batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
+
+        inputs = batch.pop("input")
+        labels = batch.pop("labels")
+        return inputs, labels, batch
+
     def _prepare_multimodal_embeds(
         self,
         tokens: torch.Tensor,
@@ -362,6 +459,16 @@ class KimiK3Model(Decoder):
         num_tokens_per_item = (grid_thw[:, 1] // kernel_h) * (
             grid_thw[:, 2] // kernel_w
         )
+        sp_group = self._sp_group
+        if sp_group is not None and not isinstance(embeddings_TD, DTensor):
+            return _splice_under_sequence_parallel(
+                embeddings_TD,
+                tokens,
+                vision_embeds=vision_embeds,
+                num_tokens_per_item=num_tokens_per_item,
+                image_id=special_tokens["image_id"],
+                group=sp_group,
+            )
         vision_positions = get_vision_positions(
             tokens,
             num_tokens_per_item,

@@ -68,6 +68,15 @@ def parallelize_kimi_k3(
         # (default), deepep and minimal_async_ep run on this model; hybridep
         # needs GB200-class hardware.
         model.parallelize(parallel_dims)
+        if (
+            parallelism.spmd_backend == "spmd_types"
+            and parallel_dims.tp_enabled
+            and parallelism.enable_sequence_parallel
+        ):
+            # The stream is a plain local tensor under spmd_types, so the
+            # multimodal splice learns here that it holds a sequence shard.
+            assert isinstance(model, KimiK3Model)
+            model._sp_group = parallel_dims.get_mesh("tp").get_group()
 
     if parallelism.spmd_backend == "spmd_types":
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
