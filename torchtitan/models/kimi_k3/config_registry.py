@@ -7,7 +7,11 @@
 from dataclasses import replace
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
+from torchtitan.components.data import (
+    ConcatThenSplitPackingConfig,
+    GrainDataLoader,
+    SingleDatasetConfig,
+)
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
@@ -20,6 +24,7 @@ from torchtitan.hf_datasets.multimodal.mm_datasets import (
     MultiModalProcessor,
 )
 from torchtitan.hf_datasets.multimodal.utils.image import resize_to_navit_patch_grid
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.trainer import Trainer
 
@@ -60,7 +65,18 @@ def _kimi_k3_multimodal_dataloader(
 
 
 def kimi_k3_debugmodel() -> Trainer.Config:
-    model_spec = model_registry("debugmodel")
+    """The text decoder on the text debug dataset."""
+    config = kimi_k3_debugmodel_mm()
+    config.model_spec = model_registry("debugmodel")
+    config.dataloader = GrainDataLoader.Config(
+        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"])
+    )
+    return config
+
+
+def kimi_k3_debugmodel_mm() -> Trainer.Config:
+    """The decoder with the MoonViT tower on the multimodal debug dataset."""
+    model_spec = model_registry("debugmodel_mm")
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(

@@ -555,24 +555,26 @@ def llama3_debugmodel_seed_checkpoint() -> Trainer.Config:
 
 
 def kimi_k3_debugmodel_cp2() -> Trainer.Config:
-    """Kimi K3 text decoder with context parallel over two ranks.
+    """Kimi K3 with context parallel over two ranks, on the multimodal flavor.
 
-    The packed Ulysses kernel on the MLA layers, KCP on the KDA layers.
+    The packed Ulysses kernel on the MLA layers, KCP on the KDA layers; the
+    multimodal flavor, since the vision splice under CP is the one piece of
+    the model body the kernels do not cover.
     """
-    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mm
 
     from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
 
-    return kimi_k3_context_parallel(kimi_k3_debugmodel(), cp_degree=2)
+    return kimi_k3_context_parallel(kimi_k3_debugmodel_mm(), cp_degree=2)
 
 
 def kimi_k3_debugmodel_cp2_allgather() -> Trainer.Config:
     """The cp2 flavor with the packed all-gather KV kernel on the MLA layers."""
-    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mm
     from torchtitan.models.kimi_k3.context_parallel import MLAAllGatherCPFlexAttention
 
     from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
 
     return kimi_k3_context_parallel(
-        kimi_k3_debugmodel(), cp_degree=2, mla_kernel=MLAAllGatherCPFlexAttention
+        kimi_k3_debugmodel_mm(), cp_degree=2, mla_kernel=MLAAllGatherCPFlexAttention
     )
