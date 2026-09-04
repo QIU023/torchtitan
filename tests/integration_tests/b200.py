@@ -18,4 +18,10 @@ def build_b200_tests_list() -> list[OverrideDefinitions]:
             test_name="kimi_k3_mm_fsdp",
             ngpu=2,
         ),
+        OverrideDefinitions(
+            configs=[recipes.kimi_k3_debugmodel_mm_fsdp2_ep2],
+            test_descr="Kimi K3 multimodal, FSDP2 x EP2",
+            test_name="kimi_k3_mm_fsdp2_ep2",
+            ngpu=2,
+        ),
     ]
