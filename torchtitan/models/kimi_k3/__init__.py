@@ -377,7 +377,7 @@ def _kimi_k3_config(
     num_experts: int,
     top_k: int,
     num_shared_experts: int,
-    vision_encoder: KimiK3VisionEncoder.Config,
+    vision_encoder: KimiK3VisionEncoder.Config | None,
     attn_backend: str,
     moe_comm_backend: str = "standard",
 ) -> KimiK3Model.Config:
@@ -466,7 +466,9 @@ def _kimi_k3_config(
     )
 
 
-def _debugmodel(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
+def _debugmodel(
+    attn_backend: str, moe_comm_backend: str, *, with_vision: bool = False
+) -> KimiK3Model.Config:
     dim = 1024
     return _kimi_k3_config(
         dim=dim,
@@ -489,21 +491,27 @@ def _debugmodel(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
         num_experts=32,
         top_k=4,
         num_shared_experts=2,
-        vision_encoder=_vision_encoder_config(
-            text_dim=dim,
-            dim=512,
-            qkv_dim=768,
-            hidden_dim=2048,
-            num_layers=8,
-            num_heads=6,
-            init_pos_emb_height=32,
-            init_pos_emb_width=32,
+        vision_encoder=(
+            _vision_encoder_config(
+                text_dim=dim,
+                dim=512,
+                qkv_dim=768,
+                hidden_dim=2048,
+                num_layers=8,
+                num_heads=6,
+                init_pos_emb_height=32,
+                init_pos_emb_width=32,
+            )
+            if with_vision
+            else None
         ),
         attn_backend=attn_backend,
     )
 
 
-def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
+def _kimi_k3(
+    attn_backend: str, moe_comm_backend: str, *, with_vision: bool = False
+) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
         dim=dim,
@@ -526,23 +534,31 @@ def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
         num_experts=896,
         top_k=16,
         num_shared_experts=2,
-        vision_encoder=_vision_encoder_config(
-            text_dim=dim,
-            dim=1024,
-            qkv_dim=1536,
-            hidden_dim=4096,
-            num_layers=27,
-            num_heads=12,
-            init_pos_emb_height=64,
-            init_pos_emb_width=64,
+        vision_encoder=(
+            _vision_encoder_config(
+                text_dim=dim,
+                dim=1024,
+                qkv_dim=1536,
+                hidden_dim=4096,
+                num_layers=27,
+                num_heads=12,
+                init_pos_emb_height=64,
+                init_pos_emb_width=64,
+            )
+            if with_vision
+            else None
         ),
         attn_backend=attn_backend,
     )
 
 
+# The text decoder and, as ``_mm``, the decoder with the MoonViT tower: the
+# muse_glimmer split, so a text run never carries an unused tower.
 kimi_k3_configs = {
     "debugmodel": (_debugmodel, 16384),
+    "debugmodel_mm": (partial(_debugmodel, with_vision=True), 16384),
     "Kimi-K3": (_kimi_k3, 262144),
+    "Kimi-K3_mm": (partial(_kimi_k3, with_vision=True), 262144),
 }
 
 

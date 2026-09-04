@@ -10,8 +10,8 @@ from torchtitan.trainer import Trainer
 
 
 def kimi_k3_debugmodel_mm_fsdp2() -> Trainer.Config:
-    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mm
 
-    config = kimi_k3_debugmodel()
+    config = kimi_k3_debugmodel_mm()
     config.parallelism.data_parallel_shard_degree = 2
     return config
