@@ -128,6 +128,7 @@ class KimiMLAAttention(BaseAttention):
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del positions
 
         num_tokens = x_TD.shape[0]
         # Head count derived from the projection width: under TP the colwise
@@ -167,8 +168,7 @@ class KimiMLAAttention(BaseAttention):
                     k_THK, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
                 )
 
-        # Under CP the inner attention is the Ulysses kernel, which trades the
-        # token shard for a head shard on the way in and back on the way out.
+        # Under CP the inner attention is a kernel that owns its exchange.
         out_THV = self.inner_attention(
             q_THK,
             k_THK,
@@ -535,7 +535,9 @@ class KimiK3Model(Decoder):
             # not have -- it raises "found N contiguous run(s) ... but received M
             # visual item(s)" as soon as a shard splits or omits an item.
             local_mask = tokens == special_tokens["image_id"]
-            counts = self._exchange_sentinel_counts(int(local_mask.sum().item()))
+            counts = self._exchange_sentinel_counts(
+                int(local_mask.sum().item()), vision_embeds
+            )
             mine = self._select_cp_shard(vision_embeds, counts).to(embeddings_TD.dtype)
             # Rows this rank did not consume still have to reach the graph, or
             # the tower's reduce-scatter is issued by a subset of the group.
@@ -613,7 +615,9 @@ class KimiK3Model(Decoder):
             spliced_TD = spliced_TD.redistribute(placements=sp_placements)
         return spliced_TD
 
-    def _exchange_sentinel_counts(self, local: int) -> torch.Tensor:
+    def _exchange_sentinel_counts(
+        self, local: int, vision_embeds: torch.Tensor
+    ) -> torch.Tensor:
         """Per-rank vision-placeholder counts across the CP group.
 
         Called whenever CP is on, including on ranks holding no placeholders:
@@ -621,9 +625,7 @@ class KimiK3Model(Decoder):
         """
         group = self._cp_group
         counts = torch.zeros(
-            dist.get_world_size(group),
-            dtype=torch.long,
-            device=torch.cuda.current_device(),
+            dist.get_world_size(group), dtype=torch.long, device=vision_embeds.device
         )
         counts[dist.get_rank(group)] = local
         dist.all_reduce(counts, group=group)

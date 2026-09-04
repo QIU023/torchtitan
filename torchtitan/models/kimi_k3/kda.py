@@ -9,7 +9,9 @@
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from attn_gym.linear.context_parallel import ContextParallelPlan
 from attn_gym.linear.kda import bound_gate, chunk_kda
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
 from attn_gym.linear.short_conv import causal_conv1d
@@ -79,8 +81,8 @@ class KDAKernel(Module):
         dt_bias_HK: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        cp_plan=None,
-        cp_group=None,
+        cp_plan: ContextParallelPlan | None = None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
@@ -210,8 +212,8 @@ class InnerKDA(Module):
         *,
         cu_seqlens: torch.Tensor | None,
         conv_state: torch.Tensor | None = None,
-        cp_plan=None,
-        cp_group=None,
+        cp_plan: ContextParallelPlan | None = None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
         """Causal conv then the delta-rule scan; the CP kernel passes its plan."""
         conv_output_1TC = causal_conv1d(

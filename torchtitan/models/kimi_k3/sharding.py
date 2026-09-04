@@ -92,10 +92,7 @@ def _tp_replicate_config() -> ShardingConfig:
 
 
 def _set_mla_sharding(
-    attention_cfg,
-    *,
-    enable_sp: bool,
-    invariant_stream: bool = False,
+    attention_cfg, *, enable_sp: bool, invariant_stream: bool = False
 ) -> None:
     """Head-parallel TP for MLA.
 
@@ -251,9 +248,7 @@ def set_tensor_parallel_sharding_config(
                 cfg.sharding_config = _tp_invariant_config()
         if layer.attention is not None:
             _set_mla_sharding(
-                layer.attention,
-                enable_sp=enable_sp,
-                invariant_stream=spmd_types,
+                layer.attention, enable_sp=enable_sp, invariant_stream=spmd_types
             )
         if layer.delta_attention is not None:
             _set_kda_sharding(layer.delta_attention, enable_sp=enable_sp)
