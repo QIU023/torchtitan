@@ -38,6 +38,7 @@ from torchtitan.models.kimi_k3.layout import (
     infer_block_layout_tables_from_stages,
 )
 from torchtitan.models.kimi_k3.pipeline_stage import AttnResPipelineStage, RankStore
+from torchtitan.models.kimi_k3.pp_balance import install_pp_balance, PPBalanceKnobs
 from torchtitan.tools.logging import logger
 
 from .model import KimiK3Model
@@ -203,7 +204,13 @@ def _schedule_stages(schedule: _PipelineSchedule) -> list[AttnResPipelineStage]:
     return cast(list[AttnResPipelineStage], stages)
 
 
-def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs):
+def pipeline_kimi_k3(
+    model: nn.Module,
+    *,
+    attn_res_cache: bool = True,
+    pp_balance: PPBalanceKnobs | None = None,
+    **kwargs,
+):
     """``pipelining_fn`` for Kimi K3.
 
     Splits the model with this model's names, builds the schedule on
@@ -221,6 +228,9 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
     different order, so they are not bitwise against each other. Every rank
     must resolve it identically: a rank routing differently from its peers
     hangs the first hop with nothing pointing at the cause.
+    ``pp_balance`` names the PP ranks that park the tensors autograd saves in a
+    pool on another rank's GPU through the Mooncake Transfer Engine
+    (``pp_balance.py``); a recipe sets it the same way.
     """
     import dataclasses
 
@@ -268,4 +278,12 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
         [s.stage_index for s in stages],
         "delta with rank store" if attn_res_cache else "whole stack every hop",
     )
+    if pp_balance is not None and pp_balance.pp_balance_source_ranks:
+        # The engine owns the registered pool and staging buffers; it lives as
+        # long as the schedule does.
+        setattr(
+            pp_schedule,
+            "_pp_balance_engine",
+            install_pp_balance(pp_schedule, stages[0].group, pp_balance),
+        )
     return pp_schedule, model_parts, has_first_stage, has_last_stage
