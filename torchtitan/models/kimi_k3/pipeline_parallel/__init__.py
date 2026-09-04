@@ -24,6 +24,7 @@ from torchtitan.distributed.pipeline_parallel import (
     pipeline_with_first_last_stage_modules,
 )
 
+from ..pp_balance import install_pp_balance, PPBalanceKnobs
 from .layout import infer_block_layout_tables, layer_to_stage_from_split
 from .stage import AttnResPipelineStage, PPRankLocalCache
 
@@ -79,11 +80,13 @@ def pipeline_kimi_k3(
     *,
     attn_res_cache: bool = True,
     attn_res_cache_offload: bool = False,
+    pp_balance: PPBalanceKnobs | None = None,
     **kwargs,
 ):
     """pipelining_fn for Kimi K3; with attn_res_cache a hop carries only the blocks the
     receiving rank lacks, without it the whole stack, and every rank must agree;
-    attn_res_cache_offload parks the stored blocks on pinned host memory."""
+    attn_res_cache_offload parks the stored blocks on pinned host memory; pp_balance names
+    the PP ranks that park autograd's saved tensors on a peer through the Mooncake Transfer Engine."""
     (
         pp_schedule,
         model_parts,
@@ -116,6 +119,13 @@ def pipeline_kimi_k3(
     store = PPRankLocalCache(offload=attn_res_cache and attn_res_cache_offload)
     for stage in stages:
         stage.set_routing(layout, store)
+    if pp_balance is not None and pp_balance.pp_balance_source_ranks:
+        # The engine owns the registered pool and staging buffers; it lives as
+        # long as the schedule does.
+        # pyrefly: ignore[missing-attribute]
+        pp_schedule._pp_balance_engine = install_pp_balance(
+            pp_schedule, stages[0].group, pp_balance
+        )
     logger.info(
         "Kimi K3 pipeline: %d stage(s) on this rank %s, block transport %s",
         len(stages),
