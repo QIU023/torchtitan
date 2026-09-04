@@ -88,7 +88,8 @@ def parallelize_kimi_k3(
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
-        if model.config.ac_reuse_attention:
+        config = model.config
+        if isinstance(config, KimiK3Model.Config) and config.ac_reuse_attention:
             _apply_ac_outside_attention(ac_policy, model)
         else:
             ac_policy.apply(model)
@@ -136,7 +137,9 @@ def _apply_ac_outside_attention(ac_policy, model: nn.Module) -> None:
     mm save/recompute balance where the parameter memory is, while attention
     and the residual math keep their activations and are reused in backward.
     """
-    for name, block in model.layers.named_children():
+    layers = model.layers
+    assert isinstance(layers, nn.ModuleDict)
+    for name, block in layers.named_children():
         inner_name = "moe" if block.moe is not None else "feed_forward"
         inner = getattr(block, inner_name)
         wrapped = ac_policy._wrap_block(inner, base_fqn=f"layers.{name}.{inner_name}")
@@ -144,5 +147,5 @@ def _apply_ac_outside_attention(ac_policy, model: nn.Module) -> None:
     logger.info(
         "Applied activation checkpointing to the MoE/feed-forward of %d block(s); "
         "attention and the residual math stay outside (ac_reuse_attention).",
-        len(model.layers),
+        len(layers),
     )
