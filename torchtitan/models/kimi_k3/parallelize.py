@@ -205,7 +205,13 @@ def _schedule_stages(schedule: _PipelineSchedule) -> list[AttnResPipelineStage]:
     return cast(list[AttnResPipelineStage], stages)
 
 
-def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs):
+def pipeline_kimi_k3(
+    model: nn.Module,
+    *,
+    attn_res_cache: bool = True,
+    attn_res_cache_offload: bool = False,
+    **kwargs,
+):
     """``pipelining_fn`` for Kimi K3.
 
     Splits the model with this model's names, builds the schedule on
@@ -223,6 +229,9 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
     different order, so they are not bitwise against each other. Every rank
     must resolve it identically: a rank routing differently from its peers
     hangs the first hop with nothing pointing at the cause.
+    ``attn_res_cache_offload`` parks the store's blocks on pinned host memory
+    between the stage that commits them and the rank's later stages; the
+    result is bitwise the on-device store.
     """
     import dataclasses
 
@@ -266,13 +275,16 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
         layer_to_stage=layer_to_stage,
         cache=attn_res_cache,
     )
-    store = RankStore()
+    store = RankStore(offload=attn_res_cache and attn_res_cache_offload)
     for stage in stages:
         stage.set_routing(layout, store)
     logger.info(
         "Kimi K3 pipeline: %d stage(s) on this rank %s, block transport %s",
         len(stages),
         [s.stage_index for s in stages],
-        "delta with rank store" if attn_res_cache else "whole stack every hop",
+        "delta with rank store"
+        + (" on pinned host memory" if attn_res_cache_offload else "")
+        if attn_res_cache
+        else "whole stack every hop",
     )
     return pp_schedule, model_parts, has_first_stage, has_last_stage
