@@ -40,7 +40,6 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
             ("context parallel", parallel_dims.cp_enabled),
         )
@@ -60,11 +59,23 @@ def parallelize_kimi_k3(
         # declarations. Vision buffers declare their DP layouts separately.
         annotate_replicated_parameters(model, parallel_dims)
 
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
+    if (
+        parallelism.spmd_backend == "spmd_types"
+        or parallel_dims.ep_enabled
+        or parallel_dims.tp_enabled
+    ):
         # model_registry's moe_comm_backend picks the dispatcher: standard
         # (default), deepep and minimal_async_ep run on this model; hybridep
         # needs GB200-class hardware.
         model.parallelize(parallel_dims)
+    if (
+        parallelism.spmd_backend == "spmd_types"
+        and parallel_dims.tp_enabled
+        and parallelism.enable_sequence_parallel
+    ):
+        # The stream is a plain local tensor under spmd_types, so the
+        # multimodal splice learns here that it holds a sequence shard.
+        model._sp_group = parallel_dims.get_mesh("tp").get_group()
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
