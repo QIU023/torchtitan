@@ -38,7 +38,6 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
             ("expert parallel", parallel_dims.ep_enabled),
         )
@@ -60,6 +59,20 @@ def parallelize_kimi_k3(
     if parallelism.spmd_backend == "spmd_types":
         annotate_replicated_parameters(model, parallel_dims)
         model.parallelize(parallel_dims)
+    elif parallel_dims.tp_enabled:
+        # partial_dtensor: the declared tp placements are applied through
+        # the Module protocol.
+        model.parallelize(parallel_dims)
+    if (
+        parallelism.spmd_backend == "spmd_types"
+        and parallel_dims.tp_enabled
+        and parallelism.enable_sequence_parallel
+    ):
+        # The stream is a plain local tensor under spmd_types, so the
+        # multimodal splice learns here that it holds a sequence shard.
+        model._sp_group = parallel_dims.get_mesh("tp").get_group()
+
+    if parallelism.spmd_backend == "spmd_types":
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     else:
         dp_mesh_names = (

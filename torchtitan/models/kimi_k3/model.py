@@ -7,13 +7,17 @@
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+import spmd_types as spmd
 import torch
+import torch.distributed as dist
 from attn_gym.linear.context_parallel import ContextParallelRouting
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
@@ -24,6 +28,8 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import (
     decoder_input_sharding,
+    dense_activation_placement,
+    dense_sequence_parallel_placement,
     token_id_placement,
 )
 from torchtitan.models.common.multimodal import (
@@ -282,6 +288,45 @@ class KimiK3TransformerBlock(Module):
         return prefix_sum_TD + h_TD, block_residual_TND
 
 
+def _splice_under_sequence_parallel(
+    embeddings_TD: torch.Tensor,
+    tokens: torch.Tensor,
+    *,
+    vision_embeds: torch.Tensor,
+    num_tokens_per_item: torch.Tensor,
+    image_id: int,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Splice vision features into a sequence-parallel shard of the stream.
+
+    Sequence parallel shards the embedding's output, not the tokens: under
+    spmd_types the stream is a plain tensor holding this rank's shard while
+    ``tokens`` is the whole sequence, and a placeholder run can cross the
+    shard boundary. So the stream is gathered (a reduce-scatter backward) and
+    spliced on the whole sequence, which is returned whole; the caller cuts
+    this rank's shard back out past the DP-local region, where the checker
+    records the stream's DP shard.
+    """
+    embeddings_full = spmd.redistribute(
+        embeddings_TD.contiguous(),
+        group,
+        src=spmd.S(0),
+        dst=spmd.R,
+        backward_options={"op_dtype": embeddings_TD.dtype},
+    )
+    if embeddings_full.shape[0] != tokens.shape[0]:
+        raise ValueError(
+            f"Sequence parallel splice: the gathered stream has "
+            f"{embeddings_full.shape[0]} rows but the tokens {tokens.shape[0]}; "
+            "the tokens are expected whole and the stream sharded on the tp axis."
+        )
+    return scatter_vision_embeds(
+        embeddings_full,
+        vision_embeds=vision_embeds,
+        vision_positions=get_vision_positions(tokens, num_tokens_per_item, image_id),
+    )
+
+
 class KimiK3Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
@@ -319,10 +364,24 @@ class KimiK3Model(Decoder):
                 for layer in self.layers:
                     if layer.delta_attention is not None:
                         set_kda_context_parallel(layer.delta_attention)
+            enable_sp = (
+                parallelism.tensor_parallel_degree > 1
+                and parallelism.enable_sequence_parallel
+            )
             if parallelism.spmd_backend == "spmd_types":
                 from .sharding import set_kimi_k3_sharding_config
 
-                set_kimi_k3_sharding_config(self)
+                set_kimi_k3_sharding_config(self, enable_sp=enable_sp)
+            if parallelism.tensor_parallel_degree > 1:
+                from .sharding import set_tensor_parallel_sharding_config
+
+                # partial_dtensor reads the tp placements; spmd_types also
+                # takes the stream boundaries the dense path declares.
+                set_tensor_parallel_sharding_config(
+                    self,
+                    enable_sp=enable_sp,
+                    spmd_types=parallelism.spmd_backend == "spmd_types",
+                )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
@@ -366,7 +425,12 @@ class KimiK3Model(Decoder):
             if layer.delta_attention is not None
         }
 
-    def preprocess_inputs(
+    # Set by parallelize_kimi_k3 under sequence parallel on spmd_types: the tp
+    # group whose Shard(0) the stream carries, which the multimodal splice
+    # needs since a placeholder run can cross the shard boundary.
+    _sp_group: dist.ProcessGroup | None = None
+
+    def preprocess_inputs(  # pyrefly: ignore [bad-override]
         self,
         input_dict: dict[str, torch.Tensor],
         *,
@@ -487,6 +551,16 @@ class KimiK3Model(Decoder):
             )
         if special_tokens is None:
             raise ValueError("special_tokens are required for multimodal inputs.")
+        sp_group = self._sp_group
+        if sp_group is not None and not isinstance(embeddings_TD, DTensor):
+            return _splice_under_sequence_parallel(
+                embeddings_TD,
+                tokens,
+                vision_embeds=vision_embeds,
+                num_tokens_per_item=num_tokens_per_item,
+                image_id=special_tokens["image_id"],
+                group=sp_group,
+            )
         vision_positions = get_vision_positions(
             tokens,
             num_tokens_per_item,
@@ -525,6 +599,28 @@ class KimiK3Model(Decoder):
                 )
         else:
             h_TD = tokens
+        if (
+            self._sp_group is not None
+            and self.tok_embeddings is not None
+            and pixel_values is not None
+        ):
+            # The splice returned the whole sequence; this rank's shard is cut
+            # here (an all-gather backward), past the DP-local region.
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                spmd.assert_type(
+                    h_TD, dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+                )
+            h_TD = spmd.redistribute(h_TD, self._sp_group, src=spmd.R, dst=spmd.S(0))
+        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            # The splice leaves a token-aligned stream: the decoder's DP token
+            # sharding resumes past the DP-local region, invariant on TP or,
+            # under sequence parallel, the tp axis' shard of the sequence.
+            spmd.assert_type(
+                h_TD,
+                dense_sequence_parallel_placement()
+                if self._sp_group is not None
+                else dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
+            )
 
         block_residual_TND = h_TD.unsqueeze(1)[:, :0]
         for layer in self.layers.values():
