@@ -526,6 +526,9 @@ def kimi_k3_debugmodel_pp8_vp4() -> Trainer.Config:
     from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
 
     config = kimi_k3_debugmodel()
+    # The pipeline runs on partial_dtensor; the flavor's multimodal inputs have
+    # no spmd_types layout on main yet (the declarations PR adds it).
+    config.parallelism.spmd_backend = "partial_dtensor"
     config.parallelism.pipeline_parallel_degree = 8
     config.parallelism.pipeline_parallel_layers_per_stage = 1
     config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
