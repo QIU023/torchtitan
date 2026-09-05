@@ -645,9 +645,38 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.nn.utils.get_total_norm(
-        grads, norm_type, error_if_nonfinite, foreach
-    )
+    # Group by mesh before the norm: a model with undeclared (inert, hence
+    # replicated) modules under TP holds grads on two meshes -- the declared
+    # parameters on (fsdp, tp), the inert ones on (fsdp,) -- and
+    # get_total_norm's foreach stack refuses to mix them. Disjoint groups
+    # combine exactly ((sum of norm^p)^(1/p); max for inf), the same algebra
+    # the EP path above already uses for its two groups. With one mesh this
+    # is the single get_total_norm call it always was.
+    by_mesh: dict = {}
+    for param in parameters:
+        if param.grad is None:
+            continue
+        g = param.grad
+        key = g.device_mesh if isinstance(g, DTensor) else None
+        by_mesh.setdefault(key, []).append(param)
+    if len(by_mesh) <= 1:
+        total_norm = torch.nn.utils.get_total_norm(
+            grads, norm_type, error_if_nonfinite, foreach
+        )
+    else:
+        group_norms = []
+        for group_params in by_mesh.values():
+            n = torch.nn.utils.get_total_norm(
+                [p.grad for p in group_params], norm_type, error_if_nonfinite, foreach
+            )
+            if isinstance(n, DTensor):
+                n = n.full_tensor()
+            group_norms.append(n)
+        stacked = torch.stack(group_norms)
+        if math.isinf(norm_type):
+            total_norm = stacked.max()
+        else:
+            total_norm = (stacked**norm_type).sum() ** (1.0 / norm_type)
 
     # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
     # We can simply reduce the DTensor to get the total norm in this tensor's process group
@@ -668,7 +697,16 @@ def clip_grad_norm_(
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
             total_norm **= 1.0 / norm_type
 
-    torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    if len(by_mesh) <= 1:
+        torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    else:
+        # Same scale for every group -- the clip is grad * (max_norm /
+        # total_norm) with ONE total_norm -- so applying it group by group is
+        # the identical arithmetic, just never stacking across meshes.
+        for group_params in by_mesh.values():
+            torch.nn.utils.clip_grads_with_norm_(
+                group_params, max_norm, total_norm, foreach
+            )
     return total_norm
 
 
@@ -704,20 +742,15 @@ def _clip_grad_norm_with_ep(
     # - In autoparallel, all params may live on a single sparse mesh with "ep" dimension,
     #   so non_ep_grads would be empty
     # - In PP + EP setups, certain PP ranks may only own EP or non-EP layers
-    ep_grads_total_norm = torch.nn.utils.get_total_norm(
+    ep_grads_total_norm = _total_norm_by_mesh(
         ep_grads, norm_type, error_if_nonfinite, foreach
     )
-    # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
-    if isinstance(ep_grads_total_norm, DTensor):
-        ep_grads_total_norm = ep_grads_total_norm.full_tensor()
-
-    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
+    # Under TP the dense parameters span two meshes, (fsdp, tp) for the
+    # declared modules and (fsdp,) for the undeclared ones; the norm is taken
+    # per mesh and combined, as the two groups here are.
+    non_ep_grads_total_norm = _total_norm_by_mesh(
         non_ep_grads, norm_type, error_if_nonfinite, foreach
     )
-    # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
-    if isinstance(non_ep_grads_total_norm, DTensor):
-        non_ep_grads_total_norm = non_ep_grads_total_norm.full_tensor()
-
     if math.isinf(norm_type):
         total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
     else:
@@ -734,7 +767,53 @@ def _clip_grad_norm_with_ep(
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
             total_norm **= 1.0 / norm_type
 
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
-
+    _clip_grads_by_mesh(ep_params, max_norm, total_norm, foreach)
+    _clip_grads_by_mesh(non_ep_params, max_norm, total_norm, foreach)
     return total_norm
+
+
+def _total_norm_by_mesh(
+    grads: list[torch.Tensor],
+    norm_type: float,
+    error_if_nonfinite: bool,
+    foreach: bool | None,
+) -> torch.Tensor:
+    """``get_total_norm`` over grads that may live on several meshes, as a plain tensor."""
+    by_mesh: dict = {}
+    for g in grads:
+        by_mesh.setdefault(
+            g.device_mesh if isinstance(g, DTensor) else None, []
+        ).append(g)
+    norms = []
+    for group in by_mesh.values():
+        n = torch.nn.utils.get_total_norm(group, norm_type, error_if_nonfinite, foreach)
+        if isinstance(n, DTensor):
+            n = n.full_tensor()
+        norms.append(n)
+    if not norms:
+        # get_total_norm returns tensor(0.) for an empty list
+        return torch.nn.utils.get_total_norm(
+            grads, norm_type, error_if_nonfinite, foreach
+        )
+    if len(norms) == 1:
+        return norms[0]
+    stacked = torch.stack(norms)
+    if math.isinf(norm_type):
+        return stacked.max()
+    return (stacked**norm_type).sum() ** (1.0 / norm_type)
+
+
+def _clip_grads_by_mesh(
+    params: list[torch.Tensor],
+    max_norm: float,
+    total_norm: torch.Tensor,
+    foreach: bool | None,
+) -> None:
+    by_mesh: dict = {}
+    for p in params:
+        g = p.grad
+        by_mesh.setdefault(
+            g.device_mesh if isinstance(g, DTensor) else None, []
+        ).append(p)
+    for group in by_mesh.values():
+        torch.nn.utils.clip_grads_with_norm_(group, max_norm, total_norm, foreach)
