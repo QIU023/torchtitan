@@ -242,20 +242,32 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
             ] = torch.cat((qkv["q"], qkv["k"], qkv["v"]), dim=0)
 
         # The released HF model contain these unused layer-0 attn res parameters.
-        # TT omits them, so synthesize deterministic, placeholders to preserve strict HF state-dict loading.
-        if self.kimi_config.layers[0].attention_res_norm is None:
+        # TT omits them, so synthesize deterministic placeholders to preserve
+        # strict HF state-dict loading -- on the rank that holds layer 0 (a
+        # pipeline stage without it has nothing to place), shaped like layer 1's
+        # when that layer is here and from the config otherwise.
+        layer0_prefix = "language_model.model.layers.0."
+        if self.kimi_config.layers[0].attention_res_norm is None and any(
+            key.startswith(layer0_prefix) for key in hf_state_dict
+        ):
             norm_template_key = (
                 "language_model.model.layers.1.self_attention_res_norm.weight"
             )
             proj_template_key = (
                 "language_model.model.layers.1.self_attention_res_proj.weight"
             )
-            hf_state_dict[
-                "language_model.model.layers.0.self_attention_res_norm.weight"
-            ] = torch.ones_like(hf_state_dict[norm_template_key])
-            hf_state_dict[
-                "language_model.model.layers.0.self_attention_res_proj.weight"
-            ] = torch.zeros_like(hf_state_dict[proj_template_key])
+            if norm_template_key in hf_state_dict and proj_template_key in hf_state_dict:
+                norm = torch.ones_like(hf_state_dict[norm_template_key])
+                proj = torch.zeros_like(hf_state_dict[proj_template_key])
+            else:
+                like = next(
+                    v for k, v in hf_state_dict.items() if k.startswith(layer0_prefix)
+                )
+                dim = self.kimi_config.dim
+                norm = torch.ones(dim, dtype=like.dtype, device=like.device)
+                proj = torch.zeros(1, dim, dtype=like.dtype, device=like.device)
+            hf_state_dict[layer0_prefix + "self_attention_res_norm.weight"] = norm
+            hf_state_dict[layer0_prefix + "self_attention_res_proj.weight"] = proj
 
         if unmapped:
             raise ValueError(
