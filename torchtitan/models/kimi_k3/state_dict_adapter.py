@@ -23,6 +23,11 @@ _UNUSED_HF_LAYER_ZERO_ATTN_RES_KEYS = {
 }
 
 
+# Core's LoRA linear stores its factors as ``<fqn>.lora_a.weight`` /
+# ``<fqn>.lora_b.weight``; the earlier wrapper named them ``lora_a`` / ``lora_b``.
+_LORA_ADAPTER_SUFFIXES = (".lora_a.weight", ".lora_b.weight", ".lora_a", ".lora_b")
+
+
 class KimiK3StateDictAdapter(MoEStateDictAdapter):
     def __init__(
         self,
@@ -149,6 +154,11 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
         unmapped: list[str] = []
 
         for key, value in state_dict.items():
+            if key.endswith(_LORA_ADAPTER_SUFFIXES):
+                # LoRA adapters have no HF form: the HF load leaves them at their
+                # init, and an export folds them into the bases first
+                # (merge_lora_state_dict), so they are the one unmapped class.
+                continue
             if "moe.routed_experts.inner_experts" in key:
                 abstract_key = re.sub(r"(?<=\.)\d+(?=\.)", "{}", key, count=1)
                 layer_num_match = re.search(r"layers\.(\d+)\.", key)
