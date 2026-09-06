@@ -244,35 +244,6 @@ def _attention_residual_math(
     return output_TD.to(values_TND.dtype)
 
 
-def _apply_attention_residual(
-    prefix_sum_TD: torch.Tensor,
-    block_residual_TND: torch.Tensor,
-    projection: Linear,
-    norm: RMSNorm,
-) -> torch.Tensor:
-    """Apply the attention residual with its computation wrapped in checkpointing.
-
-    The residual math upcasts the whole (N+1)-entry block stack to fp32 twice
-    per layer; saving those intermediates would make each layer's activation
-    footprint grow with the stack. Wrapping the computation recomputes them in
-    backward from the stack and the prefix sum -- both alive elsewhere -- so
-    the activations saved per layer are identical to the standard residual
-    architecture.
-    """
-    if torch.is_grad_enabled() and (
-        prefix_sum_TD.requires_grad or block_residual_TND.requires_grad
-    ):
-        return torch.utils.checkpoint.checkpoint(
-            _attention_residual_math,
-            prefix_sum_TD,
-            block_residual_TND,
-            projection,
-            norm,
-            use_reentrant=False,
-        )
-    return _attention_residual_math(prefix_sum_TD, block_residual_TND, projection, norm)
-
-
 class KimiK3TransformerBlock(Module):
     """Hybrid KDA/MLA decoder block with Kimi attention residuals."""
 
