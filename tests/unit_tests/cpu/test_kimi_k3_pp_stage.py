@@ -12,6 +12,7 @@ import torch
 
 from torchtitan.models.kimi_k3.pipeline_stage import (
     assemble_stack,
+    AttnResPipelineStage,
     RankStore,
     route_payload,
     split_stack_grad,
@@ -96,3 +97,18 @@ class TestCarrier(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForwardOnly(unittest.TestCase):
+    def test_eval_backward_routes_nothing_and_forgets_the_chunk(self):
+        """schedule.eval calls backward_one_chunk with has_backward off; the
+        base class returns at once and the routing must too, dropping the
+        forward's bookkeeping instead of reading a gradient it never made."""
+        stage = AttnResPipelineStage.__new__(AttnResPipelineStage)
+        stage._has_backward = False
+        stage.fwd_cache = {0: ((torch.zeros(1),), [])}
+        stage.bwd_cache = {}
+        stage._order = {0: [0, 1]}
+        stage._delta_in = {0: [1]}
+        AttnResPipelineStage.backward_one_chunk(stage, 0)
+        self.assertEqual((stage.fwd_cache, stage._order, stage._delta_in), ({}, {}, {}))
