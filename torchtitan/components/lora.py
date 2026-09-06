@@ -43,10 +43,15 @@ def _lora_adapter_sharding(
     replicated_weight = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.R)},
     )
-    if base_weight_sharding == dense_param_placement(tp=spmd.R):
-        # TP-invariant base (e.g. a compression that is rank-sized, not
-        # head-sized): the adapters replicate with it.
-        return replicated_weight, replicated_weight
+    if base_weight_sharding in (
+        dense_param_placement(tp=spmd.R),
+        dense_param_placement(tp=spmd.I),
+    ):
+        # A base that is not sharded on TP (replicated, or invariant on the
+        # stream the declarations keep invariant without sequence parallel):
+        # the adapters take its placement.
+        same = ShardingConfig(state_shardings={"weight": base_weight_sharding})
+        return same, same
     if base_weight_sharding == dense_param_placement(tp=spmd.S(0)):
         lora_b_sharding = ShardingConfig(
             state_shardings={"weight": base_weight_sharding},
