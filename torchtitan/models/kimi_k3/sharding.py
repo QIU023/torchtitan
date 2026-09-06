@@ -312,6 +312,30 @@ def set_tensor_parallel_sharding_config(
                     )
             layer.moe.routed_up.sharding_config = routed_up_cfg
             layer.moe.routed_norm.sharding_config = routed_norm_cfg
+    # The MTP mirror layer follows the backbone declarations: KDA and the
+    # dense FFN as a backbone layer's, the norms and the projections that
+    # read the whole stream as the backbone's attn-res projections (the
+    # stream stays TP-invariant: sequence parallel is refused with MTP).
+    for mtp_layer in config.mtp_layers:
+        mtp_layer.enorm.sharding_config = norm_config(enable_sp=False)
+        mtp_layer.hnorm.sharding_config = norm_config(enable_sp=False)
+        mtp_layer.eh_proj.sharding_config = _stream_param_config(enable_sp=False)
+        block = mtp_layer.block
+        for name in ("attention_norm", "ffn_norm", "ffn_res_norm"):
+            cfg = getattr(block, name, None)
+            if cfg is not None:
+                cfg.sharding_config = norm_config(enable_sp=False)
+        block.ffn_res_proj.sharding_config = _stream_param_config(enable_sp=False)
+        if block.delta_attention is not None:
+            _set_kda_sharding(
+                block.delta_attention, enable_sp=False, invariant_stream=spmd_types
+            )
+        if block.feed_forward is not None:
+            set_dense_ffn_sharding(
+                block.feed_forward,
+                attn_x_layout=dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
+                enable_sp=False,
+            )
 
 
 def _set_vision_encoder_sharding(ve_cfg, *, enable_sp: bool) -> None:

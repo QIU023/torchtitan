@@ -31,6 +31,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .kda import InnerKDA, KDA, KDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
+from .mtp import KimiK3MTPLayer
 from .parallelize import parallelize_kimi_k3, pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import KimiK3VisionEncoder, KimiK3VisionProjector
@@ -55,6 +56,7 @@ KIMI_K3_SPECIAL_TOKENS = {
 }
 
 
+_RES_PROJ_INIT = {"weight": nn.init.zeros_}
 _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
     "bias": nn.init.zeros_,
@@ -380,6 +382,7 @@ def _kimi_k3_config(
     vision_encoder: KimiK3VisionEncoder.Config,
     attn_backend: str,
     moe_comm_backend: str = "standard",
+    num_mtp_layers: int = 0,
 ) -> KimiK3Model.Config:
     """Assemble a Kimi K3 config from the released topology's free parameters.
 
@@ -445,9 +448,41 @@ def _kimi_k3_config(
             )
         )
 
+    mtp_layers = [
+        KimiK3MTPLayer.Config(
+            enorm=_norm(dim),
+            hnorm=_norm(dim),
+            eh_proj=_linear(2 * dim, dim),
+            # KDA-typed mirror block with layer_id=0: it opens its own empty
+            # block stack, and KDA consumes the depth-shortened sequence
+            # directly (an MLA mirror would need per-depth mask rebuilds).
+            block=KimiK3TransformerBlock.Config(
+                layer_id=0,
+                attn_res_block_size=attn_res_block_size,
+                attention=None,
+                delta_attention=_kda_config(
+                    dim=dim,
+                    num_heads=num_heads,
+                    head_dim=kda_head_dim,
+                    conv_kernel_size=conv_kernel_size,
+                ),
+                feed_forward=_feed_forward_config(dim=dim, hidden_dim=dense_hidden_dim),
+                moe=None,
+                attention_norm=_norm(dim),
+                ffn_norm=_norm(dim),
+                attention_res_norm=None,
+                attention_res_proj=None,
+                ffn_res_norm=_norm(dim),
+                ffn_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
+            ),
+        )
+        for _ in range(num_mtp_layers)
+    ]
+
     return KimiK3Model.Config(
         dim=dim,
         vocab_size=vocab_size,
+        mtp_layers=mtp_layers,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
@@ -472,10 +507,15 @@ def kimi_k3_full_attention_layers(num_layers: int) -> set[int]:
 
 
 def _debugmodel(
-    attn_backend: str, moe_comm_backend: str, *, num_layers: int
+    attn_backend: str,
+    moe_comm_backend: str,
+    *,
+    num_layers: int,
+    num_mtp_layers: int = 0,
 ) -> KimiK3Model.Config:
     dim = 1024
     return _kimi_k3_config(
+        num_mtp_layers=num_mtp_layers,
         dim=dim,
         moe_comm_backend=moe_comm_backend,
         vocab_size=163840,
@@ -563,6 +603,7 @@ def model_registry(
     moe_comm_backend: str = "standard",
     *,
     seq_len: int | None = None,
+    num_mtp_layers: int = 0,
 ) -> ModelSpec:
     # The KDA / MLA layers build their own RoPE, so seq_len is not a builder
     # argument here -- it only reports the context length on the ModelSpec.
@@ -573,7 +614,10 @@ def model_registry(
             f"Requested seq_len {context_len} exceeds max context length "
             f"{max_context_len} for flavor {flavor}"
         )
-    config = get_config(attn_backend=attn_backend, moe_comm_backend=moe_comm_backend)
+    kwargs = {"num_mtp_layers": num_mtp_layers} if num_mtp_layers else {}
+    config = get_config(
+        attn_backend=attn_backend, moe_comm_backend=moe_comm_backend, **kwargs
+    )
     if converters is not None:
         validate_converter_order(converters)
         for converter in converters:

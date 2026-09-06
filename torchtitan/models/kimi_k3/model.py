@@ -52,10 +52,11 @@ from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
     quadratic_attention_flops_per_token,
 )
-from torchtitan.protocols.module import Module
+from torchtitan.protocols.module import Module, ModuleDict
 
 from .kda import KDA
 from .moe import KimiFeedForward, KimiLatentMoE
+from .mtp import KimiK3MTPLayer, put_mtp_logits
 from .vision_encoder import KimiK3VisionEncoder
 
 # Shape suffixes:
@@ -398,6 +399,7 @@ class KimiK3Model(Decoder):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        mtp_layers: list[KimiK3MTPLayer.Config] = field(default_factory=list)
         # Under selective AC, checkpoint only each block's MoE/feed-forward and
         # keep attention and the residual math outside, so their activations
         # are reused in backward: the KDA kernel is a custom op outside the
@@ -425,6 +427,18 @@ class KimiK3Model(Decoder):
             # declarations are issued whenever it drives the model, not only
             # at tp > 1; partial_dtensor reads only their tp placements.
             spmd_types = config.parallelism.spmd_backend == "spmd_types"
+            if self.mtp_layers and (
+                enable_sp or parallelism.context_parallel_degree > 1
+            ):
+                # The depth-shifted slice indexes tokens on the stream, which
+                # sequence and context parallel shard by position.
+                raise ValueError(
+                    "MTP does not yet compose with sequence or context "
+                    "parallelism: the depth-shifted slice indexes tokens on the "
+                    "sequence-sharded stream. Pass "
+                    "--parallelism.no-enable-sequence-parallel with tp>1 and "
+                    "keep context_parallel_degree at 1."
+                )
             if parallelism.context_parallel_degree > 1:
                 from .context_parallel import ContextParallelInnerKDA
 
@@ -477,6 +491,14 @@ class KimiK3Model(Decoder):
                         key_head_dim=delta_attention.head_dim,
                         v_head_dim=delta_attention.head_dim,
                     )
+            for mtp_layer in self.mtp_layers:
+                mirror = mtp_layer.block.delta_attention
+                if isinstance(mirror, KDA.Config):
+                    attention_op_flops += delta_rule_flops_per_token(
+                        num_heads=mirror.num_heads,
+                        key_head_dim=mirror.head_dim,
+                        v_head_dim=mirror.head_dim,
+                    )
             return nparams, 6 * active_nparams + attention_op_flops
 
     def __init__(self, config: Config):
@@ -485,6 +507,13 @@ class KimiK3Model(Decoder):
         self.output_res_proj = config.output_res_proj.build()
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
+        )
+        # Registered last so the backbone and the tower draw the same init
+        # stream as a model without MTP: their step-1 loss stays bitwise.
+        self.mtp_layers = (
+            ModuleDict({str(i): cfg.build() for i, cfg in enumerate(config.mtp_layers)})
+            if config.mtp_layers
+            else None
         )
 
     # Set by parallelize_kimi_k3 under sequence parallel on spmd_types: the tp
@@ -795,7 +824,55 @@ class KimiK3Model(Decoder):
             self.output_res_proj,
             self.output_res_norm,
         )
+        h_pre_norm_TD = h_TD
         h_TD = self.norm(h_TD) if self.norm is not None else h_TD
+        if self.mtp_layers is not None and self.lm_head is not None:
+            if self._skip_lm_head:
+                # Raised rather than skipped: skipping would leave
+                # take_mtp_logits() empty and the run would LOOK like it
+                # trains MTP while it does not. MTP needs full-vocab logits
+                # per depth, which is exactly the allocation chunked loss
+                # exists to avoid; combining them means per-chunk MTP logits,
+                # a change to the loss, not a guard here.
+                raise ValueError(
+                    "MTP and chunked loss cannot be combined yet: use a "
+                    "non-chunked loss for MTP flavors."
+                )
+            put_mtp_logits(self._compute_mtp_logits(tokens, h_pre_norm_TD))
         if self._skip_lm_head:
             return h_TD
         return self.lm_head(h_TD) if self.lm_head is not None else h_TD
+
+    def _compute_mtp_logits(
+        self, tokens: torch.Tensor, h_pre_norm_TD: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Logits for each MTP depth; depth k predicts the token k+1 ahead.
+
+        The depth-k input fuses the backbone's final PRE-norm hidden state
+        (the reference feeds hnorm the unnormalised state; normalising twice
+        is not an identity and breaks parity against official MTP weights)
+        with the embedding of the token k+1 ahead. The last k+1 positions
+        have no target and are dropped rather than padded -- padding would
+        invent supervision. The folded stream has one token axis, hence the
+        [T]-shaped slicing; the multimodal splice is length-preserving here,
+        so shift-by-k stays aligned and the visual positions already carry
+        IGNORE_INDEX in the labels.
+        """
+        if self.tok_embeddings is None:
+            raise RuntimeError(
+                "MTP needs tok_embeddings and lm_head together, and "
+                "tok_embeddings is None -- PP has split them across stages. "
+                "Keep the embedding and the head on one stage for MTP."
+            )
+        assert self.mtp_layers is not None and self.lm_head is not None
+        out = []
+        for k in range(len(self.mtp_layers)):
+            shift = k + 1
+            ahead_T = tokens[shift:]
+            emb_TD = self.tok_embeddings(ahead_T)
+            h_TD = h_pre_norm_TD[: ahead_T.shape[0]]
+            hidden_TD = self.mtp_layers[str(k)](h_TD, emb_TD)
+            if self.norm is not None:
+                hidden_TD = self.norm(hidden_TD)
+            out.append(self.lm_head(hidden_TD))
+        return out
