@@ -354,6 +354,13 @@ class AttnResPipelineStage(PipelineStage):
             full_backward=full_backward,
             last_backward=last_backward,
         )
+        if not self.has_backward:
+            # Forward-only (schedule.eval): the base class ran no backward, so
+            # there is no gradient to route; drop what the forward kept for one.
+            self.fwd_cache.pop(bwd_chunk_id, None)
+            self._order.pop(bwd_chunk_id, None)
+            self._delta_in.pop(bwd_chunk_id, None)
+            return
         if self.is_first:
             return
         layout, store = self._routing()
