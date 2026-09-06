@@ -85,6 +85,20 @@ def set_kimi_k3_sharding_config(
             enable_sp=enable_sp,
             enable_ep=enable_ep,
         )
+    # The MTP mirror layer follows the backbone declarations: its block is a
+    # KDA-typed layer 0, and enorm, hnorm and eh_proj read the whole stream
+    # as the backbone's attn-res weights do (the stream stays TP-invariant:
+    # sequence parallel is refused with MTP).
+    for mtp_layer in config.mtp_layers:
+        mtp_layer.enorm.sharding_config = norm_config(enable_sp=False)
+        mtp_layer.hnorm.sharding_config = norm_config(enable_sp=False)
+        mtp_layer.eh_proj.sharding_config = _stream_weight_config(enable_sp=False)
+        _set_kimi_k3_layer_sharding(
+            mtp_layer.block,  # pyrefly: ignore [bad-argument-type]
+            attn_x_layout=dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
+            enable_sp=False,
+            enable_ep=enable_ep,
+        )
 
 
 def _set_kimi_k3_layer_sharding(
