@@ -39,3 +39,16 @@ def test_layer_0_with_layer_1_follows_the_template():
         }
     )
     assert out[_NORM0].shape == (1024,) and out[_PROJ0].shape == (1, 1024)
+
+
+def test_lora_adapters_are_left_out_of_the_hf_dict():
+    """The HF load hands to_hf the whole model state dict, adapters included."""
+    out = _adapter().to_hf(
+        {
+            "layers.0.feed_forward.w1.weight": torch.ones(4096, 1024),
+            "layers.0.feed_forward.w1.lora_a.weight": torch.ones(8, 1024),
+            "layers.0.feed_forward.w1.lora_b.weight": torch.zeros(4096, 8),
+        }
+    )
+    assert not [k for k in out if "lora" in k]
+    assert any(k.endswith("mlp.gate_proj.weight") or k.endswith("w1.weight") for k in out), sorted(out)
