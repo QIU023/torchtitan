@@ -287,6 +287,15 @@ class AttnResPipelineStage(PipelineStage):
         if not committed:
             return (grad_hidden, grad_delta)
         if grad_delta is None:
+            outputs_meta = self._stage_meta.outputs
+            if outputs_meta is not None and not outputs_meta[1].requires_grad:
+                # Nothing upstream of the payload's blocks is trainable (a
+                # frozen embedding under LoRA feeds block 0's entry residual):
+                # the next stage has no gradient channel for it, and the
+                # deposits for these blocks have nowhere to go.
+                for j in committed:
+                    self._collect_into(None, bwd_chunk_id, out_blocks[j])
+                return (grad_hidden, None)
             raise RuntimeError(
                 f"stage {self.stage_index} micro-batch {bwd_chunk_id}: no gradient "
                 f"arrived for the payload carrying its own blocks "
@@ -297,7 +306,9 @@ class AttnResPipelineStage(PipelineStage):
             self._collect_into(grad_delta[:, j], bwd_chunk_id, out_blocks[j])
         return (grad_hidden, grad_delta)
 
-    def _collect_into(self, grad_col_TD: torch.Tensor, mb: int, b: int) -> None:
+    def _collect_into(self, grad_col_TD: torch.Tensor | None, mb: int, b: int) -> None:
+        """Add the rank's deposits for block ``b`` into its gradient column; a
+        None column discards them (the block needs no gradient)."""
         layout, store = self._routing()
         deposit, count = store.collect(mb, b)
         expected = layout.deposits_expected(b, self.stage_index)
@@ -307,7 +318,7 @@ class AttnResPipelineStage(PipelineStage):
                 f"{count} gradient deposit(s) but {expected} expected; a "
                 "later stage on this rank did not run its backward"
             )
-        if deposit is not None:
+        if deposit is not None and grad_col_TD is not None:
             grad_col_TD.add_(deposit)
 
     def backward_one_chunk(
