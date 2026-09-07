@@ -292,6 +292,7 @@ class KimiK3TransformerBlock(Module):
         positions: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
         kda_cp_routing: "ContextParallelRouting | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.first_layer_in_block:
@@ -324,6 +325,7 @@ class KimiK3TransformerBlock(Module):
                 h_TD,
                 layer_mask,
                 positions,
+                cu_seqlens=cu_seqlens,
                 routing=kda_cp_routing,
             )
         prefix_sum_TD = h_TD if self.first_layer_in_block else x_TD + h_TD
@@ -632,6 +634,7 @@ class KimiK3Model(Decoder):
         padding_mask: torch.Tensor | None = None,
         kda_cp_routing: "ContextParallelRouting | None" = None,
         vision_bank_indices_T: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
@@ -674,6 +677,7 @@ class KimiK3Model(Decoder):
                 attention_masks,
                 positions,
                 padding_mask=padding_mask,
+                cu_seqlens=cu_seqlens,
                 kda_cp_routing=kda_cp_routing,
             )
 
