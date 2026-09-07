@@ -274,6 +274,7 @@ class KimiK3TransformerBlock(Module):
         block_residual_TND: torch.Tensor,
         attention_masks: KimiK3AttentionMaskDict | None = None,
         positions: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.first_layer_in_block:
             block_residual_TND = torch.cat(
@@ -302,7 +303,9 @@ class KimiK3TransformerBlock(Module):
             h_TD = self.attention(h_TD, layer_mask, positions)
         else:
             assert self.delta_attention is not None
-            h_TD = self.delta_attention(h_TD, layer_mask, positions)
+            h_TD = self.delta_attention(
+                h_TD, layer_mask, positions, cu_seqlens=cu_seqlens
+            )
         prefix_sum_TD = h_TD if self.first_layer_in_block else x_TD + h_TD
 
         h_TD = _apply_attention_residual(
@@ -541,6 +544,7 @@ class KimiK3Model(Decoder):
         special_tokens: dict[str, int] | None = None,
         positions: torch.Tensor | None = None,
         attention_masks: KimiK3AttentionMaskDict | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
@@ -573,6 +577,7 @@ class KimiK3Model(Decoder):
                 block_residual_TND,
                 attention_masks,
                 positions,
+                cu_seqlens=cu_seqlens,
             )
 
         # The aggregation belongs to the head-owning stage; every other stage

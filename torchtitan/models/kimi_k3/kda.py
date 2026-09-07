@@ -30,6 +30,29 @@ from torchtitan.protocols.module import Module
 # W = convolution kernel width.
 
 
+def cu_seqlens_from_positions(
+    positions: torch.Tensor | None, num_tokens: int
+) -> torch.Tensor | None:
+    """Packed-stream offsets ``[0, ..., T]`` from the positions of a folded
+    ``[T]`` stream: a document starts wherever the position restarts at 0.
+    ``None`` when there are no positions or no interior restart. A helper for
+    callers that pack documents (verl's engine); the model never derives
+    boundaries on its own, since a padded single sample restarts too."""
+    if positions is None:
+        return None
+    if positions.ndim == 2 and positions.shape[0] == 1:
+        positions = positions[0]
+    if positions.ndim != 1 or positions.shape[0] != num_tokens:
+        return None
+    starts = torch.nonzero(positions == 0).flatten()
+    if starts.numel() == 0 or starts[0].item() != 0:
+        starts = torch.cat((starts.new_zeros(1), starts))
+    if starts.numel() == 1:
+        return None
+    ends = starts.new_full((1,), num_tokens)
+    return torch.cat((starts, ends)).to(torch.int32)
+
+
 class KimiRMSNormGated(Module):
     """Per-head RMSNorm followed by a sigmoid output gate."""
 
@@ -246,6 +269,7 @@ class KDA(Module):
         x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del positions
         if x_TD.ndim != 2:
@@ -253,15 +277,18 @@ class KDA(Module):
                 f"KDA input must have shape [T, D], got {tuple(x_TD.shape)}."
             )
 
-        if attention_masks is None:
-            cu_seqlens = None
-        elif isinstance(attention_masks, VarlenMetadata):
+        if isinstance(attention_masks, VarlenMetadata):
             cu_seqlens = attention_masks.cu_seq_q
-        else:
+        elif attention_masks is not None:
             raise ValueError(
                 "KDA attention_masks must be VarlenMetadata or None, "
                 f"got {type(attention_masks).__name__}."
             )
+        # Otherwise ``cu_seqlens`` is the caller's: a packed stream under flex
+        # attention (verl's rmpad micro-batches) hands the document offsets in
+        # explicitly, so the recurrent state and the short convolution reset
+        # at every document; an unpacked run passes nothing and keeps the
+        # single-sequence kernels.
         raw_gate_THK = local_head_split(
             self.forget_b(self.forget_a(x_TD)), self.head_dim
         )
