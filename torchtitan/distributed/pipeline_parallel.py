@@ -384,7 +384,7 @@ def pipeline_llm(
     parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
     stage_args_factory: Callable[[int, int], tuple[Any, Any]] | None = None,
-    stage_class: type[PipelineStage] = PipelineStage,
+    stage_class: type[PipelineStage] | None = None,
 ) -> PipelineResult:
     """Build a pipeline for a decoder model.
 
@@ -920,7 +920,7 @@ def _pipeline_module_split(
     module_names_per_stage: list[list[str]],
     get_mesh: Callable | None = None,
     static_stage_args: Callable[[int, int], tuple[Any, Any]] | None = None,
-    stage_class: type[PipelineStage] = PipelineStage,
+    stage_class: type[PipelineStage] | None = None,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """Create pipeline stages based on specified module names for each stage.
 
@@ -965,6 +965,8 @@ def _pipeline_module_split(
     pp_rank_to_stage_indices = _get_pp_rank_to_stage_indices_mapping(
         pp_rank, pp_degree, pp_schedule, num_stages
     )
+    if stage_class is None:
+        stage_class = PipelineStage  # resolved here so a patched module attribute is honoured
     for stage_idx in pp_rank_to_stage_indices:
         module_names = module_names_per_stage[stage_idx]
         model_chunk = _split_module(whole_model, module_names)

@@ -36,7 +36,11 @@ from torchtitan.models.kimi_k3.layout import (
     gather_layer_to_stage,
     infer_block_layout_tables_from_stages,
 )
-from torchtitan.models.kimi_k3.pipeline_stage import AttnResPipelineStage, RankStore
+from torchtitan.models.kimi_k3.pipeline_stage import (
+    AttnResPipelineRuntime,
+    AttnResPipelineStage,
+    RankStore,
+)
 from torchtitan.tools.logging import logger
 
 from .model import KimiK3Model
@@ -243,9 +247,8 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
                 module_fqns_per_model_part=fqns,
                 pipeline_parallel_layers_per_stage=None,
             )
-    pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
-        model, stage_class=AttnResPipelineStage, **kwargs
-    )
+    result = pipeline_llm(model, stage_class=AttnResPipelineStage, **kwargs)
+    pp_schedule = result.schedule
 
     stages = _schedule_stages(pp_schedule)
     model_config = kwargs["model_config"]
@@ -275,4 +278,5 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
         [s.stage_index for s in stages],
         "delta with rank store" if attn_res_cache else "whole stack every hop",
     )
-    return pp_schedule, model_parts, has_first_stage, has_last_stage
+    # The store's lifecycle on the trainer's runtime hooks (micro-batch index, drained-store check).
+    return dataclasses.replace(result, runtime=AttnResPipelineRuntime(stages, store))

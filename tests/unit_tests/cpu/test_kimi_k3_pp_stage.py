@@ -77,3 +77,34 @@ class TestCarrier(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAttnResPipelineRuntime:
+    """The store's lifecycle on the trainer's runtime hooks."""
+
+    def test_microbatch_index_rides_the_kwargs_and_resets_each_step(self):
+        from torchtitan.models.kimi_k3.pipeline_stage import AttnResPipelineRuntime, RankStore
+
+        rt = AttnResPipelineRuntime([], RankStore())
+        assert [rt.prepare_microbatch(None, {})["pp_microbatch_index"] for _ in range(3)] == [0, 1, 2]
+        assert rt.prepare_microbatch(None, {"k": 1}) == {"k": 1, "pp_microbatch_index": 3}
+        rt.finalize_gradients()
+        assert rt.prepare_microbatch(None, {})["pp_microbatch_index"] == 0
+
+    def test_step_end_raises_on_a_block_or_deposit_left_behind(self):
+        import pytest
+        import torch
+
+        from torchtitan.models.kimi_k3.pipeline_stage import AttnResPipelineRuntime, RankStore
+
+        store = RankStore(); rt = AttnResPipelineRuntime([], store)
+        rt.finalize_gradients()  # empty store: fine
+        store.put(0, 1, torch.zeros(2, 2))
+        with pytest.raises(RuntimeError, match="micro-batches \\[0\\]"):
+            rt.finalize_gradients()
+        store.release(0)
+        store.deposit(1, 2, torch.ones(2, 2))
+        with pytest.raises(RuntimeError, match="deposits not collected"):
+            rt.finalize_gradients()
+        store.collect(1, 2)
+        rt.finalize_gradients()

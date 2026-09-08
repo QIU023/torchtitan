@@ -49,6 +49,8 @@ import torch
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining._utils import flatten_args
 
+from torchtitan.distributed.pipeline_parallel import PipelineRuntime
+
 from torchtitan.models.kimi_k3.layout import BlockLayoutTables
 
 
@@ -247,7 +249,13 @@ class AttnResPipelineStage(PipelineStage):
             stack_TND = self._assemble(fwd_chunk_id, hidden_TD, delta_TND)
             composite_args = (hidden_TD, stack_TND)
             order_in = self._order[fwd_chunk_id]
-        composite_kwargs = kwargs or {}
+        composite_kwargs = dict(kwargs or {})
+        # The runtime tags every micro-batch's kwargs with a running index. It
+        # is advisory: the trainer's metadata-inference pass prepares
+        # micro-batches too and nothing marks a step boundary, so the runtime
+        # cannot count in lockstep with the schedule; the schedule's chunk id
+        # stays the store's key.
+        composite_kwargs.pop("pp_microbatch_index", None)
 
         output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
 
@@ -362,6 +370,7 @@ class AttnResPipelineStage(PipelineStage):
     ):
         """Run the module on the placeholders the way ``forward_one_chunk``
         would, so the recorded output metadata is the payload's."""
+        kwargs.pop("pp_microbatch_index", None)  # the runtime's tag is the stage's, not the model's
         layout, _ = self._routing()
         if self.is_first:
             output = module(*args, **kwargs)
@@ -393,3 +402,37 @@ class AttnResPipelineStage(PipelineStage):
         return tuple(
             g.contiguous() if isinstance(g, torch.Tensor) else g for g in grads
         )
+
+
+class AttnResPipelineRuntime(PipelineRuntime):
+    """The block store's lifecycle on the trainer's runtime hooks.
+
+    ``prepare_microbatch`` tags each micro-batch's kwargs with a running index
+    (advisory: the hook carries no micro-batch index and no step boundary, and
+    the trainer's metadata-inference pass calls it too, so the count drifts
+    from the schedule's chunk id, which stays the store's key);
+    ``finalize_gradients`` runs after every backward of the step and checks the
+    store drained: every block released, every deposit collected. A block or a
+    deposit left behind is a routing error that would otherwise train silently.
+    """
+
+    def __init__(self, stages: list[AttnResPipelineStage], store: RankStore) -> None:
+        self._stages = stages
+        self._store = store
+        self._next_mb = 0
+
+    def prepare_microbatch(self, inputs: torch.Tensor, kwargs: dict[str, Any]) -> dict[str, Any]:
+        tagged = dict(kwargs)
+        tagged["pp_microbatch_index"] = self._next_mb
+        self._next_mb += 1
+        return tagged
+
+    def finalize_gradients(self) -> None:
+        self._next_mb = 0
+        left_blocks = sorted(self._store._blocks)
+        left_deposits = sorted(self._store._deposits)
+        if left_blocks or left_deposits:
+            raise RuntimeError(
+                "AttnRes rank store not drained at step end: blocks kept for "
+                f"micro-batches {left_blocks}, deposits not collected {left_deposits}"
+            )
