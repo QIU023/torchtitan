@@ -105,15 +105,20 @@ def _set_inner_kda_sharding(inner_kda: Module.Config) -> None:
 
 
 def set_kimi_k3_sharding_config(
-    config: "KimiK3Model.Config", *, enable_sp: bool = False
+    config: "KimiK3Model.Config",
+    *,
+    enable_sp: bool = False,
+    declare_vision_encoder: bool = True,
 ) -> None:
     """Install the local kernel boundaries used by Kimi K3 CP.
 
     ``enable_sp`` is sequence parallel on the tp axis: the MoE internals then
     take and return the sequence shard (``set_tensor_parallel_sharding_config``
-    declares the stream around them).
+    declares the stream around them). Under partial_dtensor the tower stays
+    undeclared (``declare_vision_encoder=False``): MoonViT's position lookup
+    indexes its table with a plain tensor, which a DTensor table refuses.
     """
-    if config.vision_encoder is not None:
+    if config.vision_encoder is not None and declare_vision_encoder:
         _set_vision_encoder_sharding(config.vision_encoder)
     for layer in config.layers:
         if layer.attention is not None:

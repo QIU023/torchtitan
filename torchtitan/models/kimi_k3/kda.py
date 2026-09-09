@@ -16,7 +16,11 @@ from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
 from attn_gym.linear.short_conv import causal_conv1d
 from torch import nn
 
-from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    local_head_split,
+    VarlenMetadata,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv1d
 from torchtitan.protocols.module import Module
@@ -360,11 +364,12 @@ class KDA(Module):
                 "KDA attention_masks must be VarlenMetadata or None, "
                 f"got {type(attention_masks).__name__}."
             )
-        num_tokens = x_TD.shape[0]
-        raw_gate_THK = self.forget_b(self.forget_a(x_TD)).reshape(
-            num_tokens, self.num_heads, self.head_dim
+        # The projections hand back the TP-local head slice; the head split
+        # runs as core's local_head_split, typed head-sharded on TP.
+        raw_gate_THK = local_head_split(
+            self.forget_b(self.forget_a(x_TD)), self.head_dim
         )
-        raw_beta_TH = self.beta(x_TD).reshape(num_tokens, self.num_heads)
+        raw_beta_TH = self.beta(x_TD)
         out_THV = self.inner_kda(
             self.q_proj(x_TD),
             self.k_proj(x_TD),
@@ -380,5 +385,5 @@ class KDA(Module):
             routing=routing,
         )
 
-        output_gate_THV = self.output_gate(x_TD).view_as(out_THV)
+        output_gate_THV = local_head_split(self.output_gate(x_TD), self.head_dim)
         return self.output_proj(self.output_norm(out_THV, output_gate_THV).flatten(-2))
