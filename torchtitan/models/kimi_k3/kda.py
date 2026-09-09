@@ -87,10 +87,12 @@ class KDAKernel(Module):
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
         capability = torch.cuda.get_device_capability(q_1THK.device)
-        if capability not in {(10, 0), (10, 3)}:
+        if capability < (8, 0):
+            # Attention Gym's default fused KDA path is Triton and needs
+            # capability 8.0; its SM100 CuTe backend is opt-in.
             raise RuntimeError(
-                "Attention Gym KDA requires Blackwell SM100/SM103; "
-                f"got CUDA capability {capability}."
+                "Attention Gym KDA requires CUDA capability 8.0 or newer; "
+                f"got {capability}."
             )
 
         gate_1THK = bound_gate(
