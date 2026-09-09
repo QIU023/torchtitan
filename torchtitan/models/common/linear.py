@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.protocols.module import Module
 
@@ -110,7 +110,26 @@ class RouterGateLinear(Linear):
         pass
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        output_TE = _RouterGateLinearFunction.apply(input, self.weight)
+        weight = self.weight
+        if isinstance(weight, DTensor) or isinstance(input, DTensor):
+            # aten.mm.dtype has no DTensor sharding strategy. The gate is
+            # replicated on tp and its scores stay Replicate, so run it on the
+            # local shards and wrap the fp32 output with the input's placements.
+            mesh = (
+                input.device_mesh if isinstance(input, DTensor) else weight.device_mesh
+            )
+            placements = (
+                input.placements
+                if isinstance(input, DTensor)
+                else tuple(Replicate() for _ in range(mesh.ndim))
+            )
+            x = input.to_local() if isinstance(input, DTensor) else input
+            w = weight.to_local() if isinstance(weight, DTensor) else weight
+            output_TE = DTensor.from_local(
+                _RouterGateLinearFunction.apply(x, w), mesh, placements
+            )
+        else:
+            output_TE = _RouterGateLinearFunction.apply(input, weight)
         if self.bias is not None:
             output_TE = output_TE + self.bias.float()
         return output_TE
