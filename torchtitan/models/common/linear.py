@@ -115,9 +115,9 @@ class RouterGateLinear(Linear):
             # aten.mm.dtype has no DTensor sharding strategy. The gate is
             # replicated on tp and its scores stay Replicate, so run it on the
             # local shards and wrap the fp32 output with the input's placements.
-            mesh = (
-                input.device_mesh if isinstance(input, DTensor) else weight.device_mesh
-            )
+            distributed = input if isinstance(input, DTensor) else weight
+            assert isinstance(distributed, DTensor)
+            mesh = distributed.device_mesh
             placements = (
                 input.placements
                 if isinstance(input, DTensor)
