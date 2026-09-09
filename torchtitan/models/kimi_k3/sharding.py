@@ -222,8 +222,8 @@ def _set_kda_sharding(
     ``dt_bias``, the depthwise convolutions) shards with the heads, and the
     kernel runs on the local heads behind the ``local_map`` on ``inner_kda``
     that ``_set_inner_kda_sharding`` installs; this redeclares it with the head
-    axis sharded on tp. The
-    one low-rank compression, ``forget_a``, is rank-sized and stays whole.
+    axis sharded on tp. The one low-rank compression, ``forget_a``, is
+    rank-sized and stays whole.
     """
     for name in ("q_proj", "k_proj", "v_proj", "forget_b", "beta", "output_gate"):
         getattr(delta_attention_cfg, name).sharding_config = colwise_config()
@@ -310,9 +310,8 @@ def set_tensor_parallel_sharding_config(
     if spmd_types and config.vision_encoder is not None:
         # Under spmd_types every parameter needs a layout, and at tp > 1 the
         # tower runs whole on every rank: invariant linears, the attention
-        # rank-local over cp. (4500's projector declaration is colwise /
-        # rowwise; at tp > 1 its rowwise exit is Partial and, with sequence
-        # parallel off, nothing between the tower and the splice reduces it.)
+        # rank-local over cp. The core colwise / rowwise projector declaration
+        # would leave a Partial exit that nothing reduces with SP off.
         _set_vision_encoder_tp_invariant_sharding(
             config.vision_encoder, enable_sp=enable_sp
         )
@@ -357,14 +356,11 @@ def set_tensor_parallel_sharding_config(
             routed_up_cfg = _stream_param_config(enable_sp=enable_sp)
             routed_norm_cfg = norm_config(enable_sp=enable_sp)
             if spmd_types and not enable_sp:
-                # The experts hand the norm their rowwise output, Partial on
-                # TP, and nothing between reduces it under spmd_types
-                # (partial_dtensor's DTensor did so implicitly): the norm's
-                # boundary reduces, keyed "x", the argument nn.RMSNorm.forward
-                # takes. routed_up re-enters the Partial domain so its sum
-                # with the shared experts' Partial output types and core's MoE
-                # exit reduces once for both; that exit then returns to the
-                # invariant stream.
+                # The experts' rowwise output is Partial on TP: the norm's
+                # boundary ("x", nn.RMSNorm.forward's argument) reduces it,
+                # routed_up re-enters Partial so core's MoE exit reduces it
+                # with the shared experts' output, and that exit returns to
+                # the invariant stream.
                 routed_norm_cfg.in_src_shardings = {
                     "x": dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
                 }
