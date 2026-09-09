@@ -294,6 +294,7 @@ def set_tensor_parallel_sharding_config(
     *,
     enable_sp: bool = False,
     spmd_types: bool = False,
+    enable_ep: bool = False,
 ) -> None:
     """Declare the sharding tensor parallel acts on.
 
@@ -349,10 +350,15 @@ def set_tensor_parallel_sharding_config(
                 layer.feed_forward, attn_x_layout=attn_x_layout, enable_sp=enable_sp
             )
         if layer.moe is not None:
-            # routed_down feeds the TP-sharded experts (partial gradients:
-            # replicated); routed_up feeds the stream from the reduced norm
-            # output, so it follows the stream's rule.
-            layer.moe.routed_down.sharding_config = _tp_replicate_config()
+            # routed_down feeds the experts. Without EP they are TP-sharded and
+            # hand back partial input gradients (replicated weight); with EP
+            # they are whole on every tp rank, so it follows the stream's rule,
+            # as routed_up does from the reduced norm output.
+            layer.moe.routed_down.sharding_config = (
+                _stream_param_config(enable_sp=enable_sp)
+                if enable_ep
+                else _tp_replicate_config()
+            )
             routed_up_cfg = _stream_param_config(enable_sp=enable_sp)
             routed_norm_cfg = norm_config(enable_sp=enable_sp)
             if spmd_types and not enable_sp:
