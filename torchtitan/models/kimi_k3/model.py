@@ -16,7 +16,10 @@ from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed.parallel_dims import MeshAxisName, ParallelDims
-from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.distributed.spmd_types import (
+    annotate_input_spmd_types,
+    current_spmd_mesh,
+)
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
 from torchtitan.models.common import Linear
@@ -32,6 +35,7 @@ from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_sequence_parallel_placement,
 )
+from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     multimodal_context,
@@ -166,6 +170,7 @@ class KimiMLAAttention(BaseAttention):
                     k_THK, spmd.V, spmd.PartitionSpec(("dp", "cp"), "tp", None)
                 )
 
+        # Under CP the inner attention is a kernel that owns its exchange.
         out_THV = self.inner_attention(
             q_THK,
             k_THK,
@@ -366,9 +371,10 @@ class KimiK3Model(Decoder):
             # and KDA recurrent states at document boundaries.
             if isinstance(dataset, MMSamplePackingConfig):
                 raise ValueError("Kimi K3 does not yet support sample packing.")
+            parallelism = config.parallelism
             enable_sp = (
-                config.parallelism.tensor_parallel_degree > 1
-                and config.parallelism.enable_sequence_parallel
+                parallelism.tensor_parallel_degree > 1
+                and parallelism.enable_sequence_parallel
             )
             set_kimi_k3_sharding_config(
                 self,
@@ -376,12 +382,29 @@ class KimiK3Model(Decoder):
                 enable_sp=enable_sp,
             )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
-            parallelism = config.parallelism
-            if parallelism.tensor_parallel_degree > 1:
+            spmd_types = parallelism.spmd_backend == "spmd_types"
+            if parallelism.context_parallel_degree > 1:
+                from .context_parallel import ContextParallelInnerKDA
+
+                # The MLA kernels are validated upstream (validate_context_parallel);
+                # the KDA layers are not attention configs, so their kernel is
+                # checked here. Both are installed by the recipe's transforms.
+                for layer in self.layers:
+                    kda = layer.delta_attention
+                    if kda is not None and not isinstance(
+                        kda.inner_kda, ContextParallelInnerKDA.Config
+                    ):
+                        raise ValueError(
+                            "Kimi K3 context parallel needs the KCP kernel on every "
+                            "KDA layer; apply torchtitan_recipes.kimi_k3."
+                            "KimiK3DeltaContextParallelTransform."
+                        )
+            if parallelism.tensor_parallel_degree > 1 or spmd_types:
                 from .sharding import set_tensor_parallel_sharding_config
 
                 # partial_dtensor reads the tp placements; spmd_types also
-                # takes the stream boundaries the dense path declares.
+                # takes the stream boundaries the dense path declares, at
+                # tp = 1 as well (context parallel runs there).
                 set_tensor_parallel_sharding_config(
                     self,
                     enable_sp=enable_sp,
@@ -442,10 +465,10 @@ class KimiK3Model(Decoder):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build masks and annotate K3 multimodal inputs."""
         batch: dict[str, Any] = dict(input_dict)
+        inner = self.config.first_full_attention_backend
         positions = batch.get("positions")
         padding_mask = batch.pop("padding_mask", None)
         if positions is not None:
-            inner = self.config.first_full_attention_backend
             if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
                 batch["attention_masks"] = self.get_attention_masks(
                     positions=positions,
@@ -454,19 +477,28 @@ class KimiK3Model(Decoder):
                     max_context_length=max_context_length,
                 )
 
-        multimodal_layout = SpmdType({MeshAxisName.DP: spmd.V})
-        input_sharding = decoder_input_sharding()
-        input_sharding.update(
-            {
-                name: multimodal_layout
-                for name in (
-                    "pixel_values",
-                    "pixel_values_videos",
-                    "grid_thw",
-                    "grid_thw_videos",
-                )
-            }
-        )
+        # pixel_values and grid_thw are DP-local and TP-invariant, the layout
+        # every VLM decoder shares; the vision encoder runs per rank.
+        input_sharding = {
+            **decoder_input_sharding(),
+            **multimodal_input_sharding(include_cp_axis=True),
+        }
+        if parallel_dims.cp_enabled:
+            # Imported here: context_parallel.api imports models.common, which
+            # imports the decoder this module extends.
+            from torchtitan.distributed.context_parallel.api import (
+                prepare_context_parallel_input,
+            )
+
+            batch = prepare_context_parallel_input(
+                batch,
+                input_sharding,
+                parallel_dims.get_mesh("cp"),
+                parallelism.context_parallel_load_balancer,
+                parallelism.context_parallel_ptrr_mask_key,
+                # The kernel declares whether it needs a local or global mask.
+                shard_attention_mask=getattr(inner, "shard_attention_mask", True),
+            )
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 
@@ -514,6 +546,47 @@ class KimiK3Model(Decoder):
                 image_id=special_tokens["image_id"],
                 group=sp_group,
             )
+        cp_group = self._context_parallel_group()
+        if cp_group is not None:
+            # This rank holds a sequence shard but encoded every image: take the
+            # feature slice its placeholders correspond to and scatter that.
+            # get_vision_positions needs whole visual items, which a shard does
+            # not have -- it raises "found N contiguous run(s) ... but received M
+            # visual item(s)" as soon as a shard splits or omits an item.
+            local_mask = tokens == special_tokens["image_id"]
+            counts = self._exchange_sentinel_counts(
+                int(local_mask.sum().item()), vision_embeds, cp_group
+            )
+            mine = self._select_cp_shard(vision_embeds, counts, cp_group).to(
+                embeddings_TD.dtype
+            )
+            # Rows this rank did not consume still have to reach the graph, or
+            # the tower's reduce-scatter is issued by a subset of the group.
+            unused = vision_embeds.sum().to(embeddings_TD.dtype)
+            mask_T1 = local_mask.unsqueeze(-1)
+            if isinstance(embeddings_TD, DTensor):
+                # Under TP the embedding output is a DTensor whose cp axis is
+                # already Shard(0): the local rows are this rank's shard, the
+                # same rows the tower slice and the mask describe, so wrap them
+                # with the stream's own placements. A shard on the tp axis is
+                # sequence parallel, where the splice would need the whole
+                # sequence.
+                mesh = embeddings_TD.device_mesh
+                placements = embeddings_TD.placements
+                names = mesh.mesh_dim_names or ()
+                if "tp" in names and placements[names.index("tp")].is_shard():
+                    raise NotImplementedError(
+                        "Kimi K3 context parallel with sequence parallel is not "
+                        "supported: the vision splice needs the whole sequence."
+                    )
+                # masked_scatter has no DTensor sharding strategy: run it on
+                # the local shard and re-wrap with the same placements.
+                local_TD = embeddings_TD.to_local(grad_placements=placements)
+                local_TD = local_TD.masked_scatter(mask_T1, mine) + unused * 0.0
+                return DTensor.from_local(local_TD, mesh, placements)
+            embeddings_TD = embeddings_TD.masked_scatter(mask_T1, mine)
+            return embeddings_TD + unused * 0.0
+
         vision_positions = get_vision_positions(
             tokens,
             num_tokens_per_item,
@@ -552,6 +625,62 @@ class KimiK3Model(Decoder):
         if sp_placements is not None and isinstance(spliced_TD, DTensor):
             spliced_TD = spliced_TD.redistribute(placements=sp_placements)
         return spliced_TD
+
+    @staticmethod
+    def _context_parallel_group() -> dist.ProcessGroup | None:
+        """The CP group of the active SPMD mesh, found the way the CP kernels
+        find theirs; None when no multi-rank cp axis is active."""
+        mesh = current_spmd_mesh()
+        if mesh is None or "cp" not in (mesh.mesh_dim_names or ()):
+            return None
+        group = mesh.get_group("cp")
+        return group if group.size() > 1 else None
+
+    def _exchange_sentinel_counts(
+        self, local: int, vision_embeds: torch.Tensor, group: dist.ProcessGroup
+    ) -> torch.Tensor:
+        """Per-rank vision-placeholder counts across the CP group.
+
+        Called whenever CP is on, including on ranks holding no placeholders:
+        the collective's participants are decided by the mesh, never by the data.
+        """
+        counts = torch.zeros(
+            dist.get_world_size(group), dtype=torch.long, device=vision_embeds.device
+        )
+        counts[dist.get_rank(group)] = local
+        dist.all_reduce(counts, group=group)
+        return counts
+
+    def _select_cp_shard(
+        self,
+        vision_embeds: torch.Tensor,
+        counts: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor:
+        """Keep only the visual features belonging to this CP rank's shard.
+
+        ``prepare_context_parallel_input`` shards inputs, labels and positions
+        along the sequence but leaves ``pixel_values`` whole, so every rank
+        encodes every image while holding only a slice of the placeholders. The
+        features are ordered by sequence position and the shards are contiguous
+        and equal -- the config rejects a load balancer under CP precisely
+        because a permuting one would break that -- so this rank's slice starts
+        after however many placeholders the lower ranks hold.
+
+        This is correctness, not an optimization: the encoder still runs
+        redundantly on every CP rank.
+        """
+        num_rows = vision_embeds.shape[0]
+        if int(counts.sum().item()) != num_rows:
+            raise ValueError(
+                f"CP ranks hold {int(counts.sum().item())} vision "
+                f"placeholder(s) in total but {num_rows} visual token(s) were "
+                "encoded; the sequence shard and the image batch disagree"
+            )
+        rank = dist.get_rank(group)
+        start = int(counts[:rank].sum().item())
+        local = int(counts[rank].item())
+        return vision_embeds[start : start + local]
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
