@@ -55,6 +55,8 @@ def _set_inner_kda_sharding(inner_kda: Module.Config) -> None:
         {DP: spmd.V}, partition_spec=spmd.PartitionSpec(DP, None, None)
     )
     parameter = SpmdType({DP: spmd.R})
+    # The packed stream's document offsets: per rank, no partition spec.
+    offsets = SpmdType({DP: spmd.V})
 
     inner_kda.sharding_config = ShardingConfig(
         in_src_shardings={
@@ -68,6 +70,7 @@ def _set_inner_kda_sharding(inner_kda: Module.Config) -> None:
             "conv_v_weight_C1W": parameter,
             "A_log_H": parameter,
             "dt_bias_HK": parameter,
+            "cu_seqlens": offsets,
         },
         in_dst_shardings={
             "query_TC": token_channels,
@@ -80,6 +83,7 @@ def _set_inner_kda_sharding(inner_kda: Module.Config) -> None:
             "conv_v_weight_C1W": parameter,
             "A_log_H": parameter,
             "dt_bias_HK": parameter,
+            "cu_seqlens": offsets,
         },
         out_src_shardings=token_heads,
         out_dst_shardings=token_heads,
@@ -95,6 +99,7 @@ def _set_inner_kda_sharding(inner_kda: Module.Config) -> None:
                 parameter,
                 parameter,
                 parameter,
+                offsets,
             ),
         ),
     )
@@ -278,6 +283,9 @@ def _set_kda_sharding(
         "conv_v_weight_C1W": head_param,
         "A_log_H": head_param,
         "dt_bias_HK": head_param,
+        # The packed stream's document offsets: per rank on dp and cp, the
+        # same on every tp rank.
+        "cu_seqlens": SpmdType({DP: spmd.V, CP: spmd.V, TP: spmd.I}),
     }
     delta_attention_cfg.inner_kda.sharding_config = ShardingConfig(
         in_src_shardings=inputs,
