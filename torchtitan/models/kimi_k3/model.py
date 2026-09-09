@@ -382,6 +382,7 @@ class KimiK3Model(Decoder):
                     self,
                     enable_sp=enable_sp,
                     spmd_types=parallelism.spmd_backend == "spmd_types",
+                    enable_ep=parallelism.expert_parallel_degree > 1,
                 )
 
         def get_nparams_and_flops(
