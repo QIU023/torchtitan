@@ -515,3 +515,16 @@ def llama3_debugmodel_seed_checkpoint() -> Trainer.Config:
     config.checkpoint.create_seed_checkpoint = True
     config.training.disable_cuda_graphs = True
     return config
+
+
+def kimi_k3_debugmodel_pp8_vp4() -> Trainer.Config:
+    # 35 units (33 layers, the embedding and the head) over 32 stages, so the
+    # split is uneven and the last stage holds the head alone.
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+
+    config = kimi_k3_debugmodel()
+    config.parallelism.pipeline_parallel_degree = 8
+    config.parallelism.pipeline_parallel_layers_per_stage = 1
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+    config.parallelism.num_pp_microbatches = 8
+    return config
