@@ -54,12 +54,11 @@ def parallelize_kimi_k3(
     dump_folder: str,
     skip_dp: bool = False,
 ) -> nn.Module:
-    """Apply FSDP2 to the Kimi K3 decoder and vision encoder."""
+    """Apply FSDP2 and context parallelism to the Kimi K3 decoder and vision encoder."""
 
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            ("context parallel", parallel_dims.cp_enabled),
         )
         if enabled
     ]
