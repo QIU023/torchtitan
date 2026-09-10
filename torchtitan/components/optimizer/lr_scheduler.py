@@ -196,10 +196,12 @@ class LRSchedulersContainer(Stateful, Configurable):
     schedulers: list[LRScheduler]
 
     def __init__(self, optimizers: OptimizersContainer, lr_lambda: Callable) -> None:
-        assert (
-            len(optimizers) > 0
-        ), "Must have at least one optimizer to create LRScheduler"
-
+        # No assert on len(optimizers) > 0: a pipeline stage that owns only
+        # frozen weights gets no optimizer (see
+        # OptimizersContainer._build_param_groups) and has no learning rate to
+        # schedule either. The comprehension then yields zero schedulers, and
+        # step() / get_metrics() iterate, so an empty container is well
+        # defined. LoRA plus pipeline parallelism produces such a stage.
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
 
     def __iter__(self) -> Iterator[LRScheduler]:
@@ -224,6 +226,12 @@ class LRSchedulersContainer(Stateful, Configurable):
             scheduler.step()
 
     def state_dict(self) -> dict[str, Any]:
+        # A container with no schedulers has no last_epoch to report; an empty
+        # dict rather than a zero that a later load would apply as progress.
+        # DCP accepts a rank contributing no keys.
+        if not self.schedulers:
+            return {}
+
         # Only last_epoch is needed — each scheduler recomputes its lr from
         # its own optimizer's base_lrs on load. Per-scheduler state (base_lrs,
         # _last_lr) is not saved because it's reconstructed from the optimizer
@@ -240,6 +248,10 @@ class LRSchedulersContainer(Stateful, Configurable):
         # of (last_epoch, base_lr) — LambdaLR with a pure lambda. If a stateful
         # scheduler (e.g. ReduceLROnPlateau) is added, this method must be updated
         # to restore additional state.
+        # Nothing to restore on a stage that schedules nothing, and its own
+        # state_dict() never wrote the key.
+        if not self.schedulers:
+            return
         last_epoch = state_dict["last_epoch"]
         for scheduler in self.schedulers:
             scheduler.last_epoch = last_epoch
