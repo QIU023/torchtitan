@@ -81,6 +81,17 @@ class TestLRScheduler(unittest.TestCase):
 
         return config
 
+    def test_empty_optimizer_container(self):
+        """A container with no optimizer schedules nothing and saves no state."""
+        empty = MagicMock(spec=OptimizersContainer)
+        empty.__iter__.return_value = iter([])
+        empty.__len__.return_value = 0
+        schedulers = LRSchedulersContainer(empty, lambda step: 1.0)
+        self.assertEqual(len(schedulers.schedulers), 0)
+        schedulers.step()
+        self.assertEqual(schedulers.state_dict(), {})
+        schedulers.load_state_dict({})
+
     def test_linear_warmup_decay(self):
         """Test the linear warmup followed by linear decay schedule."""
         # Create a job config with 10 steps, 2 warmup steps, and linear decay

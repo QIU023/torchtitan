@@ -473,6 +473,52 @@ class TestOptimizersContainerWithParamGroups(unittest.TestCase):
         self.assertEqual(len(opt.param_groups), 1)
 
 
+class TestFrozenModelPart(unittest.TestCase):
+    """A model part with nothing to train gets no optimizer, not an error."""
+
+    @staticmethod
+    def _frozen():
+        model = SimpleModel()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        return model
+
+    def test_frozen_part_yields_no_param_groups(self):
+        """An empty match on a part without trainable parameters is skipped."""
+        config = OptimizersContainer.Config(param_groups=[_DEFAULT_ADAMW])
+        impl_kwargs = OptimizersContainer._build_impl_kwargs(config)
+        groups, patterns = OptimizersContainer._build_param_groups(
+            self._frozen(), config.param_groups, impl_kwargs
+        )
+        self.assertEqual(dict(groups), {})
+        self.assertEqual(dict(patterns), {})
+
+    def test_frozen_part_builds_an_empty_container(self):
+        """The container is still an Optimizer: one empty group, no-op steps."""
+        config = OptimizersContainer.Config(
+            implementation="for-loop", param_groups=[_DEFAULT_ADAMW]
+        )
+        container = config.build(model_parts=[self._frozen()])
+        self.assertEqual(len(container), 0)
+        self.assertEqual(len(container.param_groups), 1)
+        self.assertEqual(container.param_groups[0]["params"], [])
+        container.zero_grad()
+        container.step()
+
+    def test_frozen_part_next_to_a_trainable_part(self):
+        """Only the trainable part gets an optimizer; its params are all covered."""
+        trainable = SimpleModel()
+        config = OptimizersContainer.Config(
+            implementation="for-loop", param_groups=[_DEFAULT_ADAMW]
+        )
+        container = config.build(model_parts=[self._frozen(), trainable])
+        self.assertEqual(len(container), 1)
+        covered = {
+            id(p) for g in container.optimizers[0].param_groups for p in g["params"]
+        }
+        self.assertEqual(covered, {id(p) for p in trainable.parameters()})
+
+
 class TestDCPWithParamGroups(unittest.TestCase):
     def test_state_dict_round_trip(self):
         """Optimizer state_dict save/load works with multiple param groups."""
