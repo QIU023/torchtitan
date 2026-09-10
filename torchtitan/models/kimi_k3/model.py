@@ -427,7 +427,7 @@ class KimiK3Model(Decoder):
     # needs since a placeholder run can cross the shard boundary.
     _sp_group: dist.ProcessGroup | None = None
 
-    def preprocess_inputs(  # pyrefly: ignore [bad-override]
+    def preprocess_inputs(
         self,
         input_dict: dict[str, torch.Tensor],
         *,
