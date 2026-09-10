@@ -142,11 +142,12 @@ def parallelize_kimi_k3(
             )
             edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
-    vision_encoder = model.vision_encoder
-    if vision_encoder is not None and parallel_dims.cp_enabled:
+    if parallel_dims.cp_enabled:
         # Dynamic CP for the tower partitions the large images across sub-CP
         # groups; every layout is built here, once, in the same order on every
-        # rank (report sec 5.2.3).
+        # rank. The build is a world-wide collective (new_group and the rank
+        # list exchange), so every rank runs it, including a pipeline stage
+        # that holds no tower and never uses the result.
         setattr(  # noqa: B010
             model,
             "_cp_subgroups",
