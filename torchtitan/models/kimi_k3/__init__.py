@@ -16,7 +16,13 @@ from torchtitan.models.common.config_utils import (
     get_attention_config,
     make_token_dispatcher_config,
 )
-from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
+from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.moe import (
+    GroupedExperts,
+    MoE,
+    RoutedExperts,
+    TokenChoiceTopKRouter,
+)
 from torchtitan.models.common.nn_modules import GELU, RMSNorm
 from torchtitan.models.common.vision_encoder import (
     VisionAttention,
@@ -134,16 +140,20 @@ def _mla_config(
     *,
     dim: int,
     num_heads: int,
-    q_lora_rank: int,
+    q_lora_rank: int | None,
     kv_lora_rank: int,
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
     v_head_dim: int,
     attn_backend: str,
+    gated: bool = True,
 ) -> KimiMLAAttention.Config:
+    """K3's MLA, or with ``q_lora_rank=None`` and ``gated=False`` Kimi-Linear-48B's:
+    the query projected straight to the heads and no output gate."""
     inner_attention = get_attention_config(attn_backend)
 
     q_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    compressed = q_lora_rank is not None
     return KimiMLAAttention.Config(
         dim=dim,
         n_heads=num_heads,
@@ -151,16 +161,21 @@ def _mla_config(
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
-        wq_a=_linear(dim, q_lora_rank),
-        q_norm=_norm(q_lora_rank),
-        wq_b=_linear(q_lora_rank, num_heads * q_head_dim),
+        wq=None if compressed else _linear(dim, num_heads * q_head_dim),
+        wq_a=_linear(dim, q_lora_rank) if q_lora_rank is not None else None,
+        q_norm=_norm(q_lora_rank) if q_lora_rank is not None else None,
+        wq_b=(
+            _linear(q_lora_rank, num_heads * q_head_dim)
+            if q_lora_rank is not None
+            else None
+        ),
         wkv_a=_linear(dim, kv_lora_rank + qk_rope_head_dim),
         kv_norm=_norm(kv_lora_rank),
         wkv_b=_linear(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
         ),
-        gate=_linear(dim, num_heads * v_head_dim),
+        gate=_linear(dim, num_heads * v_head_dim) if gated else None,
         wo=_linear(num_heads * v_head_dim, dim),
         inner_attention=inner_attention,
     )
@@ -172,7 +187,12 @@ def _kda_config(
     num_heads: int,
     head_dim: int,
     conv_kernel_size: int,
+    full_rank_output_gate: bool = True,
+    gate_lower_bound: float | None = -5.0,
 ) -> KDA.Config:
+    """K3's KDA, or Kimi-Linear-48B's with the output gate factored through
+    head_dim (``full_rank_output_gate=False``) and the decay unbounded
+    (``gate_lower_bound=None``)."""
     projection_dim = num_heads * head_dim
 
     def conv() -> Conv1d.Config:
@@ -198,10 +218,14 @@ def _kda_config(
         forget_a=_linear(dim, head_dim),
         forget_b=_linear(head_dim, projection_dim),
         beta=_linear(dim, num_heads),
-        output_gate=_linear(dim, projection_dim),
+        output_gate=_linear(dim, projection_dim) if full_rank_output_gate else None,
+        output_gate_a=None if full_rank_output_gate else _linear(dim, head_dim),
+        output_gate_b=(
+            None if full_rank_output_gate else _linear(head_dim, projection_dim)
+        ),
         inner_kda=InnerKDA.Config(
             head_dim=head_dim,
-            kernel=KDAKernel.Config(),
+            kernel=KDAKernel.Config(lower_bound=gate_lower_bound),
         ),
         output_norm=KimiRMSNormGated.Config(
             dim=head_dim,
@@ -213,6 +237,73 @@ def _kda_config(
             "A_log": _a_log_init,
             "dt_bias": nn.init.zeros_,
         },
+    )
+
+
+def _swiglu_feed_forward_config(
+    *,
+    dim: int,
+    hidden_dim: int,
+) -> FeedForward.Config:
+    """Kimi-Linear-48B's dense and shared-expert feed-forward (SiLU, not SiTU)."""
+    return FeedForward.Config(
+        w1=_linear(dim, hidden_dim),
+        w2=_linear(hidden_dim, dim),
+        w3=_linear(dim, hidden_dim),
+    )
+
+
+def _moe_config(
+    *,
+    dim: int,
+    expert_hidden_dim: int,
+    num_experts: int,
+    top_k: int,
+    num_shared_experts: int,
+    route_scale: float,
+    moe_comm_backend: str,
+) -> MoE.Config:
+    """Kimi-Linear-48B's routed MoE: the released model's experts read the
+    full-width token (no latent), one shared expert, sigmoid scores renormalised
+    and scaled by ``routed_scaling_factor`` (2.446 in the released config)."""
+    return MoE.Config(
+        num_experts=num_experts,
+        router=TokenChoiceTopKRouter.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            gate=RouterGateLinear.Config(
+                in_features=dim,
+                out_features=num_experts,
+                bias=False,
+                param_init=_LINEAR_INIT,
+            ),
+            score_func="sigmoid",
+            route_norm=True,
+            route_scale=route_scale,
+        ),
+        routed_experts=RoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(
+                dim=dim,
+                hidden_dim=expert_hidden_dim,
+                num_experts=num_experts,
+                param_init={
+                    "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
+                    "w2_EDF": partial(nn.init.trunc_normal_, std=0.02),
+                    "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
+                },
+            ),
+            token_dispatcher=make_token_dispatcher_config(
+                num_experts=num_experts,
+                top_k=top_k,
+                comm_backend=moe_comm_backend,
+                hidden_dim=dim,
+            ),
+        ),
+        shared_experts=_swiglu_feed_forward_config(
+            dim=dim,
+            hidden_dim=num_shared_experts * expert_hidden_dim,
+        ),
+        load_balance_coeff=1e-3,
     )
 
 
@@ -471,6 +562,178 @@ def _kimi_k3_config(
     )
 
 
+def _kimi_linear_config(
+    *,
+    dim: int,
+    vocab_size: int,
+    num_layers: int,
+    full_attention_layers: set[int],
+    attn_res_block_size: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int,
+    kda_head_dim: int,
+    conv_kernel_size: int,
+    dense_hidden_dim: int,
+    expert_hidden_dim: int,
+    num_experts: int,
+    top_k: int,
+    num_shared_experts: int,
+    route_scale: float,
+    attn_backend: str,
+    moe_comm_backend: str = "standard",
+) -> KimiK3Model.Config:
+    """Assemble a Kimi-Linear-48B-shaped config: the released text-only model
+    with K3's block attention residuals woven in.
+
+    Kimi Linear differs from K3 in every module: SiLU feed-forwards, an
+    ungated MLA without query compression, a KDA whose output gate is factored
+    through ``head_dim`` and whose decay is unbounded, and a routed MoE that
+    reads the full-width token with one shared expert and a routed scale.
+    ``full_attention_layers`` holds zero-based indices; layer 0 is the dense
+    layer (released ``first_k_dense_replace=1``). No vision tower.
+    """
+    layers = []
+    for layer_idx in range(num_layers):
+        is_full_attention = layer_idx in full_attention_layers
+        layers.append(
+            KimiK3TransformerBlock.Config(
+                layer_id=layer_idx,
+                attn_res_block_size=attn_res_block_size,
+                attention=(
+                    _mla_config(
+                        dim=dim,
+                        num_heads=num_heads,
+                        q_lora_rank=None,
+                        kv_lora_rank=kv_lora_rank,
+                        qk_nope_head_dim=qk_nope_head_dim,
+                        qk_rope_head_dim=qk_rope_head_dim,
+                        v_head_dim=v_head_dim,
+                        attn_backend=attn_backend,
+                        gated=False,
+                    )
+                    if is_full_attention
+                    else None
+                ),
+                delta_attention=(
+                    None
+                    if is_full_attention
+                    else _kda_config(
+                        dim=dim,
+                        num_heads=num_heads,
+                        head_dim=kda_head_dim,
+                        conv_kernel_size=conv_kernel_size,
+                        full_rank_output_gate=False,
+                        gate_lower_bound=None,
+                    )
+                ),
+                feed_forward=(
+                    _swiglu_feed_forward_config(dim=dim, hidden_dim=dense_hidden_dim)
+                    if layer_idx == 0
+                    else None
+                ),
+                moe=(
+                    None
+                    if layer_idx == 0
+                    else _moe_config(
+                        dim=dim,
+                        expert_hidden_dim=expert_hidden_dim,
+                        num_experts=num_experts,
+                        top_k=top_k,
+                        num_shared_experts=num_shared_experts,
+                        route_scale=route_scale,
+                        moe_comm_backend=moe_comm_backend,
+                    )
+                ),
+                attention_norm=_norm(dim),
+                ffn_norm=_norm(dim),
+                attention_res_norm=None if layer_idx == 0 else _norm(dim),
+                attention_res_proj=None if layer_idx == 0 else _linear(dim, 1),
+                ffn_res_norm=_norm(dim),
+                ffn_res_proj=_linear(dim, 1),
+            )
+        )
+
+    return KimiK3Model.Config(
+        dim=dim,
+        vocab_size=vocab_size,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+        ),
+        layers=layers,
+        norm=_norm(dim),
+        lm_head=_linear(
+            dim,
+            vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        output_res_norm=_norm(dim),
+        output_res_proj=_linear(dim, 1),
+        vision_encoder=None,
+    )
+
+
+def _kimi_linear_debugmodel(
+    attn_backend: str, moe_comm_backend: str
+) -> KimiK3Model.Config:
+    """The 48B-A3B topology at debug extents: KDA:MLA 3:1 with the final layer
+    global, as the released 27-layer split; 3-layer residual blocks."""
+    return _kimi_linear_config(
+        dim=512,
+        moe_comm_backend=moe_comm_backend,
+        vocab_size=163840,
+        num_layers=9,
+        full_attention_layers={3, 7, 8},
+        attn_res_block_size=3,
+        num_heads=4,
+        kv_lora_rank=128,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=1024,
+        expert_hidden_dim=256,
+        num_experts=8,
+        top_k=2,
+        num_shared_experts=1,
+        route_scale=2.446,
+        attn_backend=attn_backend,
+    )
+
+
+def _kimi_linear_48b(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
+    """Kimi-Linear-48B-A3B as released (27 layers, MLA at 1-based 4, 8, ...,
+    24 and 27, 256 experts top-8, one shared expert, dense layer 0 at 9216),
+    with block attention residuals of 3 layers (nine blocks)."""
+    return _kimi_linear_config(
+        dim=2304,
+        moe_comm_backend=moe_comm_backend,
+        vocab_size=163840,
+        num_layers=27,
+        full_attention_layers={3, 7, 11, 15, 19, 23, 26},
+        attn_res_block_size=3,
+        num_heads=32,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=9216,
+        expert_hidden_dim=1024,
+        num_experts=256,
+        top_k=8,
+        num_shared_experts=1,
+        route_scale=2.446,
+        attn_backend=attn_backend,
+    )
+
+
 def _debugmodel(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 1024
     return _kimi_k3_config(
@@ -548,6 +811,10 @@ def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
 kimi_k3_configs = {
     "debugmodel": (_debugmodel, 16384),
     "Kimi-K3": (_kimi_k3, 262144),
+    # The Kimi-Linear-48B-A3B shapes (text-only, with the residuals woven in),
+    # the graft target of the post-train stack.
+    "kimi_linear_debugmodel": (_kimi_linear_debugmodel, 4096),
+    "kimi_linear_48b": (_kimi_linear_48b, 4096),
 }
 
 
@@ -574,7 +841,9 @@ def model_registry(
         for converter in converters:
             config = converter.build().convert(config)
     return ModelSpec(
-        name="kimi_k3",
+        # The Kimi-Linear shapes keep the released model's name: renaming a
+        # published model after the folder would misattribute it.
+        name="kimi_linear" if flavor.startswith("kimi_linear_") else "kimi_k3",
         flavor=flavor,
         model=config,
         max_context_length=context_len,

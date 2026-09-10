@@ -25,6 +25,8 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     multimodal_context,
@@ -40,7 +42,6 @@ from torchtitan.models.utils import (
 from torchtitan.protocols.module import Module
 
 from .kda import KDA
-from .moe import KimiFeedForward, KimiLatentMoE
 from .vision_encoder import KimiK3VisionEncoder
 
 # Shape suffixes:
@@ -65,15 +66,30 @@ class KimiMLAAttention(BaseAttention):
         qk_nope_head_dim: int
         qk_rope_head_dim: int
         v_head_dim: int
-        wq_a: Linear.Config
-        q_norm: RMSNorm.Config
-        wq_b: Linear.Config
+        # K3 compresses the query through wq_a / q_norm / wq_b (released
+        # q_lora_rank 1536); Kimi-Linear-48B has no query compression and
+        # projects straight to the heads through wq. Exactly one form is set.
+        wq_a: Linear.Config | None = None
+        q_norm: RMSNorm.Config | None = None
+        wq_b: Linear.Config | None = None
+        wq: Linear.Config | None = None
         wkv_a: Linear.Config
         kv_norm: RMSNorm.Config
         wkv_b: Linear.Config
-        gate: Linear.Config
+        # K3's gated MLA (report Eq. 7); Kimi-Linear-48B's MLA is ungated.
+        gate: Linear.Config | None = None
         wo: Linear.Config
         inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
+
+        def __post_init__(self):
+            compressed = (self.wq_a, self.q_norm, self.wq_b)
+            if self.wq is None:
+                if any(part is None for part in compressed):
+                    raise ValueError(
+                        "MLA needs either wq or all of wq_a, q_norm and wq_b."
+                    )
+            elif any(part is not None for part in compressed):
+                raise ValueError("MLA takes wq or wq_a / q_norm / wq_b, not both.")
 
     def __init__(self, config: Config):
         super().__init__()
@@ -85,13 +101,14 @@ class KimiMLAAttention(BaseAttention):
         self.kv_lora_rank = config.kv_lora_rank
         self.scale = self.q_head_dim**-0.5
 
-        self.wq_a = config.wq_a.build()
-        self.q_norm = config.q_norm.build()
-        self.wq_b = config.wq_b.build()
+        self.wq_a = config.wq_a.build() if config.wq_a is not None else None
+        self.q_norm = config.q_norm.build() if config.q_norm is not None else None
+        self.wq_b = config.wq_b.build() if config.wq_b is not None else None
+        self.wq = config.wq.build() if config.wq is not None else None
         self.wkv_a = config.wkv_a.build()
         self.kv_norm = config.kv_norm.build()
         self.wkv_b = config.wkv_b.build()
-        self.gate = config.gate.build()
+        self.gate = config.gate.build() if config.gate is not None else None
         self.wo = config.wo.build()
         self.inner_attention = config.inner_attention.build()
 
@@ -104,9 +121,14 @@ class KimiMLAAttention(BaseAttention):
         del positions
 
         num_tokens = x_TD.shape[0]
-        q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
-            num_tokens, self.n_heads, self.q_head_dim
-        )
+        if self.wq is not None:
+            q_TC = self.wq(x_TD)
+        else:
+            assert self.wq_a is not None
+            assert self.q_norm is not None
+            assert self.wq_b is not None
+            q_TC = self.wq_b(self.q_norm(self.wq_a(x_TD)))
+        q_THK = q_TC.view(num_tokens, self.n_heads, self.q_head_dim)
 
         compressed_kv_TC = self.wkv_a(x_TD)
         kv_latent_TC, k_rope_TK = torch.split(
@@ -137,7 +159,8 @@ class KimiMLAAttention(BaseAttention):
             scale=self.scale,
         )
         out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
-        out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
+        if self.gate is not None:
+            out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
 
 
@@ -173,8 +196,8 @@ class KimiK3TransformerBlock(Module):
         attn_res_block_size: int
         attention: KimiMLAAttention.Config | None
         delta_attention: KDA.Config | None
-        feed_forward: KimiFeedForward.Config | None
-        moe: KimiLatentMoE.Config | None
+        feed_forward: FeedForward.Config | None
+        moe: MoE.Config | None
         attention_norm: RMSNorm.Config
         ffn_norm: RMSNorm.Config
         attention_res_norm: RMSNorm.Config | None
