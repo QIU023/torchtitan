@@ -808,6 +808,38 @@ def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     )
 
 
+def _apply_graft_gate(config: KimiK3Model.Config) -> KimiK3Model.Config:
+    """Turn on the alpha-gated residual reads on every layer and the output.
+
+    The alphas are this module's own parameters, so they take their
+    zero-initialisation through ``param_init`` like KDA's ``A_log``.
+    """
+    alpha_init = {
+        "attention_res_alpha": nn.init.zeros_,
+        "ffn_res_alpha": nn.init.zeros_,
+    }
+    for layer in config.layers:
+        layer.attn_res_gated = True
+        layer.param_init = alpha_init
+    config.attn_res_gated = True
+    config.param_init = {"output_res_alpha": nn.init.zeros_}
+    return config
+
+
+# Post-train graft suffixes and the flag each implies, longest first so the
+# longer name cannot decompose as the shorter one plus a bogus base flavor.
+# ``_gated_lora`` (the graft over a LoRA base) lives with the LoRA change.
+_GRAFT_SUFFIXES: tuple[str, ...] = ("_gated",)
+
+
+def _decompose_graft(flavor: str) -> tuple[str, bool]:
+    """Split a flavor into its base name and whether the graft gate is on."""
+    for suffix in sorted(_GRAFT_SUFFIXES, key=len, reverse=True):
+        if flavor.endswith(suffix):
+            return flavor[: -len(suffix)], True
+    return flavor, False
+
+
 kimi_k3_configs = {
     "debugmodel": (_debugmodel, 16384),
     "Kimi-K3": (_kimi_k3, 262144),
@@ -828,7 +860,8 @@ def model_registry(
 ) -> ModelSpec:
     # The KDA / MLA layers build their own RoPE, so seq_len is not a builder
     # argument here -- it only reports the context length on the ModelSpec.
-    get_config, max_context_len = kimi_k3_configs[flavor]
+    base_flavor, gated = _decompose_graft(flavor)
+    get_config, max_context_len = kimi_k3_configs[base_flavor]
     context_len = seq_len or max_context_len
     if context_len > max_context_len:
         raise ValueError(
@@ -836,6 +869,8 @@ def model_registry(
             f"{max_context_len} for flavor {flavor}"
         )
     config = get_config(attn_backend=attn_backend, moe_comm_backend=moe_comm_backend)
+    if gated:
+        config = _apply_graft_gate(config)
     if converters is not None:
         validate_converter_order(converters)
         for converter in converters:
