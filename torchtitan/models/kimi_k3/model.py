@@ -41,6 +41,7 @@ from torchtitan.protocols.module import Module
 
 from .kda import KDA
 from .moe import KimiFeedForward, KimiLatentMoE
+from .moon_ep_dispatcher import MoonEPTokenDispatcher
 from .vision_encoder import KimiK3VisionEncoder
 
 # Shape suffixes:
@@ -289,6 +290,23 @@ class KimiK3Model(Decoder):
             set_kimi_k3_sharding_config(
                 self, enable_ep=config.parallelism.expert_parallel_degree > 1
             )
+            # MoonEP's S is a static shape: the per-rank token count of every
+            # dispatch, after CP and TP/SP have sharded the token axis. Core
+            # fills the same figure for its own persistent backends and does
+            # not know this one.
+            for layer in self.layers:
+                moe = layer.moe
+                if moe is None:
+                    continue
+                dispatcher = moe.routed_experts.token_dispatcher
+                if isinstance(dispatcher, MoonEPTokenDispatcher.Config):
+                    shards = (
+                        config.parallelism.context_parallel_degree
+                        * config.parallelism.tensor_parallel_degree
+                    )
+                    dispatcher.num_max_tokens_per_rank = (
+                        config.training.num_tokens_per_microbatch_per_dp_rank // shards
+                    )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
         def get_nparams_and_flops(
