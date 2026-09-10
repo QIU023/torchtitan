@@ -99,8 +99,13 @@ class TestQuantileBalancingDistributed(DTensorTestBase):
             local_scores_TE = score_rows_LRE[layer_idx, self.rank].expand(4, -1)
             with torch.no_grad():
                 router.gate.weight.copy_(torch.eye(4, device=device))
-            _, _, routing_map_TE = router(
+            # This tree's router returns the unbiased scores as its third
+            # output; the routing map is rebuilt from the selected experts.
+            _, expert_ids_TK, scores_TE = router(
                 torch.logit(local_scores_TE), moe.expert_bias_E
+            )
+            routing_map_TE = torch.zeros_like(scores_TE, dtype=torch.bool).scatter_(
+                -1, expert_ids_TK, True
             )
 
             histogram_EB = router.quantile_balancer.required_bias_histogram_EB
