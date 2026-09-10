@@ -7,6 +7,7 @@
 from typing import cast
 
 import torch.nn as nn
+import torch.distributed as dist
 
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
@@ -141,6 +142,16 @@ def parallelize_kimi_k3(
             )
             edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
+    vision_encoder = model.vision_encoder
+    if vision_encoder is not None and parallel_dims.cp_enabled:
+        # Dynamic CP for the tower partitions the large images across sub-CP
+        # groups; every layout is built here, once, in the same order on every
+        # rank (report sec 5.2.3).
+        setattr(
+            model,
+            "_cp_subgroups",
+            _build_cp_subgroups(parallel_dims.get_mesh("cp").get_group()),
+        )
     vision_encoder = model.vision_encoder
     if vision_encoder is not None:
         # TODO: An image batch on one DP rank and a text-only batch on another
@@ -558,3 +569,43 @@ def _install_vision_dep(
         cost_ratio,
         max_pending,
     )
+
+
+def _build_cp_subgroups(cp_group) -> dict[int, dist.ProcessGroup]:
+    """Every sub-CP group layout this CP group could use, built once.
+
+    Which layout a step wants depends on how many large images the batch
+    holds, and a process group cannot be built per batch: ``new_group`` must be
+    called by every process, with the same rank lists, in the same order. So
+    the divisors of the CP size are all built here, and the CP rank lists are
+    all-gathered first so every rank walks the same global list and keeps the
+    group it belongs to. Returns ``{num_subgroups: this rank's group}``.
+    """
+    if cp_group is None:
+        return {}
+    cp_ranks = dist.get_process_group_ranks(cp_group)
+    cp_size = len(cp_ranks)
+    if cp_size <= 1:
+        return {}
+    world = dist.get_world_size()
+    all_cp: list[list[int] | None] = [None] * world
+    dist.all_gather_object(all_cp, cp_ranks)
+    seen: list[list[int]] = []
+    for entry in all_cp:
+        if entry and list(entry) not in seen:
+            seen.append(list(entry))
+    seen.sort()
+    my_rank = dist.get_rank()
+    out: dict[int, dist.ProcessGroup] = {}
+    for n_sub in [d for d in range(1, cp_size + 1) if cp_size % d == 0]:
+        g = cp_size // n_sub
+        mine: dist.ProcessGroup | None = None
+        for ranks in seen:
+            for s in range(n_sub):
+                members = ranks[s * g : (s + 1) * g]
+                pg = dist.new_group(ranks=members)
+                if my_rank in members and isinstance(pg, dist.ProcessGroup):
+                    mine = pg
+        if mine is not None:
+            out[n_sub] = mine
+    return out
