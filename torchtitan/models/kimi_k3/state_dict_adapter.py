@@ -4,7 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""HuggingFace checkpoint adapter for unquantized Kimi K3 weights."""
+"""HuggingFace checkpoint adapter for unquantized Kimi K3 weights.
+
+Two spellings of the text stack: the released multimodal K3 wraps it as
+``language_model.model.*`` / ``language_model.lm_head.weight``, while a
+text-only model (the released Kimi-Linear-48B, the graft target) spells it
+``model.*`` / ``lm_head.weight``. A config without a vision tower takes the
+text-only spelling, since the multimodal wrapper would name a module the
+model does not have and the loader builds its expected keys from this map.
+
+The text-only key space is the released Kimi-Linear architecture: the
+attention-residual reads and the graft gate's alphas, which the released
+checkpoint does not carry, are left out of the export so that an official
+checkpoint loads into a graft flavor without phantom keys (the loader asks the
+checkpoint for every key this map produces) and the reads keep their
+initialisation. The K3 spelling exports the reads the released K3 has.
+"""
 
 import re
 from typing import Any
@@ -17,10 +32,12 @@ from torchtitan.models.utils import MoEStateDictAdapter
 from .model import KimiK3Model
 
 
-_UNUSED_HF_LAYER_ZERO_ATTN_RES_KEYS = {
-    "language_model.model.layers.0.self_attention_res_norm.weight",
-    "language_model.model.layers.0.self_attention_res_proj.weight",
-}
+def _is_graft_extra(key: str) -> bool:
+    """A parameter the released Kimi-Linear architecture does not have: an
+    attention-residual read (norm, projection) or a graft gate alpha."""
+    return (
+        ".attention_res_" in key or ".ffn_res_" in key or key.startswith("output_res_")
+    )
 
 
 class KimiK3StateDictAdapter(MoEStateDictAdapter):
@@ -32,46 +49,61 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
         super().__init__(model_config, hf_assets_path)
         self.kimi_config = model_config
 
+        text_only = model_config.vision_encoder is None
+        # The wrapper prefix of the text stack and the head's key, by spelling.
+        P = "model." if text_only else "language_model.model."
+        lm_head = "lm_head.weight" if text_only else "language_model.lm_head.weight"
+        self.text_prefix = P
+        self.text_only = text_only
+        self.unused_hf_layer_zero_attn_res_keys = {
+            f"{P}layers.0.self_attention_res_norm.weight",
+            f"{P}layers.0.self_attention_res_proj.weight",
+        }
+
         self.from_hf_map = {
             # Language model.
-            "language_model.model.embed_tokens.weight": "tok_embeddings.weight",
-            "language_model.model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
-            "language_model.model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
-            "language_model.model.layers.{}.self_attention_res_norm.weight": "layers.{}.attention_res_norm.weight",
-            "language_model.model.layers.{}.self_attention_res_proj.weight": "layers.{}.attention_res_proj.weight",
-            "language_model.model.layers.{}.mlp_res_norm.weight": "layers.{}.ffn_res_norm.weight",
-            "language_model.model.layers.{}.mlp_res_proj.weight": "layers.{}.ffn_res_proj.weight",
-            "language_model.model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
-            "language_model.model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
-            "language_model.model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
+            f"{P}embed_tokens.weight": "tok_embeddings.weight",
+            f"{P}layers.{{}}.input_layernorm.weight": "layers.{}.attention_norm.weight",
+            f"{P}layers.{{}}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
+            f"{P}layers.{{}}.self_attention_res_norm.weight": "layers.{}.attention_res_norm.weight",
+            f"{P}layers.{{}}.self_attention_res_proj.weight": "layers.{}.attention_res_proj.weight",
+            f"{P}layers.{{}}.mlp_res_norm.weight": "layers.{}.ffn_res_norm.weight",
+            f"{P}layers.{{}}.mlp_res_proj.weight": "layers.{}.ffn_res_proj.weight",
+            # The graft gate's alphas (absent from a released checkpoint).
+            f"{P}layers.{{}}.attention_res_alpha": "layers.{}.attention_res_alpha",
+            f"{P}layers.{{}}.ffn_res_alpha": "layers.{}.ffn_res_alpha",
+            f"{P}output_res_alpha": "output_res_alpha",
+            f"{P}layers.{{}}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
+            f"{P}layers.{{}}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
+            f"{P}layers.{{}}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
             # MoE.
-            "language_model.model.layers.{}.block_sparse_moe.experts.{}.w1.weight": (
+            f"{P}layers.{{}}.block_sparse_moe.experts.{{}}.w1.weight": (
                 "layers.{}.moe.routed_experts.inner_experts.w1_EFD"
             ),
-            "language_model.model.layers.{}.block_sparse_moe.experts.{}.w2.weight": (
+            f"{P}layers.{{}}.block_sparse_moe.experts.{{}}.w2.weight": (
                 "layers.{}.moe.routed_experts.inner_experts.w2_EDF"
             ),
-            "language_model.model.layers.{}.block_sparse_moe.experts.{}.w3.weight": (
+            f"{P}layers.{{}}.block_sparse_moe.experts.{{}}.w3.weight": (
                 "layers.{}.moe.routed_experts.inner_experts.w3_EFD"
             ),
-            "language_model.model.layers.{}.block_sparse_moe.gate.weight": "layers.{}.moe.router.gate.weight",
-            "language_model.model.layers.{}.block_sparse_moe.gate.e_score_correction_bias": "layers.{}.moe.expert_bias_E",
-            "language_model.model.layers.{}.block_sparse_moe.routed_expert_down_proj.weight": "layers.{}.moe.routed_down.weight",
-            "language_model.model.layers.{}.block_sparse_moe.routed_expert_up_proj.weight": "layers.{}.moe.routed_up.weight",
-            "language_model.model.layers.{}.block_sparse_moe.routed_expert_norm.weight": "layers.{}.moe.routed_norm.weight",
-            "language_model.model.layers.{}.block_sparse_moe.shared_experts.gate_proj.weight": (
+            f"{P}layers.{{}}.block_sparse_moe.gate.weight": "layers.{}.moe.router.gate.weight",
+            f"{P}layers.{{}}.block_sparse_moe.gate.e_score_correction_bias": "layers.{}.moe.expert_bias_E",
+            f"{P}layers.{{}}.block_sparse_moe.routed_expert_down_proj.weight": "layers.{}.moe.routed_down.weight",
+            f"{P}layers.{{}}.block_sparse_moe.routed_expert_up_proj.weight": "layers.{}.moe.routed_up.weight",
+            f"{P}layers.{{}}.block_sparse_moe.routed_expert_norm.weight": "layers.{}.moe.routed_norm.weight",
+            f"{P}layers.{{}}.block_sparse_moe.shared_experts.gate_proj.weight": (
                 "layers.{}.moe.shared_experts.w1.weight"
             ),
-            "language_model.model.layers.{}.block_sparse_moe.shared_experts.up_proj.weight": (
+            f"{P}layers.{{}}.block_sparse_moe.shared_experts.up_proj.weight": (
                 "layers.{}.moe.shared_experts.w3.weight"
             ),
-            "language_model.model.layers.{}.block_sparse_moe.shared_experts.down_proj.weight": (
+            f"{P}layers.{{}}.block_sparse_moe.shared_experts.down_proj.weight": (
                 "layers.{}.moe.shared_experts.w2.weight"
             ),
-            "language_model.model.output_attn_res_norm.weight": "output_res_norm.weight",
-            "language_model.model.output_attn_res_proj.weight": "output_res_proj.weight",
-            "language_model.model.norm.weight": "norm.weight",
-            "language_model.lm_head.weight": "lm_head.weight",
+            f"{P}output_attn_res_norm.weight": "output_res_norm.weight",
+            f"{P}output_attn_res_proj.weight": "output_res_proj.weight",
+            f"{P}norm.weight": "norm.weight",
+            lm_head: "lm_head.weight",
             # Vision encoder.
             "vision_tower.patch_embed.proj.weight": "vision_encoder.patch_embed.weight",
             "vision_tower.patch_embed.pos_emb.weight": "vision_encoder.pos_embed",
@@ -86,30 +118,35 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
             "mm_projector.post_norm.weight": "vision_encoder.projector.post_norm.weight",
         }
         self.mla_from_hf_map = {
-            "language_model.model.layers.{}.self_attn.q_a_proj.weight": "layers.{}.attention.wq_a.weight",
-            "language_model.model.layers.{}.self_attn.q_a_layernorm.weight": "layers.{}.attention.q_norm.weight",
-            "language_model.model.layers.{}.self_attn.q_b_proj.weight": "layers.{}.attention.wq_b.weight",
-            "language_model.model.layers.{}.self_attn.kv_a_proj_with_mqa.weight": "layers.{}.attention.wkv_a.weight",
-            "language_model.model.layers.{}.self_attn.kv_a_layernorm.weight": "layers.{}.attention.kv_norm.weight",
-            "language_model.model.layers.{}.self_attn.kv_b_proj.weight": "layers.{}.attention.wkv_b.weight",
-            "language_model.model.layers.{}.self_attn.g_proj.weight": "layers.{}.attention.gate.weight",
-            "language_model.model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
+            # Kimi-Linear-48B projects the query straight to the heads.
+            f"{P}layers.{{}}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
+            f"{P}layers.{{}}.self_attn.q_a_proj.weight": "layers.{}.attention.wq_a.weight",
+            f"{P}layers.{{}}.self_attn.q_a_layernorm.weight": "layers.{}.attention.q_norm.weight",
+            f"{P}layers.{{}}.self_attn.q_b_proj.weight": "layers.{}.attention.wq_b.weight",
+            f"{P}layers.{{}}.self_attn.kv_a_proj_with_mqa.weight": "layers.{}.attention.wkv_a.weight",
+            f"{P}layers.{{}}.self_attn.kv_a_layernorm.weight": "layers.{}.attention.kv_norm.weight",
+            f"{P}layers.{{}}.self_attn.kv_b_proj.weight": "layers.{}.attention.wkv_b.weight",
+            f"{P}layers.{{}}.self_attn.g_proj.weight": "layers.{}.attention.gate.weight",
+            f"{P}layers.{{}}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
         }
         self.kda_from_hf_map = {
-            "language_model.model.layers.{}.self_attn.q_proj.weight": "layers.{}.delta_attention.q_proj.weight",
-            "language_model.model.layers.{}.self_attn.k_proj.weight": "layers.{}.delta_attention.k_proj.weight",
-            "language_model.model.layers.{}.self_attn.v_proj.weight": "layers.{}.delta_attention.v_proj.weight",
-            "language_model.model.layers.{}.self_attn.q_conv1d.weight": "layers.{}.delta_attention.q_conv.weight",
-            "language_model.model.layers.{}.self_attn.k_conv1d.weight": "layers.{}.delta_attention.k_conv.weight",
-            "language_model.model.layers.{}.self_attn.v_conv1d.weight": "layers.{}.delta_attention.v_conv.weight",
-            "language_model.model.layers.{}.self_attn.f_a_proj.weight": "layers.{}.delta_attention.forget_a.weight",
-            "language_model.model.layers.{}.self_attn.f_b_proj.weight": "layers.{}.delta_attention.forget_b.weight",
-            "language_model.model.layers.{}.self_attn.b_proj.weight": "layers.{}.delta_attention.beta.weight",
-            "language_model.model.layers.{}.self_attn.g_proj.weight": "layers.{}.delta_attention.output_gate.weight",
-            "language_model.model.layers.{}.self_attn.o_norm.weight": "layers.{}.delta_attention.output_norm.weight",
-            "language_model.model.layers.{}.self_attn.o_proj.weight": "layers.{}.delta_attention.output_proj.weight",
-            "language_model.model.layers.{}.self_attn.A_log": "layers.{}.delta_attention.A_log",
-            "language_model.model.layers.{}.self_attn.dt_bias": "layers.{}.delta_attention.dt_bias",
+            f"{P}layers.{{}}.self_attn.q_proj.weight": "layers.{}.delta_attention.q_proj.weight",
+            f"{P}layers.{{}}.self_attn.k_proj.weight": "layers.{}.delta_attention.k_proj.weight",
+            f"{P}layers.{{}}.self_attn.v_proj.weight": "layers.{}.delta_attention.v_proj.weight",
+            f"{P}layers.{{}}.self_attn.q_conv1d.weight": "layers.{}.delta_attention.q_conv.weight",
+            f"{P}layers.{{}}.self_attn.k_conv1d.weight": "layers.{}.delta_attention.k_conv.weight",
+            f"{P}layers.{{}}.self_attn.v_conv1d.weight": "layers.{}.delta_attention.v_conv.weight",
+            f"{P}layers.{{}}.self_attn.f_a_proj.weight": "layers.{}.delta_attention.forget_a.weight",
+            f"{P}layers.{{}}.self_attn.f_b_proj.weight": "layers.{}.delta_attention.forget_b.weight",
+            f"{P}layers.{{}}.self_attn.b_proj.weight": "layers.{}.delta_attention.beta.weight",
+            f"{P}layers.{{}}.self_attn.g_proj.weight": "layers.{}.delta_attention.output_gate.weight",
+            # Kimi-Linear-48B factors the output gate through head_dim.
+            f"{P}layers.{{}}.self_attn.g_a_proj.weight": "layers.{}.delta_attention.output_gate_a.weight",
+            f"{P}layers.{{}}.self_attn.g_b_proj.weight": "layers.{}.delta_attention.output_gate_b.weight",
+            f"{P}layers.{{}}.self_attn.o_norm.weight": "layers.{}.delta_attention.output_norm.weight",
+            f"{P}layers.{{}}.self_attn.o_proj.weight": "layers.{}.delta_attention.output_proj.weight",
+            f"{P}layers.{{}}.self_attn.A_log": "layers.{}.delta_attention.A_log",
+            f"{P}layers.{{}}.self_attn.dt_bias": "layers.{}.delta_attention.dt_bias",
         }
 
         # The released index contains MXFP4 packed/scale FQNs, while this
@@ -149,6 +186,8 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
         unmapped: list[str] = []
 
         for key, value in state_dict.items():
+            if self.text_only and _is_graft_extra(key):
+                continue
             if "moe.routed_experts.inner_experts" in key:
                 abstract_key = re.sub(r"(?<=\.)\d+(?=\.)", "{}", key, count=1)
                 layer_num_match = re.search(r"layers\.(\d+)\.", key)
@@ -243,18 +282,15 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
 
         # The released HF model contain these unused layer-0 attn res parameters.
         # TT omits them, so synthesize deterministic, placeholders to preserve strict HF state-dict loading.
-        if self.kimi_config.layers[0].attention_res_norm is None:
-            norm_template_key = (
-                "language_model.model.layers.1.self_attention_res_norm.weight"
-            )
-            proj_template_key = (
-                "language_model.model.layers.1.self_attention_res_proj.weight"
-            )
+        if self.kimi_config.layers[0].attention_res_norm is None and not self.text_only:
+            P = self.text_prefix
+            norm_template_key = f"{P}layers.1.self_attention_res_norm.weight"
+            proj_template_key = f"{P}layers.1.self_attention_res_proj.weight"
             hf_state_dict[
-                "language_model.model.layers.0.self_attention_res_norm.weight"
+                f"{P}layers.0.self_attention_res_norm.weight"
             ] = torch.ones_like(hf_state_dict[norm_template_key])
             hf_state_dict[
-                "language_model.model.layers.0.self_attention_res_proj.weight"
+                f"{P}layers.0.self_attention_res_proj.weight"
             ] = torch.zeros_like(hf_state_dict[proj_template_key])
 
         if unmapped:
@@ -271,7 +307,7 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
         unmapped: list[str] = []
 
         for key, value in hf_state_dict.items():
-            if key in _UNUSED_HF_LAYER_ZERO_ATTN_RES_KEYS:
+            if key in self.unused_hf_layer_zero_attn_res_keys:
                 continue
             if key.endswith("rotary_emb.inv_freq"):
                 continue
@@ -345,7 +381,7 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
 
                 new_abstract_key = (
                     self._map_from_hf_layer_key(abstract_key, layer_num)
-                    if key.startswith("language_model.model.layers.")
+                    if key.startswith(f"{self.text_prefix}layers.")
                     else self.from_hf_map.get(abstract_key)
                 )
                 if new_abstract_key is None:
