@@ -733,7 +733,7 @@ class KimiK3Model(Decoder):
         my_sub = cp_rank // g
         rank_in_sub = cp_rank % g
         group_of = balance_images([counts[i] for i in large], n_sub)
-        my_large = [img for img, sub in zip(large, group_of) if sub == my_sub]
+        my_large = [img for img, sub in zip(large, group_of, strict=True) if sub == my_sub]
         if not self._dyncp_logged:
             self._dyncp_logged = True
             logger.info(

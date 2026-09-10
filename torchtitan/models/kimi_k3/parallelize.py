@@ -147,7 +147,7 @@ def parallelize_kimi_k3(
         # Dynamic CP for the tower partitions the large images across sub-CP
         # groups; every layout is built here, once, in the same order on every
         # rank (report sec 5.2.3).
-        setattr(
+        setattr(  # noqa: B010
             model,
             "_cp_subgroups",
             _build_cp_subgroups(parallel_dims.get_mesh("cp").get_group()),
