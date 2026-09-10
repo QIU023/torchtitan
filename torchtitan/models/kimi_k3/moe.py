@@ -110,6 +110,29 @@ class KimiLatentMoE(MoE):
         self.routed_norm = config.routed_norm.build()
         self.routed_up = config.routed_up.build()
 
+    def parallelize(self, parallel_dims) -> None:
+        super().parallelize(parallel_dims)
+        # MoonEP's expert side needs the dispatcher's plan and the EP mesh;
+        # both exist only after the children above have been parallelized.
+        # Imported here: moon_ep_experts imports this module.
+        from torchtitan.models.kimi_k3.moon_ep_dispatcher import MoonEPTokenDispatcher
+        from torchtitan.models.kimi_k3.moon_ep_experts import (
+            check_moonep_mesh,
+            MoonEPTableBackendNVLink,
+        )
+
+        dispatcher = self.routed_experts.token_dispatcher
+        if (
+            isinstance(dispatcher, MoonEPTokenDispatcher)
+            and dispatcher.ep_mesh is not None
+        ):
+            check_moonep_mesh(parallel_dims)
+            self.routed_experts.inner_experts.attach(
+                dispatcher,
+                MoonEPTableBackendNVLink(dispatcher.ep_mesh),
+                dispatcher.ep_mesh,
+            )
+
     def forward(self, x_TD: torch.Tensor, **router_kwargs) -> torch.Tensor:
         weights_TK, expert_ids_TK, routing_map_TE = self.router(
             x_TD, self.expert_bias_E, **router_kwargs

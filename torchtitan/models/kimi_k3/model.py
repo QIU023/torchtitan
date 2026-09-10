@@ -47,6 +47,7 @@ from torchtitan.protocols.module import Module, ModuleDict
 
 from .kda import KDA
 from .moe import KimiFeedForward, KimiLatentMoE
+from .moon_ep_dispatcher import MoonEPTokenDispatcher
 from .mtp import KimiK3MTPLayer, put_mtp_logits
 from .vision_encoder import KimiK3VisionEncoder
 
@@ -179,7 +180,9 @@ def _apply_attention_residual(
             norm,
             use_reentrant=False,
         )
-    return _attention_residual_math(partial_block_TD, block_residual_TND, projection, norm)
+    return _attention_residual_math(
+        partial_block_TD, block_residual_TND, projection, norm
+    )
 
 
 def _attention_residual_math(
@@ -360,6 +363,23 @@ class KimiK3Model(Decoder):
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
+            # MoonEP's S is a static shape: the per-rank token count of every
+            # dispatch, after CP and TP/SP have sharded the token axis. Core
+            # fills the same figure for its own persistent backends and does
+            # not know this one.
+            for layer in self.layers:
+                moe = layer.moe
+                if moe is None:
+                    continue
+                dispatcher = moe.routed_experts.token_dispatcher
+                if isinstance(dispatcher, MoonEPTokenDispatcher.Config):
+                    shards = (
+                        parallelism.context_parallel_degree
+                        * parallelism.tensor_parallel_degree
+                    )
+                    dispatcher.num_max_tokens_per_rank = (
+                        config.training.num_tokens_per_microbatch_per_dp_rank // shards
+                    )
             tp_sp = tp > 1 and parallelism.enable_sequence_parallel
             if self.mtp_layers and (tp_sp or parallelism.context_parallel_degree > 1):
                 # The depth-shifted slice indexes tokens on the stream, which
