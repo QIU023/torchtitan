@@ -6,6 +6,7 @@
 
 from typing import cast
 
+import torch
 import torch.nn as nn
 import torch.distributed as dist
 
@@ -23,6 +24,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
@@ -58,19 +60,12 @@ def parallelize_kimi_k3(
 ) -> nn.Module:
     """Apply FSDP2 and context parallelism to the Kimi K3 decoder and vision encoder."""
 
-    unsupported_parallelisms = [
-        name
-        for name, enabled in (
-        )
-        if enabled
-    ]
+    unsupported_parallelisms = [name for name, enabled in () if enabled]
     if unsupported_parallelisms:
         raise NotImplementedError(
             "Kimi K3 currently supports FSDP2 data parallelism "
             f"only; disable {', '.join(unsupported_parallelisms)}."
         )
-    if compile_config.enable and "model" in compile_config.components:
-        raise NotImplementedError("Kimi K3 does not support model compilation yet.")
     if parallel_dims.tp_enabled and parallelism.spmd_backend != "spmd_types":
         # The vision tower runs whole on every tensor-parallel rank. Under
         # spmd_types its parameters are declared on the tp axis with the rest
@@ -116,6 +111,11 @@ def parallelize_kimi_k3(
             ac_policy.apply(model)
         if model.vision_encoder is not None:
             ac_policy.apply(model.vision_encoder)
+
+    if compile_config.enable and "model" in compile_config.components:
+        _apply_compile_kimi_k3(
+            model, compile_config=compile_config, parallel_dims=parallel_dims
+        )
 
     # Skip FSDP wrapper for inference. FSDP's forward hooks
     # are incompatible with torch.inference_mode() used by vLLM.
@@ -418,6 +418,48 @@ def pipeline_kimi_k3(
             max_pending=int(vit_bubble_max_pending),
         )
     return pp_schedule, model_parts, has_first_stage, has_last_stage
+
+
+_kernels_carved_out = False
+
+
+def _carve_kernels_out_of_dynamo() -> None:
+    """Keep the KDA kernel wrapper out of the compiled graph.
+
+    ``KDAKernel.forward`` is the Attention Gym Triton kernels plus their gate
+    and normalisation preprocessing, and under context parallelism the
+    per-fragment state exchange; dynamo does not trace through them, so the
+    whole forward runs eagerly and the graph breaks around it.
+    ``recursive=True`` keeps dynamo out on re-entry from the backward too.
+    Class-level state, applied once, not per model part.
+    """
+    global _kernels_carved_out
+    if _kernels_carved_out:
+        return
+    _kernels_carved_out = True
+    from torchtitan.models.kimi_k3.kda import KDAKernel
+
+    KDAKernel.forward = torch.compiler.disable(  # pyrefly: ignore [bad-assignment]
+        KDAKernel.forward, recursive=True
+    )
+
+
+def _apply_compile_kimi_k3(
+    model: nn.Module, *, compile_config: CompileConfig, parallel_dims: ParallelDims
+) -> None:
+    """Compile each transformer block with the KDA kernels carved out.
+
+    A block alternates between KDA and MLA attention, so the compiled blocks
+    specialise per attention class; the graph breaks around the kernel wrapper
+    mean ``fullgraph`` cannot be required.
+    """
+    _carve_kernels_out_of_dynamo()
+    apply_compile(
+        model,
+        compile_config=compile_config,
+        parallel_dims=parallel_dims,
+        fullgraph=False,
+    )
 
 
 def _apply_ac_outside_attention(ac_policy, model: nn.Module) -> None:
