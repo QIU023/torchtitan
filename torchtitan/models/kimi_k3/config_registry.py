@@ -7,7 +7,11 @@
 from dataclasses import replace
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
+from torchtitan.components.data import (
+    ConcatThenSplitPackingConfig,
+    GrainDataLoader,
+    SingleDatasetConfig,
+)
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
@@ -20,6 +24,7 @@ from torchtitan.hf_datasets.multimodal.mm_datasets import (
     MultiModalProcessor,
 )
 from torchtitan.hf_datasets.multimodal.utils.image import resize_to_navit_patch_grid
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.trainer import Trainer
 
@@ -72,6 +77,48 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_spec,
         dataloader=_kimi_k3_multimodal_dataloader(MM_DATASETS["cc12m-test"]),
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            num_tokens_per_microbatch_per_dp_rank=256,
+            max_context_length=256,
+            steps=10,
+            dtype="bfloat16",
+            disable_cuda_graphs=True,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=SelectiveAC.Config(),
+    )
+
+
+def kimi_linear_debugmodel() -> Trainer.Config:
+    """The Kimi-Linear-48B-A3B topology at debug extents, on text data.
+
+    The released Kimi Linear is text-only, so this recipe reads the packed
+    text dataset the other text debug models use rather than K3's multimodal
+    loader; everything else follows ``kimi_k3_debugmodel``.
+    """
+    model_spec = model_registry("kimi_linear_debugmodel")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model_spec=model_spec,
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+        ),
         optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,

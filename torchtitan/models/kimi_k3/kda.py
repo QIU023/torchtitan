@@ -50,15 +50,35 @@ class KimiRMSNormGated(Module):
         return (normalized_THV * gate_THV.float().sigmoid()).to(input_dtype)
 
 
+def _unbounded_gate(
+    raw_gate_1THK: torch.Tensor,
+    A_log_H: torch.Tensor,
+    dt_bias_HK: torch.Tensor,
+) -> torch.Tensor:
+    """Kimi-Linear-48B's log decay, ``-exp(A_log) * softplus(raw + dt_bias)``.
+
+    The released Kimi Linear leaves the decay unbounded; K3 bounds it below
+    (``bound_gate``). Arithmetic and output in FP32, as for the bounded gate.
+    Attention Gym's fused chunk kernels take per-token decays in about
+    ``[-5.914, 0]`` only (their FP32 exponent budget over a 15-step span), so
+    an unbounded decay runs on the eager reference path, which has no such
+    limit; the fused path stays with the bounded gate.
+    """
+    return -torch.exp(A_log_H.float()).view(1, 1, -1, 1) * F.softplus(
+        raw_gate_1THK.float() + dt_bias_HK.float()
+    )
+
+
 class KDAKernel(Module):
     """Apply KDA preprocessing and the Attention Gym kernel."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        lower_bound: float = -5.0
+        # None leaves the decay unbounded (Kimi-Linear-48B); K3 bounds it.
+        lower_bound: float | None = -5.0
 
         def __post_init__(self):
-            if not -5.0 <= self.lower_bound < 0.0:
+            if self.lower_bound is not None and not -5.0 <= self.lower_bound < 0.0:
                 raise ValueError(
                     "KDA lower_bound must be in the safe range [-5, 0), "
                     f"got {self.lower_bound}."
@@ -89,15 +109,18 @@ class KDAKernel(Module):
                 f"got CUDA capability {capability}."
             )
 
-        gate_1THK = bound_gate(
-            raw_gate_1THK,
-            # TODO: The long-term solution is to specify mixed precision per FQN
-            # instead of per layer. https://github.com/pytorch/pytorch/issues/156784
-            A_log_H.float(),
-            dt_bias_HK.float(),
-            lower_bound=self.lower_bound,
-            impl="fused",
-        )
+        if self.lower_bound is None:
+            gate_1THK = _unbounded_gate(raw_gate_1THK, A_log_H, dt_bias_HK)
+        else:
+            gate_1THK = bound_gate(
+                raw_gate_1THK,
+                # TODO: The long-term solution is to specify mixed precision per FQN
+                # instead of per layer. https://github.com/pytorch/pytorch/issues/156784
+                A_log_H.float(),
+                dt_bias_HK.float(),
+                lower_bound=self.lower_bound,
+                impl="fused",
+            )
         output_1THV, _ = chunk_kda(
             l2norm(q_1THK),
             l2norm(k_1THK),
@@ -105,6 +128,7 @@ class KDAKernel(Module):
             gate_1THK,
             raw_beta_1TH.float().sigmoid(),
             cu_seqlens=cu_seqlens,
+            impl="fused" if self.lower_bound is not None else "reference",
         )
         return output_1THV
 
@@ -196,12 +220,29 @@ class KDA(Module):
         forget_a: Linear.Config
         forget_b: Linear.Config
         beta: Linear.Config
-        output_gate: Linear.Config
+        # K3 (report Eq. 6) makes the output gate full rank; Kimi-Linear-48B
+        # factors it through head_dim (output_gate_a, output_gate_b). Exactly
+        # one form is set.
+        output_gate: Linear.Config | None = None
+        output_gate_a: Linear.Config | None = None
+        output_gate_b: Linear.Config | None = None
         inner_kda: Module.Config
         output_norm: KimiRMSNormGated.Config
         output_proj: Linear.Config
 
         def __post_init__(self):
+            low_rank = (self.output_gate_a, self.output_gate_b)
+            if self.output_gate is None:
+                if any(part is None for part in low_rank):
+                    raise ValueError(
+                        "KDA needs either output_gate or both output_gate_a "
+                        "and output_gate_b."
+                    )
+            elif any(part is not None for part in low_rank):
+                raise ValueError(
+                    "KDA takes output_gate or output_gate_a / output_gate_b, "
+                    "not both."
+                )
             if self.num_heads < 1:
                 raise ValueError(f"num_heads must be positive, got {self.num_heads}")
             if self.head_dim != 128:
@@ -227,7 +268,15 @@ class KDA(Module):
         self.forget_a = config.forget_a.build()
         self.forget_b = config.forget_b.build()
         self.beta = config.beta.build()
-        self.output_gate = config.output_gate.build()
+        self.output_gate = (
+            config.output_gate.build() if config.output_gate is not None else None
+        )
+        self.output_gate_a = (
+            config.output_gate_a.build() if config.output_gate_a is not None else None
+        )
+        self.output_gate_b = (
+            config.output_gate_b.build() if config.output_gate_b is not None else None
+        )
         self.inner_kda = config.inner_kda.build()
         self.output_norm = config.output_norm.build()
         self.output_proj = config.output_proj.build()
@@ -275,5 +324,11 @@ class KDA(Module):
             cu_seqlens=cu_seqlens,
         )
 
-        output_gate_THV = self.output_gate(x_TD).view_as(out_THV)
+        if self.output_gate is not None:
+            output_gate_TC = self.output_gate(x_TD)
+        else:
+            assert self.output_gate_a is not None
+            assert self.output_gate_b is not None
+            output_gate_TC = self.output_gate_b(self.output_gate_a(x_TD))
+        output_gate_THV = output_gate_TC.view_as(out_THV)
         return self.output_proj(self.output_norm(out_THV, output_gate_THV).flatten(-2))
