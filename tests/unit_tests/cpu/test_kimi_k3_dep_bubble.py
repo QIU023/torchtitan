@@ -26,6 +26,8 @@ from torchtitan.models.kimi_k3.dep_bubble_runtime import install_bubble_runtime
 
 
 class _FakeAction:
+    __slots__ = ("computation_type", "stage_index", "microbatch_index")
+
     def __init__(self, kind: str, stage: int, mb: int | None) -> None:
         self.computation_type = kind
         self.stage_index = stage
