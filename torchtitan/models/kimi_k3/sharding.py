@@ -110,6 +110,11 @@ def set_kimi_k3_sharding_config(
                     "w3_EFD": spmd.S(1),
                 },
             )
+    # The MTP mirror block carries a KDA of its own; its kernel takes the
+    # same local boundary as the backbone layers'.
+    for mtp_layer in config.mtp_layers:
+        if mtp_layer.block.delta_attention is not None:
+            _set_inner_kda_sharding(mtp_layer.block.delta_attention.inner_kda)
 
 
 def _set_vision_buffer_sharding(config: "KimiK3VisionEncoder.Config") -> None:
