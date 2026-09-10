@@ -11,7 +11,13 @@ import torch
 
 pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
 
-from torchtitan.components.quantization.mx_qat import _fake_quant_mx, MXQATExpertsBase
+from torchtitan.components.quantization.mx_qat import (
+    _fake_quant_mx,
+    MXFP4QATConverter,
+    MXQATExpertsBase,
+)
+from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.kimi_k3 import model_registry
 from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mx_qat
 
 
@@ -72,3 +78,32 @@ def test_qat_forward_differs_from_parent_and_grads_flow():
     ), "fake-quant forward equals the unquantized parent's"
     out.sum().backward()
     assert m.w1_EFD.grad is not None and m.w1_EFD.grad.abs().sum() > 0
+
+
+def test_converter_reaches_exactly_the_routed_expert_modules():
+    """The released scope: every GroupedExperts is swapped, nothing else."""
+    model_config = model_registry("debugmodel", seq_len=256).model
+    with torch.device("meta"):
+        model = model_config.build()
+    expert_modules = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, GroupedExperts)
+    }
+    assert expert_modules
+    converted = MXFP4QATConverter(MXFP4QATConverter.Config()).convert(model_config)
+    with torch.device("meta"):
+        qat_model = converted.build()
+    reached = {
+        name
+        for name, module in qat_model.named_modules()
+        if isinstance(module, MXQATExpertsBase)
+    }
+    assert reached == expert_modules
+    untouched = {
+        name
+        for name, module in qat_model.named_modules()
+        if isinstance(module, GroupedExperts)
+        and not isinstance(module, MXQATExpertsBase)
+    }
+    assert untouched == set()
