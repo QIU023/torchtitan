@@ -4,16 +4,29 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
+from typing import cast
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.optimizer import (
+    default_adamw,
+    LRSchedulersContainer,
+    OptimizersContainer,
+    ParamGroupConfig,
+)
 from torchtitan.components.tokenizer import MultiModalTokenizer
-from torchtitan.config import TrainingConfig
+from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.flex_shard import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    Owned,
+)
+from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
 from torchtitan.hf_datasets.multimodal.mm_datasets import (
     MM_DATASETS,
@@ -21,9 +34,13 @@ from torchtitan.hf_datasets.multimodal.mm_datasets import (
 )
 from torchtitan.hf_datasets.multimodal.utils.image import resize_to_navit_patch_grid
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.kimi_k2_7.config_registry import _per_expert_compute_layout
+from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 
-from . import KIMI_K3_SPECIAL_TOKENS, model_registry
+from . import KIMI_K3_SPECIAL_TOKENS, KimiK3Model, model_registry
+from .kda import KDA
+from .model import KimiMLAAttention
 
 
 def _kimi_k3_multimodal_dataloader(
@@ -92,3 +109,241 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def _dist_muon_optimizer(
+    model_spec: ModelSpec,
+    *,
+    lr: float,
+    parallelism: ParallelismConfig,
+) -> OptimizersContainer.Config:
+    """DistMuon on the matrix parameters of Kimi K3, AdamW on the rest.
+
+    Muon orthogonalises per head where the weight stacks heads along its
+    output dimension: the MLA query and key-value up-projections, and the
+    KDA query, key and value projections. Routed experts are batch-first
+    stacks of matrices and orthogonalise per expert. Everything else that is
+    a plain matrix (down-projections, gates, the latent projections, shared
+    experts, the router gate, dense feed-forward) is owned whole. Norms,
+    biases, the KDA convolutions and gate parameters, the one-row residual
+    projections, embeddings, the LM head and the vision tower stay on AdamW.
+    """
+    model_config = cast(KimiK3Model.Config, model_spec.model)
+    owned = ComputeLayout(
+        shardings_by_mesh_axis={MeshAxisName.DP_SHARD.value: Owned()},
+    )
+    per_expert = _per_expert_compute_layout(parallelism)
+    expert_projections = ("w1_EFD", "w2_EDF", "w3_EFD")
+
+    def per_head(block_size: int) -> ComputeLayout:
+        return ComputeLayout(
+            shardings_by_mesh_axis={
+                MeshAxisName.DP_SHARD.value: BlockShard(dim=0, block_size=block_size)
+            },
+        )
+
+    def compute_shardings_for_layer(layer_id: int) -> dict[str, ComputeLayout]:
+        layer = model_config.layers[layer_id]
+        prefix = f"layers.{layer_id}"
+        shardings: dict[str, ComputeLayout] = {}
+        if layer.attention is not None:
+            attention = cast(KimiMLAAttention.Config, layer.attention)
+            shardings.update(
+                {
+                    f"{prefix}.attention.wq_a.weight": owned,
+                    f"{prefix}.attention.wq_b.weight": per_head(
+                        attention.qk_nope_head_dim + attention.qk_rope_head_dim
+                    ),
+                    f"{prefix}.attention.wkv_a.weight": owned,
+                    f"{prefix}.attention.wkv_b.weight": per_head(
+                        attention.qk_nope_head_dim + attention.v_head_dim
+                    ),
+                    f"{prefix}.attention.wo.weight": owned,
+                    f"{prefix}.attention.gate.weight": owned,
+                }
+            )
+        if layer.delta_attention is not None:
+            kda = cast(KDA.Config, layer.delta_attention)
+            shardings.update(
+                {
+                    f"{prefix}.delta_attention.{projection}.weight": per_head(
+                        kda.head_dim
+                    )
+                    for projection in ("q_proj", "k_proj", "v_proj")
+                }
+            )
+            shardings.update(
+                {
+                    f"{prefix}.delta_attention.{projection}.weight": owned
+                    for projection in (
+                        "output_gate",
+                        "output_proj",
+                        "beta",
+                        "forget_a",
+                        "forget_b",
+                    )
+                }
+            )
+        if layer.feed_forward is not None:
+            shardings.update(
+                {
+                    f"{prefix}.feed_forward.{projection}.weight": owned
+                    for projection in ("w1", "w2", "w3")
+                }
+            )
+        if layer.moe is not None:
+            shardings.update(
+                {
+                    f"{prefix}.moe.routed_experts.inner_experts.{projection}": per_expert
+                    for projection in expert_projections
+                }
+            )
+            shardings[f"{prefix}.moe.router.gate.weight"] = owned
+            shardings[f"{prefix}.moe.routed_down.weight"] = owned
+            shardings[f"{prefix}.moe.routed_up.weight"] = owned
+            shardings.update(
+                {
+                    f"{prefix}.moe.shared_experts.{projection}.weight": owned
+                    for projection in ("w1", "w2", "w3")
+                }
+            )
+        return shardings
+
+    num_layers = len(model_config.layers)
+    compute_sharding_by_fqn_per_layer = tuple(
+        compute_shardings_for_layer(layer_id) for layer_id in range(num_layers)
+    )
+    compute_sharding_by_fqn = {
+        fqn: compute_sharding
+        for layer_compute_sharding_by_fqn in compute_sharding_by_fqn_per_layer
+        for fqn, compute_sharding in layer_compute_sharding_by_fqn.items()
+    }
+    # One bucket per pair of layers, the routed experts of the pair in a
+    # bucket of their own, as the Kimi K2.5 recipe does.
+    bucket_configs_list: list[BucketConfig] = []
+    for first_layer_id in range(0, num_layers, 2):
+        layer_ids = tuple(range(first_layer_id, min(first_layer_id + 2, num_layers)))
+        non_routed = tuple(
+            fqn
+            for layer_id in layer_ids
+            for fqn in compute_sharding_by_fqn_per_layer[layer_id]
+            if ".moe.routed_experts.inner_experts." not in fqn
+        )
+        routed = tuple(
+            fqn
+            for layer_id in layer_ids
+            for fqn in compute_sharding_by_fqn_per_layer[layer_id]
+            if ".moe.routed_experts.inner_experts." in fqn
+        )
+        name = f"layers.{layer_ids[0]}-{layer_ids[-1]}"
+        if non_routed:
+            bucket_configs_list.append(BucketConfig(name=name, patterns=non_routed))
+        if routed:
+            bucket_configs_list.append(
+                BucketConfig(name=f"{name}.routed-experts", patterns=routed)
+            )
+    muon_pattern = (
+        r"(?:"
+        r"attention\.(?:wq_a|wq_b|wkv_a|wkv_b|wo|gate)\.weight|"
+        r"delta_attention\.(?:q_proj|k_proj|v_proj|output_gate|output_proj|beta|forget_a|forget_b)\.weight|"
+        r"routed_experts\.inner_experts\.(?:w1_EFD|w2_EDF|w3_EFD)|"
+        r"feed_forward\.w[123]\.weight|"
+        r"moe\.router\.gate\.weight|"
+        r"moe\.routed_(?:down|up)\.weight|"
+        r"moe\.shared_experts\.w[123]\.weight"
+        r")$"
+    )
+    return OptimizersContainer.Config(
+        implementation="foreach",
+        param_groups=[
+            ParamGroupConfig(
+                pattern=muon_pattern,
+                optimizer_name="DistMuon",
+                optimizer_kwargs={
+                    "lr": lr,
+                    "weight_decay": 0.1,
+                    "foreach": False,
+                    "adjust_lr_fn": "match_rms_adamw",
+                },
+            ),
+            ParamGroupConfig(
+                pattern=r".*",
+                optimizer_name="AdamW",
+                optimizer_kwargs={
+                    "lr": lr,
+                    "betas": (0.9, 0.95),
+                    "eps": 1e-8,
+                    "weight_decay": 0.1,
+                },
+            ),
+        ],
+        optimizer_factory_kwargs_by_name={
+            "DistMuon": {
+                "bucket_configs": tuple(bucket_configs_list),
+                "compute_sharding_by_fqn": compute_sharding_by_fqn,
+            }
+        },
+    )
+
+
+def _align_dist_muon_expert_compute_layouts(
+    optimizer_config: OptimizersContainer.Config,
+    *,
+    parallelism: ParallelismConfig,
+) -> OptimizersContainer.Config:
+    """Rebuild the routed-expert layouts from the final parallelism config.
+
+    The CLI can override ``expert_parallel_degree`` after the registry built
+    the layouts, and that degree decides whether routed experts use the 1-D
+    ``dp_shard`` layout or the 2-D EP/EFSDP one.
+    """
+    factory_kwargs_by_name = {
+        name: dict(factory_kwargs)
+        for name, factory_kwargs in optimizer_config.optimizer_factory_kwargs_by_name.items()
+    }
+    dist_muon_kwargs = factory_kwargs_by_name.get("DistMuon")
+    if dist_muon_kwargs is None:
+        return optimizer_config
+    compute_sharding_by_fqn = cast(
+        dict[str, ComputeLayout], dist_muon_kwargs["compute_sharding_by_fqn"]
+    )
+    per_expert = _per_expert_compute_layout(parallelism)
+    aligned = {
+        fqn: (
+            per_expert
+            if ".moe.routed_experts.inner_experts." in fqn
+            else compute_layout
+        )
+        for fqn, compute_layout in compute_sharding_by_fqn.items()
+    }
+    if aligned == compute_sharding_by_fqn:
+        return optimizer_config
+    dist_muon_kwargs["compute_sharding_by_fqn"] = aligned
+    return replace(
+        optimizer_config, optimizer_factory_kwargs_by_name=factory_kwargs_by_name
+    )
+
+
+@dataclass(kw_only=True, slots=True)
+class _KimiK3MuonTrainerConfig(Trainer.Config):
+    def __post_init__(self) -> None:
+        Trainer.Config.__post_init__(self)
+        self.optimizer = _align_dist_muon_expert_compute_layouts(
+            self.optimizer, parallelism=self.parallelism
+        )
+        if self.parallelism.tensor_parallel_degree > 1:
+            raise ValueError(
+                "Kimi K3 DistMuon currently requires tensor_parallel_degree=1: "
+                "tensor parallelism can produce unsupported _StridedShard "
+                "parameter layouts."
+            )
+
+
+def kimi_k3_debugmodel_muon() -> Trainer.Config:
+    """The debug model trained with DistMuon (per-head MLA and KDA layouts)."""
+    base = kimi_k3_debugmodel()
+    values = {f.name: getattr(base, f.name) for f in fields(base)}
+    values["optimizer"] = _dist_muon_optimizer(
+        base.model_spec, lr=8e-4, parallelism=base.parallelism
+    )
+    return _KimiK3MuonTrainerConfig(**values)
