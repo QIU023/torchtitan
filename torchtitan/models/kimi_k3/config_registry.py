@@ -139,3 +139,12 @@ def kimi_linear_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_linear_debugmodel_gated() -> Trainer.Config:
+    """``kimi_linear_debugmodel`` with the graft gate: every residual read is
+    mixed into the plain stream through a zero-initialised alpha, so step 0 is
+    the plain backbone exactly."""
+    config = kimi_linear_debugmodel()
+    config.model_spec = model_registry("kimi_linear_debugmodel_gated")
+    return config

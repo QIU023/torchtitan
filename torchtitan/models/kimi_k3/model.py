@@ -187,6 +187,22 @@ def _apply_attention_residual(
     return output_TD.to(values_TND.dtype)
 
 
+def _gate_residual_read(
+    read_TD: torch.Tensor,
+    plain_stream_TD: torch.Tensor,
+    alpha: torch.Tensor,
+) -> torch.Tensor:
+    """Mix a residual read into the plain stream: ``plain + alpha * (read - plain)``.
+
+    ``alpha`` is a scalar parameter kept as an fp32 master while the stream is
+    bf16; cast to the stream's dtype so the mix does not promote the residual
+    stream. At alpha = 0 the result is the plain stream itself.
+    """
+    if alpha.dtype != plain_stream_TD.dtype:
+        alpha = alpha.to(plain_stream_TD.dtype)
+    return plain_stream_TD + alpha * (read_TD - plain_stream_TD)
+
+
 class KimiK3TransformerBlock(Module):
     """Hybrid KDA/MLA decoder block with Kimi attention residuals."""
 
@@ -204,6 +220,11 @@ class KimiK3TransformerBlock(Module):
         attention_res_proj: Linear.Config | None
         ffn_res_norm: RMSNorm.Config
         ffn_res_proj: Linear.Config
+        # The graft gate: each residual read is mixed into the plain residual
+        # stream through a scalar alpha, zero-initialised, so a pretrained
+        # backbone's function is preserved exactly at step 0 and the reads
+        # train away from identity. Off for from-scratch pretraining.
+        attn_res_gated: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
@@ -242,6 +263,10 @@ class KimiK3TransformerBlock(Module):
         )
         self.ffn_res_norm = config.ffn_res_norm.build()
         self.ffn_res_proj = config.ffn_res_proj.build()
+        self.attn_res_gated = config.attn_res_gated
+        if config.attn_res_gated:
+            self.attention_res_alpha = nn.Parameter(torch.empty(1))
+            self.ffn_res_alpha = nn.Parameter(torch.empty(1))
 
     def forward(
         self,
@@ -249,8 +274,18 @@ class KimiK3TransformerBlock(Module):
         block_residual_TND: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        plain_stream_TD: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Run the block; ``plain_stream_TD`` rides along only under the graft gate.
+
+        The plain stream is the standard residual stream (sum of every attention
+        and feed-forward output so far), accumulated in the same op order as the
+        plain backbone, so with alpha = 0 the gated read is bit-identical to it;
+        reconstructing it as blocks + partial would reorder the additions.
+        """
         prefix_sum_TD = x_TD
+        if self.attn_res_gated:
+            assert plain_stream_TD is not None
 
         if block_residual_TND.shape[1] > 0:
             assert self.attention_res_proj is not None
@@ -261,6 +296,9 @@ class KimiK3TransformerBlock(Module):
                 self.attention_res_proj,
                 self.attention_res_norm,
             )
+        if self.attn_res_gated:
+            assert plain_stream_TD is not None
+            x_TD = _gate_residual_read(x_TD, plain_stream_TD, self.attention_res_alpha)
 
         opens_block = self.layer_id % self.attn_res_block_size == 0
         if opens_block:
@@ -279,6 +317,8 @@ class KimiK3TransformerBlock(Module):
             assert self.delta_attention is not None
             h_TD = self.delta_attention(h_TD, None, positions)
         prefix_sum_TD = h_TD if opens_block else prefix_sum_TD + h_TD
+        if plain_stream_TD is not None:
+            plain_stream_TD = plain_stream_TD + h_TD
 
         h_TD = _apply_attention_residual(
             prefix_sum_TD,
@@ -286,13 +326,18 @@ class KimiK3TransformerBlock(Module):
             self.ffn_res_proj,
             self.ffn_res_norm,
         )
+        if self.attn_res_gated:
+            assert plain_stream_TD is not None
+            h_TD = _gate_residual_read(h_TD, plain_stream_TD, self.ffn_res_alpha)
         h_TD = self.ffn_norm(h_TD)
         if self.moe is not None:
             h_TD = self.moe(h_TD)
         else:
             assert self.feed_forward is not None
             h_TD = self.feed_forward(h_TD)
-        return prefix_sum_TD + h_TD, block_residual_TND
+        if plain_stream_TD is not None:
+            plain_stream_TD = plain_stream_TD + h_TD
+        return prefix_sum_TD + h_TD, block_residual_TND, plain_stream_TD
 
 
 class KimiK3Model(Decoder):
@@ -302,6 +347,8 @@ class KimiK3Model(Decoder):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        # The graft gate on the output read; the layers carry their own flag.
+        attn_res_gated: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
@@ -350,6 +397,9 @@ class KimiK3Model(Decoder):
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
+        self.attn_res_gated = config.attn_res_gated
+        if config.attn_res_gated:
+            self.output_res_alpha = nn.Parameter(torch.empty(1))
 
     def preprocess_inputs(
         self,
@@ -464,20 +514,28 @@ class KimiK3Model(Decoder):
             spmd.assert_type(h_TD, {MeshAxisName.DP: spmd.S(0)})
 
         block_residual_TND = h_TD.unsqueeze(1)[:, :0]
+        plain_stream_TD = h_TD if self.attn_res_gated else None
         for layer in self.layers.values():
-            h_TD, block_residual_TND = layer(
+            h_TD, block_residual_TND, plain_stream_TD = layer(
                 h_TD,
                 block_residual_TND,
                 attention_masks,
                 positions,
+                plain_stream_TD,
             )
 
-        h_TD = _apply_attention_residual(
+        read_TD = _apply_attention_residual(
             h_TD,
             block_residual_TND,
             self.output_res_proj,
             self.output_res_norm,
         )
+        if self.attn_res_gated:
+            assert plain_stream_TD is not None
+            read_TD = _gate_residual_read(
+                read_TD, plain_stream_TD, self.output_res_alpha
+            )
+        h_TD = read_TD
         h_TD = self.norm(h_TD) if self.norm is not None else h_TD
         if self._skip_lm_head:
             return h_TD
