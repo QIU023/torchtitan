@@ -37,13 +37,13 @@ from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_sequence_parallel_placement,
 )
-from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.common.multimodal import (
     get_vision_positions,
     multimodal_context,
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.kimi_k3.sharding import set_kimi_k3_sharding_config
 from torchtitan.models.utils import (
     delta_rule_flops_per_token,
@@ -55,6 +55,7 @@ from torchtitan.tools.logging import logger
 
 from .kda import KDA
 from .moe import KimiFeedForward, KimiLatentMoE
+from .moon_ep_dispatcher import MoonEPTokenDispatcher
 from .mtp import KimiK3MTPLayer, put_mtp_logits
 from .vision_encoder import KimiK3VisionEncoder
 
@@ -214,7 +215,9 @@ def _apply_attention_residual(
             norm,
             use_reentrant=False,
         )
-    return _attention_residual_math(partial_block_TD, block_residual_TND, projection, norm)
+    return _attention_residual_math(
+        partial_block_TD, block_residual_TND, projection, norm
+    )
 
 
 def _attention_residual_math(
@@ -446,6 +449,23 @@ class KimiK3Model(Decoder):
                 enable_ep=config.parallelism.expert_parallel_degree > 1,
                 enable_sp=enable_sp,
             )
+            # MoonEP's S is a static shape: the per-rank token count of every
+            # dispatch, after CP and TP/SP have sharded the token axis. Core
+            # fills the same figure for its own persistent backends and does
+            # not know this one.
+            for layer in self.layers:
+                moe = layer.moe
+                if moe is None:
+                    continue
+                dispatcher = moe.routed_experts.token_dispatcher
+                if isinstance(dispatcher, MoonEPTokenDispatcher.Config):
+                    shards = (
+                        parallelism.context_parallel_degree
+                        * parallelism.tensor_parallel_degree
+                    )
+                    dispatcher.num_max_tokens_per_rank = (
+                        config.training.num_tokens_per_microbatch_per_dp_rank // shards
+                    )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             spmd_types = parallelism.spmd_backend == "spmd_types"
             if self.mtp_layers and (
