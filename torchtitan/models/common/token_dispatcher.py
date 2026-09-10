@@ -90,10 +90,12 @@ class LocalTokenDispatcher(Configurable):
             topk_scores_experts_sorted_N: ``(N,)`` scores in expert-sorted order
         """
         # Reorder the token indices to match the order of the experts where N = T*K
+        # reshape, not view: a router may hand over a strided slice of a
+        # wider top-k (the quantile-balanced router's Top-(k+1) selection).
         token_indices_experts_sorted_N = torch.argsort(
-            topk_expert_ids_TK.view(-1), stable=True
+            topk_expert_ids_TK.reshape(-1), stable=True
         )
-        topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[
+        topk_scores_experts_sorted_N = topk_scores_TK.reshape(-1)[
             token_indices_experts_sorted_N
         ]
         token_indices_experts_sorted_N = token_indices_experts_sorted_N // self.top_k
