@@ -10,6 +10,8 @@ import re
 from typing import Any
 
 import torch
+
+from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.tensor import DTensor
 
 from torchtitan.models.utils import MoEStateDictAdapter
@@ -21,6 +23,21 @@ _UNUSED_HF_LAYER_ZERO_ATTN_RES_KEYS = {
     "language_model.model.layers.0.self_attention_res_norm.weight",
     "language_model.model.layers.0.self_attention_res_proj.weight",
 }
+
+
+# Key suffixes of packed or scaled weights in compressed checkpoints; the
+# released Kimi K3 index carries the routed experts as ``mxfp4-pack-quantized``
+# blocks and scales under such names.
+_PACKED_KEY_SUFFIXES = (
+    ".weight_packed",
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".weight_blocks",
+    ".scales",
+    ".qweight",
+    ".qzeros",
+)
+_PACKED_DTYPES = (torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 class KimiK3StateDictAdapter(MoEStateDictAdapter):
@@ -210,6 +227,10 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
                     continue
                 if abstract_key == "layers.{}.delta_attention.dt_bias":
                     value = value.reshape(-1)
+                elif abstract_key == "layers.{}.delta_attention.A_log":
+                    # The released layout carries the per-head log-decay as
+                    # [1, 1, heads, 1]; the model keeps it as [heads].
+                    value = value.reshape(1, 1, -1, 1)
                 hf_state_dict[hf_abstract_key.format(layer_num)] = value
                 continue
 
@@ -264,8 +285,40 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
             )
         return hf_state_dict
 
+    def get_hf_storage_reader(
+        self, path: str, from_quantized: bool = False
+    ) -> HuggingFaceStorageReader:
+        """The released checkpoint packs the routed experts as MXFP4 blocks
+        and scales; torch's quantized reader dequantizes them on load, so
+        ``from_hf`` always sees plain weights."""
+        if from_quantized:
+            from torch.distributed.checkpoint.quantized_hf_storage import (
+                QuantizedHuggingFaceStorageReader,
+            )
+
+            return QuantizedHuggingFaceStorageReader(path)
+        return HuggingFaceStorageReader(path)
+
+    @staticmethod
+    def _check_not_packed(hf_state_dict: dict[str, Any]) -> None:
+        """Refuse packed tensors rather than mapping their bytes as weights."""
+        packed = [
+            key
+            for key, value in hf_state_dict.items()
+            if key.endswith(_PACKED_KEY_SUFFIXES)
+            or (isinstance(value, torch.Tensor) and value.dtype in _PACKED_DTYPES)
+        ]
+        if packed:
+            raise NotImplementedError(
+                "The HF state dict holds packed or scaled tensors "
+                f"(e.g. {packed[:4]}); load a quantized checkpoint through the "
+                "quantized storage reader (from_quantized=True) so the experts "
+                "arrive dequantized."
+            )
+
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert an unquantized HuggingFace state dict to TorchTitan."""
+        self._check_not_packed(hf_state_dict)
         state_dict: dict[str, Any] = {}
         expert_weights_by_layer: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
         unmapped: list[str] = []
@@ -361,6 +414,8 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
                         delta_config.num_heads,
                         delta_config.head_dim,
                     )
+                elif new_abstract_key == "layers.{}.delta_attention.A_log":
+                    value = value.reshape(-1)
                 state_dict[new_abstract_key.format(layer_num)] = value
                 continue
 

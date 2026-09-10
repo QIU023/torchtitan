@@ -508,6 +508,89 @@ def _debugmodel(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     )
 
 
+def _small_vision_encoder_config(text_dim: int) -> KimiK3VisionEncoder.Config:
+    """The released tower shrunk to 4 layers and width 256, every structural
+    feature kept (single varlen attention pass, 2-D RoPE with the divided_fixed
+    absolute embedding, temporal pooling, the two-layer projector); head_dim 128
+    like the released tower's 1536 / 12."""
+    return _vision_encoder_config(
+        text_dim=text_dim,
+        dim=256,
+        qkv_dim=384,
+        hidden_dim=1024,
+        num_layers=4,
+        num_heads=3,
+        init_pos_emb_height=64,
+        init_pos_emb_width=64,
+    )
+
+
+def _report_arch(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
+    """A 13-layer twin of the released topology at width 256: the same layer
+    pattern (KDA:MLA 3:1 with the final layer global, so full attention at
+    1-based 4, 8, 12, 13), a dense first layer, 8 latent-MoE experts with two
+    shared, attention residual blocks of 7 layers (one full block and a
+    6-layer tail, the released 93 = 7 x 12 + 9 structure at this depth)."""
+    dim = 256
+    return _kimi_k3_config(
+        dim=dim,
+        moe_comm_backend=moe_comm_backend,
+        vocab_size=163840,
+        num_layers=13,
+        full_attention_layers={3, 7, 11, 12},
+        attn_res_block_size=7,
+        num_heads=4,
+        q_lora_rank=128,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=896,
+        latent_dim=256,
+        expert_hidden_dim=224,
+        num_experts=8,
+        top_k=2,
+        num_shared_experts=2,
+        vision_encoder=_small_vision_encoder_config(dim),
+        attn_backend=attn_backend,
+    )
+
+
+def _k3mini(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
+    """A 21-layer downscale at width 512 that keeps the released block
+    structure: attention residual blocks of 12 layers (one full block and a
+    9-layer tail, as 93 = 7 x 12 + 9), KDA:MLA 3:1 with the final layer
+    global, a dense first layer, 8 latent-MoE experts with two shared, and the
+    released head dimensions so the KDA kernel runs at its real width."""
+    dim = 512
+    return _kimi_k3_config(
+        dim=dim,
+        moe_comm_backend=moe_comm_backend,
+        vocab_size=163840,
+        num_layers=21,
+        full_attention_layers={3, 7, 11, 15, 19, 20},
+        attn_res_block_size=12,
+        num_heads=4,
+        q_lora_rank=128,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=896,
+        latent_dim=256,
+        expert_hidden_dim=224,
+        num_experts=8,
+        top_k=2,
+        num_shared_experts=2,
+        vision_encoder=_small_vision_encoder_config(dim),
+        attn_backend=attn_backend,
+    )
+
+
 def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
@@ -547,6 +630,8 @@ def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
 
 kimi_k3_configs = {
     "debugmodel": (_debugmodel, 16384),
+    "report_arch": (_report_arch, 4096),
+    "k3mini": (_k3mini, 4096),
     "Kimi-K3": (_kimi_k3, 262144),
 }
 
