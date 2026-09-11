@@ -68,13 +68,21 @@ def parallelize_kimi_k3(
 
     unsupported_parallelisms = [
         name
-        for name, enabled in (("context parallel", parallel_dims.cp_enabled),)
+        for name, enabled in (
+            (
+                "context parallel with tensor parallel",
+                parallel_dims.cp_enabled and parallel_dims.tp_enabled,
+            ),
+            (
+                "context parallel with pipeline parallel",
+                parallel_dims.cp_enabled and parallel_dims.pp_enabled,
+            ),
+        )
         if enabled
     ]
     if unsupported_parallelisms:
         raise NotImplementedError(
-            "Kimi K3 currently supports FSDP2 data parallelism "
-            f"only; disable {', '.join(unsupported_parallelisms)}."
+            f"Kimi K3 does not support {', '.join(unsupported_parallelisms)}."
         )
 
     assert isinstance(model, KimiK3Model)
