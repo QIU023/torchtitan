@@ -599,13 +599,25 @@ def llama3_debugmodel_seed_checkpoint() -> Trainer.Config:
 
 
 def kimi_k3_debugmodel_pp8_vp4() -> Trainer.Config:
-    # 35 units (33 layers, the embedding and the head) over 32 stages, so the
-    # split is uneven and the last stage holds the head alone.
+    # 35 units (33 layers, the embedding and the head) over 32 stages: no
+    # layers_per_stage yields that count under core's ceiling rule, so the
+    # recipe spells the split out with core's generator. Uneven, and the last
+    # stage holds the head, with the AttnRes aggregation pinned next to it.
+    from torchtitan.distributed.pipeline_parallel import (
+        _generate_llm_fqn_per_model_part,
+    )
     from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
 
     config = kimi_k3_debugmodel()
+    num_layers = len(config.model_spec.model.layers)
     config.parallelism.pipeline_parallel_degree = 8
-    config.parallelism.pipeline_parallel_layers_per_stage = 1
     config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
     config.parallelism.num_pp_microbatches = 8
+    config.parallelism.module_fqns_per_model_part = _generate_llm_fqn_per_model_part(
+        32,
+        num_layers,
+        config.parallelism.pipeline_parallel_first_stage_less_layers,
+        config.parallelism.pipeline_parallel_last_stage_less_layers,
+        last_stage_modules=("output_res_proj", "output_res_norm"),
+    )
     return config

@@ -79,7 +79,15 @@ def pipeline_llm(
     parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
     stage_class: type[PipelineStage] = PipelineStage,
+    first_stage_modules: Sequence[str] = (),
+    last_stage_modules: Sequence[str] = (),
 ) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
+    """Split ``model`` into pipeline stages and build the schedule.
+
+    ``first_stage_modules`` / ``last_stage_modules`` name modules the generated
+    split pins to the first / last stage next to the embedding / the head; they
+    are ignored when ``parallelism.module_fqns_per_model_part`` is given.
+    """
     pp_mesh = parallel_dims.get_mesh("pp")
 
     (
@@ -92,7 +100,12 @@ def pipeline_llm(
     module_names_per_stage = parallelism.module_fqns_per_model_part
     if module_names_per_stage is None:
         module_names_per_stage = _generate_llm_fqn_per_model_part(
-            num_virtual_stages, num_layers, input_weight, output_weight
+            num_virtual_stages,
+            num_layers,
+            input_weight,
+            output_weight,
+            first_stage_modules=first_stage_modules,
+            last_stage_modules=last_stage_modules,
         )
     for i, stage_ms in enumerate(module_names_per_stage):
         logger.debug(f"Stage {i}: {stage_ms}")
@@ -364,6 +377,9 @@ def _generate_llm_fqn_per_model_part(
     num_layers: int,
     input_weight: int = 1,
     output_weight: int = 1,
+    *,
+    first_stage_modules: Sequence[str] = (),
+    last_stage_modules: Sequence[str] = (),
 ) -> list[list[str]]:
     """Programmatically generates module names per model part, focused on LLM models.
 
@@ -375,6 +391,12 @@ def _generate_llm_fqn_per_model_part(
         num_layers: Total number of transformer layers in the model
         input_weight: Weight for input modules (tok_embeddings) in layer calculation
         output_weight: Weight for output modules (norm + output) in layer calculation
+        first_stage_modules: Extra module names pinned to the first stage, after
+            ``tok_embeddings`` (e.g. a vision encoder whose features are spliced
+            into the embeddings). They do not count as layers.
+        last_stage_modules: Extra module names pinned to the last stage, after
+            ``norm`` and ``lm_head`` (e.g. modules that aggregate the whole
+            model's output). They do not count as layers.
 
     Returns:
         List of lists containing module names for each model part
@@ -386,10 +408,19 @@ def _generate_llm_fqn_per_model_part(
     if num_stages < 1:
         raise ValueError("Number of stages must be at least 1")
 
+    first_extra = list(first_stage_modules)
+    last_extra = list(last_stage_modules)
+
     if num_stages == 1:
         # Single stage gets everything
         layer_names = [f"layers.{i}" for i in range(num_layers)]
-        return [["tok_embeddings"] + layer_names + ["norm", "lm_head"]]
+        return [
+            ["tok_embeddings"]
+            + first_extra
+            + layer_names
+            + ["norm", "lm_head"]
+            + last_extra
+        ]
 
     # Calculate effective layers including weights
     num_effective_layers = num_layers + input_weight + output_weight
@@ -437,6 +468,7 @@ def _generate_llm_fqn_per_model_part(
         # First stage: handle input modules with weighting
         if stage_idx == 0:
             stage_modules.append("tok_embeddings")
+            stage_modules.extend(first_extra)
             # Account for input weight in layer distribution
             remaining_layers_for_stage = effective_layers_for_stage - input_weight
 
@@ -459,6 +491,7 @@ def _generate_llm_fqn_per_model_part(
 
             # Add output modules
             stage_modules.extend(["norm", "lm_head"])
+            stage_modules.extend(last_extra)
 
         # Middle stages: only transformer layers
         else:
