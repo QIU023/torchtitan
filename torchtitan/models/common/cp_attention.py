@@ -12,7 +12,7 @@ Tensor suffixes: ``T`` tokens, ``H`` heads, ``K`` qk head dim, ``V`` v head dim.
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, cast, Literal, TYPE_CHECKING
+from typing import Any, cast, ClassVar, Literal, TYPE_CHECKING
 
 import spmd_types as spmd
 
@@ -30,6 +30,8 @@ from torchtitan.models.common.attention import FlexInnerAttention
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
+    from torchtitan.config.configurable import Configurable
+
 __all__ = [
     "CPInnerAttention",
     "KVAllGatherCPFlexInnerAttention",
@@ -44,6 +46,8 @@ _BLOCK_MASK_QUERY_DIM = 2
 class CPInnerAttention(ABC):
     """Inner attention that owns its context-parallel metadata sharding."""
 
+    requires_backend_config: ClassVar[bool] = False
+
     @classmethod
     @abstractmethod
     def cp_shard_metadata(
@@ -51,8 +55,10 @@ class CPInnerAttention(ABC):
         input_dict: dict[str, Any],
         cp_mesh: "DeviceMesh",
         load_balancer: ContextParallelLoadBalancer,
+        *,
+        backend_config: "Configurable.Config | None" = None,
     ) -> dict[str, Any]:
-        """Shard metadata owned by this attention implementation."""
+        """Prepare metadata owned by this context-parallel backend."""
 
 
 class KVAllGatherCPFlexInnerAttention(CPInnerAttention, FlexInnerAttention):
@@ -73,7 +79,10 @@ class KVAllGatherCPFlexInnerAttention(CPInnerAttention, FlexInnerAttention):
         input_dict: dict[str, Any],
         cp_mesh: "DeviceMesh",
         load_balancer: ContextParallelLoadBalancer,
+        *,
+        backend_config: "Configurable.Config | None" = None,
     ) -> dict[str, Any]:
+        del backend_config
         attention_masks = input_dict.get("attention_masks")
         if attention_masks is None:
             return input_dict
@@ -153,6 +162,8 @@ class UlyssesCPFlexInnerAttention(CPInnerAttention, FlexInnerAttention):
         input_dict: dict[str, Any],
         cp_mesh: "DeviceMesh",
         load_balancer: ContextParallelLoadBalancer,
+        *,
+        backend_config: "Configurable.Config | None" = None,
     ) -> dict[str, Any]:
         """Keep attention metadata global for the Ulysses head-sharded layout.
 
@@ -160,7 +171,7 @@ class UlyssesCPFlexInnerAttention(CPInnerAttention, FlexInnerAttention):
         head-sharded tensors in ``forward``, so its attention metadata must not
         be sharded along the token dimension here.
         """
-        del cp_mesh, load_balancer
+        del cp_mesh, load_balancer, backend_config
         return input_dict
 
     def forward(

@@ -35,9 +35,12 @@ class ModelConfigTransform(ABC):
 
 
 def convert_config_type(
-    existing: Module.Config, replacement: type[Module]
+    existing: Module.Config,
+    replacement: type[Module],
+    *,
+    config_updates: dict[str, object] | None = None,
 ) -> Module.Config:
-    """Build ``replacement``'s config from ``existing``, keeping its fields.
+    """Build ``replacement``'s config from ``existing`` and explicit updates.
 
     Requiring inheritance preserves wrappers added by earlier transforms.
     """
@@ -46,6 +49,6 @@ def convert_config_type(
             f"{replacement.__qualname__}.Config must inherit "
             f"{type(existing).__qualname__}."
         )
-    return replacement.Config(
-        **{f.name: getattr(existing, f.name) for f in fields(existing)}
-    )
+    values = {f.name: getattr(existing, f.name) for f in fields(existing)}
+    values.update(config_updates or {})
+    return replacement.Config(**values)

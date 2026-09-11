@@ -8,7 +8,7 @@
 
 from .apply import apply_transforms, transform_model_config_
 from .base import convert_config_type, ModelConfigTransform
-from .context_parallel import ContextParallelTransform
+from .context_parallel import ContextParallelTransform, KDAContextParallelTransform
 from .lora import LoRAConverter
 from .quantization import (
     Float8GroupedExpertsConverter,
@@ -25,6 +25,7 @@ __all__ = [
     "transform_model_config_",
     "convert_config_type",
     "ContextParallelTransform",
+    "KDAContextParallelTransform",
     "LoRAConverter",
     "Float8GroupedExpertsConverter",
     "Float8LinearConverter",

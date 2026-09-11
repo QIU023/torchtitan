@@ -371,7 +371,15 @@ class Decoder(BaseModel):
                 or owner in sharded_backends
             ):
                 continue
-            batch = owner.cp_shard_metadata(batch, cp_mesh, load_balancer)
+            if owner.requires_backend_config:
+                batch = owner.cp_shard_metadata(
+                    batch,
+                    cp_mesh,
+                    load_balancer,
+                    backend_config=module_config,
+                )
+            else:
+                batch = owner.cp_shard_metadata(batch, cp_mesh, load_balancer)
             sharded_backends.add(owner)
         return batch
 

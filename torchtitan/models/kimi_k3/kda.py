@@ -6,6 +6,8 @@
 
 """Kimi Delta Attention using Attention Gym kernels."""
 
+from typing import TYPE_CHECKING
+
 from dataclasses import dataclass
 
 import torch
@@ -23,6 +25,9 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv1d
 from torchtitan.protocols.module import Module
+
+if TYPE_CHECKING:
+    from attn_gym.linear.context_parallel import ContextParallelRouting
 
 # Shape suffixes:
 # T = packed tokens, D = model dimension, C = projection channels,
@@ -84,6 +89,34 @@ class KDAKernel(Module):
         *,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        q_1THK, k_1THK, gate_1THK, beta_1TH = self.prepare_inputs(
+            q_1THK,
+            k_1THK,
+            raw_gate_1THK,
+            raw_beta_1TH,
+            A_log_H,
+            dt_bias_HK,
+        )
+        output_1THV, _ = chunk_kda(
+            q_1THK,
+            k_1THK,
+            v_1THV,
+            gate_1THK,
+            beta_1TH,
+            cu_seqlens=cu_seqlens,
+        )
+        return output_1THV
+
+    def prepare_inputs(
+        self,
+        q_1THK: torch.Tensor,
+        k_1THK: torch.Tensor,
+        raw_gate_1THK: torch.Tensor,
+        raw_beta_1TH: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_HK: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply the preprocessing shared by local and CP KDA cores."""
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
         capability = torch.cuda.get_device_capability(q_1THK.device)
@@ -94,7 +127,6 @@ class KDAKernel(Module):
                 "Attention Gym KDA requires CUDA capability 8.0 or newer; "
                 f"got {capability}."
             )
-
         gate_1THK = bound_gate(
             raw_gate_1THK,
             # TODO: The long-term solution is to specify mixed precision per FQN
@@ -104,15 +136,10 @@ class KDAKernel(Module):
             lower_bound=self.lower_bound,
             impl="fused",
         )
-        output_1THV, _ = chunk_kda(
-            l2norm(q_1THK),
-            l2norm(k_1THK),
-            v_1THV,
-            gate_1THK,
-            raw_beta_1TH.float().sigmoid(),
-            cu_seqlens=cu_seqlens,
-        )
-        return output_1THV
+        q_1THK = l2norm(q_1THK)
+        k_1THK = l2norm(k_1THK)
+        beta_1TH = raw_beta_1TH.float().sigmoid()
+        return q_1THK, k_1THK, gate_1THK, beta_1TH
 
 
 class InnerKDA(Module):
@@ -148,7 +175,41 @@ class InnerKDA(Module):
         dt_bias_HK: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None,
+        routing: "ContextParallelRouting | None",
     ) -> torch.Tensor:
+        assert routing is None, "Only ContextParallelInnerKDA accepts routing."
+        return self.run_stages(
+            query_TC,
+            key_TC,
+            value_TC,
+            raw_gate_THK,
+            raw_beta_TH,
+            conv_q_weight_C1W,
+            conv_k_weight_C1W,
+            conv_v_weight_C1W,
+            A_log_H,
+            dt_bias_HK,
+            cu_seqlens=cu_seqlens,
+            routing=routing,
+        )
+
+    def run_stages(
+        self,
+        query_TC: torch.Tensor,
+        key_TC: torch.Tensor,
+        value_TC: torch.Tensor,
+        raw_gate_THK: torch.Tensor,
+        raw_beta_TH: torch.Tensor,
+        conv_q_weight_C1W: torch.Tensor,
+        conv_k_weight_C1W: torch.Tensor,
+        conv_v_weight_C1W: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_HK: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None,
+        routing: "ContextParallelRouting | None",
+    ) -> torch.Tensor:
+        """Run the pipeline shared by local and context-parallel KDA."""
         raw_gate_1THK = raw_gate_THK.unsqueeze(0)
         raw_beta_1TH = raw_beta_TH.unsqueeze(0)
         mixed_qkv_1TC = torch.cat(
@@ -159,20 +220,66 @@ class InnerKDA(Module):
             (conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W),
             dim=0,
         )
-        conv_output_1TC = causal_conv1d(
+        conv_output_1TC = self.short_convolution(
             mixed_qkv_1TC,
-            conv_weight_C1W[:, 0],
-            activation="silu",
+            conv_weight_C1W,
             cu_seqlens=cu_seqlens,
+            routing=routing,
         )
-        assert isinstance(conv_output_1TC, torch.Tensor)
 
         q_1TC, k_1TC, v_1TC = conv_output_1TC.chunk(3, dim=-1)
         q_1THK, k_1THK, v_1THV = (
             tensor.unflatten(-1, (-1, self.head_dim))
             for tensor in (q_1TC, k_1TC, v_1TC)
         )
-        output_1THV = self.kernel(
+        output_1THV = self.kda_core(
+            q_1THK,
+            k_1THK,
+            v_1THV,
+            raw_gate_1THK,
+            raw_beta_1TH,
+            A_log_H,
+            dt_bias_HK,
+            cu_seqlens=cu_seqlens,
+            routing=routing,
+        )
+        return output_1THV.squeeze(0)
+
+    def short_convolution(
+        self,
+        qkv_1TC: torch.Tensor,
+        conv_weight_C1W: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        *,
+        cu_seqlens: torch.Tensor | None,
+        routing: "ContextParallelRouting | None",
+    ) -> torch.Tensor:
+        del routing
+        output_1TC = causal_conv1d(
+            qkv_1TC,
+            conv_weight_C1W[:, 0],
+            activation="silu",
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+        )
+        assert isinstance(output_1TC, torch.Tensor)
+        return output_1TC
+
+    def kda_core(
+        self,
+        q_1THK: torch.Tensor,
+        k_1THK: torch.Tensor,
+        v_1THV: torch.Tensor,
+        raw_gate_1THK: torch.Tensor,
+        raw_beta_1TH: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_HK: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None,
+        routing: "ContextParallelRouting | None",
+    ) -> torch.Tensor:
+        del routing
+        return self.kernel(
             q_1THK,
             k_1THK,
             v_1THV,
@@ -182,7 +289,6 @@ class InnerKDA(Module):
             dt_bias_HK,
             cu_seqlens=cu_seqlens,
         )
-        return output_1THV.squeeze(0)
 
 
 class KDA(Module):
@@ -246,6 +352,8 @@ class KDA(Module):
         x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        *,
+        routing: "ContextParallelRouting | None" = None,
     ) -> torch.Tensor:
         del positions
         if x_TD.ndim != 2:
@@ -278,6 +386,7 @@ class KDA(Module):
             self.A_log,
             self.dt_bias,
             cu_seqlens=cu_seqlens,
+            routing=routing,
         )
 
         output_gate_THV = local_head_split(self.output_gate(x_TD), self.head_dim)
