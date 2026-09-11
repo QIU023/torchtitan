@@ -52,6 +52,16 @@ def parallelize_kimi_k3(
         )
     if compile_config.enable and "model" in compile_config.components:
         raise NotImplementedError("Kimi K3 does not support model compilation yet.")
+    if parallel_dims.tp_enabled and parallelism.spmd_backend != "spmd_types":
+        # Under spmd_types the tower's parameters are declared on the tp axis
+        # with the rest of the model, so every gradient lives on one mesh;
+        # under partial_dtensor the tower is sharded by FSDP alone and its
+        # gradients sit on the fsdp mesh while the decoder's sit on (fsdp, tp),
+        # which the gradient-norm stack refuses to mix.
+        raise NotImplementedError(
+            "Kimi K3 tensor parallelism requires the spmd_types SPMD backend "
+            f"(got {parallelism.spmd_backend!r})."
+        )
 
     assert isinstance(model, KimiK3Model)
     if parallelism.spmd_backend == "spmd_types":
