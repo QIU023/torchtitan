@@ -9,7 +9,6 @@ from typing import Any, cast
 
 import spmd_types as spmd
 import torch
-from spmd_types import SpmdType
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
@@ -25,6 +24,7 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     create_varlen_metadata_for_document,
     FlexAttention,
+    local_head_split,
     VarlenAttention,
     VarlenMetadata,
 )
@@ -35,6 +35,7 @@ from torchtitan.models.common.multimodal import (
     scatter_vision_embeds,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.kimi_k3.sharding import set_kimi_k3_sharding_config
 from torchtitan.models.utils import (
     delta_rule_flops_per_token,
@@ -109,9 +110,8 @@ class KimiMLAAttention(BaseAttention):
     ) -> torch.Tensor:
         del positions
 
-        num_tokens = x_TD.shape[0]
-        q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
-            num_tokens, self.n_heads, self.q_head_dim
+        q_THK = local_head_split(
+            self.wq_b(self.q_norm(self.wq_a(x_TD))), self.q_head_dim
         )
 
         compressed_kv_TC = self.wkv_a(x_TD)
@@ -120,9 +120,8 @@ class KimiMLAAttention(BaseAttention):
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
-            num_tokens,
-            self.n_heads,
+        kv_THC = local_head_split(
+            self.wkv_b(self.kv_norm(kv_latent_TC)),
             self.qk_nope_head_dim + self.v_head_dim,
         )
         k_nope_THK, v_THV = torch.split(
@@ -130,10 +129,14 @@ class KimiMLAAttention(BaseAttention):
             [self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
-        k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-            -1, self.n_heads, -1
-        )
-        k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
+        # The rotary slice is headless (replicated on TP); expanding it onto
+        # the local heads and joining it to the head-sharded nope part runs as
+        # a local region, typed head-sharded on TP like local_head_split.
+        with spmd.local():
+            k_rope_THK = k_rope_TK.unsqueeze(1).expand(-1, k_nope_THK.shape[-2], -1)
+            k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
+            if spmd.is_type_checking():
+                spmd.assert_type(k_THK, {"dp": spmd.S(0), "tp": spmd.S(1)})
 
         out_THV = self.inner_attention(
             q_THK,
@@ -142,7 +145,7 @@ class KimiMLAAttention(BaseAttention):
             attention_masks=attention_masks,
             scale=self.scale,
         )
-        out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
+        out_TD = out_THV.flatten(-2)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
 
@@ -293,10 +296,25 @@ class KimiK3Model(Decoder):
         vision_encoder: KimiK3VisionEncoder.Config | None = None
 
         def update_from_config(self, *, config, **kwargs) -> None:
-            set_kimi_k3_sharding_config(
-                self, enable_ep=config.parallelism.expert_parallel_degree > 1
-            )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
+            parallelism = config.parallelism
+            tp = parallelism.tensor_parallel_degree
+            if (
+                tp > 1
+                and self.vision_encoder is not None
+                and self.vision_encoder.block.attn.num_heads % tp != 0
+            ):
+                raise ValueError(
+                    f"tensor_parallel_degree ({tp}) must divide "
+                    f"vision num_heads ({self.vision_encoder.block.attn.num_heads})."
+                )
+            enable_tp = tp > 1
+            set_kimi_k3_sharding_config(
+                self,
+                enable_ep=parallelism.expert_parallel_degree > 1,
+                enable_tp=enable_tp,
+                enable_sp=enable_tp and parallelism.enable_sequence_parallel,
+            )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
@@ -358,19 +376,7 @@ class KimiK3Model(Decoder):
                     max_context_length=max_context_length,
                 )
 
-        multimodal_layout = SpmdType({MeshAxisName.DP: spmd.V})
-        input_sharding = decoder_input_sharding()
-        input_sharding.update(
-            {
-                name: multimodal_layout
-                for name in (
-                    "pixel_values",
-                    "pixel_values_videos",
-                    "grid_thw",
-                    "grid_thw_videos",
-                )
-            }
-        )
+        input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
         if parallelism.spmd_backend == "spmd_types":
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
 
@@ -448,6 +454,9 @@ class KimiK3Model(Decoder):
             num_tokens_per_item,
             special_tokens["image_id"],
         )
+        # The declarations keep the embedding replicated on TP when a vision
+        # tower is present, so the scatter indexes the whole sequence on every
+        # rank; layer 0's input boundary restores the decoder's layout.
         return scatter_vision_embeds(
             embeddings_TD,
             vision_embeds=vision_embeds,
@@ -478,7 +487,6 @@ class KimiK3Model(Decoder):
                 )
         else:
             h_TD = tokens
-
         if spmd.is_type_checking():
             spmd.assert_type(h_TD, {MeshAxisName.DP: spmd.S(0)})
 
