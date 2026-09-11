@@ -156,6 +156,7 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "parallelism.num_pp_microbatches",
         "parallelism.pipeline_parallel_schedule",
         "parallelism.pipeline_parallel_schedule_csv",
+        "parallelism.pipeline_parallel_virtual_stages_per_rank",
         "parallelism.spmd_backend",
         "parallelism.tensor_parallel_degree",
         "profiler.enable_memory_snapshot",

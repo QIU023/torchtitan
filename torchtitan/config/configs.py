@@ -217,14 +217,9 @@ class ParallelismConfig:
 
     pipeline_parallel_virtual_stages_per_rank: int | None = None
     """
-    The number of (virtual) pipeline stages each rank holds, for looped schedules that want a
-    stage count the layer arithmetic cannot express. pipeline_parallel_layers_per_stage reaches a
-    stage count only as ceil(units / layers_per_stage), which for some models skips the count a
-    schedule needs: a 33-layer model is 35 units, and that expression takes 35, 18, 12, 9, 7, 6,
-    5, 4, 3, 2, 1 -- so four stages per rank on eight ranks is unreachable, while the split
-    generator itself is happy to produce 32 stages. This field states the count directly; the
-    total is pipeline_parallel_degree * this, so it is a multiple of the degree by construction.
-    Exclusive with pipeline_parallel_layers_per_stage and module_fqns_per_model_part.
+    The number of (virtual) pipeline stages each rank holds, for a stage count that
+    pipeline_parallel_layers_per_stage cannot express. Exclusive with
+    pipeline_parallel_layers_per_stage and module_fqns_per_model_part.
     """
 
     pipeline_parallel_schedule: str = "1F1B"
