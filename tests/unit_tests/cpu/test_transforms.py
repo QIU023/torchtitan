@@ -7,6 +7,8 @@
 """Model transform base class, ordering, and the context-parallel transform."""
 
 import unittest
+from dataclasses import dataclass
+from typing import cast
 
 import torchtitan.config.transform as transform_api
 from torchtitan.config.transform import (
@@ -17,8 +19,12 @@ from torchtitan.config.transform import (
     transform_model_config_,
 )
 
-from torchtitan.models.common.attention import FlexInnerAttention
-from torchtitan.models.common.cp_attention import KVAllGatherCPFlexInnerAttention
+from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
+from torchtitan.models.common.cp_attention import (
+    KVAllGatherCPFlexInnerAttention,
+    UlyssesCPVarlenInnerAttention,
+)
+from torchtitan.protocols.module import Module
 
 
 def _llama3_cp_ready():
@@ -71,6 +77,12 @@ class _Boom(ModelConfigTransform):
     def transform(self, model):
         model.layers[0].attention.inner_attention.block_size = (1, 1)
         raise ValueError("boom")
+
+
+class _MixedAttentionModel(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        inner_attentions: list[Module.Config]
 
 
 class TestConvertConfigType(unittest.TestCase):
@@ -141,7 +153,13 @@ class TestAtomicApplication(unittest.TestCase):
         config = _llama3_cp_ready()
         result = apply_transforms(
             config,
-            [ContextParallelTransform(inner_attention=KVAllGatherCPFlexInnerAttention)],
+            [
+                ContextParallelTransform(
+                    inner_attention={
+                        FlexInnerAttention.Config: KVAllGatherCPFlexInnerAttention
+                    }
+                )
+            ],
         )
         self.assertIsNot(result, config)
         original = config.model_spec.model.layers[0].attention.inner_attention
@@ -161,7 +179,13 @@ class TestTransformModel(unittest.TestCase):
         spec = self._spec()
         spec.model = transform_model_config_(
             spec.model,
-            [ContextParallelTransform(inner_attention=KVAllGatherCPFlexInnerAttention)],
+            [
+                ContextParallelTransform(
+                    inner_attention={
+                        FlexInnerAttention.Config: KVAllGatherCPFlexInnerAttention
+                    }
+                )
+            ],
         )
         inner = spec.model.layers[0].attention.inner_attention
         self.assertIsInstance(inner, KVAllGatherCPFlexInnerAttention.Config)
@@ -175,7 +199,13 @@ class TestTransformModel(unittest.TestCase):
         spec = self._spec()
         transform_model_config_(
             spec.model,
-            [ContextParallelTransform(inner_attention=KVAllGatherCPFlexInnerAttention)],
+            [
+                ContextParallelTransform(
+                    inner_attention={
+                        FlexInnerAttention.Config: KVAllGatherCPFlexInnerAttention
+                    }
+                )
+            ],
         )
 
     def test_orders_transforms(self):
@@ -192,6 +222,32 @@ class TestContextParallelTransform(unittest.TestCase):
         handler_cls = getattr(transform_api, "LinearLoRAHandler", None)
         self.assertIsNotNone(handler_cls, "LinearLoRAHandler is not exported")
 
+    def test_replaces_each_config_type_with_its_mapped_backend(self):
+        config = _MixedAttentionModel.Config(
+            inner_attentions=[
+                FlexInnerAttention.Config(),
+                VarlenInnerAttention.Config(window_size=(128, 0)),
+            ]
+        )
+
+        result = cast(
+            _MixedAttentionModel.Config,
+            ContextParallelTransform(
+                inner_attention={
+                    FlexInnerAttention.Config: KVAllGatherCPFlexInnerAttention,
+                    VarlenInnerAttention.Config: UlyssesCPVarlenInnerAttention,
+                }
+            ).transform(config),
+        )
+
+        self.assertIsInstance(
+            result.inner_attentions[0], KVAllGatherCPFlexInnerAttention.Config
+        )
+        self.assertIsInstance(
+            result.inner_attentions[1], UlyssesCPVarlenInnerAttention.Config
+        )
+        self.assertEqual(result.inner_attentions[1].window_size, (128, 0))
+
     def test_swap_keeps_the_tuning_of_the_kernel_it_replaces(self):
         config = _llama3_cp_ready()
         tuned = config.model_spec.model.layers[0].attention.inner_attention
@@ -200,7 +256,13 @@ class TestContextParallelTransform(unittest.TestCase):
 
         result = apply_transforms(
             config,
-            [ContextParallelTransform(inner_attention=KVAllGatherCPFlexInnerAttention)],
+            [
+                ContextParallelTransform(
+                    inner_attention={
+                        FlexInnerAttention.Config: KVAllGatherCPFlexInnerAttention
+                    }
+                )
+            ],
         )
 
         swapped = result.model_spec.model.layers[0].attention.inner_attention
@@ -210,7 +272,9 @@ class TestContextParallelTransform(unittest.TestCase):
 
     def test_rejects_a_kernel_that_is_not_context_parallel(self):
         with self.assertRaisesRegex(ValueError, "must inherit CPInnerAttention"):
-            ContextParallelTransform(inner_attention=FlexInnerAttention)
+            ContextParallelTransform(
+                inner_attention={FlexInnerAttention.Config: FlexInnerAttention}
+            )
 
     def test_lora_runs_after_context_parallelism(self):
         transform_cls = getattr(transform_api, "LoRATransform", None)
