@@ -95,6 +95,11 @@ class ContextParallelLoadBalancer(LoadBalancer):
         )
         self._load_balancer_impl: _LoadBalancer | None = None
 
+    @property
+    def cp_mesh(self) -> DeviceMesh:
+        """Device mesh whose CP axis owns this partition."""
+        return self._cp_mesh
+
     def shard(
         self,
         buffers: list[Any] | tuple[Any, ...],
