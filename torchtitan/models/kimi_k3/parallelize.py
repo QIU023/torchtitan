@@ -29,11 +29,15 @@ from torchtitan.distributed.fsdp import (
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.distributed.pipeline_parallel import (
+    _generate_llm_fqn_per_model_part,
+    _get_pipeline_metadata,
+    pipeline_llm,
+)
 from torchtitan.distributed.spmd_types import annotate_replicated_parameters
 from torchtitan.models.kimi_k3.layout import (
-    gather_layer_to_stage,
     infer_block_layout_tables_from_stages,
+    layer_to_stage_from_split,
 )
 from torchtitan.models.kimi_k3.pipeline_stage import AttnResPipelineStage, RankStore
 from .model import KimiK3Model
@@ -145,6 +149,30 @@ def _kimi_k3_last_stage_modules(model: nn.Module) -> tuple[str, ...]:
     return tuple(n for n in _KIMI_ATTN_RES_LAST_STAGE_FQNS if hasattr(model, n))
 
 
+def _module_fqns_per_model_part(model: nn.Module, kwargs: dict) -> list[list[str]]:
+    """The split core applies in ``pipeline_llm``: the config's, or the one
+    generated from the same metadata with this model's pinned modules."""
+    parallelism = kwargs["parallelism"]
+    if parallelism.module_fqns_per_model_part is not None:
+        return parallelism.module_fqns_per_model_part
+    (
+        num_virtual_stages,
+        num_layers,
+        input_weight,
+        output_weight,
+    ) = _get_pipeline_metadata(
+        kwargs["parallel_dims"], parallelism, kwargs["model_config"]
+    )
+    return _generate_llm_fqn_per_model_part(
+        num_virtual_stages,
+        num_layers,
+        input_weight,
+        output_weight,
+        first_stage_modules=_kimi_k3_first_stage_modules(model),
+        last_stage_modules=_kimi_k3_last_stage_modules(model),
+    )
+
+
 def _schedule_stages(schedule: _PipelineSchedule) -> list[AttnResPipelineStage]:
     """The stages a schedule holds on this rank."""
     if isinstance(schedule, PipelineScheduleSingle):
@@ -164,9 +192,8 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
 
     Builds the schedule on :class:`AttnResPipelineStage` over core's split with
     this model's pinned modules, then gives every stage the routing tables
-    computed from the split the trainer applied: the layer-to-stage map is one
-    all-gather over the pipeline group, and the stage-to-rank map is the
-    schedule's own.
+    computed from that split: the layer-to-stage map is read off the split
+    and the stage-to-rank map is the schedule's own.
 
     ``attn_res_cache`` is a property of the transport, not of the model: with
     it, a hop carries only the blocks the receiving rank has not seen and the
@@ -197,10 +224,13 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
     n_layers = len(layer_cfgs)
     layers_per_block = layer_cfgs[0].attn_res_block_size
     num_blocks = -(-n_layers // layers_per_block)
-    # The split is whatever the trainer applied, uneven stages included: a
-    # rank sees only its own stages, so the layer-to-stage map is one
-    # all-gather over the pipeline group; the schedule owns stage-to-rank.
-    layer_to_stage = gather_layer_to_stage(stages, stages[0].group)
+    # The split is whatever core applied, uneven stages included: the
+    # config's FQNs, or the generated ones from the same metadata and the same
+    # pinned modules, so every rank reads the same layer-to-stage map off it
+    # with no collective; the schedule owns stage-to-rank.
+    layer_to_stage = layer_to_stage_from_split(
+        _module_fqns_per_model_part(model, kwargs)
+    )
     layout = infer_block_layout_tables_from_stages(
         stages,
         stage_to_rank=dict(stages[0].stage_index_to_group_rank),
