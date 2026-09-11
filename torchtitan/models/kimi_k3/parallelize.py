@@ -69,15 +69,12 @@ def parallelize_kimi_k3(
         # declarations. Vision buffers declare their DP layouts separately.
         annotate_replicated_parameters(model, parallel_dims)
 
-    if (
-        parallelism.spmd_backend == "spmd_types"
-        or parallel_dims.ep_enabled
-        or parallel_dims.tp_enabled
-    ):
+    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
         # model_registry's moe_comm_backend picks the dispatcher: standard
         # (default), deepep and minimal_async_ep run on this model; hybridep
         # needs GB200-class hardware.
         model.parallelize(parallel_dims)
+
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
         ac_policy.apply(model)
