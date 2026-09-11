@@ -204,6 +204,9 @@ class KimiK3TransformerBlock(Module):
             raise ValueError("Exactly one of feed_forward or moe must be configured.")
         self.layer_id = config.layer_id
         self.attn_res_block_size = config.attn_res_block_size
+        # A block's first layer closes the previous block: the incoming stream
+        # joins the stack; every other layer carries it as the open block's sum.
+        self.first_layer_in_block = self.layer_id % self.attn_res_block_size == 0
         self.attention = (
             config.attention.build() if config.attention is not None else None
         )
@@ -244,10 +247,7 @@ class KimiK3TransformerBlock(Module):
         *,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # A block's first layer closes the previous block: the incoming stream
-        # joins the stack; every other layer carries it as the open block's sum.
-        first_layer_in_block = self.layer_id % self.attn_res_block_size == 0
-        if first_layer_in_block:
+        if self.first_layer_in_block:
             block_residual_TND = torch.cat(
                 (block_residual_TND, x_TD.unsqueeze(1)), dim=1
             )
@@ -275,7 +275,7 @@ class KimiK3TransformerBlock(Module):
         else:
             assert self.delta_attention is not None
             h_TD = self.delta_attention(h_TD, layer_mask, positions)
-        prefix_sum_TD = h_TD if first_layer_in_block else x_TD + h_TD
+        prefix_sum_TD = h_TD if self.first_layer_in_block else x_TD + h_TD
 
         h_TD = _apply_attention_residual(
             prefix_sum_TD,
