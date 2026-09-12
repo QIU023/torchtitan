@@ -33,7 +33,15 @@ def flux_activation_placement(
     )
 
 
-def set_flux_inner_attention_local_spmd(inner_attention_cfg) -> None:
+def flux_input_sharding() -> dict[str, SpmdType]:
+    """Input sharding for Flux training and validation."""
+    return {
+        name: flux_activation_placement(cp=spmd.S(1))
+        for name in ("img", "img_ids", "txt", "txt_ids", "target")
+    }
+
+
+def set_flux_inner_attention_local_map(inner_attention_cfg) -> None:
     q_layout = flux_activation_placement(cp=spmd.S(1))
     kv_src_layout = flux_activation_placement(cp=spmd.S(1))
     kv_dst_layout = flux_activation_placement(cp=spmd.R)

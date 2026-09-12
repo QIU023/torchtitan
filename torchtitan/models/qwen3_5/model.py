@@ -382,11 +382,6 @@ class Qwen35Model(Decoder):
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build masks, CP-shard, SPMD-wrap (+ deltanet annotation), and return."""
-        # Function-local import avoids a circular import.
-        from torchtitan.distributed.context_parallel.api import (
-            prepare_context_parallel_input,
-        )
-
         batch: dict[str, Any] = dict(input_dict)
         padding_mask = batch.pop("padding_mask", None)
 
@@ -431,12 +426,11 @@ class Qwen35Model(Decoder):
         )
         batch["positions"] = rope_positions
         if parallel_dims.cp_enabled:
-            batch = prepare_context_parallel_input(
+            batch = self._prepare_context_parallel_batch(
                 batch,
                 input_sharding,
                 parallel_dims.get_mesh("cp"),
-                parallelism.context_parallel_load_balancer,
-                parallelism.context_parallel_ptrr_mask_key,
+                parallelism,
             )
         batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
         # Plain-tensor inputs are typed above; the GatedDeltaNet cu_seq_q,
