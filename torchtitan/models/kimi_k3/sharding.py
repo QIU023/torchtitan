@@ -103,21 +103,8 @@ def set_kimi_k3_sharding_config(
     enable_tp: bool = False,
     enable_sp: bool = False,
 ) -> None:
-    """Declare Kimi K3's sharding: vision buffers, experts, and tensor parallel.
-
-    Without tensor parallelism the vision buffers replicate across DP ranks,
-    the routed experts shard on the expert axis (``set_moe_sharding_config``
-    declares that layout; its input boundary lifts the plain incoming
-    activations itself) and the KDA kernel runs behind a DP-local boundary.
-
-    With ``enable_tp`` the head and feature axes shard: MLA and KDA are
-    head-parallel, the MoE's latent projections wrap core's expert sharding,
-    and the vision tower takes Kimi K2.5's plan (colwise / rowwise linears,
-    invariant norms and tables, K3's projector norm after its second linear).
-    With ``enable_sp`` the token stream between modules carries the TP-axis
-    Shard(0) of sequence parallel: norms compute on the shard, the attention
-    module boundaries gather it and the rowwise outputs reduce-scatter back
-    (the llama3 template); without it the stream stays whole on the TP axis.
+    """Declare Kimi K3's sharding: vision buffers and experts, plus head-parallel
+    tensor parallelism with ``enable_tp`` and sequence parallelism with ``enable_sp``.
     """
     if not enable_tp:
         if config.vision_encoder is not None:
@@ -155,14 +142,7 @@ def _set_vision_buffer_sharding(config: "KimiK3VisionEncoder.Config") -> None:
 
 
 def _stream_param_config(*, enable_sp: bool) -> ShardingConfig:
-    """Weight that reads and feeds the token stream between the TP modules.
-
-    Without SP the stream is invariant on TP and every module converts it
-    I -> R on entry, so the gradient reaching this weight is identical on every
-    rank: invariant, where replicated would sum the copies. Under SP the stream
-    is the sequence shard and the gradient a per-rank partial: replicated, and
-    FSDP sums it. The rule ``norm_config`` applies to the norms on that stream.
-    """
+    """Weight on the token stream: TP-replicated under SP, invariant without it."""
     return ShardingConfig(
         state_shardings={
             "weight": dense_param_placement(tp=spmd.R if enable_sp else spmd.I)
@@ -171,29 +151,18 @@ def _stream_param_config(*, enable_sp: bool) -> ShardingConfig:
 
 
 def _tp_replicate_config() -> ShardingConfig:
-    """Weight replicated on the TP axis, with no activation boundary declared.
-
-    The replicated member of the colwise/rowwise family, which core does not
-    have: declaring the activation boundaries would lift the input to a
-    DTensor while ``Linear.forward`` unwraps its own weight to local.
-    """
+    """Weight replicated on TP, with no activation boundary."""
     return ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})
 
 
 def _set_mla_sharding(attention_cfg, *, enable_sp: bool) -> None:
-    """Head-parallel TP for MLA.
-
-    The projections that produce or consume the head axis split on it; the
-    two compressions stay whole because they are rank-sized, not head-sized.
-    """
+    """Head-parallel TP for MLA; the two rank-sized compressions stay whole."""
     attention_cfg.wq_b.sharding_config = colwise_config()
     attention_cfg.wkv_b.sharding_config = colwise_config()
     attention_cfg.gate.sharding_config = colwise_config()
     attention_cfg.wo.sharding_config = rowwise_config(output_sp=enable_sp)
     if enable_sp:
-        # The module boundary gathers the sequence shard on the way in -- the
-        # attention core needs the full sequence -- and wo reduce-scatters
-        # back to Shard(0), the GQA pattern.
+        # The boundary gathers the sequence shard; wo reduce-scatters back (GQA).
         attention_cfg.sharding_config = ShardingConfig(
             in_src_shardings={"x_TD": dense_sequence_parallel_placement()},
             in_dst_shardings={
@@ -201,11 +170,8 @@ def _set_mla_sharding(attention_cfg, *, enable_sp: bool) -> None:
             },
         )
     else:
-        # The block stream is invariant on TP while the attention body is
-        # replicated with sharded heads: entering converts
-        # I -> R (no-op forward, all-reduce of the input gradient in backward,
-        # since wq_b/wkv_b are colwise); wo's rowwise boundary hands the
-        # stream back invariant.
+        # The invariant stream enters the replicated body (I -> R); wo's rowwise
+        # exit hands it back invariant.
         attention_cfg.sharding_config = ShardingConfig(
             in_src_shardings={
                 "x_TD": dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
@@ -216,9 +182,7 @@ def _set_mla_sharding(attention_cfg, *, enable_sp: bool) -> None:
         )
     attention_cfg.wq_a.sharding_config = _tp_replicate_config()
     attention_cfg.wkv_a.sharding_config = _tp_replicate_config()
-    # Inside the replicated body the activations are R and the norms feed the
-    # colwise wq_b/wkv_b, so their weights take partial gradients: replicated,
-    # state only (norm_config's invariant [T, D] boundary is the stream's).
+    # Norms in the replicated body feed colwise wq_b / wkv_b: replicated, state only.
     for name in ("q_norm", "kv_norm"):
         getattr(attention_cfg, name).sharding_config = ShardingConfig(
             state_shardings={"weight": dense_param_placement(tp=spmd.R)}
@@ -227,15 +191,8 @@ def _set_mla_sharding(attention_cfg, *, enable_sp: bool) -> None:
 
 
 def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool) -> None:
-    """Head-parallel TP for KDA.
-
-    The delta rule is independent per head, so the projections that produce
-    or consume the head axis split on it, the per-head state (``A_log``,
-    ``dt_bias``, the depthwise convolutions) shards with the heads, and the
-    kernel runs on the local heads behind the ``local_map`` on ``inner_kda``
-    that ``_set_inner_kda_sharding`` installs; this redeclares it with the head
-    axis sharded on tp. The one low-rank compression, ``forget_a``, is
-    rank-sized and stays whole.
+    """Head-parallel TP for KDA: projections, per-head state and the kernel boundary
+    shard on the heads; the rank-sized ``forget_a`` stays whole.
     """
     for name in ("q_proj", "k_proj", "v_proj", "forget_b", "beta", "output_gate"):
         getattr(delta_attention_cfg, name).sharding_config = colwise_config()
@@ -264,9 +221,7 @@ def _set_kda_sharding(delta_attention_cfg, *, enable_sp: bool) -> None:
             "x_TD": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
         }
     else:
-        # The MLA boundary's twin: the invariant stream enters replicated (the
-        # projections are colwise, so the backward all-reduces the input
-        # gradient) and output_proj's rowwise exit hands it back invariant.
+        # As in MLA: the invariant stream enters replicated; output_proj returns it.
         kda_module_config.in_src_shardings = {
             "x_TD": dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
         }
@@ -342,10 +297,8 @@ def _set_tensor_parallel_sharding(
                 enable_sp=enable_sp,
             )
         if layer.moe is not None:
-            # routed_down feeds the experts. Without EP they are TP-sharded and
-            # hand back partial input gradients (replicated weight); with EP
-            # they are whole on every tp rank, so it follows the stream's rule,
-            # as routed_up does from the reduced norm output.
+            # routed_down is replicated when the experts are TP-sharded and follows
+            # the stream's rule under EP, where they are whole on every tp rank.
             layer.moe.routed_down.sharding_config = (
                 _stream_param_config(enable_sp=enable_sp)
                 if enable_ep
@@ -354,11 +307,8 @@ def _set_tensor_parallel_sharding(
             routed_up_cfg = _stream_param_config(enable_sp=enable_sp)
             routed_norm_cfg = norm_config(enable_sp=enable_sp)
             if not enable_sp:
-                # The experts' rowwise output is Partial on TP: the norm's
-                # boundary ("x", nn.RMSNorm.forward's argument) reduces it,
-                # routed_up re-enters Partial so core's MoE exit reduces it
-                # with the shared experts' output, and that exit returns to
-                # the invariant stream.
+                # The experts' Partial output is reduced at the norm's boundary;
+                # routed_up re-enters Partial so the MoE exit reduces it once.
                 routed_norm_cfg.in_src_shardings = {
                     "x": dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
                 }
@@ -380,12 +330,7 @@ def _set_tensor_parallel_sharding(
 
 
 def _block_residual_placement(*, tp: spmd.PerMeshAxisSpmdType) -> SpmdType:
-    """Placement for the ``(tokens, entries, hidden)`` block-residual stack.
-
-    The 3-D twin of ``dense_activation_placement``: DP shards the tokens,
-    ``tp`` says how the TP axis holds the stack (``S(0)`` under sequence
-    parallel, invariant or replicated otherwise).
-    """
+    """Placement of the ``(tokens, entries, hidden)`` block-residual stack."""
     if isinstance(tp, spmd.Shard):
         return SpmdType(
             {DP: spmd.V, TP: spmd.V},
@@ -399,13 +344,8 @@ def _block_residual_placement(*, tp: spmd.PerMeshAxisSpmdType) -> SpmdType:
 def _shard_decoder_after_embedding_scatter(
     config: "KimiK3Model.Config", layer_input_layout: SpmdType, *, enable_sp: bool
 ) -> None:
-    """Keep ``tok_embeddings`` replicated on TP and restore the layout at layer 0.
-
-    The vision scatter writes features at arbitrary sequence positions, so it
-    needs the whole sequence on every rank (Kimi K2.5's and Qwen3.5's
-    pattern). Layer 0's input boundary then takes the stream, and the empty
-    block-residual stack that is cut from it, to the decoder's layout: the
-    sequence shard under SP, invariant otherwise.
+    """Keep ``tok_embeddings`` TP-replicated for the vision scatter; layer 0's
+    input boundary restores the decoder's layout for the stream and the stack.
     """
     replicated = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     config.tok_embeddings.sharding_config = ShardingConfig(

@@ -129,9 +129,7 @@ class KimiMLAAttention(BaseAttention):
             [self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
-        # The rotary slice is headless (replicated on TP); expanding it onto
-        # the local heads and joining it to the head-sharded nope part runs as
-        # a local region, typed head-sharded on TP like local_head_split.
+        # Headless rope slice broadcast onto the local heads, as in DeepSeek-V3's MLA.
         with spmd.local():
             k_rope_THK = k_rope_TK.unsqueeze(1).expand(-1, k_nope_THK.shape[-2], -1)
             k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
@@ -454,9 +452,7 @@ class KimiK3Model(Decoder):
             num_tokens_per_item,
             special_tokens["image_id"],
         )
-        # The declarations keep the embedding replicated on TP when a vision
-        # tower is present, so the scatter indexes the whole sequence on every
-        # rank; layer 0's input boundary restores the decoder's layout.
+        # With a tower, tok_embeddings is TP-replicated so the scatter sees every token.
         return scatter_vision_embeds(
             embeddings_TD,
             vision_embeds=vision_embeds,
@@ -487,6 +483,7 @@ class KimiK3Model(Decoder):
                 )
         else:
             h_TD = tokens
+
         if spmd.is_type_checking():
             spmd.assert_type(h_TD, {MeshAxisName.DP: spmd.S(0)})
 
