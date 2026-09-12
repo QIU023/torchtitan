@@ -1,4 +1,3 @@
-from typing import Any
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -6,9 +5,9 @@ from typing import Any
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
-from collections.abc import Sequence
-
 import logging
+from collections.abc import Sequence
+from typing import Any
 
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import (
