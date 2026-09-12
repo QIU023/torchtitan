@@ -251,6 +251,15 @@ class ParallelismConfig:
     """
 
     def __post_init__(self):
+        if (
+            self.module_fqns_per_model_part is not None
+            and self.pipeline_parallel_layers_per_stage is not None
+        ):
+            raise ValueError(
+                "parallelism.module_fqns_per_model_part and "
+                "parallelism.pipeline_parallel_layers_per_stage both describe the "
+                "pipeline split; give at most one of them."
+            )
         if self.context_parallel_load_balancer == "":
             raise ValueError(
                 "context_parallel_load_balancer cannot be an empty string. "
