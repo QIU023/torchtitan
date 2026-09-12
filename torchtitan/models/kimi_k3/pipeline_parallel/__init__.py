@@ -8,6 +8,7 @@
 pinned to its ends, AttnRes stages, and the block routing tables."""
 
 import logging
+from typing import Any
 
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import (
@@ -18,6 +19,8 @@ from torch.distributed.pipelining.schedules import (
 from torch.distributed.pipelining.stage import _PipelineStageBase, PipelineStage
 
 from torchtitan.distributed.pipeline_parallel import (
+    _neighbor_p2p_stage_class,
+    _NeighborP2PTransportMixin,
     pipeline_with_first_last_stage_modules,
 )
 
@@ -35,7 +38,13 @@ _KIMI_K3_LAST_STAGE_FQNS = ("output_res_proj", "output_res_norm")
 
 def _as_attn_res_stage(stage: _PipelineStageBase) -> AttnResPipelineStage:
     assert isinstance(stage, PipelineStage)
-    rebuilt = AttnResPipelineStage(
+    # Keep the opt-in neighbor transport if core composed it into the stage.
+    stage_class: type[AttnResPipelineStage] = AttnResPipelineStage
+    extra: dict[str, Any] = {}
+    if isinstance(stage, _NeighborP2PTransportMixin):
+        stage_class = _neighbor_p2p_stage_class(AttnResPipelineStage)
+        extra["transport"] = stage._transport
+    rebuilt = stage_class(
         stage.submod,
         stage.stage_index,
         stage.num_stages,
@@ -43,6 +52,7 @@ def _as_attn_res_stage(stage: _PipelineStageBase) -> AttnResPipelineStage:
         group=stage.group,
         dw_builder=stage.dw_builder,
         get_mesh=stage._mesh_cache._get_mesh_cb,
+        **extra,
     )
     # The schedule wrote its stage-to-rank map onto the stage it was handed.
     rebuilt.stage_index_to_group_rank = stage.stage_index_to_group_rank
