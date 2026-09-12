@@ -17,6 +17,7 @@ from .configs import (
     CompileConfig,
     DebugConfig,
     FSDPSymmMemScope,
+    LoadBalancer,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "TORCH_DTYPE_MAP",
     # Config dataclasses
     "CompileConfig",
+    "LoadBalancer",
     "ParallelismConfig",
     "CommConfig",
     "TrainingConfig",

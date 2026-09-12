@@ -15,6 +15,7 @@ from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.config import ParallelismConfig
+from torchtitan.distributed.context_parallel import ContextParallelLoadBalancer
 from torchtitan.distributed.parallel_dims import MeshAxisName, ParallelDims
 from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
@@ -386,11 +387,6 @@ class Qwen35Model(Decoder):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build masks, CP-shard, SPMD-wrap (+ deltanet annotation), and return."""
         del kwargs
-        # Function-local import avoids a circular import.
-        from torchtitan.distributed.context_parallel.api import (
-            prepare_context_parallel_input,
-        )
-
         batch: dict[str, Any] = dict(input_dict)
         padding_mask = batch.get("padding_mask", None)
 
@@ -435,13 +431,17 @@ class Qwen35Model(Decoder):
         )
         batch["positions"] = rope_positions
         if parallel_dims.cp_enabled:
-            batch = prepare_context_parallel_input(
-                batch,
-                input_sharding,
-                parallel_dims.get_mesh("cp"),
-                parallelism.context_parallel_load_balancer,
-                parallelism.context_parallel_ptrr_mask_key,
+            load_balancer_config = (
+                parallelism.context_parallel_load_balancer
+                or ContextParallelLoadBalancer.Config()
             )
+            load_balancer: ContextParallelLoadBalancer = load_balancer_config.build(
+                input_dict=batch,
+                input_shardings=input_sharding,
+                cp_mesh=parallel_dims.get_mesh("cp"),
+            )
+            batch = load_balancer.shard_inputs(batch)
+            batch = self._prepare_context_parallel_metadata(batch, load_balancer)
         batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
         # Plain-tensor inputs are typed above; the GatedDeltaNet cu_seq_q,
         # nested inside attention_masks, must be annotated at its container.
