@@ -6,7 +6,7 @@
 
 """Sharding configs for common vision encoder components."""
 
-from typing import TYPE_CHECKING
+from typing import Literal, TYPE_CHECKING
 
 import spmd_types as spmd
 from spmd_types import SpmdType
@@ -236,3 +236,29 @@ def set_vision_transformer_block_sharding_config(
     block.mlp.fc2.sharding_config = vision_scaled_bias_rowwise_config(
         include_cp_axis=include_cp_axis
     )
+
+
+def set_moonvit_sharding_config(
+    ve_cfg, *, projector_norm: Literal["pre_norm", "post_norm"]
+) -> None:
+    """Tensor-parallel plan for a MoonViT encoder (Kimi K2.5, Kimi K3).
+
+    Activations stay invariant on TP; linears are colwise / rowwise, norms and
+    position tables invariant. ``projector_norm`` names the projector's norm.
+    """
+    ve_cfg.sharding_config = ShardingConfig(
+        state_shardings={"pos_embed": SpmdType({DP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
+        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
+    )
+    ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
+        state_shardings={"inv_freq": SpmdType({DP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
+    )
+    ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
+    set_vision_transformer_block_sharding_config(ve_cfg.block, rope_cache_dp=spmd.V)
+    ve_cfg.final_norm.sharding_config = invariant_norm_config()
+    proj = ve_cfg.projector
+    getattr(proj, projector_norm).sharding_config = invariant_norm_config()
+    proj.linear_1.sharding_config = vision_colwise_config()
+    proj.linear_2.sharding_config = vision_scaled_bias_rowwise_config()

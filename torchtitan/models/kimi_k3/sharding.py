@@ -31,13 +31,7 @@ from torchtitan.models.common.decoder_sharding import (
     token_id_placement,
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.models.common.vision_encoder_sharding import (
-    invariant_norm_config,
-    set_vision_transformer_block_sharding_config,
-    vision_colwise_config,
-    vision_invariant_linear_config,
-    vision_scaled_bias_rowwise_config,
-)
+from torchtitan.models.common.vision_encoder_sharding import set_moonvit_sharding_config
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
@@ -320,7 +314,7 @@ def _set_tensor_parallel_sharding(
         _shard_decoder_after_embedding_scatter(
             config, layer_input_layout, enable_sp=enable_sp
         )
-        _set_vision_encoder_sharding(config.vision_encoder)
+        set_moonvit_sharding_config(config.vision_encoder, projector_norm="post_norm")
     config.output_res_norm.sharding_config = norm_config(enable_sp=enable_sp)
     config.output_res_proj.sharding_config = _stream_param_config(enable_sp=enable_sp)
     for layer in config.layers:
@@ -434,30 +428,3 @@ def _shard_decoder_after_embedding_scatter(
             ),
         },
     )
-
-
-def _set_vision_encoder_sharding(ve_cfg: "KimiK3VisionEncoder.Config") -> None:
-    """Kimi K2.5's MoonViT plan for the K3 tower.
-
-    Activations flow invariant on TP (no SP: the patch sequence is short);
-    the linears are colwise / rowwise for memory, norms and the position
-    tables invariant. K3's projector differs from K2.5's only in placing its
-    norm after the second linear, whose scaled-bias rowwise exit is already
-    invariant.
-    """
-    ve_cfg.sharding_config = ShardingConfig(
-        state_shardings={"pos_embed": SpmdType({DP: spmd.R, TP: spmd.I})},
-        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
-    )
-    ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
-        state_shardings={"inv_freq": SpmdType({DP: spmd.R, TP: spmd.I})},
-        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
-    )
-    ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
-    set_vision_transformer_block_sharding_config(ve_cfg.block, rope_cache_dp=spmd.V)
-    ve_cfg.final_norm.sharding_config = invariant_norm_config()
-    proj = ve_cfg.projector
-    proj.linear_1.sharding_config = vision_colwise_config()
-    proj.linear_2.sharding_config = vision_scaled_bias_rowwise_config()
-    proj.post_norm.sharding_config = invariant_norm_config()

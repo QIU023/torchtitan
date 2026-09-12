@@ -21,27 +21,17 @@ TP/EP/SP uniformly via the Module protocol.
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
-from spmd_types import SpmdType
 
-from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
     token_id_placement,
 )
-from torchtitan.models.common.vision_encoder_sharding import (
-    invariant_norm_config,
-    set_vision_transformer_block_sharding_config,
-    vision_colwise_config,
-    vision_invariant_linear_config,
-    vision_scaled_bias_rowwise_config,
-)
+from torchtitan.models.common.vision_encoder_sharding import set_moonvit_sharding_config
 from torchtitan.models.deepseek_v3.sharding import set_deepseek_v3_sharding_config
 from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
-DP = MeshAxisName.DP
-TP = MeshAxisName.TP
 
 if TYPE_CHECKING:
     from torchtitan.models.kimi_k2_7.model import KimiK25Model
@@ -63,7 +53,7 @@ def set_kimi_k2_5_sharding_config(
     if config.vision_encoder is not None:
         if enable_sp:
             _shard_decoder_after_embedding_scatter(config)
-        _set_vision_encoder_sharding(config.vision_encoder)
+        set_moonvit_sharding_config(config.vision_encoder, projector_norm="pre_norm")
 
 
 def _shard_decoder_after_embedding_scatter(config: "KimiK25Model.Config") -> None:
@@ -91,41 +81,3 @@ def _shard_decoder_after_embedding_scatter(config: "KimiK25Model.Config") -> Non
         in_dst_shardings={"x": dense_sequence_parallel_placement()},
         out_src_shardings=dense_sequence_parallel_placement(),
     )
-
-
-def _set_vision_encoder_sharding(ve_cfg) -> None:
-    """Invariant-activation TP plan for the MoonViT3d vision encoder.
-
-    Linear layers are Colwise/Rowwise sharded for memory; norms and the
-    learnable position table stay Invariant. ``patch_embed`` wraps the plain
-    ``pixel_values`` input as a TP-invariant tensor so the rest of the encoder
-    runs in distributed tensor space.
-    """
-    # The encoder's own ``pos_embed`` table is invariant across TP ranks.
-    ve_cfg.sharding_config = ShardingConfig(
-        state_shardings={
-            "pos_embed": SpmdType({DP: spmd.R, TP: spmd.I}),
-        },
-        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
-    )
-    ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
-        state_shardings={
-            "inv_freq": SpmdType({DP: spmd.R, TP: spmd.I}),
-        },
-        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
-    )
-
-    ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
-
-    set_vision_transformer_block_sharding_config(
-        ve_cfg.block,
-        rope_cache_dp=spmd.V,
-    )
-
-    # Final norm + projector.
-    ve_cfg.final_norm.sharding_config = invariant_norm_config()
-    proj = ve_cfg.projector
-    proj.pre_norm.sharding_config = invariant_norm_config()
-    proj.linear_1.sharding_config = vision_colwise_config()
-    proj.linear_2.sharding_config = vision_scaled_bias_rowwise_config()
