@@ -970,13 +970,14 @@ def _pipeline_module_split(
         pp_rank, pp_degree, pp_schedule, num_stages
     )
     stage_kwargs: dict[str, Any] = {}
+    stage_class: type[PipelineStage] = PipelineStage
     if transport_groups is not None:
-        stage_class = _neighbor_p2p_stage_class(stage_class)
+        stage_class = _neighbor_p2p_stage_class(PipelineStage)
         stage_kwargs["transport"] = transport_groups
     for stage_idx in pp_rank_to_stage_indices:
         module_names = module_names_per_stage[stage_idx]
         model_chunk = _split_module(whole_model, module_names)
-        stage = PipelineStage(
+        stage = stage_class(
             model_chunk,
             stage_idx,
             num_stages,
