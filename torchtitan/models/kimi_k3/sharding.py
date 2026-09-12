@@ -103,8 +103,12 @@ def set_kimi_k3_sharding_config(
     enable_tp: bool = False,
     enable_sp: bool = False,
 ) -> None:
-    """Declare Kimi K3's sharding: vision buffers and experts, plus head-parallel
-    tensor parallelism with ``enable_tp`` and sequence parallelism with ``enable_sp``.
+    """Declare Kimi K3 vision-buffer and expert sharding.
+
+    Vision buffers replicate across DP ranks. The routed experts shard on the
+    expert axis; ``set_moe_sharding_config`` declares that layout, and its
+    input boundary lifts the plain incoming activations itself.
+    ``enable_tp`` adds tensor parallelism and ``enable_sp`` sequence parallelism.
     """
     if not enable_tp:
         if config.vision_encoder is not None:
