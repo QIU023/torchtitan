@@ -441,7 +441,7 @@ def llama3_debugmodel_ulysses_cp2() -> Trainer.Config:
     _set_spmd_typechecking(config, typechecking=True)
     config.parallelism.context_parallel_degree = 2
     # Head-sharded attention has no per-rank sequence imbalance to balance.
-    config.parallelism.context_parallel_load_balancer = None
+    config.parallelism.context_parallel_load_balancer.load_balancer_type = None
     return apply_transforms(
         config,
         [ContextParallelTransform(inner_attention=UlyssesCPFlexInnerAttention)],
@@ -455,7 +455,7 @@ def llama3_debugmodel_ulysses_cp2_varlen() -> Trainer.Config:
     _set_spmd_typechecking(config, typechecking=False)
     config.parallelism.context_parallel_degree = 2
     # Ulysses does not support token reordering.
-    config.parallelism.context_parallel_load_balancer = None
+    config.parallelism.context_parallel_load_balancer.load_balancer_type = None
     return apply_transforms(
         config,
         [ContextParallelTransform(inner_attention=UlyssesCPVarlenInnerAttention)],

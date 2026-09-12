@@ -12,6 +12,7 @@ import tyro
 
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.context_parallel import prepare_context_parallel_batch
 from torchtitan.models.flux.configs import FluxEncoderConfig, Inference
 from torchtitan.models.flux.model.autoencoder import load_ae
 from torchtitan.models.flux.model.model import FluxModel
