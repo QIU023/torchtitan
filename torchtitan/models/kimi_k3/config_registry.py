@@ -126,11 +126,13 @@ def kimi_k3_debugmodel_cc12m_pp_naive() -> Trainer.Config:  # PROBE ONLY (not co
     return config
 
 
-_C4_ROW_TOKENS = 256  # one row per 256-token micro-batch; PROBE ONLY (not committed)
+# One row per micro-batch: set C4_ROW_TOKENS to the micro-batch size (64 for #4500's
+# 256 tokens per step as four micro-batches). PROBE ONLY (not committed)
+_C4_ROW_TOKENS = int(__import__("os").environ.get("C4_ROW_TOKENS", "256"))
 
 
 def _process_c4_text_sample(sample, **kwargs):  # PROBE ONLY (not committed)
-    """A c4 doc as one text-only row: its first 256 tokens (the multimodal
+    """A c4 doc as one text-only row: its first _C4_ROW_TOKENS tokens (the multimodal
     batcher packs whole rows into a micro-batch, so a row never spans two)."""
     from torchtitan.hf_datasets.multimodal.mm_datasets import _process_mm_sample
 
