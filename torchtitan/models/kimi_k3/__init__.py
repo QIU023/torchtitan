@@ -385,6 +385,7 @@ def _kimi_k3_config(
     vision_encoder: KimiK3VisionEncoder.Config,
     attn_backend: str,
     moe_comm_backend: str = "standard",
+    dense_ffn_only: bool = False,  # PROBE ONLY (not committed): every layer the layer-0 dense FFN, no MoE
 ) -> KimiK3Model.Config:
     """Assemble a Kimi K3 config from the released topology's free parameters.
 
@@ -425,12 +426,12 @@ def _kimi_k3_config(
                 ),
                 feed_forward=(
                     _feed_forward_config(dim=dim, hidden_dim=dense_hidden_dim)
-                    if layer_idx == 0
+                    if layer_idx == 0 or dense_ffn_only
                     else None
                 ),
                 moe=(
                     None
-                    if layer_idx == 0
+                    if layer_idx == 0 or dense_ffn_only
                     else _latent_moe_config(
                         dim=dim,
                         latent_dim=latent_dim,
@@ -477,12 +478,13 @@ def kimi_k3_full_attention_layers(num_layers: int) -> set[int]:
 
 
 def _debugmodel(
-    attn_backend: str, moe_comm_backend: str, *, num_layers: int = 24
+    attn_backend: str, moe_comm_backend: str, *, num_layers: int = 24, dense_ffn_only: bool = False
 ) -> KimiK3Model.Config:
     dim = 1024
     return _kimi_k3_config(
         dim=dim,
         moe_comm_backend=moe_comm_backend,
+        dense_ffn_only=dense_ffn_only,
         vocab_size=163840,
         num_layers=num_layers,
         full_attention_layers=kimi_k3_full_attention_layers(num_layers),
@@ -560,6 +562,8 @@ kimi_k3_configs = {
     # pipeline stress cell uses it; every other flavor keeps "debugmodel".
     "debugmodel_33_layers": (partial(_debugmodel, num_layers=33), 16384),
     "Kimi-K3": (_kimi_k3, 262144),
+    # PROBE ONLY (not committed): the debug model with a dense FFN in every layer (no MoE routing).
+    "debugmodel_dense": (partial(_debugmodel, dense_ffn_only=True), 16384),
 }
 
 

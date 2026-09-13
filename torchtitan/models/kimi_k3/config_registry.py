@@ -178,3 +178,25 @@ def kimi_k3_debugmodel_c4_pp_naive() -> Trainer.Config:  # PROBE ONLY (not commi
         pipeline_kimi_k3, attn_res_cache=False
     )
     return config
+
+
+def kimi_k3_debugmodel_c4_dense() -> Trainer.Config:  # PROBE ONLY (not committed)
+    """kimi_k3_debugmodel_c4 with a dense FFN in every layer (no MoE routing)."""
+    from torchtitan.models.kimi_k3 import model_registry
+
+    config = kimi_k3_debugmodel_c4()
+    config.model_spec = model_registry("debugmodel_dense")
+    return config
+
+
+def kimi_k3_debugmodel_c4_dense_pp_naive() -> Trainer.Config:  # PROBE ONLY (not committed)
+    import functools
+
+    from torchtitan.models.kimi_k3.parallelize import pipeline_kimi_k3
+
+    config = kimi_k3_debugmodel_c4_dense()
+    assert config.model_spec is not None
+    config.model_spec.pipelining_fn = functools.partial(
+        pipeline_kimi_k3, attn_res_cache=False
+    )
+    return config
