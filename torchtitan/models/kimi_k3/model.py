@@ -125,7 +125,7 @@ class KimiMLAAttention(BaseAttention):
         del positions
 
         q_THK = local_head_split(
-            self.wq_b(self.q_norm(self.wq_a(x_TD))), self.q_head_dim
+            self.wq_b(self.q_norm(self.wq_a(x_TD))), self.q_head_dim, cp_sharded=True
         )
 
         compressed_kv_TC = self.wkv_a(x_TD)
@@ -137,6 +137,7 @@ class KimiMLAAttention(BaseAttention):
         kv_THC = local_head_split(
             self.wkv_b(self.kv_norm(kv_latent_TC)),
             self.qk_nope_head_dim + self.v_head_dim,
+            cp_sharded=True,
         )
         k_nope_THK, v_THV = torch.split(
             kv_THC,
@@ -148,7 +149,13 @@ class KimiMLAAttention(BaseAttention):
             k_rope_THK = k_rope_TK.unsqueeze(1).expand(-1, k_nope_THK.shape[-2], -1)
             k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
             if spmd.is_type_checking():
-                spmd.assert_type(k_THK, {"dp": spmd.S(0), "tp": spmd.S(1)})
+                spmd.assert_type(
+                    k_THK,
+                    spmd.SpmdType(
+                        {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+                        partition_spec=spmd.PartitionSpec(("dp", "cp"), "tp", None),
+                    ),
+                )
 
         out_THV = self.inner_attention(
             q_THK,
@@ -787,9 +794,14 @@ class KimiK3Model(Decoder):
         if spmd.is_type_checking():
             # Vision fusion runs on a DP-local mesh. Restore the token layout
             # before constructing and propagating the attention residual state.
+            # Tokens shard on DP and CP; the TP layout here is the
+            # declarations' (replicated for the vision scatter under TP).
             spmd.assert_type(
                 h_TD,
-                dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
+                spmd.SpmdType(
+                    {"dp": spmd.V, "cp": spmd.V},
+                    partition_spec=spmd.PartitionSpec(("dp", "cp"), None),
+                ),
             )
 
         block_residual_TND = (

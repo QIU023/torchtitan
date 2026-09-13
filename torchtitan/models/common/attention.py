@@ -110,10 +110,24 @@ def local_head_split(
     head_dim: int,
     *,
     dp_shard_dim: int = 0,
+    cp_sharded: bool = False,
 ) -> torch.Tensor:
     # TODO(pianpwk): Remove once spmd_types tracks sharding evenness.
-    input_type = {"dp": spmd.S(dp_shard_dim), "tp": spmd.S(t.ndim - 1)}
-    output_type = {"dp": spmd.S(dp_shard_dim), "tp": spmd.S(t.ndim - 1)}
+    input_type: object = {"dp": spmd.S(dp_shard_dim), "tp": spmd.S(t.ndim - 1)}
+    output_type: object = {"dp": spmd.S(dp_shard_dim), "tp": spmd.S(t.ndim - 1)}
+    if cp_sharded:
+        # Tokens shard on DP and then CP (the decoder stream under context
+        # parallelism; a size-1 axis without it); the split dim on TP.
+        def _type(ndim: int) -> spmd.SpmdType:
+            spec: list = [None] * ndim
+            spec[dp_shard_dim] = ("dp", "cp")
+            spec[t.ndim - 1] = "tp"
+            return spmd.SpmdType(
+                {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+                partition_spec=spmd.PartitionSpec(*spec),
+            )
+
+        input_type, output_type = _type(t.ndim), _type(t.ndim + 1)
     with spmd.local():
         if spmd.is_type_checking():
             spmd.assert_type(t, input_type)

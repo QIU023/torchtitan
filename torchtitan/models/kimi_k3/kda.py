@@ -398,7 +398,7 @@ class KDA(Module):
         # at every document; an unpacked run passes nothing and keeps the
         # single-sequence kernels.
         raw_gate_THK = local_head_split(
-            self.forget_b(self.forget_a(x_TD)), self.head_dim
+            self.forget_b(self.forget_a(x_TD)), self.head_dim, cp_sharded=True
         )
         raw_beta_TH = self.beta(x_TD)
         out_THV = self.inner_kda(
@@ -416,5 +416,7 @@ class KDA(Module):
             routing=routing,
         )
 
-        output_gate_THV = local_head_split(self.output_gate(x_TD), self.head_dim)
+        output_gate_THV = local_head_split(
+            self.output_gate(x_TD), self.head_dim, cp_sharded=True
+        )
         return self.output_proj(self.output_norm(out_THV, output_gate_THV).flatten(-2))
