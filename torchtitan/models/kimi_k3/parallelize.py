@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -162,7 +162,10 @@ def _as_attn_res_stage(stage: _PipelineStageBase) -> AttnResPipelineStage:
     stage_class: type[AttnResPipelineStage] = AttnResPipelineStage
     extra: dict[str, Any] = {}
     if isinstance(stage, _NeighborP2PTransportMixin):
-        stage_class = _neighbor_p2p_stage_class(AttnResPipelineStage)
+        stage_class = cast(
+            type[AttnResPipelineStage],
+            _neighbor_p2p_stage_class(AttnResPipelineStage),
+        )
         extra["transport"] = stage._transport
     rebuilt = stage_class(
         stage.submod,
