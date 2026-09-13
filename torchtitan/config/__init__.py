@@ -10,6 +10,7 @@ TORCH_DTYPE_MAP = {
     "float16": torch.float16,
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
+    "float64": torch.float64,  # LOCAL PROBE (fp64 runs)
 }
 
 from .configs import (
