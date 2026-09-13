@@ -75,7 +75,11 @@ def set_kimi_k3_sharding_config(
         _shard_decoder_after_embedding_scatter(
             config, layer_input_layout, enable_sp=enable_sp
         )
-        set_moonvit_sharding_config(config.vision_encoder, projector_norm="post_norm")
+        # The tower is replicated on the cp axis like every other declaration
+        # here, which carries the cp axis whether or not it is sharded.
+        set_moonvit_sharding_config(
+            config.vision_encoder, projector_norm="post_norm", include_cp_axis=True
+        )
     config.output_res_norm.sharding_config = _stream_weight_config(enable_sp=enable_sp)
     config.output_res_proj.sharding_config = _stream_weight_config(enable_sp=enable_sp)
     for layer_cfg in config.layers:
