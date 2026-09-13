@@ -297,7 +297,7 @@ def _get_pipeline_metadata(
         # Fallback to default behavior when layers_per_stage is not provided
         # For multi-stage schedules, default is 2 virtual stages per rank
         # For single-stage schedules, default is 1 virtual stage per rank
-        stages_per_rank = 1 if is_single_stage_schedule else 2
+        stages_per_rank = 1 if is_single_stage_schedule else int(os.environ.get("PP_STAGES_PER_RANK", "2"))  # LOCAL PROBE HACK (not committed): pp4 x vp4
         num_virtual_stages = parallel_dims.pp * stages_per_rank
     return num_virtual_stages, num_layers, input_weight, output_weight
 
