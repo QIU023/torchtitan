@@ -49,22 +49,17 @@ def kimi_k3_debugmodel_pp8_vp4() -> Trainer.Config:
     # embedding and the head) over 32 stages, so the split is uneven and the
     # last stage holds the head alone. The depth travels with this recipe, not
     # with the shared "debugmodel" flavor. No layers_per_stage reaches 32 stages
-    # for 35 units, so the recipe spells out core's split for that count, with
-    # the vision tower and the AttnRes aggregation where Kimi K3's entry pins them.
-    from torchtitan.distributed.pipeline_parallel import (
-        _generate_llm_fqn_per_model_part,
-    )
+    # for 35 units, so the recipe spells out Kimi K3's split for that count.
     from torchtitan.models.kimi_k3 import model_registry
     from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan.models.kimi_k3.parallelize import kimi_k3_module_fqns_per_model_part
 
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry("debugmodel_33_layers")
     config.parallelism.pipeline_parallel_degree = 8
     config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
     config.parallelism.num_pp_microbatches = 8
-    split = _generate_llm_fqn_per_model_part(
-        8 * 4, 33, last_stage_modules=("output_res_proj", "output_res_norm")
+    config.parallelism.module_fqns_per_model_part = kimi_k3_module_fqns_per_model_part(
+        8 * 4, 33
     )
-    split[0].insert(0, "vision_encoder")
-    config.parallelism.module_fqns_per_model_part = split
     return config

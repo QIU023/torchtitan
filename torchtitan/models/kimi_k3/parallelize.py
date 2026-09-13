@@ -4,9 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
+from collections.abc import Sequence
+
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
+    get_schedule_class,
     PipelineScheduleMulti,
     PipelineScheduleSingle,
 )
@@ -26,10 +30,7 @@ from torchtitan.distributed.fsdp import (
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
-from torchtitan.distributed.pipeline_parallel import (
-    llm_split_with_pinned_modules,
-    pipeline_llm,
-)
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.distributed.spmd_types import annotate_replicated_parameters
 from torchtitan.models.kimi_k3.layout import (
     infer_block_layout_tables_from_stages,
@@ -149,13 +150,96 @@ def parallelize_kimi_k3(
     return model
 
 
-_KIMI_ATTN_RES_LAST_STAGE_FQNS = ("output_res_proj", "output_res_norm")
 _KIMI_K3_FIRST_STAGE_FQNS = ("vision_encoder",)
+_KIMI_K3_LAST_STAGE_FQNS = ("output_res_proj", "output_res_norm")
 
 
-def _kimi_k3_last_stage_modules(model: nn.Module) -> tuple[str, ...]:
-    """Modules the split pins next to the head: the AttnRes aggregation."""
-    return tuple(n for n in _KIMI_ATTN_RES_LAST_STAGE_FQNS if hasattr(model, n))
+def kimi_k3_module_fqns_per_model_part(
+    num_stages: int,
+    num_layers: int,
+    input_weight: int = 1,
+    output_weight: int = 1,
+    *,
+    first_stage_modules: Sequence[str] = _KIMI_K3_FIRST_STAGE_FQNS,
+    last_stage_modules: Sequence[str] = _KIMI_K3_LAST_STAGE_FQNS,
+) -> list[list[str]]:
+    """Kimi K3's pipeline split: the layers plus the embedding and head weights spread
+    evenly, earlier stages taking the remainder; the vision tower rides with the
+    embedding and the AttnRes aggregation with the head."""
+    first = [*first_stage_modules, "tok_embeddings"]
+    last = ["norm", "lm_head", *last_stage_modules]
+    if num_stages == 1:
+        return [first + [f"layers.{i}" for i in range(num_layers)] + last]
+    units = num_layers + input_weight + output_weight
+    if not 1 <= num_stages <= units:
+        raise ValueError(f"{num_stages} stages for {units} units")
+    per_stage, extra = divmod(units, num_stages)
+    if max(input_weight, output_weight) > per_stage:
+        raise ValueError(
+            f"embedding / head weight ({input_weight} / {output_weight}) exceeds "
+            f"the {per_stage} units per stage"
+        )
+    split, start = [], 0
+    for s in range(num_stages):
+        is_first, is_last = s == 0, s == num_stages - 1
+        take = (
+            per_stage + (s < extra) - is_first * input_weight - is_last * output_weight
+        )
+        layers = [f"layers.{i}" for i in range(start, start + take)]
+        start += take
+        split.append((first if is_first else []) + layers + (last if is_last else []))
+    return split
+
+
+def _kimi_k3_num_stages(
+    parallelism: ParallelismConfig, pp: int, num_layers: int
+) -> int:
+    """From ``pipeline_parallel_layers_per_stage`` when set, else one stage per rank
+    for a single-stage schedule and two for a looped one."""
+    schedule = get_schedule_class(parallelism.pipeline_parallel_schedule)
+    single = issubclass(schedule, PipelineScheduleSingle)
+    layers_per_stage = parallelism.pipeline_parallel_layers_per_stage
+    if layers_per_stage is None:
+        return pp * (1 if single else 2)
+    units = (
+        num_layers
+        + parallelism.pipeline_parallel_first_stage_less_layers
+        + parallelism.pipeline_parallel_last_stage_less_layers
+    )
+    num_stages = -(-units // layers_per_stage)
+    per_rank, rest = divmod(num_stages, pp)
+    if rest or (per_rank != 1 if single else per_rank < 2):
+        raise ValueError(
+            f"layers_per_stage={layers_per_stage} gives {num_stages} stages, which "
+            f"{parallelism.pipeline_parallel_schedule} cannot run on {pp} ranks"
+        )
+    return num_stages
+
+
+def _kimi_k3_pipeline_split(
+    model: nn.Module,
+    *,
+    parallel_dims: ParallelDims,
+    parallelism: ParallelismConfig,
+    model_config,
+) -> tuple[list[list[str]], ParallelismConfig]:
+    """The split handed to ``pipeline_llm``, and the config that spells it out."""
+    num_layers = len(model_config.layers)
+    split = kimi_k3_module_fqns_per_model_part(
+        _kimi_k3_num_stages(parallelism, parallel_dims.pp, num_layers),
+        num_layers,
+        parallelism.pipeline_parallel_first_stage_less_layers,
+        parallelism.pipeline_parallel_last_stage_less_layers,
+        first_stage_modules=[
+            n for n in _KIMI_K3_FIRST_STAGE_FQNS if getattr(model, n, None) is not None
+        ],
+        last_stage_modules=[n for n in _KIMI_K3_LAST_STAGE_FQNS if hasattr(model, n)],
+    )
+    return split, dataclasses.replace(
+        parallelism,
+        module_fqns_per_model_part=split,
+        pipeline_parallel_layers_per_stage=None,
+    )
 
 
 def _as_attn_res_stage(stage: _PipelineStageBase) -> AttnResPipelineStage:
@@ -202,13 +286,11 @@ def pipeline_kimi_k3(model: nn.Module, *, attn_res_cache: bool = True, **kwargs)
     parallelism = kwargs.pop("parallelism")
     module_fqns_per_model_part = parallelism.module_fqns_per_model_part
     if module_fqns_per_model_part is None:
-        module_fqns_per_model_part, parallelism = llm_split_with_pinned_modules(
+        module_fqns_per_model_part, parallelism = _kimi_k3_pipeline_split(
             model,
             parallel_dims=kwargs["parallel_dims"],
             parallelism=parallelism,
             model_config=kwargs["model_config"],
-            first_stage_module_fqns=_KIMI_K3_FIRST_STAGE_FQNS,
-            last_stage_module_fqns=_kimi_k3_last_stage_modules(model),
         )
 
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(

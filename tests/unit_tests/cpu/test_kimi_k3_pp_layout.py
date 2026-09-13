@@ -111,5 +111,99 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(layer_to_stage_from_split(split), {0: 0, 1: 0, 2: 1, 3: 2})
 
 
+def _layers_per_stage(fqns: list[list[str]]) -> list[int]:
+    return [sum(1 for n in stage if n.startswith("layers.")) for stage in fqns]
+
+
+class TestSplit(unittest.TestCase):
+    def test_even_spread_with_the_remainder_first(self):
+        from torchtitan.models.kimi_k3.parallelize import (
+            kimi_k3_module_fqns_per_model_part as split,
+        )
+
+        self.assertEqual(
+            split(2, 3, 2, 2, first_stage_modules=(), last_stage_modules=()),
+            [
+                ["tok_embeddings", "layers.0", "layers.1"],
+                ["layers.2", "norm", "lm_head"],
+            ],
+        )
+        self.assertEqual(_layers_per_stage(split(4, 8)), [2, 3, 2, 1])
+        self.assertEqual(
+            split(1, 2),
+            [
+                [
+                    "vision_encoder",
+                    "tok_embeddings",
+                    "layers.0",
+                    "layers.1",
+                    "norm",
+                    "lm_head",
+                    "output_res_proj",
+                    "output_res_norm",
+                ]
+            ],
+        )
+        with self.assertRaises(ValueError):
+            split(6, 3)
+
+    def test_35_units_over_32_stages_leave_the_head_alone(self):
+        from torchtitan.models.kimi_k3.parallelize import (
+            kimi_k3_module_fqns_per_model_part as split,
+        )
+
+        fqns = split(32, 33)
+        self.assertEqual(len(fqns), 32)
+        self.assertEqual(sum(_layers_per_stage(fqns)), 33)
+        self.assertEqual(fqns[0][:2], ["vision_encoder", "tok_embeddings"])
+        self.assertEqual(
+            fqns[-1], ["norm", "lm_head", "output_res_proj", "output_res_norm"]
+        )
+
+    def test_the_entry_spells_the_split_out_and_drops_the_knob(self):
+        from torchtitan.config import ParallelismConfig
+        from torchtitan.models.kimi_k3.parallelize import _kimi_k3_pipeline_split
+
+        model = SimpleNamespace(
+            vision_encoder=object(), output_res_proj=object(), output_res_norm=object()
+        )
+        fqns, spelled_out = _kimi_k3_pipeline_split(
+            model,
+            parallel_dims=SimpleNamespace(pp=2),
+            parallelism=ParallelismConfig(
+                pipeline_parallel_degree=2,
+                pipeline_parallel_layers_per_stage=3,
+                pipeline_parallel_schedule="Interleaved1F1B",
+            ),
+            model_config=SimpleNamespace(layers=[None] * 10),
+        )
+        self.assertEqual(spelled_out.module_fqns_per_model_part, fqns)
+        self.assertIsNone(spelled_out.pipeline_parallel_layers_per_stage)
+        self.assertEqual(len(fqns), 4)
+        self.assertEqual(sum(_layers_per_stage(fqns)), 10)
+        self.assertEqual(fqns[0][:2], ["vision_encoder", "tok_embeddings"])
+
+    def test_the_stress_cell_spells_out_the_split(self):
+        from torchtitan_recipes.tests.b200 import kimi_k3_debugmodel_pp8_vp4
+
+        parallelism = kimi_k3_debugmodel_pp8_vp4().parallelism
+        fqns = parallelism.module_fqns_per_model_part
+        assert fqns is not None
+        self.assertIsNone(parallelism.pipeline_parallel_layers_per_stage)
+        self.assertEqual(len(fqns), 32)
+        self.assertEqual(sum(_layers_per_stage(fqns)), 33)
+
+    def test_the_shared_debug_model_keeps_its_depth(self):
+        from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+        from torchtitan_recipes.tests.b200 import (
+            kimi_k3_debugmodel_pp2_vp2,
+            kimi_k3_debugmodel_pp8_vp4,
+        )
+
+        self.assertEqual(len(kimi_k3_debugmodel().model_spec.model.layers), 24)
+        self.assertEqual(len(kimi_k3_debugmodel_pp2_vp2().model_spec.model.layers), 24)
+        self.assertEqual(len(kimi_k3_debugmodel_pp8_vp4().model_spec.model.layers), 33)
+
+
 if __name__ == "__main__":
     unittest.main()
