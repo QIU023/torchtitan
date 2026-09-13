@@ -1064,7 +1064,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 f"step {self.step}. Stopping training before the optimizer update.",
             )
             self.checkpointer.maybe_wait_for_staging()
-            self.optimizers.step()
+            if os.environ.get("NO_OPT_STEP") != "1":  # LOCAL PROBE HACK (not committed): parameters frozen
+                self.optimizers.step()
             self.lr_schedulers.step()
 
         # log metrics
