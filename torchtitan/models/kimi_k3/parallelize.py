@@ -68,9 +68,7 @@ def parallelize_kimi_k3(
 
     unsupported_parallelisms = [
         name
-        for name, enabled in (
-            ("context parallel", parallel_dims.cp_enabled),
-        )
+        for name, enabled in (("context parallel", parallel_dims.cp_enabled),)
         if enabled
     ]
     if unsupported_parallelisms:
@@ -220,8 +218,6 @@ def _kimi_k3_vit_dep_split(
         module_fqns_per_model_part=split,
         pipeline_parallel_layers_per_stage=None,
     )
-
-
 
 
 def _swap_in_attn_res_stages(

@@ -42,9 +42,7 @@ class TestBubblePlan(unittest.TestCase):
         them, however much budget has accumulated.
         """
         for vp in (1, 2, 4):
-            plans = build_plans(
-                pp_size=8, vp=vp, n_microbatches=32, cost_ratio=0.493
-            )
+            plans = build_plans(pp_size=8, vp=vp, n_microbatches=32, cost_ratio=0.493)
             for rank, plan in plans.items():
                 for p in plan.placed:
                     kind, stage, anchor_mb = p.anchor

@@ -13,10 +13,10 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.distributed.pipelining.stage as stage_lib
 import torch.nn as nn
 from torch.distributed._mesh_layout import _MeshLayout
 from torch.distributed.device_mesh import DeviceMesh
-import torch.distributed.pipelining.stage as stage_lib
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining._utils import InferenceMode
 from torch.distributed.pipelining.schedules import (
@@ -81,7 +81,9 @@ def _create_pipeline_transport_groups(
         raise RuntimeError("Pipeline neighbor P2P requires an NCCL PP group")
     transport = parallel_dims.get_pipeline_neighbor_groups(pp_global_ranks)
     if transport is None:
-        raise RuntimeError("Pipeline neighbor P2P groups were not created during mesh setup")
+        raise RuntimeError(
+            "Pipeline neighbor P2P groups were not created during mesh setup"
+        )
     metadata_group, groups_by_pair = transport
     local_pp_rank = dist.get_rank(pp_group)
     my_global = pp_global_ranks[local_pp_rank]
@@ -134,7 +136,9 @@ class _NeighborP2PTransportMixin:
             )
         return group, self._transport.edge_peers[src_stage]
 
-    def _recv_edge_ops(self, recv_infos: tuple, edge, expected_source: int) -> list[dist.P2POp]:
+    def _recv_edge_ops(
+        self, recv_infos: tuple, edge, expected_source: int
+    ) -> list[dist.P2POp]:
         ops: list[dist.P2POp] = []
         for info in recv_infos:
             if info.is_root_arg:
@@ -151,21 +155,27 @@ class _NeighborP2PTransportMixin:
             if edge is None:
                 raise RuntimeError("missing adjacent PP receive group")
             group, peer = edge
-            ops.append(dist.P2POp(dist.irecv, info.buffer, group_peer=peer, group=group))
+            ops.append(
+                dist.P2POp(dist.irecv, info.buffer, group_peer=peer, group=group)
+            )
         return ops
 
     def get_fwd_recv_ops(self, fwd_chunk_id: int) -> list[dist.P2POp]:
         if self.is_first:
             return []
         return self._recv_edge_ops(
-            self.args_recv_info[fwd_chunk_id], self._edge(self.stage_index - 1), self.stage_index - 1
+            self.args_recv_info[fwd_chunk_id],
+            self._edge(self.stage_index - 1),
+            self.stage_index - 1,
         )
 
     def get_bwd_recv_ops(self, bwd_chunk_id: int) -> list[dist.P2POp]:
         if not self.has_backward or self.is_last:
             return []
         return self._recv_edge_ops(
-            self.grad_recv_info[bwd_chunk_id], self._edge(self.stage_index), self.stage_index + 1
+            self.grad_recv_info[bwd_chunk_id],
+            self._edge(self.stage_index),
+            self.stage_index + 1,
         )
 
     def get_fwd_send_ops(self, fwd_chunk_id: int) -> list[dist.P2POp]:
@@ -236,7 +246,10 @@ class _NeighborP2PTransportMixin:
             group, peer = edge
             ops.append(
                 dist.P2POp(
-                    dist.isend, stage_lib.to_local_if_dtensor(grad), group_peer=peer, group=group
+                    dist.isend,
+                    stage_lib.to_local_if_dtensor(grad),
+                    group_peer=peer,
+                    group=group,
                 )
             )
         return ops
@@ -299,7 +312,6 @@ def _configure_neighbor_p2p_schedule(schedule: _PipelineSchedule) -> None:
             stage._inference_mode = mode
 
     schedule._warmup_p2p = MethodType(_warmup_p2p, schedule)
-
 
 
 def _build_get_mesh_callback(
