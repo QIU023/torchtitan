@@ -178,11 +178,8 @@ def pipeline_with_first_stage_modules(
             if getattr(model, module_fqn, None) is not None
         ]
         fqn_per_part[0][:0] = present_module_fqns
-        # The split now describes the stages; the knob that derived it is spent.
         parallelism = dataclasses.replace(
-            parallelism,
-            module_fqns_per_model_part=fqn_per_part,
-            pipeline_parallel_layers_per_stage=None,
+            parallelism, module_fqns_per_model_part=fqn_per_part
         )
 
     return pipeline_llm(

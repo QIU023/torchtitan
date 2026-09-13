@@ -235,11 +235,7 @@ def _kimi_k3_pipeline_split(
         ],
         last_stage_modules=[n for n in _KIMI_K3_LAST_STAGE_FQNS if hasattr(model, n)],
     )
-    return split, dataclasses.replace(
-        parallelism,
-        module_fqns_per_model_part=split,
-        pipeline_parallel_layers_per_stage=None,
-    )
+    return split, dataclasses.replace(parallelism, module_fqns_per_model_part=split)
 
 
 def _as_attn_res_stage(stage: _PipelineStageBase) -> AttnResPipelineStage:

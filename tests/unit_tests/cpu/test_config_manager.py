@@ -519,16 +519,6 @@ class TestConfigManager(unittest.TestCase):
     def test_default_context_parallel_load_balancer(self):
         assert ParallelismConfig().context_parallel_load_balancer == "headtail"
 
-    def test_pipeline_split_is_given_one_way(self):
-        """The explicit split and layers_per_stage both describe it; not both."""
-        ParallelismConfig(module_fqns_per_model_part=[["tok_embeddings"]])
-        ParallelismConfig(pipeline_parallel_layers_per_stage=2)
-        with pytest.raises(ValueError, match="describe the pipeline split"):
-            ParallelismConfig(
-                module_fqns_per_model_part=[["tok_embeddings"]],
-                pipeline_parallel_layers_per_stage=2,
-            )
-
     def test_deepseek_config(self):
         """Test that --module deepseek_v3 --config deepseek_v3_debugmodel works."""
         config_manager = ConfigManager()
