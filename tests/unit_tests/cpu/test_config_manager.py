@@ -152,6 +152,20 @@ class TestConfigManager(unittest.TestCase):
         with pytest.raises(ValueError, match="must be -1 or greater than 0"):
             TrainingConfig(num_tokens_per_train_step=0)
 
+    def test_pipeline_split_is_given_one_way(self):
+        """An explicit split and layers_per_stage both describe it; the trainer
+        config refuses both, while a split written into ParallelismConfig later
+        (as pipeline_with_first_stage_modules does) stays valid."""
+        config = ConfigManager().parse_args(
+            ["--module", "llama3", "--config", "llama3_debugmodel"]
+        )
+        with_knob = ParallelismConfig(pipeline_parallel_layers_per_stage=2)
+        spelled_out = dataclasses.replace(
+            with_knob, module_fqns_per_model_part=[["tok_embeddings"]]
+        )
+        with pytest.raises(ValueError, match="describe the pipeline split"):
+            dataclasses.replace(config, parallelism=spelled_out)
+
     def test_max_context_length_must_be_positive(self):
         for max_context_length in (0, -1):
             with pytest.raises(ValueError, match="must be greater than 0"):
