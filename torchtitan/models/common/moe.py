@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 import torch_remat as remat
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import (
     maybe_set_sparse_mesh,
