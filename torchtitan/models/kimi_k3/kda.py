@@ -83,10 +83,10 @@ class KDAKernel(Module):
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
         capability = torch.cuda.get_device_capability(q_1THK.device)
-        if capability not in {(10, 0), (10, 3)}:
+        if capability < (8, 0):  # LOCAL RUN HACK (not committed)
             raise RuntimeError(
-                "Attention Gym KDA requires Blackwell SM100/SM103; "
-                f"got CUDA capability {capability}."
+                "Attention Gym KDA requires CUDA capability 8.0 or newer; "
+                f"got {capability}."
             )
 
         gate_1THK = bound_gate(
@@ -105,6 +105,7 @@ class KDAKernel(Module):
             gate_1THK,
             raw_beta_1TH.float().sigmoid(),
             cu_seqlens=cu_seqlens,
+            autotune=__import__("os").environ.get("KDA_NOAUTOTUNE") != "1",  # LOCAL PROBE HACK (not committed)
         )
         return output_1THV
 

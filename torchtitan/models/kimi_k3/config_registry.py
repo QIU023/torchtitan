@@ -94,3 +94,85 @@ def kimi_k3_debugmodel(
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+def kimi_k3_debugmodel_pp_naive() -> Trainer.Config:  # PROBE ONLY (not committed)
+    import functools
+
+    from torchtitan.models.kimi_k3.parallelize import pipeline_kimi_k3  # pp_review3 round 2: the entry lives in parallelize.py
+
+    config = kimi_k3_debugmodel()
+    assert config.model_spec is not None
+    config.model_spec.pipelining_fn = functools.partial(
+        pipeline_kimi_k3, attn_res_cache=False
+    )
+    return config
+def kimi_k3_debugmodel_cc12m() -> Trainer.Config:  # PROBE ONLY (not committed)
+    """The debug model on the streamed cc12m (no sample repeats in 100 steps; the 32-sample
+    test set is memorized by step 90)."""
+    config = kimi_k3_debugmodel()
+    config.dataloader = _kimi_k3_multimodal_dataloader(MM_DATASETS["cc12m"])
+    return config
+
+
+def kimi_k3_debugmodel_cc12m_pp_naive() -> Trainer.Config:  # PROBE ONLY (not committed)
+    import functools
+
+    from torchtitan.models.kimi_k3.parallelize import pipeline_kimi_k3
+
+    config = kimi_k3_debugmodel_cc12m()
+    assert config.model_spec is not None
+    config.model_spec.pipelining_fn = functools.partial(
+        pipeline_kimi_k3, attn_res_cache=False
+    )
+    return config
+
+
+_C4_ROW_TOKENS = 256  # one row per 256-token micro-batch; PROBE ONLY (not committed)
+
+
+def _process_c4_text_sample(sample, **kwargs):  # PROBE ONLY (not committed)
+    """A c4 doc as one text-only row: its first 256 tokens (the multimodal
+    batcher packs whole rows into a micro-batch, so a row never spans two)."""
+    from torchtitan.hf_datasets.multimodal.mm_datasets import _process_mm_sample
+
+    # Cut the text first so the processor's context-length skip keeps long docs.
+    out = _process_mm_sample(texts=[sample["text"][:4000]], images=[None], **kwargs)
+    if out is None:
+        return None
+    n = _C4_ROW_TOKENS - 1
+    for key in ("input_ids", "labels", "positions"):
+        out[key] = out[key][:n]
+    return out
+
+
+def kimi_k3_debugmodel_c4() -> Trainer.Config:  # PROBE ONLY (not committed)
+    """The debug model on c4_test as text-only rows, each doc's first 256 tokens:
+    2000 rows, about 0.5M tokens, so a 100-step run at 1024-2048 tokens per step
+    reads 21-43% of it once; the 32-sample cc12m test set is memorised by step 20."""
+    from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
+
+    config = kimi_k3_debugmodel()
+    config.dataloader = _kimi_k3_multimodal_dataloader(
+        SingleDatasetConfig(
+            source=HuggingFaceRandomAccessSource.Config(
+                path="json",
+                split="train",
+                load_dataset_kwargs={"data_files": "tests/assets/c4_test/data.json"},
+            ),
+            processor=MultiModalProcessor.Config(sample_processor=_process_c4_text_sample),
+            post_filters=(lambda sample: sample is not None,),
+        )
+    )
+    return config
+
+
+def kimi_k3_debugmodel_c4_pp_naive() -> Trainer.Config:  # PROBE ONLY (not committed)
+    import functools
+
+    from torchtitan.models.kimi_k3.parallelize import pipeline_kimi_k3
+
+    config = kimi_k3_debugmodel_c4()
+    assert config.model_spec is not None
+    config.model_spec.pipelining_fn = functools.partial(
+        pipeline_kimi_k3, attn_res_cache=False
+    )
+    return config
