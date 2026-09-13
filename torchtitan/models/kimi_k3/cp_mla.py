@@ -112,7 +112,9 @@ class MLAKVAllGatherCPFlexInnerAttention(KVAllGatherCPFlexInnerAttention):
                 k_rope_TR.contiguous(),
             )
         )
-        k_nope_THN, v_THV = packed_THW.split(widths, dim=-1)
+        # Contiguous like the generic kernel's inputs, so the compiled flex
+        # attention runs the same kernel on the same layout.
+        k_nope_THN, v_THV = (x.contiguous() for x in packed_THW.split(widths, dim=-1))
         return FlexInnerAttention.forward(
             self, q_THK, _expand_rope(k_nope_THN, k_rope_TR), v_THV, **kwargs
         )
@@ -156,7 +158,11 @@ class MLAUlyssesCPFlexInnerAttention(UlyssesCPFlexInnerAttention):
             src=spmd.S(_TOKEN_DIM),
             dst=spmd.S(_HEAD_DIM),
         )
-        q_THK, k_nope_THN, v_THV = packed_THW.split(widths, dim=-1)
+        # Contiguous like the generic kernel's inputs, so the compiled flex
+        # attention runs the same kernel on the same layout.
+        q_THK, k_nope_THN, v_THV = (
+            x.contiguous() for x in packed_THW.split(widths, dim=-1)
+        )
         # (T/cp, R) -> (T, R): the same vector on every head, so it never
         # travels expanded. Its backward is a reduce-scatter.
         k_rope_TR = spmd.redistribute(
