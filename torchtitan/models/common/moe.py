@@ -591,7 +591,10 @@ class QuantileBalancer(Module):
         if not self.training:
             return
 
-        with torch.no_grad():
+        # A statistics side channel with no gradient: the per-rank histograms
+        # are summed explicitly by the optimizer hook, so the counting runs
+        # outside SPMD type checking (the buffer carries no layout).
+        with torch.no_grad(), spmd.no_typecheck():
             local_scores_TE = self._local_tensor(scores_TE)
             local_cutoff_T1 = self._local_tensor(cutoff_T1)
             local_expert_bias_E = self._local_tensor(expert_bias_E)
