@@ -8,7 +8,11 @@
 
 from .apply import apply_transforms, transform_model_config_
 from .base import convert_config_type, ModelConfigTransform
-from .context_parallel import ContextParallelTransform, KDAContextParallelTransform
+from .context_parallel import (
+    ContextParallelTransform,
+    KDAContextParallelTransform,
+    MLAContextParallelTransform,
+)
 
 __all__ = [
     "ModelConfigTransform",
@@ -17,4 +21,5 @@ __all__ = [
     "convert_config_type",
     "ContextParallelTransform",
     "KDAContextParallelTransform",
+    "MLAContextParallelTransform",
 ]

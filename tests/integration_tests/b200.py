@@ -60,4 +60,16 @@ def build_b200_tests_list() -> list[OverrideDefinitions]:
             test_name="kimi_k3_mm_ulysses_cp",
             ngpu=2,
         ),
+        OverrideDefinitions(
+            configs=[recipes.kimi_k3_debugmodel_mm_packed_allgather_kv_cp2],
+            test_descr="Kimi K3 multimodal K/V all-gather context parallelism, packed MLA kernel",
+            test_name="kimi_k3_mm_packed_allgather_kv_cp",
+            ngpu=2,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.kimi_k3_debugmodel_mm_packed_ulysses_cp2],
+            test_descr="Kimi K3 multimodal Ulysses context parallelism, packed MLA kernel",
+            test_name="kimi_k3_mm_packed_ulysses_cp",
+            ngpu=2,
+        ),
     ]

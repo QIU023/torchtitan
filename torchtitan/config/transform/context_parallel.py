@@ -15,7 +15,11 @@ from torchtitan.protocols.module import Module
 
 from .base import convert_config_type, ModelConfigTransform
 
-__all__ = ["ContextParallelTransform", "KDAContextParallelTransform"]
+__all__ = [
+    "ContextParallelTransform",
+    "KDAContextParallelTransform",
+    "MLAContextParallelTransform",
+]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -59,4 +63,36 @@ class KDAContextParallelTransform(ModelConfigTransform):
         for _, traversed, _, _ in model.traverse(KDA.Config):
             kda = cast(KDA.Config, traversed)
             kda.inner_kda = convert_config_type(kda.inner_kda, ContextParallelInnerKDA)
+        return model
+
+
+@dataclass(kw_only=True, slots=True)
+class MLAContextParallelTransform(ModelConfigTransform):
+    """Install a packed MLA context-parallel kernel on every Kimi K3 MLA layer.
+
+    The kernels in ``torchtitan.models.kimi_k3.cp_mla`` move MLA's rotary key
+    slice once instead of expanded onto every head; each layer's kernel takes
+    that layer's rotary width. Use it in place of ``ContextParallelTransform``
+    for Kimi K3, next to ``KDAContextParallelTransform``.
+    """
+
+    inner_attention: type[Module]
+    """A packed MLA kernel; must inherit ``CPInnerAttention``."""
+
+    def __post_init__(self) -> None:
+        if not issubclass(self.inner_attention, CPInnerAttention):
+            raise ValueError(
+                f"{self.inner_attention.__qualname__} must inherit CPInnerAttention."
+            )
+
+    def transform(self, model: Module.Config) -> Module.Config:
+        from torchtitan.models.kimi_k3.model import KimiMLAAttention
+
+        for _, traversed, _, _ in model.traverse(KimiMLAAttention.Config):
+            mla = cast(KimiMLAAttention.Config, traversed)
+            inner = convert_config_type(mla.inner_attention, self.inner_attention)
+            inner.rope_head_dim = (  # pyrefly: ignore [missing-attribute]
+                mla.qk_rope_head_dim
+            )
+            mla.inner_attention = inner
         return model

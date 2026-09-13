@@ -152,3 +152,53 @@ def kimi_k3_debugmodel_mm_ulysses_cp2() -> Trainer.Config:
             KDAContextParallelTransform(),
         ],
     )
+
+
+def kimi_k3_debugmodel_mm_packed_allgather_kv_cp2() -> Trainer.Config:
+    # The all-gather K/V cell with the packed MLA kernel: MLA's rotary key slice
+    # travels once instead of expanded onto every head.
+    from torchtitan.config.transform import (
+        apply_transforms,
+        KDAContextParallelTransform,
+        MLAContextParallelTransform,
+    )
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan.models.kimi_k3.cp_mla import MLAKVAllGatherCPFlexInnerAttention
+
+    config = kimi_k3_debugmodel()
+    _set_spmd_typechecking(config, typechecking=True)
+    config.parallelism.data_parallel_shard_degree = 1
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.context_parallel_load_balancer = "headtail"
+    return apply_transforms(
+        config,
+        [
+            MLAContextParallelTransform(inner_attention=MLAKVAllGatherCPFlexInnerAttention),
+            KDAContextParallelTransform(),
+        ],
+    )
+
+
+def kimi_k3_debugmodel_mm_packed_ulysses_cp2() -> Trainer.Config:
+    # The ulysses cell with the packed MLA kernel: MLA's rotary key slice
+    # travels once instead of expanded onto every head.
+    from torchtitan.config.transform import (
+        apply_transforms,
+        KDAContextParallelTransform,
+        MLAContextParallelTransform,
+    )
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan.models.kimi_k3.cp_mla import MLAUlyssesCPFlexInnerAttention
+
+    config = kimi_k3_debugmodel()
+    _set_spmd_typechecking(config, typechecking=True)
+    config.parallelism.data_parallel_shard_degree = 1
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.context_parallel_load_balancer = None
+    return apply_transforms(
+        config,
+        [
+            MLAContextParallelTransform(inner_attention=MLAUlyssesCPFlexInnerAttention),
+            KDAContextParallelTransform(),
+        ],
+    )

@@ -101,17 +101,16 @@ def test_h100_tests_are_registered_in_separate_suite() -> None:
 
 def test_b200_tests_are_registered_in_separate_suite() -> None:
     assert {test.test_name for test in build_b200_tests_list()} == {
+        "kimi_k3_mm_allgather_kv_cp",
         "kimi_k3_mm_fsdp",
+        "kimi_k3_mm_packed_allgather_kv_cp",
+        "kimi_k3_mm_packed_ulysses_cp",
         "kimi_k3_mm_tp2",
+        "kimi_k3_mm_ulysses_cp",
         "kimi_k3_pp2_vp2",
         "kimi_k3_pp8_vp4",
         "kimi_k3_pp8_vp4_vit_dep",
-        "kimi_k3_mm_allgather_kv_cp",
-        "kimi_k3_mm_ulysses_cp",
         "mxfp8_linear_fsdp",
-        "kimi_k3_mm_allgather_kv_cp",
-        "kimi_k3_mm_fsdp",
-        "kimi_k3_mm_ulysses_cp",
     }
     assert "kimi_k3_mm_fsdp" not in {
         test.test_name for test in build_model_tests_list()
