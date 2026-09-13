@@ -128,6 +128,13 @@ class GroupedExperts(Module):
         ``__torch_function__`` -- means it is captured by FX tracers such as
         graph_trainer's make_fx path.
         """
+        if __import__("os").environ.get("FP32_PROBE") == "1" or __import__("os").environ.get("FP64_PROBE") == "1":  # LOCAL PROBE HACK (not committed): per-expert loop
+            W, pieces, start = weight_EOI.transpose(-2, -1), [], 0
+            for e, end in enumerate(offs.tolist()):
+                pieces.append(A[start:end] @ W[e].to(A.dtype))
+                start = end
+            pieces.append(A.new_zeros(A.shape[0] - start, W.shape[-1]))
+            return torch.cat(pieces)
         return torch._grouped_mm(A, weight_EOI.bfloat16().transpose(-2, -1), offs=offs)
 
 

@@ -15,6 +15,33 @@ from typing import Annotated, Any, cast
 
 import spmd_types as spmd
 import torch
+
+if __import__("os").environ.get("FP32_PROBE") == "1":  # LOCAL PROBE HACK (not committed): bf16 casts stay float32
+    torch.Tensor.bfloat16 = lambda self, *a, **k: self
+    _fp32_probe_to = torch.Tensor.to
+
+    def _fp32_probe_to_fn(self, *a, **k):
+        a = tuple(torch.float32 if x is torch.bfloat16 else x for x in a)
+        if k.get("dtype") is torch.bfloat16:
+            k["dtype"] = torch.float32
+        return _fp32_probe_to(self, *a, **k)
+
+    torch.Tensor.to = _fp32_probe_to_fn
+if __import__("os").environ.get("FP64_PROBE") == "1":  # LOCAL PROBE HACK (not committed): every float cast goes to float64
+    _f64_to = torch.Tensor.to
+    _f64_low = (torch.bfloat16, torch.float16, torch.float32)
+    torch.Tensor.float = lambda self, *a, **k: _f64_to(self, torch.float64)
+    torch.Tensor.bfloat16 = lambda self, *a, **k: _f64_to(self, torch.float64)
+    torch.Tensor.half = lambda self, *a, **k: _f64_to(self, torch.float64)
+
+    def _f64_to_fn(self, *a, **k):
+        a = tuple(torch.float64 if (isinstance(x, torch.dtype) and x in _f64_low) else x for x in a)
+        if k.get("dtype") in _f64_low:
+            k["dtype"] = torch.float64
+        return _f64_to(self, *a, **k)
+
+    torch.Tensor.to = _f64_to_fn
+    torch.set_default_dtype(torch.float64)
 import torch.distributed.checkpoint.stateful
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -988,6 +1015,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(detached_loss)
 
         with sl.log_trace_span("optim"):
+            if os.environ.get("GRAD_DUMP") and self.step == 1:  # LOCAL PROBE HACK (not committed)
+                import torch.distributed as _dist
+
+                _d = {}
+                for _m in self.model_parts:
+                    for _n, _p in _m.named_parameters():
+                        if _p.grad is None:
+                            continue
+                        _g = _p.grad
+                        _g = _g.full_tensor() if hasattr(_g, "full_tensor") else _g
+                        _d[_n] = _g.detach().cpu()
+                torch.save(_d, f"{os.environ['GRAD_DUMP']}.rank{_dist.get_rank()}.pt")
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
@@ -1066,6 +1105,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = self.ntokens_seen
 
+        if os.environ.get("REPR_LOG") == "1":  # LOCAL PROBE HACK (not committed): full-precision loss and norm
+            _gn = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
+            print(f"REPR {self.step} rank{torch.distributed.get_rank()} loss {float(global_avg_loss):.17e} gn {float(_gn):.17e}", flush=True)
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,

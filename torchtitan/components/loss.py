@@ -669,7 +669,7 @@ class ChunkedLossWrapper(BaseLoss):
                     GradAccumulator(
                         hidden_state,
                         num_chunks=num_chunks,
-                        dtype=torch.float32,
+                        dtype=torch.float64 if __import__("os").environ.get("FP64_PROBE") == "1" else torch.float32,  # LOCAL PROBE HACK (not committed)
                     )
                     for hidden_state in pred
                 )
@@ -677,7 +677,7 @@ class ChunkedLossWrapper(BaseLoss):
                 else ()
             )
 
-            total_loss = pred[0].new_zeros((), dtype=torch.float32)
+            total_loss = pred[0].new_zeros((), dtype=torch.float64 if __import__("os").environ.get("FP64_PROBE") == "1" else torch.float32)  # LOCAL PROBE HACK (not committed)
             if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
                 total_loss = spmd.mutate_type(
                     total_loss,

@@ -1034,3 +1034,7 @@ class GQAttention(BaseAttention):
         )(out_TD)
         remat.recompute_needs_tensor(out_TD)
         return out_TD
+
+
+if __import__("os").environ.get("FP64_PROBE") == "1":  # LOCAL PROBE HACK (not committed): eager flex in float64
+    FlexAttention._compiled_flex_attn = flex_attention

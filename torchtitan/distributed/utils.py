@@ -212,7 +212,7 @@ def set_determinism(
 
         from torchtitan.models.common.attention import FlexAttention
 
-        if torch.version.hip is not None:
+        if torch.version.hip is not None or os.environ.get("FP64_PROBE") == "1":  # LOCAL PROBE HACK (not committed): eager flex in float64
             # Compiled ROCm flex attention is not deterministic.
             # Falling back to eager (non-compiled) flex_attention for determinism on ROCm.
             logger.info(

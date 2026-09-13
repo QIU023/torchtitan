@@ -50,6 +50,49 @@ class KimiRMSNormGated(Module):
         return (normalized_THV * gate_THV.float().sigmoid()).to(input_dtype)
 
 
+
+# LOCAL PROBE HACK (not committed): FP64_PROBE=1 runs KDA and its short convolution in float64 on
+# Attention Gym's eager oracles (the fused kernels take fp16 / bf16 / fp32 only).
+def _kda_fp64(q, k, v, raw_gate, raw_beta, A_log, dt_bias, lower_bound, cu_seqlens):
+    import math
+    import sys
+    from functools import partial
+
+    from attn_gym.linear.kda import chunk_kda as _ck
+    from attn_gym.linear.kda.impl.reference import reference_kda
+    from attn_gym.linear.kda.naive import l2norm_fwd_ref, naive_chunk_kda
+
+    f = torch.float64
+    q, k, v, raw_gate, raw_beta = (t.to(f) for t in (q, k, v, raw_gate, raw_beta))
+    heads = raw_gate.shape[2]
+    gate = lower_bound * torch.sigmoid(A_log.to(f).exp().view(1, 1, heads, 1) * (raw_gate + dt_bias.to(f)))
+    chunk = sys.modules[_ck.__module__]._CHUNK_SIZE
+    out, _ = reference_kda(
+        partial(naive_chunk_kda, chunk_size=chunk),
+        l2norm_fwd_ref(q), l2norm_fwd_ref(k), v, gate * math.log2(math.e), raw_beta.sigmoid(),
+        None, cu_seqlens, 1.0 / math.sqrt(q.shape[-1]), False,
+    )
+    return out
+
+
+def _causal_conv1d_fp64(x_1TC, weight_CW, cu_seqlens):
+    """Depthwise causal conv + SiLU per document, taps in stored order (matches the kernel to 8.6e-6 in fp32)."""
+    import torch.nn.functional as F
+
+    x_1TC = x_1TC.to(torch.float64); weight_CW = weight_CW.to(torch.float64)
+    channels, width = weight_CW.shape
+    bounds = [0, x_1TC.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
+    pieces = []
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        doc = x_1TC[:, start:end].transpose(1, 2)
+        y = F.conv1d(F.pad(doc, (width - 1, 0)), weight_CW.unsqueeze(1), groups=channels)
+        pieces.append(F.silu(y).transpose(1, 2))
+    tail = x_1TC.shape[1] - bounds[-1]
+    if tail:
+        pieces.append(x_1TC.new_zeros(1, tail, channels))
+    return torch.cat(pieces, dim=1)
+
+
 class KDAKernel(Module):
     """Apply KDA preprocessing and the Attention Gym kernel."""
 
@@ -89,6 +132,8 @@ class KDAKernel(Module):
                 f"got {capability}."
             )
 
+        if __import__("os").environ.get("FP64_PROBE") == "1":  # LOCAL PROBE HACK (not committed)
+            return _kda_fp64(q_1THK, k_1THK, v_1THV, raw_gate_1THK, raw_beta_1TH, A_log_H, dt_bias_HK, self.lower_bound, cu_seqlens)
         gate_1THK = bound_gate(
             raw_gate_1THK,
             # TODO: The long-term solution is to specify mixed precision per FQN
@@ -96,7 +141,7 @@ class KDAKernel(Module):
             A_log_H.float(),
             dt_bias_HK.float(),
             lower_bound=self.lower_bound,
-            impl="fused",
+            impl="reference" if __import__("os").environ.get("FP32_PROBE") == "1" else "fused",  # LOCAL PROBE HACK (not committed)
         )
         output_1THV, _ = chunk_kda(
             l2norm(q_1THK),
@@ -106,6 +151,7 @@ class KDAKernel(Module):
             raw_beta_1TH.float().sigmoid(),
             cu_seqlens=cu_seqlens,
             autotune=__import__("os").environ.get("KDA_NOAUTOTUNE") != "1",  # LOCAL PROBE HACK (not committed)
+            **({"impl": "reference"} if __import__("os").environ.get("FP32_PROBE") == "1" else {}),  # LOCAL PROBE HACK (not committed)
         )
         return output_1THV
 
@@ -154,12 +200,15 @@ class InnerKDA(Module):
             (conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W),
             dim=0,
         )
-        conv_output_1TC = causal_conv1d(
-            mixed_qkv_1TC,
-            conv_weight_C1W[:, 0],
-            activation="silu",
-            cu_seqlens=cu_seqlens,
-        )
+        if __import__("os").environ.get("FP64_PROBE") == "1":  # LOCAL PROBE HACK (not committed)
+            conv_output_1TC = _causal_conv1d_fp64(mixed_qkv_1TC, conv_weight_C1W[:, 0], cu_seqlens)
+        else:
+            conv_output_1TC = causal_conv1d(
+                mixed_qkv_1TC,
+                conv_weight_C1W[:, 0],
+                activation="silu",
+                cu_seqlens=cu_seqlens,
+            )
         assert isinstance(conv_output_1TC, torch.Tensor)
 
         q_1TC, k_1TC, v_1TC = conv_output_1TC.chunk(3, dim=-1)
