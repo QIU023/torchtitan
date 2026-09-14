@@ -11,7 +11,7 @@ import torch
 
 pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
 
-from torchtitan.components.lora import (
+from torchtitan.config.transform.lora import (
     LoRAConverter,
     merge_lora_state_dict,
     MXFP4ExpertsBase,

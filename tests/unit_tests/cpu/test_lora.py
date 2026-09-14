@@ -415,7 +415,7 @@ def _lora_llama_model(rank=4, alpha=8.0):
 
 
 def test_trainable_state_dict_is_exactly_the_adapters():
-    from torchtitan.components.lora import trainable_state_dict
+    from torchtitan.config.transform.lora import trainable_state_dict
 
     model = _lora_llama_model()
     trainable = trainable_state_dict(model)
@@ -429,7 +429,7 @@ def test_merge_lora_state_dict_keys_and_zero_init_identity():
     """With lora_b zero-initialized the merged weights EQUAL the base, and the
     merged dict carries the ORIGINAL key set -- no adapter keys, every base key
     intact."""
-    from torchtitan.components.lora import merge_lora_state_dict
+    from torchtitan.config.transform.lora import merge_lora_state_dict
 
     model = _lora_llama_model()
     raw = model.state_dict()
@@ -446,7 +446,7 @@ def test_merge_lora_state_dict_folds_the_delta():
     and a plain linear loaded with the merged weight reproduces the LoRA
     module's forward."""
     torch.manual_seed(0)
-    from torchtitan.components.lora import LoRALinearBase, merge_lora_state_dict
+    from torchtitan.config.transform.lora import LoRALinearBase, merge_lora_state_dict
 
     model = _lora_llama_model(rank=4, alpha=8.0)
     name, module = next(
@@ -483,7 +483,7 @@ def test_merge_lora_state_dict_respects_serialization_hooks():
     state-dict hook; the merged delta must land in THOSE keys, not a composed
     wqkv.weight nothing recognises."""
     torch.manual_seed(0)
-    from torchtitan.components.lora import LoRALinearBase, merge_lora_state_dict
+    from torchtitan.config.transform.lora import LoRALinearBase, merge_lora_state_dict
 
     model = _lora_llama_model(rank=4, alpha=8.0)
     name, module = next(
@@ -514,7 +514,7 @@ def test_merge_lora_state_dict_sees_through_wrappers():
         CheckpointWrapper,
     )
 
-    from torchtitan.components.lora import merge_lora_state_dict
+    from torchtitan.config.transform.lora import merge_lora_state_dict
 
     model = _lora_llama_model()
     model.layers["0"] = CheckpointWrapper(model.layers["0"])
@@ -532,7 +532,7 @@ def test_qlora_nf4_pack_forward_merge():
     pytest.importorskip("torchao.quantization.quantize_.workflows.nf4.nf4_tensor")
     from torchao.quantization.quantize_.workflows.nf4.nf4_tensor import NF4Tensor
 
-    from torchtitan.components.lora import (
+    from torchtitan.config.transform.lora import (
         LoRALinearBase,
         merge_lora_state_dict,
         quantize_lora_bases,
@@ -566,7 +566,7 @@ def test_qlora_config_packs_at_init():
     pytest.importorskip("torchao.quantization.quantize_.workflows.nf4.nf4_tensor")
     from torchao.quantization.quantize_.workflows.nf4.nf4_tensor import NF4Tensor
 
-    from torchtitan.components.lora import LoRALinearBase
+    from torchtitan.config.transform.lora import LoRALinearBase
 
     model_spec = model_registry(
         "debugmodel",
@@ -589,7 +589,7 @@ def test_qlora_mxfp4_packs_at_build_and_merges():
     pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
     torch.manual_seed(0)
 
-    from torchtitan.components.lora import LoRALinearBase, merge_lora_state_dict
+    from torchtitan.config.transform.lora import LoRALinearBase, merge_lora_state_dict
 
     model_spec = model_registry(
         "debugmodel",

@@ -15,12 +15,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Sequence
 
 from torchtitan.models.kimi_k3.dep_bubble_plan import BubblePlan
 
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 
 
 class _AnchorFirer:
