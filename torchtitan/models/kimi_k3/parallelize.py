@@ -79,9 +79,7 @@ def parallelize_kimi_k3(
             ac_policy.apply(model.vision_encoder)
 
     if compile_config.enable and "model" in compile_config.components:
-        _apply_compile_kimi_k3(
-            model, compile_config=compile_config, parallel_dims=parallel_dims
-        )
+        apply_compile(model, compile_config=compile_config, parallel_dims=parallel_dims)
 
     # Skip FSDP wrapper for inference. FSDP's forward hooks
     # are incompatible with torch.inference_mode() used by vLLM.
