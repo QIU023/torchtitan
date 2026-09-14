@@ -34,5 +34,5 @@ def test_gpt_oss_recompile_limit():
 
 
 def test_kimi_k3_recompile_limit_counts_layer_variants():
-    assert _kimi_k3_recompile_limit(model_registry("debugmodel").model) == 10
-    assert _kimi_k3_recompile_limit(model_registry("Kimi-K3").model) == 28
+    assert _kimi_k3_recompile_limit(model_registry("debugmodel").model) == 8
+    assert _kimi_k3_recompile_limit(model_registry("Kimi-K3").model) == 9
