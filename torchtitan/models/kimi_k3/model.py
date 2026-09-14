@@ -9,7 +9,7 @@ from typing import Any, cast, TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
-import torch.utils.checkpoint
+import torch_remat as remat
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
@@ -124,13 +124,51 @@ class KimiMLAAttention(BaseAttention):
     ) -> torch.Tensor:
         del positions
 
-        q_THK = local_head_split(
+        q_THK = remat.region(
+            self._project_q,
+            self.remat_region_name("q"),
+            recompute=self.remat_should_recompute("q"),
+        )(x_TD)
+        k_THK, v_THV = remat.region(
+            self._project_kv,
+            self.remat_region_name("kv"),
+            recompute=self.remat_should_recompute("kv"),
+        )(x_TD)
+        out_THV = remat.region(
+            self.inner_attention,
+            self.remat_region_name("inner_attention"),
+            recompute=self.remat_should_recompute("inner_attention"),
+        )(
+            q_THK,
+            k_THK,
+            v_THV,
+            attention_masks=attention_masks,
+            scale=self.scale,
+        )
+        gate_TD = remat.region(
+            self.gate,
+            self.remat_region_name("gate"),
+            recompute=self.remat_should_recompute("gate"),
+        )(x_TD)
+        remat.recompute_needs_tensor(out_THV, gate_TD)
+        out_TD = out_THV.flatten(-2) * torch.sigmoid(gate_TD)
+        out_TD = remat.region(
+            self.wo,
+            self.remat_region_name("wo"),
+            recompute=self.remat_should_recompute("wo"),
+        )(out_TD)
+        remat.recompute_needs_tensor(out_TD)
+        return out_TD
+
+    def _project_q(self, x_TD: torch.Tensor) -> torch.Tensor:
+        return local_head_split(
             self.wq_b(self.q_norm(self.wq_a(x_TD))), self.q_head_dim, cp_sharded=True
         )
 
-        compressed_kv_TC = self.wkv_a(x_TD)
+    def _project_kv(self, x_TD: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keys (no-position and shared rope parts) and values per head."""
         kv_latent_TC, k_rope_TK = torch.split(
-            compressed_kv_TC,
+            self.wkv_a(x_TD),
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
@@ -156,17 +194,7 @@ class KimiMLAAttention(BaseAttention):
                         partition_spec=spmd.PartitionSpec(("dp", "cp"), "tp", None),
                     ),
                 )
-
-        out_THV = self.inner_attention(
-            q_THK,
-            k_THK,
-            v_THV,
-            attention_masks=attention_masks,
-            scale=self.scale,
-        )
-        out_TD = out_THV.flatten(-2)
-        out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
-        return self.wo(out_TD)
+        return k_THK, v_THV
 
 
 def _apply_attention_residual(
@@ -175,39 +203,7 @@ def _apply_attention_residual(
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
-    """Apply the attention residual with its computation wrapped in checkpointing.
-
-    The residual math upcasts the whole (N+1)-entry block stack to fp32 twice
-    per layer; saving those intermediates would make each layer's activation
-    footprint grow with the stack. Wrapping the computation recomputes them in
-    backward from the stack and the partial block -- both alive elsewhere -- so
-    the activations saved per layer are identical to the standard residual
-    architecture.
-    """
-    if torch.is_grad_enabled() and (
-        (partial_block_TD is not None and partial_block_TD.requires_grad)
-        or block_residual_TND.requires_grad
-    ):
-        return torch.utils.checkpoint.checkpoint(
-            _attention_residual_math,
-            partial_block_TD,
-            block_residual_TND,
-            projection,
-            norm,
-            use_reentrant=False,
-        )
-    return _attention_residual_math(
-        partial_block_TD, block_residual_TND, projection, norm
-    )
-
-
-def _attention_residual_math(
-    partial_block_TD: torch.Tensor | None,
-    block_residual_TND: torch.Tensor,
-    projection: Linear,
-    norm: RMSNorm,
-) -> torch.Tensor:
-    """The block-level attention residual in FP32, unwrapped."""
+    """Apply Kimi's block-level attention residual in FP32."""
     assert norm.eps is not None
 
     values_TND = (
@@ -309,12 +305,19 @@ class KimiK3TransformerBlock(Module):
             h_TD = x_TD
         else:
             assert self.attention_res_norm is not None
-            h_TD = _apply_attention_residual(
+            # The residual math upcasts the whole block stack to fp32; a region lets
+            # RegionAC recompute it instead of keeping those intermediates.
+            h_TD = remat.region(
+                _apply_attention_residual,
+                self.remat_region_name("attention_res"),
+                recompute=self.remat_should_recompute("attention_res"),
+            )(
                 partial_block_TD,
                 block_residual_TND,
                 self.attention_res_proj,
                 self.attention_res_norm,
             )
+        remat.recompute_needs_tensor(h_TD)
         h_TD = self.attention_norm(h_TD)
         layer_mask = (
             attention_masks[self.attn_mask_key] if attention_masks is not None else None
@@ -332,12 +335,17 @@ class KimiK3TransformerBlock(Module):
             )
         prefix_sum_TD = h_TD if self.first_layer_in_block else x_TD + h_TD
 
-        h_TD = _apply_attention_residual(
+        h_TD = remat.region(
+            _apply_attention_residual,
+            self.remat_region_name("ffn_res"),
+            recompute=self.remat_should_recompute("ffn_res"),
+        )(
             prefix_sum_TD,
             block_residual_TND,
             self.ffn_res_proj,
             self.ffn_res_norm,
         )
+        remat.recompute_needs_tensor(h_TD)
         h_TD = self.ffn_norm(h_TD)
         if self.moe is not None:
             h_TD = self.moe(h_TD, padding_mask_T=padding_mask)
@@ -355,12 +363,6 @@ class KimiK3Model(Decoder):
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
         mtp_layers: list[KimiK3MTPLayer.Config] = field(default_factory=list)
-        # Under selective AC, checkpoint only each block's MoE/feed-forward and
-        # keep attention and the residual math outside, so their activations
-        # are reused in backward: the KDA kernel is a custom op outside the
-        # per-op policy's save set, so a whole-block wrap recomputes it.
-        # Trades activation memory for not re-running the attention kernels.
-        ac_reuse_attention: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
             parallelism = config.parallelism
