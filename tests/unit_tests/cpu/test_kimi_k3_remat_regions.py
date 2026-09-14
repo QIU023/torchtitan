@@ -154,6 +154,29 @@ class TestKimiK3AttentionResidualRecompute(unittest.TestCase):
         # Three residual computations in forward, each run again in backward.
         self.assertEqual(len(calls), 6)
 
+    def test_covered_block_runs_the_residual_once(self):
+        model = _TwoBlocks()
+        for block in model.layers.values():
+            block.checkpoint_residual = False
+        reference = deepcopy(model)
+        x_TD = torch.randn(_TOKENS, 1024)
+        with _unwrapped_residual():
+            expected = _run_forward_backward(reference, x_TD)
+        calls = []
+        original = k3_model._apply_attention_residual
+
+        def counting(*args):
+            calls.append(None)
+            return original(*args)
+
+        with patch.object(k3_model, "_apply_attention_residual", counting):
+            actual = _run_forward_backward(model, x_TD)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        for name, grad in expected[2].items():
+            torch.testing.assert_close(actual[2][name], grad, rtol=0, atol=0, msg=name)
+        # The block's own activation checkpoint is the recompute; no second one here.
+        self.assertEqual(len(calls), 3)
+
     def test_no_stack_shaped_activation_is_saved(self):
         model = _TwoBlocks()
         x_TD = torch.randn(_TOKENS, 1024)
