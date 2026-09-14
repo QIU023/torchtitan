@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+import torch_remat as remat
 from attn_gym.linear.kda import bound_gate, chunk_kda
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
 from attn_gym.linear.short_conv import causal_conv1d
@@ -398,14 +399,29 @@ class KDA(Module):
         # explicitly, so the recurrent state and the short convolution reset
         # at every document; an unpacked run passes nothing and keeps the
         # single-sequence kernels.
-        raw_gate_THK = local_head_split(
-            self.forget_b(self.forget_a(x_TD)), self.head_dim, cp_sharded=True
-        )
-        raw_beta_TH = self.beta(x_TD)
-        out_THV = self.inner_kda(
-            self.q_proj(x_TD),
-            self.k_proj(x_TD),
-            self.v_proj(x_TD),
+        query_TC, key_TC, value_TC = remat.region(
+            self._project_qkv,
+            self.remat_region_name("qkv"),
+            recompute=self.remat_should_recompute("qkv"),
+        )(x_TD)
+        raw_gate_THK = remat.region(
+            self._project_forget,
+            self.remat_region_name("forget"),
+            recompute=self.remat_should_recompute("forget"),
+        )(x_TD)
+        raw_beta_TH = remat.region(
+            self.beta,
+            self.remat_region_name("beta"),
+            recompute=self.remat_should_recompute("beta"),
+        )(x_TD)
+        out_THV = remat.region(
+            self.inner_kda,
+            self.remat_region_name("inner_kda"),
+            recompute=self.remat_should_recompute("inner_kda"),
+        )(
+            query_TC,
+            key_TC,
+            value_TC,
             raw_gate_THK,
             raw_beta_TH,
             self.q_conv.weight,
@@ -416,8 +432,31 @@ class KDA(Module):
             cu_seqlens=cu_seqlens,
             routing=routing,
         )
+        output_gate_TC = remat.region(
+            self.output_gate,
+            self.remat_region_name("output_gate"),
+            recompute=self.remat_should_recompute("output_gate"),
+        )(x_TD)
+        normed_THV = remat.region(
+            self.output_norm,
+            self.remat_region_name("output_norm"),
+            recompute=self.remat_should_recompute("output_norm"),
+        )(out_THV, local_head_split(output_gate_TC, self.head_dim, cp_sharded=True))
+        remat.recompute_needs_tensor(normed_THV)
+        out_TD = remat.region(
+            self.output_proj,
+            self.remat_region_name("output_proj"),
+            recompute=self.remat_should_recompute("output_proj"),
+        )(normed_THV.flatten(-2))
+        remat.recompute_needs_tensor(out_TD)
+        return out_TD
 
-        output_gate_THV = local_head_split(
-            self.output_gate(x_TD), self.head_dim, cp_sharded=True
+    def _project_qkv(
+        self, x_TD: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.q_proj(x_TD), self.k_proj(x_TD), self.v_proj(x_TD)
+
+    def _project_forget(self, x_TD: torch.Tensor) -> torch.Tensor:
+        return local_head_split(
+            self.forget_b(self.forget_a(x_TD)), self.head_dim, cp_sharded=True
         )
-        return self.output_proj(self.output_norm(out_THV, output_gate_THV).flatten(-2))
