@@ -70,11 +70,7 @@ def parallelize_kimi_k3(
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
-        config = model.config
-        if isinstance(config, KimiK3Model.Config) and config.ac_reuse_attention:
-            _apply_ac_outside_attention(ac_policy, model)
-        else:
-            ac_policy.apply(model)
+        ac_policy.apply(model)
         if model.vision_encoder is not None:
             ac_policy.apply(model.vision_encoder)
 
