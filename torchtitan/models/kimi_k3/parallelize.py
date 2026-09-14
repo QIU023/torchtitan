@@ -14,7 +14,12 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.activation_checkpoint import (
+    ActivationCheckpointingConfig,
+    FullAC,
+    RegionAC,
+    SelectiveAC,
+)
 from torchtitan.distributed.compile import apply_compile, raise_dynamo_recompile_limit
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
@@ -69,6 +74,11 @@ def parallelize_kimi_k3(
     model.parallelize(parallel_dims)
 
     if ac_config is not None:
+        if isinstance(ac_config, (SelectiveAC.Config, FullAC.Config, RegionAC.Config)):
+            # These policies checkpoint each whole block, residual math included.
+            for block in model.layers.values():
+                assert isinstance(block, KimiK3TransformerBlock)
+                block.checkpoint_residual = False
         ac_policy = ac_config.build(dump_folder=dump_folder)
         ac_policy.apply(model)
         if model.vision_encoder is not None:
