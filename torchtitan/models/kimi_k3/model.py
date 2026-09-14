@@ -221,6 +221,22 @@ def _apply_attention_residual(
     return output_TD.to(values_TND.dtype)
 
 
+def _checkpointed_attention_residual(
+    name: str,
+    partial_block_TD: torch.Tensor | None,
+    block_residual_TND: torch.Tensor,
+    projection: Linear,
+    norm: RMSNorm,
+) -> torch.Tensor:
+    args = (partial_block_TD, block_residual_TND, projection, norm)
+    if torch.is_grad_enabled() and (
+        block_residual_TND.requires_grad
+        or (partial_block_TD is not None and partial_block_TD.requires_grad)
+    ):
+        return remat.checkpoint(region_name=name)(_apply_attention_residual)(*args)
+    return _apply_attention_residual(*args)
+
+
 class KimiK3TransformerBlock(Module):
     """Hybrid KDA/MLA decoder block with Kimi attention residuals."""
 
@@ -282,6 +298,31 @@ class KimiK3TransformerBlock(Module):
         )
         self.ffn_res_norm = config.ffn_res_norm.build()
         self.ffn_res_proj = config.ffn_res_proj.build()
+        self._region_ac = False
+
+    def configure_remat_regions(self, save_patterns: list[str]) -> None:
+        # Called by RegionAC on every block it checkpoints.
+        self._region_ac = True
+        super().configure_remat_regions(save_patterns)
+
+    def _attention_residual(
+        self,
+        name: str,
+        partial_block_TD: torch.Tensor | None,
+        block_residual_TND: torch.Tensor,
+        projection: Linear,
+        norm: RMSNorm,
+    ) -> torch.Tensor:
+        """Attention residual whose fp32 intermediates are recomputed in backward."""
+        args = (partial_block_TD, block_residual_TND, projection, norm)
+        if self._region_ac:
+            # A torch_remat checkpoint cannot nest inside RegionAC's block checkpoint.
+            return remat.region(
+                _apply_attention_residual,
+                self.remat_region_name(name),
+                recompute=self.remat_should_recompute(name),
+            )(*args)
+        return _checkpointed_attention_residual(name, *args)
 
     def forward(
         self,
@@ -307,13 +348,8 @@ class KimiK3TransformerBlock(Module):
             h_TD = x_TD
         else:
             assert self.attention_res_norm is not None
-            # The residual math upcasts the whole block stack to fp32; a region lets
-            # RegionAC recompute it instead of keeping those intermediates.
-            h_TD = remat.region(
-                _apply_attention_residual,
-                self.remat_region_name("attention_res"),
-                recompute=self.remat_should_recompute("attention_res"),
-            )(
+            h_TD = self._attention_residual(
+                "attention_res",
                 partial_block_TD,
                 block_residual_TND,
                 self.attention_res_proj,
@@ -337,11 +373,8 @@ class KimiK3TransformerBlock(Module):
             )
         prefix_sum_TD = h_TD if self.first_layer_in_block else x_TD + h_TD
 
-        h_TD = remat.region(
-            _apply_attention_residual,
-            self.remat_region_name("ffn_res"),
-            recompute=self.remat_should_recompute("ffn_res"),
-        )(
+        h_TD = self._attention_residual(
+            "ffn_res",
             prefix_sum_TD,
             block_residual_TND,
             self.ffn_res_proj,
@@ -760,7 +793,8 @@ class KimiK3Model(Decoder):
         # hands the stack on, since a block residual spans the whole stack.
         if self.output_res_proj is None:
             return h_TD, block_residual_TND
-        h_TD = _apply_attention_residual(
+        h_TD = _checkpointed_attention_residual(
+            "output_res",
             h_TD,
             block_residual_TND,
             self.output_res_proj,
