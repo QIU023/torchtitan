@@ -6,9 +6,8 @@
 
 """Kimi Delta Attention using Attention Gym kernels."""
 
-from typing import TYPE_CHECKING
-
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
