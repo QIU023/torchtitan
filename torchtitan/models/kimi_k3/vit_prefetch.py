@@ -14,9 +14,11 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 
 
 class VisionPrefetcher:
