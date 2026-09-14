@@ -15,7 +15,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.compile import apply_compile
+from torchtitan.distributed.compile import apply_compile, raise_dynamo_recompile_limit
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
@@ -75,7 +75,15 @@ def parallelize_kimi_k3(
             ac_policy.apply(model.vision_encoder)
 
     if compile_config.enable and "model" in compile_config.components:
+        assert isinstance(model.config, KimiK3Model.Config)
+        raise_dynamo_recompile_limit(_kimi_k3_recompile_limit(model.config))
         apply_compile(model, compile_config=compile_config, parallel_dims=parallel_dims)
+        if model.vision_encoder is not None:
+            apply_compile(
+                model.vision_encoder,  # pyrefly: ignore [bad-argument-type]
+                compile_config=compile_config,
+                parallel_dims=parallel_dims,
+            )
 
     # Skip FSDP wrapper for inference. FSDP's forward hooks
     # are incompatible with torch.inference_mode() used by vLLM.
@@ -309,3 +317,17 @@ def _install_vision_dep(
         cost_ratio,
         max_pending,
     )
+
+
+def _kimi_k3_recompile_limit(config: KimiK3Model.Config) -> int:
+    # Every block compiles the shared checkpoint wrapper once per (MLA or KDA, opens a
+    # block, residual-stack width); the tower's image shapes and FSDP wrappers add up to 4.
+    variants = {
+        (
+            layer.attention is not None,
+            layer.layer_id % layer.attn_res_block_size == 0,
+            -(-layer.layer_id // layer.attn_res_block_size),
+        )
+        for layer in config.layers
+    }
+    return len(variants) + 4
