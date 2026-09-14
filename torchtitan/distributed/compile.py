@@ -44,14 +44,10 @@ def apply_compile(
     *,
     compile_config: CompileConfig,
     parallel_dims: ParallelDims,
-    fullgraph: bool = True,
 ) -> None:
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
-
-    ``fullgraph=False`` lets a model keep parts of a block out of the graph
-    (``torch.compiler.disable`` on a kernel wrapper) at the cost of graph breaks.
     """
     _maybe_enable_async_tp(
         compile_config,
@@ -74,7 +70,7 @@ def apply_compile(
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block.compile(backend=backend, fullgraph=fullgraph)
+        transformer_block.compile(backend=backend, fullgraph=True)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
 
