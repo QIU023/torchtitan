@@ -399,11 +399,6 @@ class KDA(Module):
         # explicitly, so the recurrent state and the short convolution reset
         # at every document; an unpacked run passes nothing and keeps the
         # single-sequence kernels.
-        query_TC, key_TC, value_TC = remat.region(
-            self._project_qkv,
-            self.remat_region_name("qkv"),
-            recompute=self.remat_should_recompute("qkv"),
-        )(x_TD)
         raw_gate_THK = remat.region(
             self._project_forget,
             self.remat_region_name("forget"),
@@ -413,6 +408,11 @@ class KDA(Module):
             self.beta,
             self.remat_region_name("beta"),
             recompute=self.remat_should_recompute("beta"),
+        )(x_TD)
+        query_TC, key_TC, value_TC = remat.region(
+            self._project_qkv,
+            self.remat_region_name("qkv"),
+            recompute=self.remat_should_recompute("qkv"),
         )(x_TD)
         out_THV = remat.region(
             self.inner_kda,
