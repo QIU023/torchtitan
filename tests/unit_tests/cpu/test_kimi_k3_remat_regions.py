@@ -113,6 +113,57 @@ def _counts(model: _TwoBlocks, residual_calls: int) -> tuple[int, int, int, int]
     )
 
 
+def _unwrapped_residual():
+    """The residual math without its checkpoint: the reference and the control."""
+    return patch.object(k3_model.remat, "checkpoint", lambda **_: (lambda fn: fn))
+
+
+def _saved_shapes(model: Module, x_TD: torch.Tensor) -> list[tuple[int, ...]]:
+    shapes = []
+
+    def pack(tensor):
+        shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        model(x_TD.detach().clone().requires_grad_(True))
+    return shapes
+
+
+class TestKimiK3AttentionResidualRecompute(unittest.TestCase):
+    def test_residual_math_reruns_in_backward_bitwise(self):
+        model = _TwoBlocks()
+        reference = deepcopy(model)
+        x_TD = torch.randn(_TOKENS, 1024)
+        with _unwrapped_residual():
+            expected = _run_forward_backward(reference, x_TD)
+        calls = []
+        original = k3_model._apply_attention_residual
+
+        def counting(*args):
+            calls.append(None)
+            return original(*args)
+
+        with patch.object(k3_model, "_apply_attention_residual", counting):
+            actual = _run_forward_backward(model, x_TD)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+        self.assertEqual(actual[2].keys(), expected[2].keys())
+        for name, grad in expected[2].items():
+            torch.testing.assert_close(actual[2][name], grad, rtol=0, atol=0, msg=name)
+        # Three residual computations in forward, each run again in backward.
+        self.assertEqual(len(calls), 6)
+
+    def test_no_stack_shaped_activation_is_saved(self):
+        model = _TwoBlocks()
+        x_TD = torch.randn(_TOKENS, 1024)
+        # Every residual here reads a one-entry stack plus the prefix sum.
+        stack_shape = (_TOKENS, 2, 1024)
+        with _unwrapped_residual():
+            self.assertIn(stack_shape, _saved_shapes(model, x_TD))
+        self.assertNotIn(stack_shape, _saved_shapes(model, x_TD))
+
+
 class TestKimiK3RematRegions(unittest.TestCase):
     def test_regions_are_declared_relative_to_the_block(self):
         model = _TwoBlocks()
