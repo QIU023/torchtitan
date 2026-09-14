@@ -30,6 +30,7 @@ complement of ``components/lora.py``'s QLoRA (really-packed frozen bases,
 trainable adapters). The two do not compose on the same weights.
 """
 
+import logging
 from dataclasses import dataclass, fields
 
 import torch
@@ -39,7 +40,8 @@ from torch.distributed.tensor import DTensor
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.module import Module
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 _WEIGHT_ELEM = torch.float4_e2m1fn_x2  # MXFP4
 _ACT_ELEM = torch.float8_e4m3fn  # MXFP8

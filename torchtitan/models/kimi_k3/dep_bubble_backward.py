@@ -35,9 +35,11 @@ prefetch's and is the real bound on how much of the backward can be moved.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 
 
 def cut_for_deferred_backward(

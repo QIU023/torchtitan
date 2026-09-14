@@ -11,8 +11,8 @@ import torch
 
 pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
 
-from torchtitan.components.quantization.mx_qat import _fake_quant_mx, MXQATExpertsBase
 from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mx_qat
+from torchtitan.quantization.mx_qat import _fake_quant_mx, MXQATExpertsBase
 
 
 def test_fake_quant_is_ste():
