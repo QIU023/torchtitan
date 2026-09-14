@@ -331,10 +331,6 @@ class QuantileBalancedTopKRouter(TokenChoiceTopKRouter):
         super().__init__(config)
         if self.score_func != "sigmoid":
             raise ValueError("Quantile balancing requires sigmoid router scores.")
-        if self.num_expert_groups is not None:
-            raise ValueError(
-                "Quantile balancing does not support group-limited routing."
-            )
         if self._debug_force_load_balance:
             raise ValueError(
                 "Quantile balancing does not support forced debug load balancing."
