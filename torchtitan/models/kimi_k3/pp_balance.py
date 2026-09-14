@@ -28,13 +28,15 @@ from __future__ import annotations
 import ctypes
 import glob
 import json
+
+import logging
 import os
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 
 
 def _load_transfer_engine():

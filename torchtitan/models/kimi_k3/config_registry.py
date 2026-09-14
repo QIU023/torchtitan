@@ -127,7 +127,7 @@ def kimi_k3_debugmodel_lora() -> Trainer.Config:
 def _kimi_k3_lora_converter(
     *, quantize_base: str | None = None, quantize_experts: str | None = None
 ):
-    from torchtitan.components.lora import LoRAConverter
+    from torchtitan.config.transform.lora import LoRAConverter
 
     return LoRAConverter.Config(
         rank=8,
@@ -173,7 +173,7 @@ def kimi_k3_debugmodel_mx_qat() -> Trainer.Config:
     K3's official quantization scope: the routed experts only, bf16 masters
     training underneath. Fake-quant is bf16 compute, so this runs on any GPU.
     """
-    from torchtitan.components.quantization.mx_qat import MXFP4QATConverter
+    from torchtitan.quantization.mx_qat import MXFP4QATConverter
 
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry(
