@@ -7,6 +7,8 @@
 import dataclasses
 from collections.abc import Sequence
 
+import logging
+
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
@@ -40,8 +42,9 @@ from torchtitan.models.kimi_k3.pipeline_stage import (
     AttnResPipelineStage,
     PPRankLocalCache,
 )
-from torchtitan.tools.logging import logger
 from .model import KimiK3Model
+
+logger = logging.getLogger(__name__)
 
 
 def parallelize_kimi_k3(
