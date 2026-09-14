@@ -39,6 +39,16 @@ FakeTensorMode.__init__ = torch.compiler.disable(  # type: ignore[method-assign]
 _regional_inductor_enabled: bool = False
 
 
+def raise_dynamo_recompile_limit(min_recompile_limit: int) -> None:
+    """Raise Dynamo's per-code-object recompile limit to at least ``min_recompile_limit``."""
+    # PyTorch types this config as Literal[8], but runtime accepts larger ints.
+    # pyrefly: ignore [bad-assignment]
+    torch._dynamo.config.recompile_limit = max(
+        torch._dynamo.config.recompile_limit,
+        min_recompile_limit,
+    )
+
+
 def apply_compile(
     model: nn.Module,
     *,
