@@ -297,6 +297,8 @@ class KimiK3TransformerBlock(Module):
         )
         self.ffn_res_norm = config.ffn_res_norm.build()
         self.ffn_res_proj = config.ffn_res_proj.build()
+        # False when an activation-checkpointing policy wraps the whole block.
+        self.checkpoint_residual = True
         self._region_ac = False
 
     def configure_remat_regions(self, save_patterns: list[str]) -> None:
@@ -321,6 +323,8 @@ class KimiK3TransformerBlock(Module):
                 self.remat_region_name(name),
                 recompute=self.remat_should_recompute(name),
             )(*args)
+        if not self.checkpoint_residual:
+            return _apply_attention_residual(*args)
         return _checkpointed_attention_residual(name, *args)
 
     def forward(
