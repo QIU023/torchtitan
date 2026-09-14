@@ -122,9 +122,9 @@ class TestKimiK3RematRegions(unittest.TestCase):
         kda_names = [
             f"delta_attention.{n}"
             for n in (
-                "qkv",
                 "forget",
                 "beta",
+                "qkv",
                 "inner_kda",
                 "output_gate",
                 "output_norm",
