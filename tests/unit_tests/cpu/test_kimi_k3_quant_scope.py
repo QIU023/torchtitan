@@ -22,11 +22,11 @@ from typing import cast
 
 import pytest
 import torch
-
-from torchtitan.components.quantization.mx_qat import MXFP4QATConverter
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.kimi_k3 import model_registry
 from torchtitan.models.kimi_k3.model import KimiK3Model
+
+from torchtitan.quantization.mx_qat import MXFP4QATConverter
 
 _INDEX = pathlib.Path(
     os.environ.get(

@@ -45,7 +45,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
 from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
-from torchtitan.components.lora import LoRALinearBase, MXFP4ExpertsBase
+from torchtitan.config.transform.lora import LoRALinearBase, MXFP4ExpertsBase
 
 
 def _packed_key_map(module_name: str, config_name: str) -> dict[str, tuple[str, str]]:
