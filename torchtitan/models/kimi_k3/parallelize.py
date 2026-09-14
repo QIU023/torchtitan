@@ -320,14 +320,13 @@ def _install_vision_dep(
 
 
 def _kimi_k3_recompile_limit(config: KimiK3Model.Config) -> int:
-    # Every block compiles the shared checkpoint wrapper once per (MLA or KDA, opens a
-    # block, residual-stack width); the tower's image shapes and FSDP wrappers add up to 4.
+    # One graph per (MLA or KDA, opens a block, stack width 0/1/>=2); the tower adds 2.
     variants = {
         (
             layer.attention is not None,
             layer.layer_id % layer.attn_res_block_size == 0,
-            -(-layer.layer_id // layer.attn_res_block_size),
+            min(-(-layer.layer_id // layer.attn_res_block_size), 2),
         )
         for layer in config.layers
     }
-    return len(variants) + 4
+    return len(variants) + 2
