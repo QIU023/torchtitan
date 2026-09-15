@@ -32,16 +32,24 @@ class TestPipelineNeighborTransport(unittest.TestCase):
         if len(pp_ranks) > 2:
             pairs[(pp_ranks[0], pp_ranks[-1])] = Mock(name="g_wrap")
         parallel_dims = Mock()
-        parallel_dims.get_pipeline_neighbor_groups.return_value = (Mock(name="meta"), pairs)
+        parallel_dims.get_pipeline_neighbor_groups.return_value = (
+            Mock(name="meta"),
+            pairs,
+        )
         with (
             patch.dict(os.environ, {pp.PIPELINE_NEIGHBOR_P2P_ENV: "1"}, clear=True),
-            patch.object(pp.dist, "get_process_group_ranks", return_value=list(pp_ranks)),
+            patch.object(
+                pp.dist, "get_process_group_ranks", return_value=list(pp_ranks)
+            ),
             patch.object(pp.dist, "get_backend", return_value="nccl"),
             patch.object(pp.dist, "get_rank", return_value=my_pp_rank),
         ):
-            return pp._create_pipeline_transport_groups(
-                parallel_dims, Mock(), num_stages=num_stages, pp_schedule=schedule
-            ), pairs
+            return (
+                pp._create_pipeline_transport_groups(
+                    parallel_dims, Mock(), num_stages=num_stages, pp_schedule=schedule
+                ),
+                pairs,
+            )
 
     def test_1f1b_edges_and_peer_indices(self):
         # PP ranks live on global ranks 3, 4, 5; this rank is pp rank 1 (global 4).
@@ -85,7 +93,11 @@ class TestPipelineNeighborTransport(unittest.TestCase):
         with patch.object(pp.dist, "send_object_list") as send:
             pp._NeighborP2PTransportMixin._send_meta(stage, {"k": 1}, 2)
         send.assert_called_once_with(
-            [{"k": 1}], dst=7, group=meta_group, device=torch.device("cpu"), use_batch=False
+            [{"k": 1}],
+            dst=7,
+            group=meta_group,
+            device=torch.device("cpu"),
+            use_batch=False,
         )
 
     def test_schedule_votes_with_one_collective(self):
@@ -101,7 +113,9 @@ class TestPipelineNeighborTransport(unittest.TestCase):
         ):
             pp._configure_neighbor_p2p_schedule(schedule)
             schedule._warmup_p2p([stage], True, False)
-        all_reduce.assert_called_once_with(ANY, op=pp.dist.ReduceOp.MIN, group=stage.group)
+        all_reduce.assert_called_once_with(
+            ANY, op=pp.dist.ReduceOp.MIN, group=stage.group
+        )
         self.assertEqual(stage._inference_mode, pp.InferenceMode.STATIC)
 
 
