@@ -6,7 +6,7 @@
 
 import logging
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any, cast, ClassVar, Protocol
 
 import spmd_types as spmd
@@ -124,6 +124,13 @@ def _get_lora_cls(parent_cls: type) -> type:
             alpha: float
             quantize_base: str | None = None
 
+            def build(self, **kwargs):
+                instance = parent_config_cls.build(self, **kwargs)
+                # Config.build installs the config's sharding after __init__.
+                if getattr(instance, "_packed_sharding", None) is not None:
+                    instance._sharding_config = instance._packed_sharding
+                return instance
+
         def __init__(self, config: Config) -> None:
             super().__init__(config)
             for param in nn.Module.parameters(self):
@@ -229,9 +236,13 @@ def _get_lora_cls(parent_cls: type) -> type:
                     self._packed_tp_style = "rowwise"
                 else:
                     pair = dense_param_placement(tp=spmd.R)
-                sharding.state_shardings["base_qdata"] = pair
-                sharding.state_shardings["base_scale"] = pair
-                del sharding.state_shardings["weight"]
+                # A copy: sharding helpers share one ShardingConfig across modules.
+                states = {
+                    k: v for k, v in sharding.state_shardings.items() if k != "weight"
+                }
+                states["base_qdata"] = pair
+                states["base_scale"] = pair
+                self._packed_sharding = replace(sharding, state_shardings=states)
             self._quantize_base = "mxfp4"
 
         def _init_packed_mxfp4_values(self) -> None:
@@ -557,7 +568,12 @@ def _get_mxfp4_experts_cls(
     class MXFP4Experts(parent_cls, MXFP4ExpertsBase):
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):
-            pass
+            def build(self, **kwargs):
+                instance = parent_config_cls.build(self, **kwargs)
+                # Config.build installs the config's sharding after __init__.
+                if getattr(instance, "_packed_sharding", None) is not None:
+                    instance._sharding_config = instance._packed_sharding
+                return instance
 
         def __init__(self, config) -> None:
             from torchao.prototype.mx_formats.mx_tensor import MXTensor
@@ -571,6 +587,13 @@ def _get_mxfp4_experts_cls(
             _, self._mx_ctx = dummy.__tensor_flatten__()
             self._mx_scale_dtype = dummy.scale.dtype
             self._mxfp4_shapes: dict[str, tuple[int, ...]] = {}
+            sharding = getattr(config, "sharding_config", None)
+            # A copy: sharding helpers share one ShardingConfig across modules.
+            states = (
+                dict(sharding.state_shardings)
+                if sharding and sharding.state_shardings
+                else None
+            )
             for name in _EXPERT_WEIGHT_NAMES:
                 p = self._parameters.get(name)
                 if p is None or p.shape[-1] % 32 != 0:
@@ -600,22 +623,18 @@ def _get_mxfp4_experts_cls(
                 self.register_parameter(
                     name + "_scale", nn.Parameter(scale, requires_grad=False)
                 )
-                sharding = getattr(config, "sharding_config", None)
-                entry = (
-                    sharding.state_shardings.pop(name, None)
-                    if sharding and sharding.state_shardings
-                    else None
-                )
+                entry = states.pop(name, None) if states is not None else None
                 if entry is not None:
-                    assert sharding is not None
                     # The declared 3-D entry carries over to the packed pair:
                     # an expert-axis shard is a row shard of the (E*A, B)
                     # flatten. The TP placements ride along unexercised (the
                     # model refuses tensor parallel); an inner-dim shard does
                     # not survive the flatten and is the packed expert-TP unit
                     # still to come.
-                    sharding.state_shardings[name + "_qdata"] = entry
-                    sharding.state_shardings[name + "_scale"] = entry
+                    states[name + "_qdata"] = entry
+                    states[name + "_scale"] = entry
+            if states is not None:
+                self._packed_sharding = replace(sharding, state_shardings=states)
 
         def init_states(self, **kwargs) -> None:
             # Config.build installs _param_init after __init__; rewrite here,
