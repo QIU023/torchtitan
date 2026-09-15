@@ -16,7 +16,9 @@ _PROJ0 = "language_model.model.layers.0.self_attention_res_proj.weight"
 
 
 def _adapter():
-    return KimiK3StateDictAdapter(model_registry("debugmodel").model, hf_assets_path=None)
+    return KimiK3StateDictAdapter(
+        model_registry("debugmodel").model, hf_assets_path=None
+    )
 
 
 def test_a_stage_without_layer_0_places_nothing():
@@ -25,7 +27,9 @@ def test_a_stage_without_layer_0_places_nothing():
 
 
 def test_layer_0_without_layer_1_is_shaped_from_the_config():
-    out = _adapter().to_hf({"layers.0.attention_norm.weight": torch.ones(1024, dtype=torch.bfloat16)})
+    out = _adapter().to_hf(
+        {"layers.0.attention_norm.weight": torch.ones(1024, dtype=torch.bfloat16)}
+    )
     assert out[_NORM0].shape == (1024,) and out[_NORM0].dtype == torch.bfloat16
     assert out[_PROJ0].shape == (1, 1024) and not out[_PROJ0].any()
 
@@ -51,4 +55,6 @@ def test_lora_adapters_are_left_out_of_the_hf_dict():
         }
     )
     assert not [k for k in out if "lora" in k]
-    assert any(k.endswith("mlp.gate_proj.weight") or k.endswith("w1.weight") for k in out), sorted(out)
+    assert any(
+        k.endswith("mlp.gate_proj.weight") or k.endswith("w1.weight") for k in out
+    ), sorted(out)
