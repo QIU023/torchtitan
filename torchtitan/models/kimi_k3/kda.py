@@ -6,18 +6,18 @@
 
 """Kimi Delta Attention using Attention Gym kernels."""
 
-from typing import TYPE_CHECKING
-
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
-from attn_gym.linear.kda import bound_gate, chunk_kda
+from attn_gym.linear.kda import bound_gate, chunk_kda, recurrent_kda
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
 from attn_gym.linear.short_conv import causal_conv1d
 from torch import nn
 
+from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     local_head_split,
@@ -121,6 +121,17 @@ class KDAKernel(Module):
             A_log_H,
             dt_bias_HK,
         )
+        if is_in_batch_invariant_mode() and cu_seqlens is not None:
+            output_1THV, _ = recurrent_kda(
+                q_1THK,
+                k_1THK,
+                v_1THV,
+                gate_1THK,
+                beta_1TH,
+                cu_seqlens=cu_seqlens,
+                batch_invariant=True,
+            )
+            return output_1THV.squeeze(0)
         output_1THV, _ = chunk_kda(
             q_1THK,
             k_1THK,
