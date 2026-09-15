@@ -38,7 +38,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.config.transform.converter import ModelConfigConverter
 from torchtitan.protocols.module import Module
 
 logger = logging.getLogger(__name__)
