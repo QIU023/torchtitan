@@ -157,7 +157,13 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
     def world_size(self) -> int:
         return 4
 
-    def _run_pipeline(self, split: list[list[int]], dtype: torch.dtype, cache: bool):
+    def _run_pipeline(
+        self,
+        split: list[list[int]],
+        dtype: torch.dtype,
+        cache: bool,
+        eval_losses: list | None = None,
+    ):
         num_stages, last = len(split), len(split) - 1
         mine = range(self.rank, num_stages, self.world_size)
         modules = [
@@ -197,6 +203,24 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
                 schedule.step(*args, target=targets, losses=losses)
             else:
                 schedule.step(*args)
+            if eval_losses is not None:
+                # The validator's path: a forward-only pass under no_grad.
+                evaluated: list[torch.Tensor] = []
+                with torch.no_grad():
+                    if last in mine:
+                        schedule.eval(*args, target=targets, losses=evaluated)
+                    else:
+                        schedule.eval(*args)
+                if store.blocks(0) or any(
+                    store.blocks(mb) for mb in range(MICROBATCHES)
+                ):
+                    raise AssertionError("eval left blocks in the rank store")
+                eval_losses.append(
+                    (
+                        [loss.detach() for loss in evaluated],
+                        sum(len(s._order) + len(s._delta_in) for s in stages),
+                    )
+                )
             return [loss.detach() for loss in losses]
 
         sent = sum(len(layout.delta_to_send(s)) for s in range(num_stages))
@@ -226,6 +250,30 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
                                 torch.testing.assert_close(
                                     losses, ref_losses, rtol=0, atol=0
                                 )
+
+    @with_comms
+    def test_forward_only_eval_between_steps(self):
+        for name, split in SPLITS.items():
+            with self.subTest(split=name):
+                reference = _run_single_device(split, torch.float32)
+                evaluated: list = []
+                history, _ = self._run_pipeline(
+                    split, torch.float32, cache=True, eval_losses=evaluated
+                )
+                for step in range(STEPS):
+                    grads, losses = history[step]
+                    ref_grads, ref_losses = reference[step]
+                    for block, grad in grads.items():
+                        torch.testing.assert_close(
+                            grad, ref_grads[block], rtol=0, atol=0
+                        )
+                    eval_step_losses, leftover = evaluated[step]
+                    if losses:
+                        torch.testing.assert_close(losses, ref_losses, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            eval_step_losses, ref_losses, rtol=0, atol=0
+                        )
+                    self.assertEqual(leftover, 0)
 
 
 if __name__ == "__main__":
