@@ -239,7 +239,6 @@ class TestMoE(unittest.TestCase):
             num_experts=2,
             score_func=Sigmoid.Config(),
             gate_param_init={"weight": nn.init.zeros_},
-            score_func=Sigmoid.Config(),
             top_k=1,
         ).build()
         router.init_states()
@@ -271,7 +270,6 @@ class TestMoE(unittest.TestCase):
             num_experts=2,
             score_func=Sigmoid.Config(),
             gate_param_init={"weight": nn.init.zeros_},
-            score_func=Sigmoid.Config(),
             top_k=1,
         ).build()
         x_TD = torch.randn(4, 4)
