@@ -440,3 +440,21 @@ def kimi_k3_debugmodel_muon() -> Trainer.Config:
         base.model_spec, lr=8e-4, parallelism=base.parallelism
     )
     return _KimiK3MuonTrainerConfig(**values)
+
+
+# The verl LoRA cell's flavor: the rl model under the LoRA converter with the debug target set,
+# reachable through VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_lora.
+def kimi_k3_rl_lora() -> Trainer.Config:
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("rl", converters=[_kimi_k3_lora_converter()])
+    return config
+
+
+# The verl QAT cell's flavor: the rl model under the MXFP4-weight / MXFP8-activation fake-quant
+# converter (routed experts only), VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_mx_qat.
+def kimi_k3_rl_mx_qat() -> Trainer.Config:
+    from torchtitan.quantization.mx_qat import MXFP4QATConverter
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("rl", converters=[MXFP4QATConverter.Config()])
+    return config
