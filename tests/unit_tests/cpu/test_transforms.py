@@ -293,7 +293,9 @@ class TestContextParallelTransform(unittest.TestCase):
                     target_modules=["wqkv", "wo"],
                 ),
                 ContextParallelTransform(
-                    inner_attention=KVAllGatherCPFlexInnerAttention
+                    inner_attention={
+                        FlexInnerAttention.Config: KVAllGatherCPFlexInnerAttention
+                    }
                 ),
             ],
         )
