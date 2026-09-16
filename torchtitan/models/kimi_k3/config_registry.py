@@ -140,9 +140,8 @@ def _kimi_k3_lora_converter(
             "wkv_b",
             "wo",
             # dense FFN and shared experts
-            "w1",
+            "w13",
             "w2",
-            "w3",
             # latent MoE down/up projections
             "routed_down",
             "routed_up",
