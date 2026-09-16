@@ -72,25 +72,6 @@ def parallelize_kimi_k3(
 ) -> nn.Module:
     """Apply FSDP2 to the Kimi K3 decoder and vision encoder."""
 
-    unsupported_parallelisms = [
-        name
-        for name, enabled in (
-            (
-                "context parallel with tensor parallel",
-                parallel_dims.cp_enabled and parallel_dims.tp_enabled,
-            ),
-            (
-                "context parallel with pipeline parallel",
-                parallel_dims.cp_enabled and parallel_dims.pp_enabled,
-            ),
-        )
-        if enabled
-    ]
-    if unsupported_parallelisms:
-        raise NotImplementedError(
-            f"Kimi K3 does not support {', '.join(unsupported_parallelisms)}."
-        )
-
     assert isinstance(model, KimiK3Model)
     # Seed replicated layouts for parameters outside the explicit expert
     # declarations. Vision buffers declare their DP layouts separately.
