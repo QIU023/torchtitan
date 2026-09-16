@@ -450,6 +450,19 @@ def kimi_k3_rl_lora() -> Trainer.Config:
     return config
 
 
+# The verl QLoRA cell's flavor: the rl model with MXFP4-packed frozen bases and experts,
+# reachable through VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_qlora_mxfp4.
+def kimi_k3_rl_qlora_mxfp4() -> Trainer.Config:
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry(
+        "rl",
+        converters=[
+            _kimi_k3_lora_converter(quantize_base="mxfp4", quantize_experts="mxfp4")
+        ],
+    )
+    return config
+
+
 # The verl QAT cell's flavor: the rl model under the MXFP4-weight / MXFP8-activation fake-quant
 # converter (routed experts only), VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_mx_qat.
 def kimi_k3_rl_mx_qat() -> Trainer.Config:
