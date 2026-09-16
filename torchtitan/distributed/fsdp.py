@@ -471,5 +471,8 @@ def add_zero_valued_dependency(
     ``output`` numerically unchanged while preserving the graph edge, so every
     rank issues the same collectives and the module receives zero gradients,
     which is also its correct contribution to the data-parallel average.
+    The scaling sits inside the sum so the zero gradient reaches the module as
+    a materialised tensor, not an expanded view; the collectives on that
+    gradient (a tensor-parallel redistribution) take contiguous input.
     """
-    return output + unused_output.sum().to(output.dtype) * 0.0
+    return output + (unused_output * 0.0).sum().to(output.dtype)
