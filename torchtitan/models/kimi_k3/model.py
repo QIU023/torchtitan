@@ -571,13 +571,17 @@ class KimiK3Model(Decoder):
         pixel_values = batch.get("pixel_values")
         grid_thw = batch.get("grid_thw")
         special_tokens = batch.get("special_tokens")
-        if parallel_dims.cp_enabled and pixel_values is not None:
+        # Under a pipeline every stage sees the batch; only the stage holding the
+        # tower (and the embedding it feeds) builds the vision bank.
+        if (
+            parallel_dims.cp_enabled
+            and pixel_values is not None
+            and self.vision_encoder is not None
+        ):
             if grid_thw is None:
                 raise ValueError(
                     "pixel_values were provided but grid_thw was not provided."
                 )
-            if self.vision_encoder is None:
-                raise ValueError("pixel_values were provided without a vision encoder.")
             if special_tokens is None or "image_id" not in special_tokens:
                 raise ValueError(
                     "pixel_values require special_tokens with an 'image_id' entry."
@@ -731,9 +735,7 @@ class KimiK3Model(Decoder):
             out = {}
             for i in which:
                 item = pixel_values[offsets[i] : offsets[i + 1]].to(weight_dtype)
-                item_grid = torch.tensor(
-                    [grids[i]], dtype=grid_thw.dtype, device=grid_thw.device
-                )
+                item_grid = grid_thw[i : i + 1]
                 out[i] = encoder(item, grid_thw=item_grid)
             return out
 
@@ -783,10 +785,11 @@ class KimiK3Model(Decoder):
         for p in range(n_passes):
             img = my_large[p] if p < len(my_large) else None
             if img is None:
-                local = pixel_values.new_zeros(kh * kw, *pixel_values.shape[1:])
-                local_grid = torch.tensor(
-                    [[1, kh, kw]], dtype=grid_thw.dtype, device=grid_thw.device
-                )
+                # Derived from the batch's own tensors so they carry its SPMD
+                # types; a fresh tensor reads as replicated on every axis.
+                local = pixel_values[: kh * kw] * 0
+                local_grid = grid_thw[:1].clone()
+                local_grid[0, 0], local_grid[0, 1], local_grid[0, 2] = 1, kh, kw
                 plan = CPPatchPlan(
                     group=group,
                     valid_total=kh * kw * g,
@@ -814,11 +817,10 @@ class KimiK3Model(Decoder):
                 for a, b in sh.ranges:
                     pieces.append(flat[a:b])
                     if pad_rows:
-                        pieces.append(flat.new_zeros(pad_rows * w, *flat.shape[1:]))
+                        pieces.append(flat[: pad_rows * w] * 0)
                 local = torch.cat(pieces, dim=0)
-                local_grid = torch.tensor(
-                    [[t, band, w]], dtype=grid_thw.dtype, device=grid_thw.device
-                )
+                local_grid = grid_thw[img : img + 1].clone()
+                local_grid[0, 1] = band
                 plan = CPPatchPlan(
                     group=group,
                     valid_total=counts[img],

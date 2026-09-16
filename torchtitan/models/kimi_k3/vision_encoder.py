@@ -18,6 +18,7 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import create_attention_mask
@@ -141,9 +142,27 @@ def _padded_key_keep(plan: "CPPatchPlan", total: int, device) -> torch.Tensor:
     return keep
 
 
-# The differentiable all-gather is a plain autograd Function; under SPMD type
-# checking it takes the local rule, since the tower runs in the dp-local context.
-spmd.register_local_autograd_function(dist_nn._AllGather)
+
+def _gather_tokens(t: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """All-gather the token dim over the sub-CP group, differentiably.
+
+    The sub-CP group is not a mesh axis, so the collective runs outside the
+    SPMD type checker and the result takes the input's types (under tensor
+    parallel the head dim stays sharded; every rank of the group holds the
+    same head shard). Under TP the activation is a DTensor, so the collective
+    runs on its local shard.
+    """
+    typed = spmd.is_type_checking()
+    if typed:
+        local_type, spec = spmd.get_local_type(t), spmd.get_partition_spec(t)
+    src = t.to_local() if isinstance(t, DTensor) else t
+    with spmd.no_typecheck():
+        out = torch.cat(dist_nn.all_gather(src.contiguous(), group=group), dim=0)
+    if isinstance(t, DTensor):
+        out = DTensor.from_local(out, t.device_mesh, t.placements, run_check=False)
+    if typed:
+        spmd.assert_type(out, local_type, partition_spec=spec)
+    return out
 
 
 class KimiK3VisionCPAttention(VisionAttention):
@@ -192,12 +211,8 @@ class KimiK3VisionCPAttention(VisionAttention):
         v_THDh = local_head_split(self.wv(x), self.head_dim)
         q_THDh, k_THDh = rope_apply(q_THDh, k_THDh, rope_cache)
 
-        k_full = torch.cat(
-            dist_nn.all_gather(k_THDh.contiguous(), group=plan.group), dim=0
-        )
-        v_full = torch.cat(
-            dist_nn.all_gather(v_THDh.contiguous(), group=plan.group), dim=0
-        )
+        k_full = _gather_tokens(k_THDh, plan.group)
+        v_full = _gather_tokens(v_THDh, plan.group)
         total = k_full.size(0)
 
         # Built unconditionally: flex requires a BlockMask, and with no padding
