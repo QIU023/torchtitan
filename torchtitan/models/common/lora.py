@@ -94,6 +94,14 @@ class _LoRALinearMixin:
         replicated_weight = ShardingConfig(
             state_shardings={"weight": dense_param_placement(tp=spmd.R)},
         )
+        if base_weight_sharding in (
+            dense_param_placement(tp=spmd.R),
+            dense_param_placement(tp=spmd.I),
+        ):
+            # A base not sharded on TP (replicated, or invariant on a stream the
+            # declarations keep invariant): the adapters take its placement.
+            same = ShardingConfig(state_shardings={"weight": base_weight_sharding})
+            return same, same
         if base_weight_sharding == dense_param_placement(tp=spmd.S(0)):
             lora_b_sharding = ShardingConfig(
                 state_shardings={"weight": base_weight_sharding},
