@@ -57,12 +57,13 @@ def _packed_key_map(module_name: str, config_name: str) -> dict[str, tuple[str, 
     with torch.device("meta"):
         model = trainer_config.model_spec.model.build()
     mapping: dict[str, tuple[str, str]] = {}
+    # The packed bases through the state dict, so a fused projection's split keys
+    # (w1 / w3 for w13) map like any other; the experts keep their module names.
+    for key in model.state_dict():
+        if key.endswith(".base_qdata"):
+            stem = key[: -len(".base_qdata")]
+            mapping[f"{stem}.weight"] = (f"{stem}.base_qdata", f"{stem}.base_scale")
     for name, mod in model.named_modules():
-        if isinstance(mod, LoRALinearBase) and mod._quantize_base == "mxfp4":
-            mapping[f"{name}.weight"] = (
-                f"{name}.base_qdata",
-                f"{name}.base_scale",
-            )
         if isinstance(mod, MXFP4ExpertsBase):
             for wname in mod._mxfp4_shapes:
                 mapping[f"{name}.{wname}"] = (

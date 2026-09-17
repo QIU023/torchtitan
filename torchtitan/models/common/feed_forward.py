@@ -57,10 +57,14 @@ class FeedForward(Module):
         self.register_state_dict_post_hook(self._split_w13_on_save)
         self.register_load_state_dict_pre_hook(self._merge_w13_on_load)
 
+    # The fused parameter and, for a packed frozen base, its packed pair: rows stay
+    # interleaved in the packed layout, so the same split applies.
+    _FUSED_ENTRIES = ("weight", "bias", "base_qdata", "base_scale")
+
     @staticmethod
     def _split_w13_on_save(module, state_dict, prefix, local_metadata) -> None:
         """Expose fused parameters under the logical w1/w3 checkpoint keys."""
-        for param_name in ("weight", "bias"):
+        for param_name in FeedForward._FUSED_ENTRIES:
             fused_key = f"{prefix}w13.{param_name}"
             if fused_key not in state_dict:
                 continue
@@ -71,7 +75,7 @@ class FeedForward(Module):
     @staticmethod
     def _merge_w13_on_load(module, state_dict, prefix, *args) -> None:
         """Pack logical w1/w3 checkpoint entries into the fused parameter."""
-        for param_name in ("weight", "bias"):
+        for param_name in FeedForward._FUSED_ENTRIES:
             gate_key = f"{prefix}w1.{param_name}"
             up_key = f"{prefix}w3.{param_name}"
             if gate_key not in state_dict or up_key not in state_dict:
