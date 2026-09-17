@@ -451,33 +451,15 @@ def kimi_k3_rl_lora() -> Trainer.Config:
 
 
 # The verl QLoRA cell's flavor: the rl model with MXFP4-packed frozen bases and experts,
-# reachable through VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_qlora_mxfp4.
-def _kimi_k3_rl_qlora_converter(*, quantized: bool):
-    converter = (
-        _kimi_k3_lora_converter(quantize_base="mxfp4", quantize_experts="mxfp4")
-        if quantized
-        else _kimi_k3_lora_converter()
-    )
-    # The fused gate-up projection serializes as split w1 / w3 keys, which the packed
-    # layout has no spelling for yet; it stays a plain frozen base here.
-    converter.target_modules = [m for m in converter.target_modules if m != "w13"]
-    return converter
-
-
+# reachable through VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_qlora_mxfp4. Its unquantized twin
+# (the repack source for scripts/quantize_lora_dcp.py) is kimi_k3_rl_lora.
 def kimi_k3_rl_qlora_mxfp4() -> Trainer.Config:
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry(
-        "rl", converters=[_kimi_k3_rl_qlora_converter(quantized=True)]
-    )
-    return config
-
-
-# The unquantized twin of kimi_k3_rl_qlora_mxfp4: the same adapters on bf16 bases, the
-# source checkpoint scripts/quantize_lora_dcp.py repacks into the packed layout.
-def kimi_k3_rl_qlora_mxfp4_source() -> Trainer.Config:
-    config = kimi_k3_debugmodel()
-    config.model_spec = model_registry(
-        "rl", converters=[_kimi_k3_rl_qlora_converter(quantized=False)]
+        "rl",
+        converters=[
+            _kimi_k3_lora_converter(quantize_base="mxfp4", quantize_experts="mxfp4")
+        ],
     )
     return config
 

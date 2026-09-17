@@ -93,3 +93,18 @@ def test_experts_pack_under_the_declared_sharding():
             assert wname + "_qdata" in sharding.state_shardings
             assert wname + "_scale" in sharding.state_shardings
     assert seen, "no packed experts carried a sharding declaration"
+
+
+def test_packed_fused_projection_round_trips_through_split_keys():
+    from torchtitan.config.transform.lora import merge_lora_state_dict
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_qlora_mxfp4
+
+    model = kimi_k3_debugmodel_qlora_mxfp4().model_spec.model.build()
+    sd = model.state_dict()
+    assert "layers.0.feed_forward.w1.base_qdata" in sd
+    assert "layers.0.feed_forward.w3.base_scale" in sd
+    assert not [k for k in sd if ".w13.base_" in k]
+    model.load_state_dict(sd, strict=True)
+    merged = merge_lora_state_dict(model)
+    assert "layers.0.feed_forward.w1.weight" in merged
+    assert not [k for k in merged if "base_qdata" in k or "lora_" in k]
