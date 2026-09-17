@@ -22,8 +22,8 @@ from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
 from .base import ModelConfigTransform
-from .converter import ModelConfigConverter
 from .context_parallel import ContextParallelTransform
+from .converter import ModelConfigConverter
 
 
 logger = logging.getLogger(__name__)
@@ -1093,6 +1093,8 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     # reverted, and never writes THROUGH a quantized tensor -- copy_ into an
     # NF4 base would silently re-quantize the merged value.
     originals = [module._parameters.get("weight") for _, module in lora_modules]
+    from torch.distributed.tensor import DTensor
+
     with torch.no_grad():
         for _, module in lora_modules:
             if module._quantize_base == "mxfp4":
@@ -1113,6 +1115,22 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             delta = module._lora_scaling * (
                 module.lora_b.weight.float() @ module.lora_a.weight.float()
             )
+            if isinstance(delta, DTensor) and not isinstance(base_w, DTensor):
+                # The adapters are sharded while a packed base dequantizes as a plain
+                # tensor: whole when its storage is a DTensor, this rank's rows when the
+                # sharding left it local. Bring both to the whole weight.
+                ref = module.lora_b.weight
+                assert isinstance(ref, DTensor)
+                if base_w.shape[0] != delta.shape[0]:
+                    base_w = DTensor.from_local(
+                        base_w, ref.device_mesh, ref.placements, run_check=False
+                    ).full_tensor()
+                delta = delta.full_tensor()
+                if base_w.shape != delta.shape:
+                    raise ValueError(
+                        f"merge: packed base {tuple(base_w.shape)} against delta "
+                        f"{tuple(delta.shape)} for a base sharded {ref.placements}"
+                    )
             module.weight = nn.Parameter(
                 (base_w.float() + delta).to(base_w.dtype).contiguous(),
                 requires_grad=False,
