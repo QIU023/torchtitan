@@ -807,3 +807,37 @@ def test_qlora_mxfp4_packs_at_build_and_merges():
         atol=0,
     )
     assert "weight" not in module._parameters
+
+
+def test_merge_folds_mains_lora_linear():
+    from torchtitan.config.transform import (
+        apply_transforms,
+        LinearLoRAHandler,
+        LoRATransform,
+    )
+    from torchtitan.config.transform.lora import merge_lora_state_dict
+    from torchtitan.models.llama3.config_registry import llama3_debugmodel
+
+    config = apply_transforms(
+        llama3_debugmodel(),
+        [
+            LoRATransform(
+                handlers=(LinearLoRAHandler(),),
+                rank=4,
+                alpha=8.0,
+                target_modules=["wo"],
+            )
+        ],
+    )
+    model = config.model_spec.model.build()
+    key = next(k for k in model.state_dict() if k.endswith("attention.wo.weight"))
+    before = merge_lora_state_dict(model)[key].clone()
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith("lora_b.weight"):
+                param.fill_(0.01)
+    merged = merge_lora_state_dict(model)
+    assert not torch.equal(merged[key], before)
+    assert not [k for k in merged if "lora_" in k]
+    # the adapters are still there for training after the merge restored the module
+    assert [n for n, _ in model.named_parameters() if n.endswith("lora_b.weight")]
