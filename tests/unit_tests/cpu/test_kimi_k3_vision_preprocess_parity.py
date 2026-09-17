@@ -18,9 +18,14 @@ import json
 import os
 import pathlib
 
+import numpy as np
 import pytest
+import torch
 
-from torchtitan.hf_datasets.multimodal.utils.image import resize_to_navit_patch_grid
+from torchtitan.hf_datasets.multimodal.utils.image import (
+    resize_to_navit_patch_grid,
+    vision_to_patches,
+)
 
 _RELEASED_DIR = pathlib.Path(
     os.environ.get("KIMI_K3_RELEASED_DEBUG_DIR", "/workspace/k3qat_mm_hf")
@@ -94,3 +99,63 @@ def test_resize_matches_the_released_processor(width, height):
     factor = patch * merge
     tokens = ((resize_h + pad_h) // factor) * ((resize_w + pad_w) // factor)
     assert tokens == theirs["num_tokens"]
+
+
+_PATCH_GRIDS = [
+    (14, 14),
+    (28, 42),
+    (56, 28),
+    (56, 56),
+    (70, 42),
+]
+
+
+def _counting_image(height: int, width: int) -> torch.Tensor:
+    """One frame whose every element is distinct, so any reordering shows."""
+
+    return torch.arange(height * width * 3, dtype=torch.float32).reshape(
+        1, height, width, 3
+    )
+
+
+def _released_patches(img, patch_size: int):
+
+    media = _released_media_utils()
+    out = media.navit_patchify(np.ascontiguousarray(img.numpy()), patch_size)
+    patches = torch.from_numpy(np.ascontiguousarray(out["pixel_values"]))
+    return patches.flatten(1), torch.from_numpy(out["grid_thw"].copy())
+
+
+@pytest.mark.parametrize("height,width", _PATCH_GRIDS)
+def test_raster_order_matches_the_released_patchify(height, width):
+
+    patch_size = _released_budgets()["patch_size"]
+    img = _counting_image(height, width)
+    ours, grid = vision_to_patches(
+        img,
+        patch_size=patch_size,
+        temporal_patch_size=1,
+        merge_size=2,
+        patch_order="raster",
+    )
+    theirs, their_grid = _released_patches(img, patch_size)
+    assert ours.shape == theirs.shape
+    assert torch.equal(ours, theirs)
+    assert torch.equal(grid, their_grid)
+
+
+def test_block_order_does_not_match_the_released_patchify():
+    """The layout parameter is load-bearing: the collator default disagrees."""
+
+    patch_size = _released_budgets()["patch_size"]
+    img = _counting_image(4 * patch_size, 4 * patch_size)
+    block, _ = vision_to_patches(
+        img,
+        patch_size=patch_size,
+        temporal_patch_size=1,
+        merge_size=2,
+        patch_order="block",
+    )
+    theirs, _ = _released_patches(img, patch_size)
+    assert block.shape == theirs.shape
+    assert not torch.equal(block, theirs)
