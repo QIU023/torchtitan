@@ -1198,6 +1198,10 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             ".base_scale",
         ):
             sd.pop(f"{prefix}{suffix}", None)
+    # A fused projection's hooks split its packed pair under other names (w13 to
+    # w1 / w3); no packed entry belongs in a merged dict, whatever its name.
+    for key in [k for k in sd if k.endswith((".base_qdata", ".base_scale"))]:
+        sd.pop(key)
     return sd
 
 
