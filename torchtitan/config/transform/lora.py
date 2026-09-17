@@ -1077,10 +1077,12 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     base (``_lora_adapter_sharding``), so ``B @ A`` composes to the base
     weight's placement and the add dispatches as DTensors.
     """
-    lora_modules = [
+    from torchtitan.models.common.lora import _LoRALinearMixin
+
+    lora_modules: list[tuple[str, Any]] = [
         (name, module)
         for name, module in model.named_modules()
-        if isinstance(module, LoRALinearBase)
+        if isinstance(module, (LoRALinearBase, _LoRALinearMixin))
     ]
     packed_experts = [
         (name, module)
@@ -1097,11 +1099,13 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
 
     with torch.no_grad():
         for _, module in lora_modules:
-            if module._quantize_base == "mxfp4":
+            # main's LoRA linear has no quantized base
+            quantize_base = getattr(module, "_quantize_base", None)
+            if quantize_base == "mxfp4":
                 # No weight param exists on a packed module: the merged
                 # weight goes in as a fresh one and the restore removes it.
                 base_w = module._dequant_base_mxfp4()
-            elif module._quantize_base == "nf4":
+            elif quantize_base == "nf4":
                 from torchao.quantization.quantize_.workflows.nf4.nf4_tensor import (
                     NF4Tensor,
                 )
