@@ -118,6 +118,11 @@ def _unwrapped_residual():
     return patch.object(k3_model.remat, "checkpoint", lambda **_: (lambda fn: fn))
 
 
+def _batch_invariant_residual():
+    """The plain form the batch-invariant mode keeps, which builds the stack."""
+    return patch.object(k3_model, "is_in_batch_invariant_mode", lambda: True)
+
+
 def _saved_shapes(model: Module, x_TD: torch.Tensor) -> list[tuple[int, ...]]:
     shapes = []
 
@@ -180,11 +185,18 @@ class TestKimiK3AttentionResidualRecompute(unittest.TestCase):
     def test_no_stack_shaped_activation_is_saved(self):
         model = _TwoBlocks()
         x_TD = torch.randn(_TOKENS, 1024)
-        # Every residual here reads a one-entry stack plus the prefix sum.
+        # Every residual here reads a one-entry stack plus the prefix sum, so
+        # the concatenated stack would be this shape if it were ever built.
         stack_shape = (_TOKENS, 2, 1024)
-        with _unwrapped_residual():
-            self.assertIn(stack_shape, _saved_shapes(model, x_TD))
+        # The aggregation keeps per-token statistics and references to its two
+        # inputs, so the concatenated stack is not saved with or without the
+        # checkpoint. Only the batch-invariant path still materialises it.
         self.assertNotIn(stack_shape, _saved_shapes(model, x_TD))
+        with _unwrapped_residual():
+            self.assertNotIn(stack_shape, _saved_shapes(model, x_TD))
+        with _batch_invariant_residual():
+            with _unwrapped_residual():
+                self.assertIn(stack_shape, _saved_shapes(model, x_TD))
 
 
 class TestKimiK3RematRegions(unittest.TestCase):
