@@ -169,7 +169,7 @@ class _AttentionResidualAggregation(torch.autograd.Function):
         block_residual_TND: torch.Tensor,
         partial_block_TD: torch.Tensor | None,
     ) -> torch.Tensor:
-        query_D = (score_weight_D * norm_weight_D).float()
+        query_D = score_weight_D.float() * norm_weight_D.float()
         values_TD = list(block_residual_TND.unbind(dim=1))
         if partial_block_TD is not None:
             values_TD.append(partial_block_TD)
@@ -213,7 +213,7 @@ class _AttentionResidualAggregation(torch.autograd.Function):
             block_residual_TND,
             partial_block_TD,
         ) = ctx.saved_tensors
-        query_D = (score_weight_D * norm_weight_D).float()
+        query_D = score_weight_D.float() * norm_weight_D.float()
         grad_float_TD = grad_output_TD.float()
         dim = block_residual_TND.shape[-1]
 

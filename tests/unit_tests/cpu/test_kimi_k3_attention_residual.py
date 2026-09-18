@@ -13,6 +13,7 @@ from torchtitan.models.kimi_k3.model import _apply_attention_residual
 
 EPS = 1e-5
 TOKENS, BLOCKS, DIM = 16, 3, 8
+WIDE_DIM = 1024
 
 
 def _reference(
@@ -82,6 +83,29 @@ class TestKimiK3AttentionResidual(unittest.TestCase):
             for with_partial in (True, False):
                 with self.subTest(blocks=blocks, with_partial=with_partial):
                     self._compare(blocks, with_partial)
+
+    def test_bf16_weights_keep_fp32_score_precision(self):
+        # The score weight is a product of two parameters. Rounding that
+        # product to bfloat16 before the upcast, rather than upcasting both
+        # factors first, moves the output by half a percent.
+        generator = torch.Generator().manual_seed(0)
+
+        def make(*shape: int) -> torch.Tensor:
+            return torch.randn(*shape, generator=generator, dtype=torch.bfloat16)
+
+        partial, stack = make(TOKENS, WIDE_DIM), make(TOKENS, BLOCKS, WIDE_DIM)
+        # Scaled so the depth softmax is not saturated: a saturated one is
+        # insensitive to the score weight and hides the precision loss.
+        projection = (make(1, WIDE_DIM).float() * WIDE_DIM ** -0.5).bfloat16()
+        norm_weight = make(WIDE_DIM)
+        expected = _reference(partial, stack, projection, norm_weight)
+        actual = _apply_attention_residual(
+            partial,
+            stack,
+            types.SimpleNamespace(weight=projection),
+            types.SimpleNamespace(weight=norm_weight, eps=EPS),
+        )
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-3, atol=2e-3)
 
     def test_empty_stack_with_a_partial_block(self):
         # A stage that holds no block yet still aggregates its own prefix sum.
