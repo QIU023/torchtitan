@@ -9,7 +9,10 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.model import _apply_attention_residual
+from torchtitan.models.kimi_k3.model import (
+    _apply_attention_residual,
+    _AttentionResidualAggregation,
+)
 
 EPS = 1e-5
 TOKENS, BLOCKS, DIM = 16, 3, 8
@@ -83,6 +86,13 @@ class TestKimiK3AttentionResidual(unittest.TestCase):
             for with_partial in (True, False):
                 with self.subTest(blocks=blocks, with_partial=with_partial):
                     self._compare(blocks, with_partial)
+
+    def test_registered_for_spmd_type_checking(self):
+        # An autograd Function the checker does not know about raises under the
+        # strict type checking the multimodal cell runs with.
+        from spmd_types._local_registration import _LOCAL_AUTOGRAD_FUNCTIONS
+
+        self.assertIn(_AttentionResidualAggregation, _LOCAL_AUTOGRAD_FUNCTIONS)
 
     def test_bf16_weights_keep_fp32_score_precision(self):
         # The score weight is a product of two parameters. Rounding that

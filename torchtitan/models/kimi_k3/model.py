@@ -151,6 +151,7 @@ class KimiMLAAttention(BaseAttention):
         return self.wo(out_TD)
 
 
+@spmd.register_local_autograd_function
 class _AttentionResidualAggregation(torch.autograd.Function):
     """Depth softmax over the block stack, saving only per-token statistics.
 
