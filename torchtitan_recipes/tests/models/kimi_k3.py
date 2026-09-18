@@ -11,6 +11,7 @@ from typing import cast
 
 from torch.distributed.tensor import Shard
 
+from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
 from torchtitan.components.data.multimodal.mm_collator import MultiModalCollator
 from torchtitan.components.data.multimodal.mm_datasets import (
