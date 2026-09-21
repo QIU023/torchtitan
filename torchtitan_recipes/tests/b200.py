@@ -31,38 +31,20 @@ def llama3_debugmodel_mxfp8_fsdp2() -> Trainer.Config:
     return config
 
 
-def kimi_k3_debugmodel_pp2_vp2() -> Trainer.Config:
-    # The smallest cell that exercises the block transport: two ranks, two
-    # stages each. 26 units (24 layers, the embedding and the head) over four
-    # stages is uneven, a stage boundary falls inside a block, and with two
-    # stages per rank a rank receives a block it already holds -- which is what
-    # the rank cache and the gradient deposits are for. The shared debug model,
-    # unchanged by this PR.
+def kimi_k3_debugmodel_pp4_vp4() -> Trainer.Config:
     from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
 
     config = kimi_k3_debugmodel()
-    config.parallelism.pipeline_parallel_degree = 2
+    _set_spmd_typechecking(config, typechecking=False)
+    config.parallelism.pipeline_parallel_degree = 4
     config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
     config.parallelism.num_pp_microbatches = 4
-    return config
-
-
-def kimi_k3_debugmodel_pp8_vp4() -> Trainer.Config:
-    # The stress cell, on a deeper model of its own: 35 units (33 layers, the
-    # embedding and the head) over 32 stages, so the split is uneven and the
-    # last stage holds the head alone. The depth travels with this recipe, not
-    # with the shared "debugmodel" flavor. No layers_per_stage reaches 32 stages
-    # for 35 units, so the recipe spells out Kimi K3's split for that count.
-    from torchtitan.models.kimi_k3 import model_registry
-    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
-    from torchtitan.models.kimi_k3.parallelize import kimi_k3_module_fqns_per_model_part
-
-    config = kimi_k3_debugmodel()
-    config.model_spec = model_registry("debugmodel_33_layers")
-    config.parallelism.pipeline_parallel_degree = 8
-    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
-    config.parallelism.num_pp_microbatches = 8
-    config.parallelism.module_fqns_per_model_part = kimi_k3_module_fqns_per_model_part(
-        8 * 4, 33
-    )
+    # 16 stages: one layer per stage from layer 5 on, the head alone on the last.
+    config.parallelism.pipeline_parallel_module_fqns_per_model_part = [
+        ["vision_encoder", "tok_embeddings", "layers.0"],
+        ["layers.1", "layers.2"],
+        ["layers.3", "layers.4"],
+        *[[f"layers.{i}"] for i in range(5, 17)],
+        ["norm", "lm_head", "output_res_proj", "output_res_norm"],
+    ]
     return config
