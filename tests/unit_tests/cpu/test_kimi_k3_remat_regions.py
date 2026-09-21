@@ -19,6 +19,7 @@ from torchtitan.models.kimi_k3 import model as k3_model, model_registry
 from torchtitan.protocols.module import Module, ModuleDict
 
 _TOKENS = 8
+_DIM = model_registry("debugmodel").model.dim
 # The attention kernels are CUDA-only; these CPU stand-ins keep the call signatures.
 
 
@@ -139,7 +140,7 @@ class TestKimiK3AttentionResidualRecompute(unittest.TestCase):
     def test_residual_math_reruns_in_backward_bitwise(self):
         model = _TwoBlocks()
         reference = deepcopy(model)
-        x_TD = torch.randn(_TOKENS, 1024)
+        x_TD = torch.randn(_TOKENS, _DIM)
         with _unwrapped_residual():
             expected = _run_forward_backward(reference, x_TD)
         calls = []
@@ -164,7 +165,7 @@ class TestKimiK3AttentionResidualRecompute(unittest.TestCase):
         for block in model.layers.values():
             block.checkpoint_residual = False
         reference = deepcopy(model)
-        x_TD = torch.randn(_TOKENS, 1024)
+        x_TD = torch.randn(_TOKENS, _DIM)
         with _unwrapped_residual():
             expected = _run_forward_backward(reference, x_TD)
         calls = []
@@ -184,10 +185,10 @@ class TestKimiK3AttentionResidualRecompute(unittest.TestCase):
 
     def test_no_stack_shaped_activation_is_saved(self):
         model = _TwoBlocks()
-        x_TD = torch.randn(_TOKENS, 1024)
+        x_TD = torch.randn(_TOKENS, _DIM)
         # Every residual here reads a one-entry stack plus the prefix sum, so
         # the concatenated stack would be this shape if it were ever built.
-        stack_shape = (_TOKENS, 2, 1024)
+        stack_shape = (_TOKENS, 2, _DIM)
         # The aggregation keeps per-token statistics and references to its two
         # inputs, so the concatenated stack is not saved with or without the
         # checkpoint. Only the batch-invariant path still materialises it.
@@ -204,7 +205,7 @@ class TestKimiK3RematRegions(unittest.TestCase):
         model = _TwoBlocks()
         RegionAC.Config(save_regions=[]).build().apply(model)
         with remat.collect_trace() as trace:
-            model(torch.randn(_TOKENS, 1024))
+            model(torch.randn(_TOKENS, _DIM))
         kda_names = [
             f"delta_attention.{n}"
             for n in (
@@ -239,7 +240,7 @@ class TestKimiK3RematRegions(unittest.TestCase):
                 baseline = _TwoBlocks()
                 region_model = deepcopy(baseline)
                 RegionAC.Config(save_regions=save_regions).build().apply(region_model)
-                x_TD = torch.randn(_TOKENS, 1024)
+                x_TD = torch.randn(_TOKENS, _DIM)
                 expected_out = _run_forward_backward(baseline, x_TD)
                 calls = []
                 original = k3_model._apply_attention_residual

@@ -34,5 +34,7 @@ def test_gpt_oss_recompile_limit():
 
 
 def test_kimi_k3_recompile_limit_counts_layer_variants():
-    assert _kimi_k3_recompile_limit(model_registry("debugmodel").model) == 8
+    # 17 layers in blocks of 4: MLA or KDA, opening a block or not, stack width 0 / 1 / 2+
+    # give eight layer variants, plus the tower's two.
+    assert _kimi_k3_recompile_limit(model_registry("debugmodel").model) == 10
     assert _kimi_k3_recompile_limit(model_registry("Kimi-K3").model) == 9
