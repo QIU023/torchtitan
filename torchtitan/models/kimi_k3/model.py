@@ -151,7 +151,7 @@ class KimiMLAAttention(BaseAttention):
 
 
 def _apply_attention_residual(
-    prefix_sum_TD: torch.Tensor,
+    partial_block_TD: torch.Tensor | None,
     block_residual_TND: torch.Tensor,
     projection: Linear,
     norm: RMSNorm,
@@ -159,7 +159,11 @@ def _apply_attention_residual(
     """Apply Kimi's block-level attention residual in FP32."""
     assert norm.eps is not None
 
-    values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
+    values_TND = (
+        block_residual_TND
+        if partial_block_TD is None
+        else torch.cat((block_residual_TND, partial_block_TD.unsqueeze(1)), dim=1)
+    )
     values_float = values_TND.float()
     variance = values_float.pow(2).mean(dim=-1, keepdim=True)
     keys_TND = values_float * torch.rsqrt(variance + norm.eps)
@@ -198,6 +202,8 @@ class KimiK3TransformerBlock(Module):
             raise ValueError("Exactly one of feed_forward or moe must be configured.")
         self.layer_id = config.layer_id
         self.attn_res_block_size = config.attn_res_block_size
+        # A block's first layer closes the previous block and joins the stack.
+        self.first_layer_in_block = self.layer_id % self.attn_res_block_size == 0
         self.attention = (
             config.attention.build() if config.attention is not None else None
         )
@@ -238,29 +244,25 @@ class KimiK3TransformerBlock(Module):
         *,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prefix_sum_TD = x_TD
+        if self.first_layer_in_block:
+            block_residual_TND = torch.cat(
+                (block_residual_TND, x_TD.unsqueeze(1)), dim=1
+            )
+            partial_block_TD = None
+        else:
+            partial_block_TD = x_TD
 
-        if block_residual_TND.shape[1] > 0:
-            assert self.attention_res_proj is not None
+        if self.attention_res_proj is None:
+            h_TD = x_TD
+        else:
             assert self.attention_res_norm is not None
-            x_TD = _apply_attention_residual(
-                prefix_sum_TD,
+            h_TD = _apply_attention_residual(
+                partial_block_TD,
                 block_residual_TND,
                 self.attention_res_proj,
                 self.attention_res_norm,
             )
-
-        opens_block = self.layer_id % self.attn_res_block_size == 0
-        if opens_block:
-            block_residual_TND = torch.cat(
-                (
-                    block_residual_TND,
-                    prefix_sum_TD.unsqueeze(1),
-                ),
-                dim=1,
-            )
-
-        h_TD = self.attention_norm(x_TD)
+        h_TD = self.attention_norm(h_TD)
         layer_mask = (
             attention_masks[self.attn_mask_key] if attention_masks is not None else None
         )
@@ -269,7 +271,7 @@ class KimiK3TransformerBlock(Module):
         else:
             assert self.delta_attention is not None
             h_TD = self.delta_attention(h_TD, layer_mask, positions)
-        prefix_sum_TD = h_TD if opens_block else prefix_sum_TD + h_TD
+        prefix_sum_TD = h_TD if self.first_layer_in_block else x_TD + h_TD
 
         h_TD = _apply_attention_residual(
             prefix_sum_TD,
@@ -462,9 +464,10 @@ class KimiK3Model(Decoder):
             vision_positions=vision_positions,
         )
 
-    def forward(  # pyrefly: ignore [bad-override]
+    def forward(  # pyrefly: ignore[bad-param-name-override, bad-override]
         self,
         tokens: torch.Tensor,
+        block_residual_TND: torch.Tensor | None = None,
         *,
         pixel_values: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
@@ -474,9 +477,11 @@ class KimiK3Model(Decoder):
         positions: torch.Tensor | None = None,
         attention_masks: KimiK3AttentionMaskDict | None = None,
         padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
+        block_residual_in = block_residual_TND
+
         if self.tok_embeddings is not None:
             with spmd_local_context("dp"):
                 h_TD = self._prepare_multimodal_embeds(
@@ -491,7 +496,11 @@ class KimiK3Model(Decoder):
         if spmd.is_type_checking():
             spmd.assert_type(h_TD, {MeshAxisName.DP: spmd.S(0)})
 
-        block_residual_TND = h_TD.unsqueeze(1)[:, :0]
+        block_residual_TND = (
+            block_residual_in
+            if block_residual_in is not None
+            else h_TD.unsqueeze(1)[:, :0]
+        )
         for layer in self.layers.values():
             h_TD, block_residual_TND = layer(
                 h_TD,
@@ -501,6 +510,9 @@ class KimiK3Model(Decoder):
                 padding_mask=padding_mask,
             )
 
+        # The aggregation runs on the head-owning stage; other stages hand the stack on.
+        if self.output_res_proj is None:
+            return h_TD, block_residual_TND
         h_TD = _apply_attention_residual(
             h_TD,
             block_residual_TND,

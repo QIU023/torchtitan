@@ -48,6 +48,7 @@ from .kda import InnerKDA, KDA, KDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiLatentMoE
 from .parallelize import parallelize_kimi_k3
+from .pipeline_parallel import pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import KimiK3VisionEncoder, KimiK3VisionProjector
 
@@ -490,35 +491,35 @@ def _kimi_k3_config(
 
 
 def _debugmodel(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
-    dim = 1024
+    dim = 256
     return _kimi_k3_config(
         dim=dim,
         moe_comm_backend=moe_comm_backend,
-        vocab_size=163840,
-        num_layers=24,
-        full_attention_layers={3, 7, 11, 15, 19, 23},
-        attn_res_block_size=12,
-        num_heads=16,
-        q_lora_rank=512,
-        kv_lora_rank=256,
+        vocab_size=2048,
+        num_layers=17,
+        full_attention_layers={3, 7, 11, 15, 16},
+        attn_res_block_size=4,
+        num_heads=4,
+        q_lora_rank=128,
+        kv_lora_rank=64,
         qk_nope_head_dim=64,
         qk_rope_head_dim=32,
         v_head_dim=64,
         kda_head_dim=128,
         conv_kernel_size=4,
-        dense_hidden_dim=4096,
-        latent_dim=512,
-        expert_hidden_dim=384,
-        num_experts=32,
-        top_k=4,
+        dense_hidden_dim=512,
+        latent_dim=128,
+        expert_hidden_dim=128,
+        num_experts=8,
+        top_k=2,
         num_shared_experts=2,
         vision_encoder=_vision_encoder_config(
             text_dim=dim,
-            dim=512,
-            qkv_dim=768,
-            hidden_dim=2048,
-            num_layers=8,
-            num_heads=6,
+            dim=256,
+            qkv_dim=512,
+            hidden_dim=512,
+            num_layers=2,
+            num_heads=4,
             init_pos_emb_height=32,
             init_pos_emb_width=32,
         ),
@@ -597,7 +598,7 @@ def model_registry(
         model=config,
         max_context_length=context_len,
         parallelize_fn=parallelize_kimi_k3,
-        pipelining_fn=None,
+        pipelining_fn=pipeline_kimi_k3,
         post_optimizer_build_fn=register_moe_quantile_balancing_hook,
         state_dict_adapter=KimiK3StateDictAdapter,
     )

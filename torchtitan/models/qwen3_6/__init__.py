@@ -11,7 +11,9 @@ from torchtitan.config.transform import (
     ModelConfigConverter,
     validate_converter_compatibility,
 )
-from torchtitan.distributed.pipeline_parallel import pipeline_with_first_stage_modules
+from torchtitan.distributed.pipeline_parallel import (
+    pipeline_with_first_last_stage_modules,
+)
 from torchtitan.models.qwen3_5 import (
     _27b,
     _35b_a3b,
@@ -78,7 +80,7 @@ def model_registry(
         max_context_length=context_len,
         parallelize_fn=parallelize_qwen3_5,
         pipelining_fn=partial(
-            pipeline_with_first_stage_modules,
+            pipeline_with_first_last_stage_modules,
             first_stage_module_fqns=("vision_encoder",),
         ),
         post_optimizer_build_fn=register_moe_load_balancing_hook,
