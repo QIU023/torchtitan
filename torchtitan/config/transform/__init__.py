@@ -14,10 +14,10 @@ from .context_parallel import ContextParallelTransform
 from .converter import ModelConfigConverter, validate_converter_compatibility
 from .lm_head_fp32 import LMHeadFP32OutputConverter
 from .lora import LoRATransform
+from .mx_qat import MXQATTransform
 from .quantization import (
     MXFP8GroupedLinearConverter,
     MXFP8LinearConverter,
-    MXQATGroupedExpertsConverter,
     NVFP4GroupedLinearConverter,
     NVFP4LinearConverter,
     QuantizationConverter,
@@ -39,7 +39,7 @@ __all__ = [
     "LoRATransform",
     "MXFP8GroupedLinearConverter",
     "MXFP8LinearConverter",
-    "MXQATGroupedExpertsConverter",
+    "MXQATTransform",
     "NVFP4GroupedLinearConverter",
     "NVFP4LinearConverter",
     "QuantizationConverter",
