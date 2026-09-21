@@ -106,24 +106,23 @@ def kimi_k3_debugmodel_mm_ulysses_cp2() -> Trainer.Config:
     )
 
 
-def kimi_k3_debugmodel_pp8_vp4_vit_dep() -> Trainer.Config:
-    # pp8 x vp4 with the vision tower and the embedding on a stage of their own
-    # (vit_dep): they take one of the 32 stages, and the 33 layers, the head and
-    # the AttnRes aggregation spread over the other 31, spelled out like the
-    # pp8 x vp4 split.
+def kimi_k3_debugmodel_pp4_vp4_vit_dep() -> Trainer.Config:
+    # pp4 x vp4 with the vision tower and the embedding on a stage of their own
+    # (vit_dep): the 17 layers, the head and the AttnRes aggregation over the other 15.
     import dataclasses
     from functools import partial
 
-    from torchtitan.models.kimi_k3.parallelize import (
-        kimi_k3_module_fqns_per_model_part,
-        pipeline_kimi_k3,
-    )
+    from torchtitan.models.kimi_k3.pipeline_parallel import pipeline_kimi_k3
 
-    config = kimi_k3_debugmodel_pp8_vp4()
-    text = kimi_k3_module_fqns_per_model_part(8 * 4 - 1, 33, 0, first_stage_modules=())
-    config.parallelism.module_fqns_per_model_part = [
-        ["tok_embeddings", "vision_encoder"]
-    ] + [[n for n in stage if n != "tok_embeddings"] for stage in text]
+    config = kimi_k3_debugmodel_pp4_vp4()
+    config.parallelism.pipeline_parallel_module_fqns_per_model_part = [
+        ["tok_embeddings", "vision_encoder"],
+        ["layers.0", "layers.1"],
+        ["layers.2", "layers.3"],
+        ["layers.4", "layers.5"],
+        *[[f"layers.{i}"] for i in range(6, 17)],
+        ["norm", "lm_head", "output_res_proj", "output_res_norm"],
+    ]
     assert config.model_spec is not None
     config.model_spec = dataclasses.replace(
         config.model_spec, pipelining_fn=partial(pipeline_kimi_k3, vit_dep=True)
