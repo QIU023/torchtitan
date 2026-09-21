@@ -16,7 +16,9 @@ from torchtitan.config.transform import (
     validate_converter_compatibility,
 )
 
-from torchtitan.distributed.pipeline_parallel import pipeline_with_first_stage_modules
+from torchtitan.distributed.pipeline_parallel import (
+    pipeline_with_first_last_stage_modules,
+)
 from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
@@ -558,7 +560,7 @@ def model_registry(
         max_context_length=context_len,
         parallelize_fn=parallelize_muse_glimmer,
         pipelining_fn=partial(
-            pipeline_with_first_stage_modules,
+            pipeline_with_first_last_stage_modules,
             first_stage_module_fqns=(
                 "vision_encoder",
                 "vision_adapter",
