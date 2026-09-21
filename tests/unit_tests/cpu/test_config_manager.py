@@ -580,13 +580,13 @@ class TestConfigManager(unittest.TestCase):
         )
         assert config.dump_folder == "/tmp/test_tt/"
 
-    def test_parse_module_fqns_per_model_part(self):
-        """module_fqns_per_model_part defaults to None."""
+    def test_parse_pipeline_parallel_module_fqns_per_model_part(self):
+        """pipeline_parallel_module_fqns_per_model_part defaults to None."""
         config_manager = ConfigManager()
         config = config_manager.parse_args(
             ["--module", "llama3", "--config", "llama3_debugmodel"]
         )
-        assert config.parallelism.module_fqns_per_model_part is None
+        assert config.parallelism.pipeline_parallel_module_fqns_per_model_part is None
 
     def test_optional_component_configs_do_not_add_cli_subcommands(self):
         config_manager = ConfigManager()
@@ -659,11 +659,13 @@ class TestConfigManager(unittest.TestCase):
 
     def test_pipeline_split_is_given_one_way(self):
         """The explicit split and layers_per_stage both describe it; not both."""
-        ParallelismConfig(module_fqns_per_model_part=[["tok_embeddings"]])
+        ParallelismConfig(
+            pipeline_parallel_module_fqns_per_model_part=[["tok_embeddings"]]
+        )
         ParallelismConfig(pipeline_parallel_layers_per_stage=2)
         with pytest.raises(ValueError, match="describe the pipeline split"):
             ParallelismConfig(
-                module_fqns_per_model_part=[["tok_embeddings"]],
+                pipeline_parallel_module_fqns_per_model_part=[["tok_embeddings"]],
                 pipeline_parallel_layers_per_stage=2,
             )
 
