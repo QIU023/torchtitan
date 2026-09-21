@@ -47,7 +47,8 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .kda import InnerKDA, KDA, KDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiLatentMoE
-from .parallelize import parallelize_kimi_k3, pipeline_kimi_k3
+from .parallelize import parallelize_kimi_k3
+from .pipeline_parallel import pipeline_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import KimiK3VisionEncoder, KimiK3VisionProjector
 

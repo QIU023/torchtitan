@@ -10,8 +10,9 @@ import unittest
 
 import torch
 
-from torchtitan.models.kimi_k3.pipeline_stage import (
+from torchtitan.models.kimi_k3.pipeline_parallel.stage import (
     assemble_stack,
+    AttnResPipelineStage,
     PPRankLocalCache,
     route_payload,
     split_stack_grad,
@@ -73,6 +74,18 @@ class TestCarrier(unittest.TestCase):
         self.assertTrue(torch.equal(grad, torch.full((4, 2), 2.0)))
         self.assertFalse(store.has_deposits(0))
         self.assertEqual(store.collect(0, 0), (None, 0))
+
+
+class TestForwardOnly(unittest.TestCase):
+    def test_eval_backward_routes_nothing_and_forgets_the_chunk(self):
+        stage = AttnResPipelineStage.__new__(AttnResPipelineStage)
+        stage._has_backward = False
+        stage.fwd_cache = {0: ((torch.zeros(1),), [])}
+        stage.bwd_cache = {}
+        stage._order = {0: [0, 1]}
+        stage._delta_in = {0: [1]}
+        AttnResPipelineStage.backward_one_chunk(stage, 0)
+        self.assertEqual((stage.fwd_cache, stage._order, stage._delta_in), ({}, {}, {}))
 
 
 if __name__ == "__main__":

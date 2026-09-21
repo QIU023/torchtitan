@@ -12,8 +12,8 @@ import torch.nn as nn
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import Schedule1F1B, ScheduleInterleaved1F1B
 
-from torchtitan.models.kimi_k3.parallelize import _swap_in_attn_res_stages
-from torchtitan.models.kimi_k3.pipeline_stage import AttnResPipelineStage
+from torchtitan.models.kimi_k3.pipeline_parallel import _swap_in_attn_res_stages
+from torchtitan.models.kimi_k3.pipeline_parallel.stage import AttnResPipelineStage
 
 
 def _loss(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -25,8 +25,6 @@ def _get_mesh(*args, **kwargs):
 
 
 class TestAttnResStageSwap(unittest.TestCase):
-    """K3 rebuilds the stages core constructed as AttnResPipelineStage."""
-
     def setUp(self):
         if not dist.is_initialized():
             dist.init_process_group(

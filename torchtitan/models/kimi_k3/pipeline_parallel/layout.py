@@ -4,12 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Routing tables for the block attention residual across pipeline stages.
+"""Routing tables for the block attention residual across pipeline stages."""
 
-Each hop carries the blocks the receiving rank does not hold yet, and a rank
-keeps what it has seen for its later stages; with ``cache=False`` every hop
-carries the whole stack.
-"""
+from collections.abc import Sequence
 
 
 class BlockLayoutTables:
@@ -27,8 +24,7 @@ class BlockLayoutTables:
     ) -> None:
         if n_layers <= 0 or layers_per_block <= 0:
             raise ValueError("n_layers and layers_per_block must be positive")
-        # A partial final block is legal (K3: 93 layers over blocks of 12), so
-        # num_blocks is the ceiling.
+        # num_blocks is a ceiling: the last block may be partial.
         expected_blocks = -(-n_layers // layers_per_block)
         if num_blocks != expected_blocks:
             raise ValueError(
@@ -55,29 +51,23 @@ class BlockLayoutTables:
         self._cache_readers: dict[int, list[int]] = {}
         self._build()
 
-    # ----- lookups ------------------------------------------------------- #
     def commits_at(self, stage_id: int) -> list[int]:
-        """Blocks stage ``stage_id`` opens, in order."""
         return list(self._commits_at.get(stage_id, ()))
 
     def cache_at_entry(self, stage_id: int) -> frozenset[int]:
-        """Blocks the stage's rank holds when the stage runs."""
         return self._cache_at_entry[stage_id]
 
     def delta_to_send(self, stage_id: int) -> list[int]:
-        """Blocks the hop from ``stage_id`` to ``stage_id + 1`` carries."""
         return list(self._delta_to_send.get(stage_id, ()))
 
     def producer_stage_of_block(self, block_idx: int) -> int:
         return self._producer_stage_of_block[block_idx]
 
     def cache_readers_of_block(self, block_idx: int) -> list[int]:
-        """Stages that take ``block_idx`` from their rank's store."""
         return list(self._cache_readers.get(block_idx, ()))
 
     def deposits_expected(self, block_idx: int, owner_stage: int) -> int:
-        """How many gradient deposits for ``block_idx`` the stage that brought it
-        onto the rank must collect: one per later stage there reading the store."""
+        """Deposits the stage that brought ``block_idx`` onto the rank collects: one per later reader there."""
         rank = self.stage_to_rank[owner_stage]
         return sum(
             1
@@ -85,7 +75,6 @@ class BlockLayoutTables:
             if self.stage_to_rank[reader] == rank and reader > owner_stage
         )
 
-    # ----- the simulation ----------------------------------------------- #
     def _build(self) -> None:
         for stage_id in range(self.num_stages):
             self._commits_at[stage_id] = []
@@ -103,8 +92,6 @@ class BlockLayoutTables:
                 f"{len(self._producer_stage_of_block)}."
             )
 
-        # One micro-batch's forward in stage order; with the cache on, every
-        # rank remembers what it has seen.
         held: dict[int, set[int]] = {r: set() for r in set(self.stage_to_rank.values())}
         accumulated: set[int] = set()
         for stage_id in range(self.num_stages):
@@ -127,8 +114,7 @@ class BlockLayoutTables:
         self._cache_readers = readers
 
 
-def infer_block_layout_tables_from_stages(
-    stages,
+def infer_block_layout_tables(
     *,
     stage_to_rank: dict[int, int],
     num_blocks: int,
@@ -137,10 +123,7 @@ def infer_block_layout_tables_from_stages(
     layer_to_stage: dict[int, int],
     cache: bool = True,
 ) -> BlockLayoutTables:
-    """Build :class:`BlockLayoutTables`; every layer must sit on one stage, in
-    contiguous runs in stage order."""
-    if len(stages) < 1:
-        raise ValueError("need at least one stage to infer layout")
+    """Build the tables; every layer must sit on one stage, in contiguous runs."""
     num_stages = len(stage_to_rank)
     if sorted(layer_to_stage) != list(range(n_layers)):
         raise ValueError(
@@ -173,7 +156,9 @@ def infer_block_layout_tables_from_stages(
     )
 
 
-def layer_to_stage_from_split(module_fqns_per_model_part) -> dict[int, int]:
+def layer_to_stage_from_split(
+    module_fqns_per_model_part: Sequence[Sequence[str]],
+) -> dict[int, int]:
     """The layer-to-stage map, read off the split core applies."""
     layer_to_stage: dict[int, int] = {}
     for stage_idx, names in enumerate(module_fqns_per_model_part):

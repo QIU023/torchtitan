@@ -16,8 +16,8 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
-from torchtitan.models.kimi_k3.layout import infer_block_layout_tables_from_stages
-from torchtitan.models.kimi_k3.pipeline_stage import (
+from torchtitan.models.kimi_k3.pipeline_parallel.layout import infer_block_layout_tables
+from torchtitan.models.kimi_k3.pipeline_parallel.stage import (
     AttnResPipelineStage,
     PPRankLocalCache,
 )
@@ -28,8 +28,7 @@ NUM_BLOCKS = NUM_LAYERS // LAYERS_PER_BLOCK
 HEAD, READOUT, INPUT = NUM_LAYERS, NUM_LAYERS + 1, NUM_LAYERS + 2
 DIM = NUM_LAYERS + 3
 TOKENS, MICROBATCHES, STEPS = 1, 4, 3
-# Layers per stage on 4 ranks: pp4 x vp4 with the head alone on the last stage, two
-# layers per stage, and uneven stages that each open a block after their first layer.
+# pp4 x vp4 with the head alone on the last stage, two layers per stage, and uneven stages
 SPLITS = {
     "pp4 x vp4, head alone": [[0], [1, 2]] + [[s + 1] for s in range(2, 15)] + [[]],
     "pp4 x vp2": [[2 * s, 2 * s + 1] for s in range(8)],
@@ -146,9 +145,6 @@ def _run_single_device(split: list[list[int]], dtype: torch.dtype):
 
 
 class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
-    """With integer block gradients the rank cache, the whole-stack transport and a
-    single device agree bitwise at every step, in bf16 and fp32."""
-
     @property
     def device_type(self) -> str:
         return "cpu"
@@ -157,7 +153,13 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
     def world_size(self) -> int:
         return 4
 
-    def _run_pipeline(self, split: list[list[int]], dtype: torch.dtype, cache: bool):
+    def _run_pipeline(
+        self,
+        split: list[list[int]],
+        dtype: torch.dtype,
+        cache: bool,
+        eval_losses: list | None = None,
+    ):
         num_stages, last = len(split), len(split) - 1
         mine = range(self.rank, num_stages, self.world_size)
         modules = [
@@ -175,8 +177,7 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
             loss_fn=_loss,
             scale_grads=False,
         )
-        layout = infer_block_layout_tables_from_stages(
-            stages,
+        layout = infer_block_layout_tables(
             stage_to_rank=dict(stages[0].stage_index_to_group_rank),
             num_blocks=NUM_BLOCKS,
             n_layers=NUM_LAYERS,
@@ -197,6 +198,23 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
                 schedule.step(*args, target=targets, losses=losses)
             else:
                 schedule.step(*args)
+            if eval_losses is not None:
+                evaluated: list[torch.Tensor] = []
+                with torch.no_grad():
+                    if last in mine:
+                        schedule.eval(*args, target=targets, losses=evaluated)
+                    else:
+                        schedule.eval(*args)
+                if store.blocks(0) or any(
+                    store.blocks(mb) for mb in range(MICROBATCHES)
+                ):
+                    raise AssertionError("eval left blocks in the rank store")
+                eval_losses.append(
+                    (
+                        [loss.detach() for loss in evaluated],
+                        sum(len(s._order) + len(s._delta_in) for s in stages),
+                    )
+                )
             return [loss.detach() for loss in losses]
 
         sent = sum(len(layout.delta_to_send(s)) for s in range(num_stages))
@@ -226,6 +244,30 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
                                 torch.testing.assert_close(
                                     losses, ref_losses, rtol=0, atol=0
                                 )
+
+    @with_comms
+    def test_forward_only_eval_between_steps(self):
+        for name, split in SPLITS.items():
+            with self.subTest(split=name):
+                reference = _run_single_device(split, torch.float32)
+                evaluated: list = []
+                history, _ = self._run_pipeline(
+                    split, torch.float32, cache=True, eval_losses=evaluated
+                )
+                for step in range(STEPS):
+                    grads, losses = history[step]
+                    ref_grads, ref_losses = reference[step]
+                    for block, grad in grads.items():
+                        torch.testing.assert_close(
+                            grad, ref_grads[block], rtol=0, atol=0
+                        )
+                    eval_step_losses, leftover = evaluated[step]
+                    if losses:
+                        torch.testing.assert_close(losses, ref_losses, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            eval_step_losses, ref_losses, rtol=0, atol=0
+                        )
+                    self.assertEqual(leftover, 0)
 
 
 if __name__ == "__main__":
