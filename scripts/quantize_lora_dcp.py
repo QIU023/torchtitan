@@ -45,11 +45,13 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
 from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
-from torchtitan.config.transform.lora import LoRALinearBase, MXFP4ExpertsBase
+from torchtitan.config.transform.lora import MXFP4ExpertsBase
 
 
-def _packed_key_map(module_name: str, config_name: str) -> dict[str, tuple[str, str]]:
-    """source key -> (qdata key, scale key), derived from the packed model."""
+def _packed_key_map(
+    module_name: str, config_name: str
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[int, ...]]]:
+    """source key -> (qdata key, scale key) and the packed keys' shapes, from the packed model."""
     registry = importlib.import_module(
         f"torchtitan.models.{module_name}.config_registry"
     )
@@ -57,9 +59,15 @@ def _packed_key_map(module_name: str, config_name: str) -> dict[str, tuple[str, 
     with torch.device("meta"):
         model = trainer_config.model_spec.model.build()
     mapping: dict[str, tuple[str, str]] = {}
-    # The packed bases through the state dict, so a fused projection's split keys
-    # (w1 / w3 for w13) map like any other; the experts keep their module names.
-    for key in model.state_dict():
+    state = model.state_dict()
+    # A packed base keeps its weight's leading shape ([N, F, D/2] for a stacked
+    # linear); the experts pack as [rows, cols/2]. The packed model's shapes decide.
+    shapes = {
+        key: tuple(value.shape)
+        for key, value in state.items()
+        if key.endswith((".base_qdata", ".base_scale", "_qdata", "_scale"))
+    }
+    for key in state:
         if key.endswith(".base_qdata"):
             stem = key[: -len(".base_qdata")]
             mapping[f"{stem}.weight"] = (f"{stem}.base_qdata", f"{stem}.base_scale")
@@ -74,7 +82,7 @@ def _packed_key_map(module_name: str, config_name: str) -> dict[str, tuple[str, 
         raise ValueError(
             f"{config_name} builds no MXFP4-packed modules; nothing to convert."
         )
-    return mapping
+    return mapping, shapes
 
 
 def _load_all(src: str) -> dict:
@@ -120,10 +128,12 @@ def main() -> None:
         os.environ.setdefault("MASTER_PORT", "29399")
         dist.init_process_group("gloo", rank=0, world_size=1)
 
+    key_map, shapes = _packed_key_map(args.module, args.config)
     mapping = {
         f"{args.prefix}{k}": (f"{args.prefix}{q}", f"{args.prefix}{s}")
-        for k, (q, s) in _packed_key_map(args.module, args.config).items()
+        for k, (q, s) in key_map.items()
     }
+    shapes = {f"{args.prefix}{k}": v for k, v in shapes.items()}
     source = _load_all(args.src)
     out: dict[str, torch.Tensor] = {}
     n_packed = n_copied = 0
@@ -136,8 +146,8 @@ def main() -> None:
                 elem_dtype=torch.float4_e2m1fn_x2,
                 block_size=32,
             )
-            out[qkey] = mx.qdata.contiguous()
-            out[skey] = mx.scale.view(torch.uint8).contiguous()
+            out[qkey] = mx.qdata.contiguous().view(shapes[qkey])
+            out[skey] = mx.scale.view(torch.uint8).contiguous().view(shapes[skey])
             n_packed += 1
         else:
             out[key] = t
