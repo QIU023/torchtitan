@@ -74,6 +74,8 @@ def test_experts_pack_under_the_declared_sharding():
 
     config = kimi_k3_debugmodel_qlora_mxfp4()
     assert config.model_spec is not None
+    # The experts declare a state sharding only under expert parallelism.
+    config.parallelism.expert_parallel_degree = 2
     model_config = config.model_spec.model
     model_config.update_from_config(config=config)
     with torch.device("meta"):
@@ -95,16 +97,30 @@ def test_experts_pack_under_the_declared_sharding():
     assert seen, "no packed experts carried a sharding declaration"
 
 
-def test_packed_fused_projection_round_trips_through_split_keys():
-    from torchtitan.config.transform.lora import merge_lora_state_dict
+def test_packed_fused_projection_keeps_the_stacked_layout():
     from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_qlora_mxfp4
 
-    model = kimi_k3_debugmodel_qlora_mxfp4().model_spec.model.build()
+    config = kimi_k3_debugmodel_qlora_mxfp4()
+    assert config.model_spec is not None
+    model = config.model_spec.model.build()
+    model.init_states()
+    w13 = model.layers["0"].feed_forward.w13
+    n, f, d = 2, w13.out_features, w13.in_features
     sd = model.state_dict()
-    assert "layers.0.feed_forward.w1.base_qdata" in sd
-    assert "layers.0.feed_forward.w3.base_scale" in sd
-    assert not [k for k in sd if ".w13.base_" in k]
+    assert tuple(sd["layers.0.feed_forward.w13.base_qdata"].shape) == (n, f, d // 2)
+    assert tuple(sd["layers.0.feed_forward.w13.base_scale"].shape) == (n, f, d // 32)
+    assert tuple(w13.lora_b.weight.shape) == (n, f, w13.lora_a.weight.shape[0])
+    x = torch.randn(3, d, dtype=w13.lora_a.weight.dtype)
+    with torch.no_grad():
+        w13.lora_b.weight.normal_()
+    dense = w13._dequant_base_mxfp4().to(x.dtype)
+    expected = torch.nn.functional.linear(x, dense.flatten(0, 1)) + w13._lora_scaling * (
+        torch.nn.functional.linear(
+            torch.nn.functional.linear(x, w13.lora_a.weight), w13.lora_b.weight.flatten(0, 1)
+        )
+    )
+    torch.testing.assert_close(w13(x), expected.unflatten(-1, (n, f)))
     model.load_state_dict(sd, strict=True)
     merged = merge_lora_state_dict(model)
-    assert "layers.0.feed_forward.w1.weight" in merged
+    assert tuple(merged["layers.0.feed_forward.w13.weight"].shape) == (n, f, d)
     assert not [k for k in merged if "base_qdata" in k or "lora_" in k]

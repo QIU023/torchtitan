@@ -65,7 +65,7 @@ def parallelize_kimi_k3(
         if model.vision_encoder is not None:
             ac_policy.apply(model.vision_encoder)
 
-    if compile_config.enable and "model" in compile_config.components:
+    if compile_config is not None and "model" in compile_config.components:
         assert isinstance(model.config, KimiK3Model.Config)
         raise_dynamo_recompile_limit(_kimi_k3_recompile_limit(model.config))
         apply_compile(model, compile_config=compile_config, parallel_dims=parallel_dims)

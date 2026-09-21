@@ -11,47 +11,48 @@ import torch
 from torchtitan.models.kimi_k3 import model_registry
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 
+_MODEL = model_registry("debugmodel").model
+_DIM = _MODEL.dim
+_FFN = _MODEL.layers[0].feed_forward.w2.in_features
 _NORM0 = "language_model.model.layers.0.self_attention_res_norm.weight"
 _PROJ0 = "language_model.model.layers.0.self_attention_res_proj.weight"
 
 
 def _adapter():
-    return KimiK3StateDictAdapter(
-        model_registry("debugmodel").model, hf_assets_path=None
-    )
+    return KimiK3StateDictAdapter(_MODEL, hf_assets_path=None)
 
 
 def test_a_stage_without_layer_0_places_nothing():
-    out = _adapter().to_hf({"layers.2.attention_norm.weight": torch.ones(1024)})
+    out = _adapter().to_hf({"layers.2.attention_norm.weight": torch.ones(_DIM)})
     assert _NORM0 not in out and _PROJ0 not in out
 
 
 def test_layer_0_without_layer_1_is_shaped_from_the_config():
     out = _adapter().to_hf(
-        {"layers.0.attention_norm.weight": torch.ones(1024, dtype=torch.bfloat16)}
+        {"layers.0.attention_norm.weight": torch.ones(_DIM, dtype=torch.bfloat16)}
     )
-    assert out[_NORM0].shape == (1024,) and out[_NORM0].dtype == torch.bfloat16
-    assert out[_PROJ0].shape == (1, 1024) and not out[_PROJ0].any()
+    assert out[_NORM0].shape == (_DIM,) and out[_NORM0].dtype == torch.bfloat16
+    assert out[_PROJ0].shape == (1, _DIM) and not out[_PROJ0].any()
 
 
 def test_layer_0_with_layer_1_follows_the_template():
     out = _adapter().to_hf(
         {
-            "layers.0.attention_norm.weight": torch.ones(1024),
-            "layers.1.attention_res_norm.weight": torch.ones(1024),
-            "layers.1.attention_res_proj.weight": torch.zeros(1, 1024),
+            "layers.0.attention_norm.weight": torch.ones(_DIM),
+            "layers.1.attention_res_norm.weight": torch.ones(_DIM),
+            "layers.1.attention_res_proj.weight": torch.zeros(1, _DIM),
         }
     )
-    assert out[_NORM0].shape == (1024,) and out[_PROJ0].shape == (1, 1024)
+    assert out[_NORM0].shape == (_DIM,) and out[_PROJ0].shape == (1, _DIM)
 
 
 def test_lora_adapters_are_left_out_of_the_hf_dict():
     """The HF load hands to_hf the whole model state dict, adapters included."""
     out = _adapter().to_hf(
         {
-            "layers.0.feed_forward.w1.weight": torch.ones(4096, 1024),
-            "layers.0.feed_forward.w1.lora_a.weight": torch.ones(8, 1024),
-            "layers.0.feed_forward.w1.lora_b.weight": torch.zeros(4096, 8),
+            "layers.0.feed_forward.w1.weight": torch.ones(_FFN, _DIM),
+            "layers.0.feed_forward.w1.lora_a.weight": torch.ones(8, _DIM),
+            "layers.0.feed_forward.w1.lora_b.weight": torch.zeros(_FFN, 8),
         }
     )
     assert not [k for k in out if "lora" in k]

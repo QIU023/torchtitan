@@ -25,6 +25,7 @@ from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
     spmd_local_context,
 )
+from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common import FeedForward, Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,

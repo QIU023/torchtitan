@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import Any, cast, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -36,20 +36,19 @@ _SPARSE_STORAGE_AXES = ["dp_replicate", "efsdp", "ep"]
 def _linear_param_shard_placements(module: nn.Module) -> dict[nn.Parameter, Shard]:
     """Shard stacked Linear parameters along their matrix-row dimension.
 
-    A stacked Linear stores weight as ``[N, F, D]`` and bias as ``[N, F]``.
-    FSDP's default ``Shard(0)`` would split the small logical-projection
-    dimension, so shard ``F`` instead. Ordinary Linear parameters remain 2D
-    and use FSDP's default placement.
+    A stacked Linear stores weight as ``[N, F, D]`` and bias as ``[N, F]``
+    (a packed base keeps that leading shape). FSDP's default ``Shard(0)``
+    would split the small logical-projection dimension, so shard ``F``
+    instead. Ordinary Linear parameters remain 2D and use FSDP's default
+    placement.
     """
     placements: dict[nn.Parameter, Shard] = {}
     for child in module.modules():
         if not isinstance(child, nn.Linear) or getattr(child, "num_linears", 1) == 1:
             continue
-        weight = cast(nn.Parameter, child.weight)
-        placements[weight] = Shard(1)
-        if child.bias is not None:
-            bias = child.bias
-            placements[bias] = Shard(1)
+        for param in child.parameters(recurse=False):
+            if param.dim() >= 2:
+                placements[param] = Shard(1)
     return placements
 
 

@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.lora import specialize_lora_linear
+from torchtitan.models.common.lora import _LoRALinearMixin, specialize_lora_linear
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
@@ -27,49 +27,6 @@ from .converter import ModelConfigConverter
 
 
 logger = logging.getLogger(__name__)
-
-
-def _lora_adapter_sharding(
-    base_sharding: ShardingConfig | None,
-) -> tuple[ShardingConfig | None, ShardingConfig | None]:
-    """Derive LoRA adapter sharding from the base linear's TP sharding.
-
-    For colwise base linears, ``lora_a`` is TP-replicated and ``lora_b``
-    mirrors the base output-dim shard.
-
-    For rowwise base linears, ``lora_a`` mirrors the base input-dim shard and
-    ``lora_b`` is TP-replicated, producing the same partial-output shape as the
-    base linear.
-    """
-    base_weight_sharding = (
-        base_sharding.state_shardings.get("weight") if base_sharding else None
-    )
-    if base_weight_sharding is None:
-        return None, None
-
-    replicated_weight = ShardingConfig(
-        state_shardings={"weight": dense_param_placement(tp=spmd.R)},
-    )
-    if base_weight_sharding in (
-        dense_param_placement(tp=spmd.R),
-        dense_param_placement(tp=spmd.I),
-    ):
-        # A base that is not sharded on TP (replicated, or invariant on the
-        # stream the declarations keep invariant without sequence parallel):
-        # the adapters take its placement.
-        same = ShardingConfig(state_shardings={"weight": base_weight_sharding})
-        return same, same
-    if base_weight_sharding == dense_param_placement(tp=spmd.S(0)):
-        lora_b_sharding = ShardingConfig(
-            state_shardings={"weight": base_weight_sharding},
-        )
-        return replicated_weight, lora_b_sharding
-    else:
-        assert base_weight_sharding == dense_param_placement(tp=spmd.S(1))
-        lora_a_sharding = ShardingConfig(
-            state_shardings={"weight": dense_param_placement(tp=spmd.S(1))},
-        )
-        return lora_a_sharding, replicated_weight
 
 
 class LoRALinearBase:
@@ -117,7 +74,7 @@ def _get_lora_cls(parent_cls: type) -> type:
 
     parent_config_cls = parent_cls.Config  # pyrefly: ignore [missing-attribute]
 
-    class LoRALinear(parent_cls, LoRALinearBase):  # type: ignore[valid-type, misc]
+    class LoRALinear(_LoRALinearMixin, parent_cls, LoRALinearBase):  # type: ignore[valid-type, misc]
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             rank: int
@@ -133,34 +90,12 @@ def _get_lora_cls(parent_cls: type) -> type:
 
         def __init__(self, config: Config) -> None:
             super().__init__(config)
-            for param in nn.Module.parameters(self):
-                param.requires_grad_(False)
-            self._lora_scaling = config.alpha / config.rank
             if config.quantize_base not in (None, "nf4", "mxfp4"):
                 raise ValueError(
                     f"quantize_base must be None, 'nf4' or 'mxfp4', got "
                     f"{config.quantize_base!r}"
                 )
             self._quantize_base_requested = config.quantize_base
-            lora_a_sharding, lora_b_sharding = _lora_adapter_sharding(
-                config.sharding_config
-            )
-            self.lora_a = Linear.Config(
-                in_features=config.in_features,
-                out_features=config.rank,
-                bias=False,
-                sharding_config=lora_a_sharding,
-                param_init={
-                    "weight": lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5)),
-                },
-            ).build()
-            self.lora_b = Linear.Config(
-                in_features=config.rank,
-                out_features=config.out_features,
-                bias=False,
-                sharding_config=lora_b_sharding,
-                param_init={"weight": nn.init.zeros_},
-            ).build()
             if config.quantize_base == "mxfp4":
                 # BUILD-time swap, before any parallelize: FSDP2 then shards
                 # the packed bytes natively (pack-then-shard), which is the
@@ -175,8 +110,9 @@ def _get_lora_cls(parent_cls: type) -> type:
 
         def _swap_in_packed_mxfp4_layout(self) -> None:
             """Replace the base weight with MXFP4 split storage (torchao MX,
-            block 32): ``base_qdata`` [out, in/2] uint8 and ``base_scale``
-            [out, in/32] e8m0-bytes-as-uint8, both plain contiguous frozen
+            block 32): ``base_qdata`` [..., in/2] uint8 and ``base_scale``
+            [..., in/32] e8m0-bytes-as-uint8 in the weight's leading shape
+            (``[N, F, D]`` for a stacked linear), both plain contiguous frozen
             params. MXTensor itself cannot be a param -- its packed qdata
             makes the logical view non-contiguous and FSDP2 rejects it -- so
             the tensor is reconstructed via ``__tensor_unflatten__`` at use.
@@ -199,10 +135,10 @@ def _get_lora_cls(parent_cls: type) -> type:
             )
             _, self._mx_ctx = dummy.__tensor_flatten__()
             self._mx_scale_dtype = dummy.scale.dtype
-            out_f, in_f = w.shape
+            *lead, in_f = w.shape
             if w.is_meta:
-                qdata = torch.empty(out_f, in_f // 2, dtype=torch.uint8, device="meta")
-                scale = torch.empty(out_f, in_f // 32, dtype=torch.uint8, device="meta")
+                qdata = torch.empty(*lead, in_f // 2, dtype=torch.uint8, device="meta")
+                scale = torch.empty(*lead, in_f // 32, dtype=torch.uint8, device="meta")
             else:
                 mx = MXTensor.to_mx(
                     w.data.to(torch.bfloat16),
@@ -223,16 +159,18 @@ def _get_lora_cls(parent_cls: type) -> type:
                 assert sharding is not None
                 # The declarative system requires a placement for every param
                 # once a sharding_config exists. The packed pair mirrors the
-                # base weight's TP layout: colwise (S(0)) shards packed ROWS,
-                # exact because MX block-32 is row-blockwise; rowwise (S(1))
-                # shards packed columns, exact only when the local in-features
-                # stay block-divisible -- checked at first dequant, when the
-                # actual shard is known. Replicate replicates.
-                if base_weight_sharding == dense_param_placement(tp=spmd.S(0)):
-                    pair = dense_param_placement(tp=spmd.S(0))
+                # base weight's TP layout: colwise (the out dim, S(0) or S(1)
+                # of a stacked weight) shards packed ROWS, exact because MX
+                # block-32 is row-blockwise; rowwise (the in dim) shards packed
+                # columns, exact only when the local in-features stay
+                # block-divisible -- checked at first dequant, when the actual
+                # shard is known. Replicate replicates.
+                out_dim, in_dim = w.dim() - 2, w.dim() - 1
+                if base_weight_sharding == dense_param_placement(tp=spmd.S(out_dim)):
+                    pair = dense_param_placement(tp=spmd.S(out_dim))
                     self._packed_tp_style = "colwise"
-                elif base_weight_sharding == dense_param_placement(tp=spmd.S(1)):
-                    pair = dense_param_placement(tp=spmd.S(1))
+                elif base_weight_sharding == dense_param_placement(tp=spmd.S(in_dim)):
+                    pair = dense_param_placement(tp=spmd.S(in_dim))
                     self._packed_tp_style = "rowwise"
                 else:
                     pair = dense_param_placement(tp=spmd.R)
@@ -261,10 +199,9 @@ def _get_lora_cls(parent_cls: type) -> type:
             qdata, scale = self.base_qdata, self.base_scale
             q_local = qdata.to_local() if isinstance(qdata, DTensor) else qdata
             s_local = scale.to_local() if isinstance(scale, DTensor) else scale
-            rows = q_local.shape[0]
             w_rows = torch.empty(
-                rows,
-                q_local.shape[1] * 2,
+                *q_local.shape[:-1],
+                q_local.shape[-1] * 2,
                 dtype=torch.bfloat16,
                 device=q_local.device,
             )
@@ -428,9 +365,11 @@ def _get_lora_cls(parent_cls: type) -> type:
             la = la.to(x_loc.dtype)
             lb = lb.to(x_loc.dtype)
 
-            out_loc = F.linear(x_loc, w_loc) + self._lora_scaling * F.linear(
-                F.linear(x_loc, la), lb
+            out_loc = F.linear(x_loc, w_loc.flatten(0, -2)) + self._lora_scaling * F.linear(
+                F.linear(x_loc, la), lb.flatten(0, -2)
             )
+            if w_loc.dim() > 2:
+                out_loc = out_loc.unflatten(-1, w_loc.shape[:-1])
             bias = getattr(self, "bias", None)
             if colwise:
                 # Colwise shards the OUTPUT features: this rank's bias slice
@@ -471,7 +410,9 @@ def _get_lora_cls(parent_cls: type) -> type:
                     w = DTensor.from_local(
                         w, mesh, [Replicate()] * mesh.ndim, run_check=False
                     )
-                base_out = torch.nn.functional.linear(input, w)
+                base_out = torch.nn.functional.linear(input, w.flatten(0, -2))
+                if w.dim() > 2:
+                    base_out = base_out.unflatten(-1, w.shape[:-1])
                 if getattr(self, "bias", None) is not None:
                     base_out = base_out + self.bias
             elif self._quantize_base == "nf4":
@@ -485,7 +426,7 @@ def _get_lora_cls(parent_cls: type) -> type:
                 if getattr(self, "bias", None) is not None:
                     base_out = base_out + self.bias
             else:
-                base_out = super().forward(input)
+                return super().forward(input)
             lora_out = self.lora_b(self.lora_a(input))
             return base_out + self._lora_scaling * lora_out
 
@@ -1074,7 +1015,7 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     serialization produce the right keys.
 
     Under TP nothing needs materializing: the adapter shardings mirror the
-    base (``_lora_adapter_sharding``), so ``B @ A`` composes to the base
+    base (``_LoRALinearMixin._adapter_sharding``), so ``B @ A`` composes to the base
     weight's placement and the add dispatches as DTensors.
     """
     from torchtitan.models.common.lora import _LoRALinearMixin
@@ -1125,7 +1066,7 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
                 # sharding left it local. Bring both to the whole weight.
                 ref = module.lora_b.weight
                 assert isinstance(ref, DTensor)
-                if base_w.shape[0] != delta.shape[0]:
+                if base_w.shape != delta.shape:
                     base_w = DTensor.from_local(
                         base_w, ref.device_mesh, ref.placements, run_check=False
                     ).full_tensor()
