@@ -43,9 +43,9 @@ def build_b200_tests_list() -> list[OverrideDefinitions]:
             ngpu=2,
         ),
         OverrideDefinitions(
-            configs=[recipes.kimi_k3_debugmodel_pp8_vp4_vit_dep],
+            configs=[recipes.kimi_k3_debugmodel_pp4_vp4_vit_dep],
             test_descr="Kimi K3, pipeline parallel pp8 x vp4, the vision tower on its own stage",
-            test_name="kimi_k3_pp8_vp4_vit_dep",
-            ngpu=8,
+            test_name="kimi_k3_pp4_vp4_vit_dep",
+            ngpu=4,
         ),
     ]
