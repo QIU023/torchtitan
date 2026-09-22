@@ -468,3 +468,22 @@ def kimi_k3_rl_mx_qat() -> Trainer.Config:
     config = kimi_k3_debugmodel()
     config.model_spec = model_registry("rl", converters=[MXFP4QATConverter.Config()])
     return config
+
+
+def kimi_k3_debugmodel_moonep(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    """The debug model with the MoonEP expert-parallel backend.
+
+    MoonEP moves expert weights over NVLink instead of moving every token to
+    its expert's owner, so each rank receives a fixed token count whatever the
+    routing does. It needs the ``moonep`` package, Hopper or newer behind an
+    NVSwitch, and ``expert_parallel_degree`` equal to
+    ``data_parallel_shard_degree * context_parallel_degree *
+    tensor_parallel_degree``; EP=1 falls back to local dispatch.
+    """
+    config = kimi_k3_debugmodel(seq_len=seq_len)
+    config.model_spec = model_registry(
+        "debugmodel", seq_len=seq_len, moe_comm_backend="moonep"
+    )
+    return config

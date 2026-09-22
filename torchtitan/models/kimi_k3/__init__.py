@@ -32,6 +32,7 @@ from torchtitan.models.common.config_utils import (
 )
 from torchtitan.models.common.moe import (
     GroupedExperts,
+    MoonEPGroupedExperts,
     QuantileBalancedTopKRouter,
     RoutedExperts,
 )
@@ -43,8 +44,6 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .kda import InnerKDA, KDA, KDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiLatentMoE
-from .moon_ep_dispatcher import MoonEPTokenDispatcher
-from .moon_ep_experts import MoonEPGroupedExperts
 from .mtp import KimiK3MTPLayer
 from .parallelize import parallelize_kimi_k3
 from .pipeline_parallel import pipeline_kimi_k3
@@ -285,24 +284,15 @@ def _latent_moe_config(
                     "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
                 },
             ),
-            # core's dispatcher factory: standard / deepep / hybridep per spec,
-            # as deepseek_v3; falls back to local dispatch when the ep mesh is
-            # None. "moonep" is Kimi K3's own transport and stays in the model
-            # folder, like fla. Either way the routed experts consume the
-            # LATENT stream, so the dispatcher buffers size by latent_dim.
-            token_dispatcher=(
-                MoonEPTokenDispatcher.Config(
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    hidden_dim=latent_dim,
-                )
-                if moe_comm_backend == "moonep"
-                else make_token_dispatcher_config(
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    comm_backend=moe_comm_backend,
-                    hidden_dim=latent_dim,
-                )
+            # core's dispatcher factory: standard / deepep / hybridep / moonep
+            # per spec, as deepseek_v3; it falls back to local dispatch when the
+            # ep mesh is None. The routed experts consume the LATENT stream, so
+            # the dispatcher buffers size by latent_dim.
+            token_dispatcher=make_token_dispatcher_config(
+                num_experts=num_experts,
+                top_k=top_k,
+                comm_backend=moe_comm_backend,
+                hidden_dim=latent_dim,
             ),
         ),
         routed_norm=_norm(latent_dim),

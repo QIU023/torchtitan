@@ -4,34 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU checks for the MoonEP unit.
+"""CPU checks for the MoonEP wiring: what the spec selects, the import guard, and the mesh precondition.
 
-MoonEP itself needs NVLink hardware and its package; nothing here touches
-either. The wiring is driven end to end through ``kimi_k3_moonep_fake``: two ranks as
-threads, the fake Buffer's collectives as barriers, a test-chosen duplication
-map so prefetch slots and slot-grad reduction are exercised. The reference is
-the dense per-token computation with every expert's fp32 weights.
+Nothing here touches MoonEP itself, which needs its package and NVLink
+multicast. The comparison against a dense reference runs against the real
+package in ``tests/unit_tests/gpu/test_kimi_k3_moon_ep.py``.
 """
 
-import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
-import torch.nn as nn
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorTestBase,
+    with_comms,
+)
+from torchtitan.distributed.moonep.moonep import _import_moonep
 
-from torchtitan.models.common.activation import SiTUGLU
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.models.common.moe import check_moonep_mesh, MoonEPGroupedExperts
+from torchtitan.models.common.token_dispatcher import MoonEPTokenDispatcher
 from torchtitan.models.kimi_k3 import model_registry
-from torchtitan.models.kimi_k3.moon_ep_dispatcher import (
-    _import_moonep,
-    MoonEPTokenDispatcher,
-)
-from torchtitan.models.kimi_k3.moon_ep_experts import (
-    check_moonep_mesh,
-    MoonEPGroupedExperts,
-)
-
-from tests.unit_tests.cpu.kimi_k3_moonep_fake import FakeMoonEPWorld, grouped_mm_loop
 
 
 def _find_dispatcher(model):
@@ -83,143 +77,143 @@ def test_moonep_import_guard_names_the_package():
         _import_moonep()
 
 
-# --- the unit, end to end, against a dense reference ---------------------- #
+class TestMoonEPMeshPrecondition(DTensorTestBase):
+    """The mesh check against real ParallelDims meshes."""
 
-R, E, K, S, D, F = 2, 8, 2, 16, 8, 16
-# Rank 0 gets a copy of expert 5 (home rank 1); rank 1 a copy of expert 1.
-DUP = {(0, 0): 5, (1, 0): 1}
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    def _dims(self, **kwargs) -> ParallelDims:
+        dims = ParallelDims(pp=1, world_size=self.world_size, **kwargs)
+        dims.build_mesh()
+        return dims
+
+    @with_comms
+    def test_moonep_mesh_requires_efsdp_of_one(self):
+        with patch(
+            "torchtitan.distributed.parallel_dims.device_type", self.device_type
+        ):
+            check_moonep_mesh(self._dims(dp_replicate=1, dp_shard=4, cp=1, tp=1, ep=4))
+            with self.assertRaisesRegex(NotImplementedError, "efsdp == 1"):
+                check_moonep_mesh(
+                    self._dims(dp_replicate=1, dp_shard=4, cp=1, tp=1, ep=2)
+                )
+            with self.assertRaisesRegex(NotImplementedError, "dp_replicate"):
+                check_moonep_mesh(
+                    self._dims(dp_replicate=2, dp_shard=2, cp=1, tp=1, ep=2)
+                )
 
 
-def _reference(x_all, weights_all, ids_all, w1, w2, w3, beta, linear_beta):
-    """Every token through its K experts, weighted, in fp32 -- what MoonEP
-    must reproduce up to bf16 rounding."""
-    act = SiTUGLU.Config(beta=beta, linear_beta=linear_beta).build()
-    out = torch.zeros_like(x_all)
-    for t in range(x_all.shape[0]):
-        for k in range(K):
-            e = int(ids_all[t, k])
-            g = x_all[t] @ w1[e].T
-            u = x_all[t] @ w3[e].T
-            h = act(g, u)
-            out[t] += weights_all[t, k] * (h @ w2[e].T)
-    return out
+class _Plan:
+    def __init__(self, experts_to_copy: torch.Tensor) -> None:
+        self.experts_to_copy = experts_to_copy
 
 
-def _run_rank(rank, world, params, inputs, results):
+class _StubDispatcher:
+    """What the experts read off the dispatcher: the plan in flight and the
+    token ends of this rank's experts followed by its slots."""
+
+    def __init__(self, cu_seqlens: torch.Tensor) -> None:
+        self.cu_seqlens = cu_seqlens
+        self.plan = None
+
+    def current_plan(self):
+        return self.plan, self.cu_seqlens
+
+
+class _StubBackend:
+    """MoonEP's pools in plain memory: prefetch fills this rank's slots from
+    the rows their owners hold, which is the behaviour the interleaving test
+    turns on."""
+
+    def __init__(self, rows_by_name: dict[str, torch.Tensor], rank: int = 0) -> None:
+        self.rows_by_name = rows_by_name
+        self.rank = rank
+        self.own_rows = 0
+        self.slots: dict[str, torch.Tensor] = {}
+
+    def configure(self, *, num_experts: int, num_slots: int) -> None:
+        self.own_rows = num_slots
+
+    def alloc_prefetch_rows(self, name, in_dim, out_dim):
+        self.slots[name] = torch.zeros(self.own_rows, in_dim, out_dim)
+        return self.slots[name]
+
+    def alloc_grad_rows(self, name, in_dim, out_dim):
+        return (
+            torch.zeros(self.own_rows, in_dim, out_dim),
+            torch.zeros(self.own_rows, in_dim, out_dim),
+        )
+
+    def prefetch(self, plan, local_rows) -> None:
+        ids = plan.experts_to_copy[self.rank]
+        for slot, expert in enumerate(ids.tolist()):
+            if expert < 0:
+                continue
+            for name, pool in self.slots.items():
+                pool[slot] = self.rows_by_name[name][expert]
+
+    def reduce_grad(self, plan, own_grads) -> None:
+        pass
+
+
+def _interleaving_case():
+    """Two plans that put different experts in the slot, over one module."""
     torch.manual_seed(0)
+    # the grouped GEMM wants rows on a 16-byte stride
+    num_experts, dim, hidden = 4, 64, 32
+    rows = {
+        "gate": torch.randn(num_experts, dim, hidden),
+        "up": torch.randn(num_experts, dim, hidden),
+        "down": torch.randn(num_experts, hidden, dim),
+    }
     experts = MoonEPGroupedExperts(
-        MoonEPGroupedExperts.Config(
-            dim=D,
-            hidden_dim=F,
-            num_experts=E,
-            activation_fn=SiTUGLU.Config(beta=4.0, linear_beta=25.0),
-        )
+        MoonEPGroupedExperts.Config(dim=dim, hidden_dim=hidden, num_experts=num_experts)
     )
-    lo, hi = rank * (E // R), (rank + 1) * (E // R)
-    experts.w1_EFD = nn.Parameter(params["w1"][lo:hi].clone())
-    experts.w2_EDF = nn.Parameter(params["w2"][lo:hi].clone())
-    experts.w3_EFD = nn.Parameter(params["w3"][lo:hi].clone())
-    dispatcher = MoonEPTokenDispatcher(
-        MoonEPTokenDispatcher.Config(
-            num_experts=E, top_k=K, hidden_dim=D, num_max_tokens_per_rank=S
-        )
-    )
-    dispatcher._buffer_factory = lambda **kw: world.buffer_for(rank)
-    mesh = world.mesh_for(rank)
-    dispatcher.wire_meshes(ep_mesh=mesh)
-    experts.attach(dispatcher, world.backend_for(rank), mesh)
+    experts.w1_EFD = torch.nn.Parameter(rows["gate"][:2].transpose(-2, -1).contiguous())
+    experts.w3_EFD = torch.nn.Parameter(rows["up"][:2].transpose(-2, -1).contiguous())
+    experts.w2_EDF = torch.nn.Parameter(rows["down"][:2].transpose(-2, -1).contiguous())
+    # rows 0-2 to this rank's expert 0, 3-4 to its expert 1, 5-6 to its first slot
+    cu = torch.tensor([3, 5, 7, 7], dtype=torch.int32)
+    dispatcher = _StubDispatcher(cu)
+    backend = _StubBackend(rows)
+    mesh = SimpleNamespace(get_local_rank=lambda: 0, size=lambda: 2)
+    experts.attach(dispatcher, backend, mesh)
+    plan_a = _Plan(torch.tensor([[2, -1], [-1, -1]], dtype=torch.int32))
+    plan_b = _Plan(torch.tensor([[3, -1], [-1, -1]], dtype=torch.int32))
+    torch.manual_seed(1)
+    x_a = torch.randn(7, dim, requires_grad=True)
+    x_b = torch.randn(7, dim, requires_grad=True)
+    grad_a = torch.randn(7, dim)
+    return experts, dispatcher, x_a, x_b, grad_a, plan_a, plan_b
 
-    x, weights, ids, counts = inputs[rank]
-    x = x.clone().requires_grad_(True)
-    routed, rows, metadata = dispatcher.dispatch(x, weights, ids, counts)
-    assert rows.numel() == E + E // R, "counts span the E + B table rows"
-    assert rows[E:].sum().item() > 0, "the duplication map put tokens in a slot"
-    expert_out = experts(routed, rows)
-    out = dispatcher.combine(expert_out, metadata, x)
-    out.float().sum().backward()
-    results[rank] = (
-        out.detach().float(),
-        x.grad.clone(),
+
+def _run(experts, dispatcher, x, plan):
+    dispatcher.plan = plan
+    return experts(x, torch.empty(0))
+
+
+def test_a_later_microbatch_forward_does_not_move_an_earlier_backward():
+    """A pipeline schedule runs the next micro-batch's forward before this
+    backward, which overwrites the slots the backward recomputes from."""
+    experts, dispatcher, x_a, x_b, grad_a, plan_a, plan_b = _interleaving_case()
+    _run(experts, dispatcher, x_a, plan_a).backward(grad_a)
+    sequential = (
+        x_a.grad.clone(),
         experts.w1_EFD.grad.clone(),
         experts.w2_EDF.grad.clone(),
-        experts.w3_EFD.grad.clone(),
     )
 
-
-def test_moonep_unit_matches_dense_reference_with_duplicated_experts(monkeypatch):
-    # The expert GEMMs run on CPU here; torch._grouped_mm is CUDA only.
-    monkeypatch.setattr(MoonEPGroupedExperts, "_grouped_mm", grouped_mm_loop)
-    torch.manual_seed(1)
-    params = {
-        "w1": torch.randn(E, F, D) * 0.2,
-        "w2": torch.randn(E, D, F) * 0.2,
-        "w3": torch.randn(E, F, D) * 0.2,
-    }
-    inputs = {}
-    for r in range(R):
-        x = torch.randn(S, D)
-        weights, ids = torch.rand(S, E).topk(K, dim=-1)
-        counts = torch.zeros(E, dtype=torch.long).scatter_add_(
-            0, ids.reshape(-1), torch.ones(S * K, dtype=torch.long)
-        )
-        inputs[r] = (x, weights, ids.to(torch.int64), counts)
-    world = FakeMoonEPWorld(
-        num_ranks=R,
-        num_experts=E,
-        top_k=K,
-        tokens_per_rank=S,
-        hidden_dim=D,
-        num_prefetch_slots=E // R,
-        dup_map=DUP,
-    )
-    results = {}
-    threads = [
-        threading.Thread(target=_run_rank, args=(r, world, params, inputs, results))
-        for r in range(R)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=60)
-    assert len(results) == R, "a rank died or deadlocked in a fake collective"
-
-    # Reference on the concatenated batch, fp32 params, weights applied.
-    x_all = torch.cat([inputs[r][0] for r in range(R)])
-    w_all = torch.cat([inputs[r][1] for r in range(R)])
-    ids_all = torch.cat([inputs[r][2] for r in range(R)])
-    x_ref = x_all.clone().requires_grad_(True)
-    p_ref = {n: params[n].clone().requires_grad_(True) for n in params}
-    ref = _reference(
-        x_ref, w_all, ids_all, p_ref["w1"], p_ref["w2"], p_ref["w3"], 4.0, 25.0
-    )
-    ref.sum().backward()
-
-    out = torch.cat([results[r][0] for r in range(R)])
-    torch.testing.assert_close(out, ref.detach(), atol=5e-2, rtol=5e-2)
-    grad_x = torch.cat([results[r][1] for r in range(R)])
-    torch.testing.assert_close(grad_x, x_ref.grad, atol=5e-2, rtol=5e-2)
-    for name, idx in (("w1", 2), ("w2", 3), ("w3", 4)):
-        got = torch.cat([results[r][idx] for r in range(R)])
-        # Includes the rows that other ranks computed in their prefetch slots
-        # and reduced back home.
-        torch.testing.assert_close(got, p_ref[name].grad, atol=5e-2, rtol=5e-2)
-
-
-def _dims(*, dp_shard, cp=1, tp=1, ep, dp_replicate=False):
-    return SimpleNamespace(
-        dp_replicate_enabled=dp_replicate, dp_shard=dp_shard, cp=cp, tp=tp, ep=ep
+    experts, dispatcher, x_a, x_b, grad_a, plan_a, plan_b = _interleaving_case()
+    out_a = _run(experts, dispatcher, x_a, plan_a)
+    _run(experts, dispatcher, x_b, plan_b)
+    out_a.backward(grad_a)
+    interleaved = (
+        x_a.grad.clone(),
+        experts.w1_EFD.grad.clone(),
+        experts.w2_EDF.grad.clone(),
     )
 
-
-def test_moonep_mesh_requires_efsdp_of_one():
-    check_moonep_mesh(_dims(dp_shard=2, ep=2))
-    check_moonep_mesh(_dims(dp_shard=1, cp=2, ep=2))
-    for dims in (
-        _dims(dp_shard=2, cp=2, ep=2),
-        _dims(dp_shard=2, tp=2, ep=2),
-        _dims(dp_shard=4, ep=2),
-    ):
-        with pytest.raises(NotImplementedError, match="efsdp == 1"):
-            check_moonep_mesh(dims)
-    with pytest.raises(NotImplementedError, match="dp_replicate"):
-        check_moonep_mesh(_dims(dp_shard=2, ep=2, dp_replicate=True))
+    for name, first, second in zip(("dgrad", "w1", "w2"), sequential, interleaved):
+        torch.testing.assert_close(first, second, msg=f"{name} moved")

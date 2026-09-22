@@ -58,12 +58,9 @@ class KimiLatentMoE(MoE):
         super().parallelize(parallel_dims)
         # MoonEP's expert side needs the dispatcher's plan and the EP mesh;
         # both exist only after the children above have been parallelized.
-        # Imported here: moon_ep_experts imports this module.
-        from torchtitan.models.kimi_k3.moon_ep_dispatcher import MoonEPTokenDispatcher
-        from torchtitan.models.kimi_k3.moon_ep_experts import (
-            check_moonep_mesh,
-            MoonEPTableBackendNVLink,
-        )
+        from torchtitan.distributed.moonep.moonep import MoonEPTableBackendNVLink
+        from torchtitan.models.common.moe import check_moonep_mesh
+        from torchtitan.models.common.token_dispatcher import MoonEPTokenDispatcher
 
         dispatcher = self.routed_experts.token_dispatcher
         if (
@@ -73,7 +70,7 @@ class KimiLatentMoE(MoE):
             check_moonep_mesh(parallel_dims)
             self.routed_experts.inner_experts.attach(
                 dispatcher,
-                MoonEPTableBackendNVLink(dispatcher.ep_mesh),
+                MoonEPTableBackendNVLink(dispatcher.ep_mesh, dispatcher),
                 dispatcher.ep_mesh,
             )
 

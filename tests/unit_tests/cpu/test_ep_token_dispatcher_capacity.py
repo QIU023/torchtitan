@@ -32,7 +32,7 @@ class _Static(_Plain):
 
 @dataclass(kw_only=True, slots=True)
 class _StaticWithFallback(_Static):
-    ep1_local_fallback: ClassVar[bool] = True
+    requires_ep: ClassVar[bool] = False
 
 
 def _run(cfg, *, ep, cp=1, tp=1, tokens=256):
@@ -53,8 +53,8 @@ def _run(cfg, *, ep, cp=1, tp=1, tokens=256):
 def test_core_persistent_backends_declare_a_static_capacity():
     assert DeepEPTokenDispatcher.Config.static_token_capacity
     assert HybridEPTokenDispatcher.Config.static_token_capacity
-    assert not DeepEPTokenDispatcher.Config.ep1_local_fallback
-    assert not HybridEPTokenDispatcher.Config.ep1_local_fallback
+    assert DeepEPTokenDispatcher.Config.requires_ep
+    assert HybridEPTokenDispatcher.Config.requires_ep
 
 
 def test_static_capacity_is_the_token_count_after_cp_and_tp():
