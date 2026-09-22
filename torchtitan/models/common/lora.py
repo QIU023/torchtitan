@@ -75,9 +75,12 @@ class _LoRALinearMixin:
             param_init={"weight": nn.init.zeros_},
         ).build()
 
-    def forward(self, input_XI: torch.Tensor) -> torch.Tensor:
-        base_out_XO = super().forward(input_XI)  # type: ignore[misc]
-        lora_out_XO = self.lora_b(self.lora_a(input_XI))
+    # The argument keeps the parent's name: a sharding config with local_spmd
+    # keys its input layouts by the forward's positional names, and the
+    # specialization inherits the parent linear's config.
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        base_out_XO = super().forward(input)  # type: ignore[misc]
+        lora_out_XO = self.lora_b(self.lora_a(input))
         return base_out_XO + self._lora_scaling * lora_out_XO
 
     @staticmethod
