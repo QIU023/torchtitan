@@ -319,6 +319,8 @@ class KimiK3Model(MultimodalModel):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        attn_res_cache_offload: bool = False
+        """Park a pipeline rank's committed blocks on pinned host memory."""
 
         def update_from_config(self, *, config, **kwargs) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)

@@ -21,18 +21,27 @@ from .layout import BlockLayoutTables
 
 
 class PPRankLocalCache:
-    """Blocks a rank holds per micro-batch and the gradient deposits, shared by its stages."""
+    """Blocks a rank holds per micro-batch and the gradient deposits, shared by its stages;
+    given a device, a stored block parks on pinned host memory between commit and read."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, device: torch.device | None = None) -> None:
+        self._device = device
         self._blocks: dict[int, dict[int, torch.Tensor]] = {}
         self._deposits: dict[tuple[int, int], torch.Tensor] = {}
         self._counts: dict[tuple[int, int], int] = {}
 
     def put(self, mb: int, block_idx: int, block_TD: torch.Tensor) -> None:
+        if self._device is not None and block_TD.is_cuda:
+            host_TD = torch.empty_like(block_TD, device="cpu", pin_memory=True)
+            host_TD.copy_(block_TD, non_blocking=True)
+            block_TD = host_TD
         self._blocks.setdefault(mb, {})[block_idx] = block_TD
 
     def blocks(self, mb: int) -> dict[int, torch.Tensor]:
-        return self._blocks.get(mb, {})
+        held = self._blocks.get(mb, {})
+        if self._device is None:
+            return held
+        return {b: t.to(self._device, non_blocking=True) for b, t in held.items()}
 
     def release(self, mb: int) -> None:
         """Free the blocks of ``mb``; the deposits stay until collected."""

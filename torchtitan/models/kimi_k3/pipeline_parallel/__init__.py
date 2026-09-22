@@ -90,7 +90,14 @@ def pipeline_kimi_k3(model: BaseModel, *, attn_res_cache: bool = True, **kwargs)
         layer_to_stage=layer_to_stage,
         cache=attn_res_cache,
     )
-    store = PPRankLocalCache()
+    offload = kwargs["model_config"].attn_res_cache_offload
+    if offload and not attn_res_cache:
+        raise NotImplementedError(
+            "attn_res_cache_offload parks the blocks a rank holds between hops, "
+            "which only the cached transport keeps; it has no effect when every "
+            "hop carries the whole stack."
+        )
+    store = PPRankLocalCache(device=kwargs["device"] if offload else None)
     for stage in stages:
         stage.set_routing(layout, store)
     logger.info(
