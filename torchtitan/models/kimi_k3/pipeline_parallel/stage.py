@@ -11,6 +11,8 @@ Suffixes: T tokens, N blocks, D model dim.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -125,6 +127,15 @@ class AttnResPipelineStage(PipelineStage):
         # per micro-batch: the stack's block order and the blocks the delta carried in
         self._order: dict[int, list[int]] = {}
         self._delta_in: dict[int, list[int]] = {}
+        self._forward_context: Callable[
+            [], contextlib.AbstractContextManager[Any]
+        ] = contextlib.nullcontext
+
+    def set_forward_context(
+        self, make_context: Callable[[], contextlib.AbstractContextManager[Any]]
+    ) -> None:
+        """Run this stage's forward inside the context ``make_context()`` returns."""
+        self._forward_context = make_context
 
     def set_routing(self, layout: BlockLayoutTables, store: PPRankLocalCache) -> None:
         self._layout = layout
@@ -206,7 +217,8 @@ class AttnResPipelineStage(PipelineStage):
             order_in = self._order[fwd_chunk_id]
         composite_kwargs = kwargs or {}
 
-        output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
+        with self._forward_context():
+            output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
 
         if self.is_last:
             output_tuple = (
