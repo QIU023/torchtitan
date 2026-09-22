@@ -48,9 +48,10 @@ from torchtitan.models.utils import (
     quadratic_attention_flops_per_token,
 )
 from torchtitan.protocols.module import Module
-
 from .kda import KDA
 from .moe import KimiLatentMoE
+
+from .pp_balance import PPBalanceKnobs
 from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import KimiK3VisionEncoder
 
@@ -319,6 +320,8 @@ class KimiK3Model(MultimodalModel):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        pp_balance: PPBalanceKnobs = field(default_factory=PPBalanceKnobs)
+        """Which pipeline ranks park their saved activations on a peer, and where."""
 
         def update_from_config(self, *, config, **kwargs) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)

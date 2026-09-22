@@ -21,6 +21,7 @@ from torchtitan.distributed.pipeline_parallel import (
 )
 from torchtitan.protocols.model import BaseModel
 
+from ..pp_balance import install_pp_balance
 from .layout import infer_block_layout_tables, layer_to_stage_from_split
 from .stage import AttnResPipelineStage, PPRankLocalCache
 
@@ -78,7 +79,11 @@ def _require_loop_style(
 
 def pipeline_kimi_k3(model: BaseModel, *, attn_res_cache: bool = True, **kwargs):
     """pipelining_fn for Kimi K3; with attn_res_cache a hop carries only the blocks the
-    receiving rank lacks, without it the whole stack, and every rank must agree."""
+    receiving rank lacks, without it the whole stack, and every rank must agree.
+
+    The model config's pp_balance names the ranks that park the tensors autograd
+    saves in a pool on another rank (pp_balance.py).
+    """
     (
         pp_schedule,
         model_parts,
@@ -112,6 +117,7 @@ def pipeline_kimi_k3(model: BaseModel, *, attn_res_cache: bool = True, **kwargs)
     store = PPRankLocalCache()
     for stage in stages:
         stage.set_routing(layout, store)
+    install_pp_balance(stages, stages[0].group, kwargs["model_config"].pp_balance)
     logger.info(
         "Kimi K3 pipeline: %d stage(s) on this rank %s, block transport %s",
         len(stages),
