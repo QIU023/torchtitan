@@ -31,7 +31,7 @@ class BlockLayoutTables:
                 f"got {sorted(stage_to_rank)}"
             )
         self.stage_to_rank = dict(stage_to_rank)
-        self.num_blocks = num_blocks
+        self.num_blocks = -(-n_layers // layers_per_block)
         self.n_layers = n_layers
         self.layers_per_block = layers_per_block
         self.cache = cache
