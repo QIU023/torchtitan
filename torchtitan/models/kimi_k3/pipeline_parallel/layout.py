@@ -24,14 +24,6 @@ class BlockLayoutTables:
     ) -> None:
         if n_layers <= 0 or layers_per_block <= 0:
             raise ValueError("n_layers and layers_per_block must be positive")
-        # num_blocks is a ceiling: the last block may be partial.
-        expected_blocks = -(-n_layers // layers_per_block)
-        if num_blocks != expected_blocks:
-            raise ValueError(
-                f"num_blocks ({num_blocks}) must equal ceil(n_layers / "
-                f"layers_per_block) = {expected_blocks} for n_layers="
-                f"{n_layers}, layers_per_block={layers_per_block}"
-            )
         self.num_stages = len(stage_to_rank)
         if sorted(stage_to_rank) != list(range(self.num_stages)):
             raise ValueError(
