@@ -498,11 +498,8 @@ class KimiK3Model(Decoder):
         if spmd.is_type_checking():
             spmd.assert_type(h_TD, {MeshAxisName.DP: spmd.S(0)})
 
-        block_residual_TND = (
-            block_residual_in
-            if block_residual_in is not None
-            else h_TD.unsqueeze(1)[:, :0]
-        )
+        if block_residual_TND is None:
+            block_residual_TND = h_TD.unsqueeze(1)[:, :0]
         for layer in self.layers.values():
             h_TD, block_residual_TND = layer(
                 h_TD,
