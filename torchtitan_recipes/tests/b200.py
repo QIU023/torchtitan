@@ -73,6 +73,10 @@ def kimi_k3_debugmodel_pp4_vp4() -> Trainer.Config:
         *[[f"layers.{i}"] for i in range(5, 17)],
         ["norm", "lm_head", "output_res_proj", "output_res_norm"],
     ]
+    # DistMuon refuses a stage where a param-group pattern matches nothing (the
+    # head-only stage here) and refuses tensor parallel; the pipeline cells train
+    # with AdamW.
+    config.optimizer = default_adamw(lr=8e-4)
     return config
 
 
@@ -90,4 +94,8 @@ def kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2() -> Trainer.Config:
     config.parallelism.pipeline_parallel_degree = 2
     config.parallelism.pipeline_parallel_schedule = "1F1B"
     config.parallelism.num_pp_microbatches = 4
+    # DistMuon refuses a stage where a param-group pattern matches nothing (the
+    # head-only stage here) and refuses tensor parallel; the pipeline cells train
+    # with AdamW.
+    config.optimizer = default_adamw(lr=8e-4)
     return config
