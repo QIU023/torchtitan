@@ -219,7 +219,7 @@ def pipeline_with_first_last_stage_modules(
             num_virtual_stages, num_layers, input_weight, output_weight
         )
 
-        def present(module_fqns: Sequence[str]) -> list[str]:
+        def get_present_modules(module_fqns: Sequence[str]) -> list[str]:
             return [
                 module_fqn
                 for module_fqn in module_fqns
