@@ -99,6 +99,8 @@ class HuggingFaceStorageReaderTest(unittest.TestCase):
                 )
                 self.assertEqual(reader.thread_count, 3)
 
+from tests.unit_tests.cpu.mx_qat_test_utils import write_mixed_checkpoint_metadata
+
 
 class NativeFusedLinearStateDictAdapterTest(unittest.TestCase):
     def test_stacked_helpers_support_nonleading_projection_dim(self) -> None:
@@ -200,17 +202,12 @@ class KimiK3StateDictAdapterTest(unittest.TestCase):
             hf_assets_path=None,
         )
 
+    def _write_checkpoint_metadata(self, path):
+        return write_mixed_checkpoint_metadata(Path(path), self.adapter)
+
     def test_quantized_load_uses_packed_pair_reader(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "config.json").write_text(
-                json.dumps(
-                    {
-                        "text_config": {
-                            "quantization_config": deepcopy(MXFP4_QUANTIZATION_CONFIG),
-                        }
-                    }
-                )
-            )
+            self._write_checkpoint_metadata(directory)
             reader = self.adapter.get_hf_storage_reader(
                 directory,
                 from_quantized=True,
@@ -241,11 +238,11 @@ class KimiK3StateDictAdapterTest(unittest.TestCase):
             "language_model.model.layers.1.block_sparse_moe.gate.weight"
             in reader.spec.target_fqns
         )
-        self.assertIn(
+        self.assertNotIn(
             "language_model.model.layers.1.block_sparse_moe.routed_expert_up_proj.weight",
             reader.spec.target_fqns,
         )
-        self.assertIn(
+        self.assertNotIn(
             "language_model.model.layers.1.mlp_res_proj.weight", reader.spec.target_fqns
         )
 
@@ -264,7 +261,9 @@ class KimiK3StateDictAdapterTest(unittest.TestCase):
         self.adapter._validate_qat_policy(policy)
         self.assertTrue(type(model.layers[1].moe.routed_up)._owner._mx_qat)
 
-    def test_qat_rejects_expert_only_selection_for_released_policy(self) -> None:
+    def test_qat_rejects_expert_only_selection_when_dense_weights_are_packed(
+        self,
+    ) -> None:
         from torchtitan.config.transform import MXQATTransform
         from torchtitan.quantization.mx_qat.checkpoint import MXFP4CheckpointPolicy
 
@@ -294,11 +293,32 @@ class KimiK3StateDictAdapterTest(unittest.TestCase):
 
         recipe = kimi_k3_debugmodel_mx_qat(seq_len=16)
         self.assertFalse(recipe.checkpointer.initial_load_in_hf_quantized)
-        recipe = kimi_k3_debugmodel_mx_qat(
-            seq_len=16, checkpoint_path="/tmp/packed-kimi"
-        )
-        self.assertTrue(recipe.checkpointer.initial_load_in_hf_quantized)
-        self.assertEqual(recipe.checkpointer.initial_load_path, "/tmp/packed-kimi")
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_checkpoint_metadata(directory)
+            recipe = kimi_k3_debugmodel_mx_qat(seq_len=16, checkpoint_path=directory)
+            self.assertTrue(recipe.checkpointer.initial_load_in_hf_quantized)
+            self.assertEqual(recipe.checkpointer.initial_load_path, directory)
+            self.assertFalse(
+                getattr(
+                    type(recipe.model.layers[1].moe.routed_up)._owner, "_mx_qat", False
+                )
+            )
+
+    def test_manifest_qat_rejects_mixed_experts_in_one_parameter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._write_checkpoint_metadata(directory)
+            prefix = "language_model.model.layers.1.block_sparse_moe.experts.0.w1"
+            del manifest[prefix + ".weight_packed"]
+            del manifest[prefix + ".weight_scale"]
+            manifest[prefix + ".weight"] = "dense.safetensors"
+            Path(directory, "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": manifest})
+            )
+            policy = self.adapter.mxfp4_policy(directory)
+            with self.assertRaisesRegex(
+                ValueError, "cannot mix packed and BF16 experts"
+            ):
+                self.adapter.qat_weight_fqns(policy)
 
     def test_quantized_load_rejects_missing_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
