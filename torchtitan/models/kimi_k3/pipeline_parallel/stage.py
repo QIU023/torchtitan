@@ -52,7 +52,7 @@ class PPRankLocalCache:
         return any(key[0] == mb for key in self._deposits)
 
 
-def assemble_stack(
+def _assemble_stack(
     hidden_TD: torch.Tensor,
     delta_TND: torch.Tensor,
     delta_blocks: list[int],
