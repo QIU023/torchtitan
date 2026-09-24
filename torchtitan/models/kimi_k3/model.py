@@ -11,13 +11,19 @@ from typing import Any, cast
 
 import spmd_types as spmd
 import torch
+import torch_remat as remat
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.function import Function
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.activation_checkpoint import (
+    ActivationCheckpointingConfig,
+    FullAC,
+    RegionAC,
+    SelectiveAC,
+)
 from torchtitan.distributed.parallel_dims import MeshAxisName, ParallelDims
 from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
@@ -202,6 +208,22 @@ class AttentionResidual(Function[torch.Tensor]):
         return output_TD.to(values_TND.dtype)
 
 
+def _checkpointed_attention_residual(
+    name: str,
+    aggregate: AttentionResidual,
+    prefix_sum_TD: torch.Tensor,
+    block_residual_TND: torch.Tensor,
+    projection: Linear,
+    norm: RMSNorm,
+) -> torch.Tensor:
+    args = (prefix_sum_TD, block_residual_TND, projection, norm)
+    if torch.is_grad_enabled() and (
+        prefix_sum_TD.requires_grad or block_residual_TND.requires_grad
+    ):
+        return remat.checkpoint(region_name=name)(aggregate)(*args)
+    return aggregate(*args)
+
+
 class KimiK3TransformerBlock(Module):
     """Hybrid KDA/MLA decoder block with Kimi attention residuals."""
 
@@ -268,6 +290,22 @@ class KimiK3TransformerBlock(Module):
         self.ffn_res_proj = config.ffn_res_proj.build()
         self.attention_res_fn = config.attention_res_fn.build()
         self.ffn_res_fn = config.ffn_res_fn.build()
+        # False when an activation-checkpointing policy wraps the whole block.
+        self.checkpoint_residual = True
+
+    def _attention_residual(
+        self,
+        name: str,
+        aggregate: AttentionResidual,
+        prefix_sum_TD: torch.Tensor,
+        block_residual_TND: torch.Tensor,
+        projection: Linear,
+        norm: RMSNorm,
+    ) -> torch.Tensor:
+        args = (prefix_sum_TD, block_residual_TND, projection, norm)
+        if not self.checkpoint_residual:
+            return aggregate(*args)
+        return _checkpointed_attention_residual(name, aggregate, *args)
 
     def forward(
         self,
@@ -283,7 +321,9 @@ class KimiK3TransformerBlock(Module):
         if block_residual_TND.shape[1] > 0:
             assert self.attention_res_proj is not None
             assert self.attention_res_norm is not None
-            x_TD = self.attention_res_fn(
+            x_TD = self._attention_residual(
+                "attention_res",
+                self.attention_res_fn,
                 prefix_sum_TD,
                 block_residual_TND,
                 self.attention_res_proj,
@@ -311,7 +351,9 @@ class KimiK3TransformerBlock(Module):
             h_TD = self.delta_attention(h_TD, layer_mask, positions)
         prefix_sum_TD = h_TD if opens_block else prefix_sum_TD + h_TD
 
-        h_TD = self.ffn_res_fn(
+        h_TD = self._attention_residual(
+            "ffn_res",
+            self.ffn_res_fn,
             prefix_sum_TD,
             block_residual_TND,
             self.ffn_res_proj,
@@ -442,6 +484,13 @@ class KimiK3Model(MultimodalModel):
             annotate_replicated_parameters(self, parallel_dims)
             self._parallelize(parallel_dims)
             if ac_config is not None:
+                if isinstance(
+                    ac_config, (SelectiveAC.Config, FullAC.Config, RegionAC.Config)
+                ):
+                    # These policies checkpoint each whole block, residual math included.
+                    for block in self.layers.values():
+                        assert isinstance(block, KimiK3TransformerBlock)
+                        block.checkpoint_residual = False
                 policy = ac_config.build(dump_folder=dump_folder)
                 policy.apply(self)
                 if self.vision_encoder is not None:
@@ -603,7 +652,9 @@ class KimiK3Model(MultimodalModel):
                 padding_mask=padding_mask,
             )
 
-        h_TD = self.output_res_fn(
+        h_TD = _checkpointed_attention_residual(
+            "output_res",
+            self.output_res_fn,
             h_TD,
             block_residual_TND,
             self.output_res_proj,
