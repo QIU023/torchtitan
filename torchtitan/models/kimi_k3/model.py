@@ -15,6 +15,8 @@ from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.configurable import Configurable
+from torchtitan.config.function import Function
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.parallel_dims import MeshAxisName, ParallelDims
 from torchtitan.distributed.spmd_types import (
@@ -170,24 +172,34 @@ class KimiMLAAttention(BaseAttention):
         return self.wo(out_TD)
 
 
-def _apply_attention_residual(
-    prefix_sum_TD: torch.Tensor,
-    block_residual_TND: torch.Tensor,
-    projection: Linear,
-    norm: RMSNorm,
-) -> torch.Tensor:
-    """Apply Kimi's block-level attention residual in FP32."""
-    assert norm.eps is not None
+class AttentionResidual(Function[torch.Tensor]):
+    """Kimi's block-level attention residual: a depth softmax over the block stack, in FP32."""
 
-    values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
-    values_float = values_TND.float()
-    variance = values_float.pow(2).mean(dim=-1, keepdim=True)
-    keys_TND = values_float * torch.rsqrt(variance + norm.eps)
-    score_weight_D = norm.weight.float() * projection.weight.squeeze(0).float()
-    scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
-    probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
-    output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
-    return output_TD.to(values_TND.dtype)
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):  # pyrefly: ignore[bad-override]
+        pass
+
+    def __init__(self, config: Config) -> None:
+        pass
+
+    def __call__(
+        self,
+        prefix_sum_TD: torch.Tensor,
+        block_residual_TND: torch.Tensor,
+        projection: Linear,
+        norm: RMSNorm,
+    ) -> torch.Tensor:
+        assert norm.eps is not None
+
+        values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
+        values_float = values_TND.float()
+        variance = values_float.pow(2).mean(dim=-1, keepdim=True)
+        keys_TND = values_float * torch.rsqrt(variance + norm.eps)
+        score_weight_D = norm.weight.float() * projection.weight.squeeze(0).float()
+        scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
+        probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
+        output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
+        return output_TD.to(values_TND.dtype)
 
 
 class KimiK3TransformerBlock(Module):
@@ -207,6 +219,12 @@ class KimiK3TransformerBlock(Module):
         attention_res_proj: Linear.Config | None
         ffn_res_norm: RMSNorm.Config
         ffn_res_proj: Linear.Config
+        attention_res_fn: AttentionResidual.Config = field(
+            default_factory=AttentionResidual.Config
+        )
+        ffn_res_fn: AttentionResidual.Config = field(
+            default_factory=AttentionResidual.Config
+        )
 
     def __init__(self, config: Config):
         super().__init__()
@@ -248,6 +266,8 @@ class KimiK3TransformerBlock(Module):
         )
         self.ffn_res_norm = config.ffn_res_norm.build()
         self.ffn_res_proj = config.ffn_res_proj.build()
+        self.attention_res_fn = config.attention_res_fn.build()
+        self.ffn_res_fn = config.ffn_res_fn.build()
 
     def forward(
         self,
@@ -263,7 +283,7 @@ class KimiK3TransformerBlock(Module):
         if block_residual_TND.shape[1] > 0:
             assert self.attention_res_proj is not None
             assert self.attention_res_norm is not None
-            x_TD = _apply_attention_residual(
+            x_TD = self.attention_res_fn(
                 prefix_sum_TD,
                 block_residual_TND,
                 self.attention_res_proj,
@@ -291,7 +311,7 @@ class KimiK3TransformerBlock(Module):
             h_TD = self.delta_attention(h_TD, layer_mask, positions)
         prefix_sum_TD = h_TD if opens_block else prefix_sum_TD + h_TD
 
-        h_TD = _apply_attention_residual(
+        h_TD = self.ffn_res_fn(
             prefix_sum_TD,
             block_residual_TND,
             self.ffn_res_proj,
@@ -323,6 +343,9 @@ class KimiK3Model(MultimodalModel):
         layers: list[KimiK3TransformerBlock.Config]
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
+        output_res_fn: AttentionResidual.Config = field(
+            default_factory=AttentionResidual.Config
+        )
         vision_encoder: KimiK3VisionEncoder.Config | None = None
 
         def update_from_config(self, *, config, **kwargs) -> None:
@@ -381,6 +404,7 @@ class KimiK3Model(MultimodalModel):
         super().__init__(config)
         self.output_res_norm = config.output_res_norm.build()
         self.output_res_proj = config.output_res_proj.build()
+        self.output_res_fn = config.output_res_fn.build()
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
         )
@@ -579,7 +603,7 @@ class KimiK3Model(MultimodalModel):
                 padding_mask=padding_mask,
             )
 
-        h_TD = _apply_attention_residual(
+        h_TD = self.output_res_fn(
             h_TD,
             block_residual_TND,
             self.output_res_proj,
