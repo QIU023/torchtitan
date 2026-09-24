@@ -57,26 +57,7 @@ def llama3_debugmodel_nvfp4_fsdp2() -> Trainer.Config:
     return config
 
 
-def kimi_k3_debugmodel_pp4_vp4() -> Trainer.Config:
-    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
-
-    config = kimi_k3_debugmodel()
-    _set_spmd_typechecking(config, typechecking=False)
-    config.parallelism.pipeline_parallel_degree = 4
-    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
-    config.parallelism.num_pp_microbatches = 4
-    # 16 stages: one layer per stage from layer 5 on, the head alone on the last.
-    config.parallelism.pipeline_parallel_module_fqns_per_model_part = [
-        ["vision_encoder", "tok_embeddings", "layers.0"],
-        ["layers.1", "layers.2"],
-        ["layers.3", "layers.4"],
-        *[[f"layers.{i}"] for i in range(5, 17)],
-        ["norm", "lm_head", "output_res_proj", "output_res_norm"],
-    ]
-    return config
-
-
-def kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2() -> Trainer.Config:
+def kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2_vpp4() -> Trainer.Config:
     from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
 
     config = kimi_k3_debugmodel()
@@ -88,8 +69,21 @@ def kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2() -> Trainer.Config:
     config.parallelism.enable_sequence_parallel = True
     config.parallelism.expert_parallel_degree = 2
     config.parallelism.pipeline_parallel_degree = 2
-    config.parallelism.pipeline_parallel_schedule = "1F1B"
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
     config.parallelism.num_pp_microbatches = 4
+    # Four stages per rank (the default is two), the shape where a hop can carry
+    # no new block and a block has three later readers on its rank. The split is
+    # the default one for eight stages.
+    config.parallelism.pipeline_parallel_module_fqns_per_model_part = [
+        ["vision_encoder", "tok_embeddings", "layers.0", "layers.1"],
+        ["layers.2", "layers.3", "layers.4"],
+        ["layers.5", "layers.6", "layers.7"],
+        ["layers.8", "layers.9"],
+        ["layers.10", "layers.11"],
+        ["layers.12", "layers.13"],
+        ["layers.14", "layers.15"],
+        ["layers.16", "norm", "lm_head", "output_res_proj", "output_res_norm"],
+    ]
     # DistMuon does not support tensor parallelism yet (#3353), so this cell
     # keeps AdamW the way kimi_k3_debugmodel_mm does.
     config.optimizer = default_adamw(lr=8e-4)
