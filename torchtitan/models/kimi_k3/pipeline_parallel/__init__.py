@@ -24,6 +24,9 @@ from torchtitan.distributed.pipeline_parallel import (
 )
 from torchtitan.protocols.model import BaseModel
 
+from torchtitan.distributed.activation_storage import ActivationStorage, HostBackend
+
+from .activations import ActivationPlan
 from .cache import PPRankLocalCache
 from .layout import infer_block_layout_tables, layer_to_stage_from_split
 from .stage import _grad_send_wait_points, _GradSendWaits, AttnResPipelineStage
@@ -134,6 +137,28 @@ def pipeline_kimi_k3(model: BaseModel, *, attn_res_cache: bool = True, **kwargs)
             wait_sends_at_backward=wait_sends_at_backward,
             grad_send_waits=grad_send_waits,
         )
+    offload = model_config.pp_offload
+    if offload.microbatches > 0:
+        if not wait_sends_at_backward:
+            raise ValueError(
+                "pp_offload brings saves back a set number of actions ahead, which needs "
+                "the action-list schedules (Interleaved1F1B and the like)."
+            )
+        rank = stages[0].group_rank
+        plan = ActivationPlan(
+            pp_schedule.pipeline_order[rank],
+            {stage.stage_index: len(stage.submod.layers) for stage in stages},
+            [("host", offload.microbatches, offload.lead)],
+        )
+        storage = ActivationStorage(
+            stages[0].device,
+            {"host": HostBackend()},
+            lambda tensor, chunk: plan.backend(chunk[0], chunk[1]),
+            min_tensor_bytes=offload.min_tensor_mib << 20,
+        )
+        for stage in stages:
+            storage.register_stage(stage.stage_index, stage.submod.layers)
+            stage.set_activation_storage(storage, plan)
     logger.info(
         "Kimi K3 pipeline: %d stage(s) on this rank %s, block transport %s",
         len(stages),

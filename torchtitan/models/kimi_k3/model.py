@@ -43,6 +43,7 @@ from torchtitan.models.common.multimodal import (
 )
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
+from torchtitan.models.kimi_k3.pipeline_parallel.activations import PPOffloadKnobs
 from torchtitan.models.kimi_k3.sharding import set_kimi_k3_sharding_config
 from torchtitan.models.utils import (
     delta_rule_flops_per_token,
@@ -333,6 +334,8 @@ class KimiK3Model(MultimodalModel):
         output_res_norm: RMSNorm.Config
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
+        pp_offload: PPOffloadKnobs = field(default_factory=PPOffloadKnobs)
+        """Pipeline ranks park the activations they hold longest on host memory."""
 
         def update_from_config(self, *, config, **kwargs) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)

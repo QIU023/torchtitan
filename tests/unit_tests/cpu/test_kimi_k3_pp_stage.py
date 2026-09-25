@@ -98,6 +98,7 @@ class TestForwardOnly(unittest.TestCase):
         stage._order = {0: [0, 1]}
         stage._delta_in = {0: [1]}
         stage._fwd_send_works = {}
+        stage._activations = None
         AttnResPipelineStage.backward_one_chunk(stage, 0)
         self.assertEqual((stage.fwd_cache, stage._order, stage._delta_in), ({}, {}, {}))
 

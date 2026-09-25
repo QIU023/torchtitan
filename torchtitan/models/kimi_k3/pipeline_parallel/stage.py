@@ -12,6 +12,7 @@ The wire format of a hop's blocks is [K, T, D], one contiguous row per block.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import torch
@@ -20,6 +21,9 @@ from torch.distributed.pipelining._utils import flatten_args
 from torch.distributed.pipelining.schedules import _batch_p2p, _ComputationType
 from torch.distributed.pipelining.stage import _make_tensor_from_meta
 
+from torchtitan.distributed.activation_storage import ActivationStorage
+
+from .activations import ActivationPlan
 from .cache import PPRankLocalCache
 from .layout import BlockLayoutTables
 
@@ -166,6 +170,7 @@ class AttnResPipelineStage(PipelineStage):
         self._rows_needed = 0
         self._wait_sends_at_backward = False
         self._grad_send_waits: _GradSendWaits | None = None
+        self._activations: tuple[ActivationStorage, ActivationPlan] | None = None
         # per micro-batch: the stack's block order and the blocks the delta carried in
         self._order: dict[int, list[int]] = {}
         self._delta_in: dict[int, list[int]] = {}
@@ -190,6 +195,16 @@ class AttnResPipelineStage(PipelineStage):
             + len(layout.commits_at(s))
             for s in mine
         )
+
+    def set_activation_storage(self, storage: ActivationStorage, plan: ActivationPlan) -> None:
+        """Route this stage's saves through ``storage`` for the micro-batches ``plan`` moves."""
+        self._activations = (storage, plan)
+
+    def _prefetch_due(self, kind: str, mb: int) -> None:
+        if self._activations is not None:
+            storage, plan = self._activations
+            for stage, due_mb in plan.due(kind, self.stage_index, mb):
+                storage.prefetch_first(stage, due_mb)
 
     def layout(self) -> BlockLayoutTables:
         if self._layout is None:
@@ -346,6 +361,7 @@ class AttnResPipelineStage(PipelineStage):
         store = self.store()
         if self._grad_send_waits is not None:
             self._grad_send_waits.wait(self.stage_index, fwd_chunk_id)
+        self._prefetch_due("F", fwd_chunk_id)
         if self.is_first:
             composite_args: tuple[Any, ...] = args
             order_in: list[int] = []
@@ -357,7 +373,13 @@ class AttnResPipelineStage(PipelineStage):
             composite_args = (hidden_TD, stack_TND)
             order_in = self._order[fwd_chunk_id]
         composite_kwargs = kwargs or {}
-        output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
+        saves = contextlib.nullcontext()
+        if self._activations is not None and self.has_backward:
+            saves = self._activations[0].forward(
+                self.stage_index, fwd_chunk_id, keep=flatten_args(composite_args)
+            )
+        with saves:
+            output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
         if self.is_last:
             output_tuple = (
                 (output,) if isinstance(output, torch.Tensor) else tuple(output)
@@ -434,12 +456,15 @@ class AttnResPipelineStage(PipelineStage):
     ):
         for work in self._fwd_send_works.pop(bwd_chunk_id, []):
             work.wait()
+        self._prefetch_due("B", bwd_chunk_id)
         super().backward_one_chunk(
             bwd_chunk_id,
             loss=loss,
             full_backward=full_backward,
             last_backward=last_backward,
         )
+        if self._activations is not None and full_backward:
+            self._activations[0].finish(self.stage_index, bwd_chunk_id)
         if not self.has_backward:
             # Forward-only pass (schedule.eval): no backward ran; drop the forward's bookkeeping.
             self.fwd_cache.pop(bwd_chunk_id, None)
@@ -492,6 +517,12 @@ class AttnResPipelineStage(PipelineStage):
                     "deposits left uncollected after the rank's last backward"
                 )
             store.release(bwd_chunk_id)
+
+    def backward_weight_one_chunk(self, bwd_chunk_id: int, last_backward=False):
+        super().backward_weight_one_chunk(bwd_chunk_id, last_backward=last_backward)
+        # the weight half of a split backward reads the saves again
+        if self._activations is not None:
+            self._activations[0].finish(self.stage_index, bwd_chunk_id)
 
     def _compute_outputs(
         self, *args: torch.Tensor, module: torch.nn.Module, **kwargs: Any
