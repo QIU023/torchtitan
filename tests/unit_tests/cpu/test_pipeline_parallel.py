@@ -17,6 +17,7 @@ from torchtitan.distributed.pipeline_parallel import (
     _get_pipeline_metadata,
     _get_pp_rank_to_stage_indices_mapping,
 )
+from torchtitan.training_engine import TrainingEngine
 
 
 def test_pipeline_with_first_last_stage_modules_prepends_present_modules(monkeypatch):
@@ -343,3 +344,12 @@ def test_layers_per_stage_sizes_the_derived_split(monkeypatch):
     unsized = dataclasses.replace(parallelism, pipeline_parallel_layers_per_stage=None)
     assert len(split) == num_stages
     assert num_stages != _get_pipeline_metadata(parallel_dims, unsized, model_config)[0]
+
+
+def test_engine_config_refuses_a_split_with_layers_per_stage():
+    both = ParallelismConfig(
+        pipeline_parallel_layers_per_stage=2,
+        pipeline_parallel_module_fqns_per_model_part=[["tok_embeddings"], ["norm"]],
+    )
+    with pytest.raises(ValueError, match="set only one of them"):
+        TrainingEngine.Config(parallelism=both)
