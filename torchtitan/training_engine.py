@@ -136,6 +136,18 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 raise ValueError(
                     "parallelism.num_pp_microbatches must be greater than 0."
                 )
+            # Not in ParallelismConfig.__post_init__: pipelining helpers write the
+            # split they derive into a copy that keeps layers_per_stage.
+            if (
+                self.parallelism.pipeline_parallel_module_fqns_per_model_part
+                is not None
+                and self.parallelism.pipeline_parallel_layers_per_stage is not None
+            ):
+                raise ValueError(
+                    "parallelism.pipeline_parallel_module_fqns_per_model_part and "
+                    "parallelism.pipeline_parallel_layers_per_stage both set the "
+                    "pipeline split; set only one of them."
+                )
             num_tokens = self.training.num_tokens_per_microbatch_per_dp_rank
             sequence_parallel_degree = (
                 self.parallelism.tensor_parallel_degree
