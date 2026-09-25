@@ -251,9 +251,8 @@ def pipeline_with_first_last_stage_modules(
         model_config=model_config,
     )
     # The caller's config is not touched.
-    parallelism = dataclasses.replace(
-        parallelism, pipeline_parallel_module_fqns_per_model_part=fqn_per_part
-    )
+    parallelism = copy.copy(parallelism)
+    parallelism.pipeline_parallel_module_fqns_per_model_part = fqn_per_part
     return pipeline_llm(
         model,
         parallel_dims=parallel_dims,
