@@ -374,7 +374,11 @@ class AttnResPipelineStage(PipelineStage):
             order_in = self._order[fwd_chunk_id]
         composite_kwargs = kwargs or {}
         saves = contextlib.nullcontext()
-        if self._activations is not None and self.has_backward:
+        if (
+            self._activations is not None
+            and self.has_backward
+            and not self._activations[1].moves_nothing
+        ):
             saves = self._activations[0].forward(
                 self.stage_index, fwd_chunk_id, keep=flatten_args(composite_args)
             )

@@ -31,6 +31,26 @@ class PPOffloadKnobs:
     """Saves smaller than this stay on the device."""
 
 
+@dataclass(kw_only=True)
+class PPBalanceKnobs:
+    """Park the activations a heavy pipeline rank holds longest in a pool on a lighter rank."""
+
+    pairs: tuple[tuple[int, int], ...] = ()
+    """(source, destination) pipeline ranks; a destination's pool is split evenly among its sources."""
+
+    microbatches: int = 0
+    """Stage micro-batches per source whose saves go to its destination, the longest held first."""
+
+    lead: int = 1
+    """Actions before a stage's backward at which the saves of its last layer start coming back."""
+
+    pool_gib: float = 2.0
+    """Pool registered on each destination for the whole run."""
+
+    staging_mib: int = 256
+    """Registered buffer each source copies through."""
+
+
 class ActivationPlan:
     """A rank's moved stage micro-batches, where each goes, and the action that brings it back."""
 
@@ -68,6 +88,10 @@ class ActivationPlan:
                 self._backend[key] = backend
                 trigger = max(index[("B", *key)] - lead, index[("F", *key)] + 1)
                 self._due[actions[trigger]].append(key)
+
+    @property
+    def moves_nothing(self) -> bool:
+        return not self._backend
 
     def backend(self, stage: int, mb: int) -> str | None:
         return self._backend.get((stage, mb))

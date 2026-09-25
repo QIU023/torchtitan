@@ -19,7 +19,11 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
-from torchtitan.distributed.activation_storage import ActivationStorage, HostBackend
+from torchtitan.distributed.activation_storage import (
+    ActivationStorage,
+    HostBackend,
+    RemoteBackend,
+)
 from torchtitan.models.kimi_k3.pipeline_parallel.activations import ActivationPlan
 from torchtitan.models.kimi_k3.pipeline_parallel.cache import PPRankLocalCache
 from torchtitan.models.kimi_k3.pipeline_parallel.layout import infer_block_layout_tables
@@ -80,7 +84,7 @@ class TestPipelineActivationOffload(DTensorTestBase):
     def world_size(self) -> int:
         return 2
 
-    def _train_pipeline(self, park: int):
+    def _train_pipeline(self, park: int, remote: bool = False):
         torch.manual_seed(0)
         split = [[0, 1], [2, 3], [4, 5], [6, 7]]
         modules_all = [_Stage(l, first=s == 0, last=s == 3) for s, l in enumerate(split)]
@@ -102,14 +106,26 @@ class TestPipelineActivationOffload(DTensorTestBase):
         waits = _GradSendWaits(_grad_send_wait_points(schedule.pipeline_order, stage_to_rank, self.rank))
         storage = None
         if park:
+            backends: dict = {"host": HostBackend()}
+            moves = [("host", park, 1)]
+            if remote:
+                # rank 0 parks on rank 1 through mooncake's TCP transport
+                backends["remote"] = RemoteBackend(
+                    stages[0].group,
+                    dests={0: 1},
+                    pool_bytes=64 << 20,
+                    staging_bytes=16 << 20,
+                    device=torch.device("cpu"),
+                )
+                moves = [("remote", park, 1)] if self.rank == 0 else []
             plan = ActivationPlan(
                 schedule.pipeline_order[self.rank],
                 {stage.stage_index: len(stage.submod.layers) for stage in stages},
-                [("host", park, 1)],
+                moves,
             )
             storage = ActivationStorage(
                 torch.device("cpu"),
-                {"host": HostBackend()},
+                backends,
                 lambda tensor, chunk: plan.backend(chunk[0], chunk[1]),
                 min_tensor_bytes=0,
             )
@@ -146,3 +162,21 @@ class TestPipelineActivationOffload(DTensorTestBase):
             # each backward's first layer came back ahead of it, the rest one layer ahead
             self.assertEqual(storage.stats["late_fetches"], 0)
             self.assertFalse(storage._chunks)
+
+    @with_comms
+    def test_saves_parked_on_a_peer_leave_every_gradient_bitwise(self):
+        try:
+            from torchtitan.distributed.activation_storage import _load_transfer_engine
+
+            _load_transfer_engine()
+        except ImportError as err:
+            self.skipTest(str(err))
+        reference, ref_losses, _ = self._train_pipeline(park=0)
+        grads, losses, storage = self._train_pipeline(park=8, remote=True)
+        for key, grad in grads.items():
+            torch.testing.assert_close(grad, reference[key], rtol=0, atol=0)
+        for a, b in zip(losses, ref_losses):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        if self.rank == 0:
+            self.assertGreater(storage.stats["remote_bytes"], 0)
+        self.assertFalse(storage._chunks)
