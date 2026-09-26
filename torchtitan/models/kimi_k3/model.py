@@ -50,6 +50,7 @@ from torchtitan.models.common.multimodal import (
 )
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
+from torchtitan.models.kimi_k3.pipeline_parallel.activations import PPMemoryConfig
 from torchtitan.models.utils import (
     delta_rule_flops_per_token,
     get_nparams_and_active_nparams,
@@ -386,6 +387,8 @@ class KimiK3Model(MultimodalModel):
         local_compile_regions: list[str] = field(
             default_factory=lambda: ["loss", "gated_rmsnorm", "situglu"]
         )
+        pp_memory: PPMemoryConfig = field(default_factory=PPMemoryConfig)
+        """How each pipeline rank stores the tensors its backward reads."""
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int

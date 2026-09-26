@@ -11,24 +11,32 @@ Suffixes: T tokens, D model dim.
 
 import torch
 
+from torchtitan.distributed.activation_storage import ActivationStorage
+
 
 class PPRankLocalCache:
     """Blocks a rank holds per micro-batch and the gradient deposits, shared by its stages."""
 
-    def __init__(self) -> None:
+    def __init__(self, storage: ActivationStorage | None = None) -> None:
+        self._storage = storage
         self._blocks: dict[int, dict[int, torch.Tensor]] = {}
         self._deposits: dict[tuple[int, int], torch.Tensor] = {}
         self._counts: dict[tuple[int, int], int] = {}
 
     def put(self, mb: int, block_idx: int, block_TD: torch.Tensor) -> None:
         self._blocks.setdefault(mb, {})[block_idx] = block_TD
+        if self._storage is not None:
+            self._storage.pin(block_TD)
 
     def blocks(self, mb: int) -> dict[int, torch.Tensor]:
         return self._blocks.get(mb, {})
 
     def release(self, mb: int) -> None:
         """Free the blocks of ``mb``; the deposits stay until collected."""
-        self._blocks.pop(mb, None)
+        held = self._blocks.pop(mb, {})
+        if self._storage is not None:
+            for block_TD in held.values():
+                self._storage.unpin(block_TD)
 
     def deposit(self, mb: int, block_idx: int, grad_TD: torch.Tensor) -> None:
         key = (mb, block_idx)
