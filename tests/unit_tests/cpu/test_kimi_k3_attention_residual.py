@@ -8,6 +8,8 @@
 
 import dataclasses
 import unittest
+from copy import deepcopy
+from unittest.mock import patch
 
 import torch
 
@@ -88,6 +90,32 @@ def _dim() -> int:
     return model_registry("debugmodel", enable_sp=False).dim
 
 
+def _run_forward_backward(model: Module, x_TD: torch.Tensor):
+    model.zero_grad(set_to_none=True)
+    input_TD = x_TD.detach().clone().requires_grad_(True)
+    output = model(input_TD)
+    output.backward()
+    grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    return output.detach(), input_TD.grad, grads
+
+
+def _unwrapped_residual():
+    """The residual math without its checkpoint: the reference and the control."""
+    return patch.object(k3_model.remat, "checkpoint", lambda **_: (lambda fn: fn))
+
+
+def _saved_shapes(model: Module, x_TD: torch.Tensor) -> list[tuple[int, ...]]:
+    shapes = []
+
+    def pack(tensor):
+        shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        model(x_TD.detach().clone().requires_grad_(True))
+    return shapes
+
+
 class TestKimiK3AttentionResidualBlocks(unittest.TestCase):
     def test_a_block_opening_appends_the_blocks_it_was_given(self):
         opener = _TwoBlocks().layers["0"]
@@ -99,6 +127,64 @@ class TestKimiK3AttentionResidualBlocks(unittest.TestCase):
         self.assertEqual(len(blocks_TD), 2)
         self.assertIs(blocks_TD[0], given[0])
         self.assertIs(blocks_TD[1], x_TD)
+
+
+class TestKimiK3AttentionResidualRecompute(unittest.TestCase):
+    def test_residual_math_reruns_in_backward_bitwise(self):
+        model = _TwoBlocks()
+        reference = deepcopy(model)
+        x_TD = torch.randn(_TOKENS, _dim())
+        with _unwrapped_residual():
+            expected = _run_forward_backward(reference, x_TD)
+        calls = []
+        original = k3_model._apply_attention_residual
+
+        def counting(*args):
+            calls.append(None)
+            return original(*args)
+
+        with patch.object(k3_model, "_apply_attention_residual", counting):
+            actual = _run_forward_backward(model, x_TD)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+        self.assertEqual(actual[2].keys(), expected[2].keys())
+        for name, grad in expected[2].items():
+            torch.testing.assert_close(actual[2][name], grad, rtol=0, atol=0, msg=name)
+        # Three residual computations in forward, each run again in backward.
+        self.assertEqual(len(calls), 6)
+
+    def test_covered_block_runs_the_residual_once(self):
+        model = _TwoBlocks()
+        for block in model.layers.values():
+            assert isinstance(block, k3_model.KimiK3TransformerBlock)
+            block.checkpoint_residual = False
+        reference = deepcopy(model)
+        x_TD = torch.randn(_TOKENS, _dim())
+        with _unwrapped_residual():
+            expected = _run_forward_backward(reference, x_TD)
+        calls = []
+        original = k3_model._apply_attention_residual
+
+        def counting(*args):
+            calls.append(None)
+            return original(*args)
+
+        with patch.object(k3_model, "_apply_attention_residual", counting):
+            actual = _run_forward_backward(model, x_TD)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        for name, grad in expected[2].items():
+            torch.testing.assert_close(actual[2][name], grad, rtol=0, atol=0, msg=name)
+        # The block's own activation checkpoint is the recompute; no second one here.
+        self.assertEqual(len(calls), 3)
+
+    def test_no_stack_shaped_activation_is_saved(self):
+        model = _TwoBlocks()
+        x_TD = torch.randn(_TOKENS, _dim())
+        # Every residual here reads a one-entry stack plus the prefix sum.
+        stack_shape = (_TOKENS, 2, _dim())
+        with _unwrapped_residual():
+            self.assertIn(stack_shape, _saved_shapes(model, x_TD))
+        self.assertNotIn(stack_shape, _saved_shapes(model, x_TD))
 
 
 if __name__ == "__main__":
