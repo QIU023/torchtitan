@@ -44,15 +44,17 @@ class TestCarrier(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "routing expects"):
             _assemble_stack(hidden, delta, [2, 3], store)
 
-    def test_payload_is_the_routed_columns_of_the_model_stack(self):
+    def test_payload_is_the_routed_blocks_of_the_model_list(self):
         T, D = 4, 8
-        stack_out = torch.randn(T, 3, D, requires_grad=True)
-        payload = _pack_outgoing_delta(stack_out, [0, 1, 2], [1, 2])
+        blocks_out = [torch.randn(T, D, requires_grad=True) for _ in range(3)]
+        like = torch.randn(T, D)
+        payload = _pack_outgoing_delta(blocks_out, [0, 1, 2], [1, 2], like)
         self.assertEqual(tuple(payload.shape), (T, 2, D))
-        self.assertTrue(torch.equal(payload[:, 0], stack_out[:, 1]))
+        self.assertTrue(torch.equal(payload[:, 0], blocks_out[1]))
         self.assertTrue(payload.requires_grad)
         self.assertEqual(
-            tuple(_pack_outgoing_delta(stack_out, [0, 1, 2], []).shape), (T, 0, D)
+            tuple(_pack_outgoing_delta(blocks_out, [0, 1, 2], [], like).shape),
+            (T, 0, D),
         )
 
     def test_gradient_split_sends_the_received_and_deposits_the_stored(self):

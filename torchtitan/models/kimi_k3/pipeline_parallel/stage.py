@@ -46,21 +46,21 @@ def _assemble_stack(
 
 
 def _pack_outgoing_delta(
-    stack_out_TND: torch.Tensor,
+    blocks_out_TD: list[torch.Tensor],
     order_out: list[int],
     out_blocks: list[int],
+    like_TD: torch.Tensor,
 ) -> torch.Tensor:
-    """The blocks the next hop carries, as views of the model's stack."""
-    if stack_out_TND.shape[1] != len(order_out):
+    """The blocks the next hop carries, stacked from the model's block list."""
+    if len(blocks_out_TD) != len(order_out):
         raise ValueError(
-            f"the model returned {stack_out_TND.shape[1]} block(s); the routing "
+            f"the model returned {len(blocks_out_TD)} block(s); the routing "
             f"expects {len(order_out)} ({order_out})"
         )
-    pieces = [stack_out_TND[:, order_out.index(b)] for b in out_blocks]
+    pieces = [blocks_out_TD[order_out.index(b)] for b in out_blocks]
     if pieces:
         return torch.stack(pieces, dim=1)
-    num_tokens, _, dim = stack_out_TND.shape
-    return stack_out_TND.new_zeros(num_tokens, 0, dim)
+    return like_TD.new_zeros(like_TD.shape[0], 0, like_TD.shape[-1])
 
 
 def _split_stack_grad(
@@ -144,16 +144,20 @@ class AttnResPipelineStage(PipelineStage):
         return stack_TND
 
     def _commit_and_route(
-        self, mb: int, stack_out_TND: torch.Tensor, order_in: list[int]
+        self,
+        mb: int,
+        blocks_out_TD: list[torch.Tensor],
+        order_in: list[int],
+        like_TD: torch.Tensor,
     ) -> torch.Tensor:
         layout, store = self.layout(), self.store()
         my_commits = layout.commits_at(self.stage_index)
         order_out = order_in + my_commits
         if layout.cache:
             for i, b in enumerate(my_commits):
-                store.put(mb, b, stack_out_TND[:, len(order_in) + i].detach())
+                store.put(mb, b, blocks_out_TD[len(order_in) + i].detach())
         return _pack_outgoing_delta(
-            stack_out_TND, order_out, layout.delta_to_send(self.stage_index)
+            blocks_out_TD, order_out, layout.delta_to_send(self.stage_index), like_TD
         )
 
     def forward_one_chunk(
@@ -166,11 +170,14 @@ class AttnResPipelineStage(PipelineStage):
         store = self.store()
         if self.is_first:
             composite_args: tuple[Any, ...] = args
+            input_args: tuple[Any, ...] = args
             order_in: list[int] = []
         else:
             hidden_TD, delta_TND = self._retrieve_recv_activations(fwd_chunk_id)
             stack_TND = self._assemble(fwd_chunk_id, hidden_TD, delta_TND)
-            composite_args = (hidden_TD, stack_TND)
+            composite_args = (hidden_TD, list(stack_TND.unbind(1)))
+            # Core reads the input gradients off the stack leaf the blocks are views of.
+            input_args = (hidden_TD, stack_TND)
             order_in = self._order[fwd_chunk_id]
         composite_kwargs = kwargs or {}
 
@@ -183,13 +190,15 @@ class AttnResPipelineStage(PipelineStage):
             if save_forward_output:
                 self.output_chunks.append(output)
         else:
-            hidden_out_TD, stack_out_TND = output
-            payload_TND = self._commit_and_route(fwd_chunk_id, stack_out_TND, order_in)
+            hidden_out_TD, blocks_out_TD = output
+            payload_TND = self._commit_and_route(
+                fwd_chunk_id, blocks_out_TD, order_in, hidden_out_TD
+            )
             output_tuple = (hidden_out_TD, payload_TND)
 
         # flatten_args returns a list with detach=False; lists keep the checker on that overload.
         flatten_input_tensors: list[torch.Tensor] = list(
-            flatten_args(composite_args)
+            flatten_args(input_args)
         ) + list(flatten_args(composite_kwargs))
         self.fwd_cache[fwd_chunk_id] = (output_tuple, flatten_input_tensors)
 
@@ -318,13 +327,16 @@ class AttnResPipelineStage(PipelineStage):
             stack_TND, order_in = _assemble_stack(
                 hidden_TD, delta_TND, delta_blocks, held
             )
-            output = module(hidden_TD, stack_TND, **kwargs)
+            output = module(hidden_TD, list(stack_TND.unbind(1)), **kwargs)
         if self.is_last:
             return output
-        hidden_out_TD, stack_out_TND = output
+        hidden_out_TD, blocks_out_TD = output
         order_out = order_in + layout.commits_at(self.stage_index)
         payload_TND = _pack_outgoing_delta(
-            stack_out_TND, order_out, layout.delta_to_send(self.stage_index)
+            blocks_out_TD,
+            order_out,
+            layout.delta_to_send(self.stage_index),
+            hidden_out_TD,
         )
         return hidden_out_TD, payload_TND
 
