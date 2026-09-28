@@ -61,24 +61,25 @@ class _ExactStage(nn.Module):
             }
         )
 
-    def forward(self, hidden: torch.Tensor, stack: torch.Tensor | None = None):
+    def forward(self, hidden: torch.Tensor, blocks: list[torch.Tensor] | None = None):
         if self.first:
             hidden = F.pad(hidden, (INPUT, 0))
-            stack = hidden.new_zeros(hidden.shape[0], 0, DIM)
-        assert stack is not None
+            blocks = []
+        assert blocks is not None
         for layer in self.layers:
             if layer % LAYERS_PER_BLOCK == 0:
                 block = self.blocks[str(layer // LAYERS_PER_BLOCK)] * hidden[:, INPUT:]
-                stack = torch.cat((stack, block.unsqueeze(1)), dim=1)
+                blocks = [*blocks, block]
             for _ in range(2):
-                read = _read(stack, layer).unsqueeze(1)
+                read = _read(blocks, layer).unsqueeze(1)
                 hidden = hidden + F.pad(read, (READOUT, DIM - READOUT - 1))
         if self.last:
-            return hidden[:, READOUT] + _read(stack, HEAD)
-        return hidden, stack
+            return hidden[:, READOUT] + _read(blocks, HEAD)
+        return hidden, blocks
 
 
-def _read(stack: torch.Tensor, channel: int) -> torch.Tensor:
+def _read(blocks: list[torch.Tensor], channel: int) -> torch.Tensor:
+    stack = torch.stack(blocks, dim=1)
     weights = torch.arange(1, stack.shape[1] + 1, dtype=stack.dtype)
     return (stack[:, :, channel] * weights).sum(1)
 
