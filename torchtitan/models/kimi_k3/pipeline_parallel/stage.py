@@ -16,6 +16,8 @@ from typing import Any
 import torch
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining._utils import flatten_args
+from torch.distributed.pipelining.schedules import _batch_p2p, _ComputationType
+from torch.distributed.pipelining.stage import _make_tensor_from_meta
 
 from .cache import PPRankLocalCache
 from .layout import BlockLayoutTables
@@ -83,6 +85,64 @@ def _split_stack_grad(
     return grad_delta, deposits
 
 
+def _grad_send_wait_points(
+    order: dict[int, list[Any]], stage_to_rank: dict[int, int], rank: int
+) -> dict[tuple[int, int], tuple[int, int]]:
+    backward = {_ComputationType.FULL_BACKWARD, _ComputationType.BACKWARD_INPUT}
+    pos = {
+        r: {
+            (a.computation_type, a.stage_index, a.microbatch_index): i
+            for i, a in enumerate(actions)
+            if a is not None
+        }
+        for r, actions in order.items()
+    }
+    points: dict[tuple[int, int], tuple[int, int]] = {}
+    for i, a in enumerate(order[rank]):
+        if a is None or a.computation_type not in backward or a.stage_index == 0:
+            continue
+        s, mb = a.stage_index, a.microbatch_index
+        receiver = stage_to_rank[s - 1]
+        consumed = next(
+            (
+                pos[receiver][(kind, s - 1, mb)]
+                for kind in backward
+                if (kind, s - 1, mb) in pos[receiver]
+            ),
+            None,
+        )
+        if consumed is None:
+            continue
+        for b in order[receiver][consumed + 1 :]:
+            if b is None or b.computation_type != _ComputationType.FORWARD:
+                continue
+            fed = b.stage_index + 1
+            if stage_to_rank.get(fed) != rank:
+                continue
+            at = pos[rank].get((_ComputationType.FORWARD, fed, b.microbatch_index))
+            if at is not None and at > i:
+                points[(s, mb)] = (fed, b.microbatch_index)
+                break
+    return points
+
+
+class _GradSendWaits:
+    def __init__(self, points: dict[tuple[int, int], tuple[int, int]]) -> None:
+        self.points = points
+        self.pinned: dict[tuple[int, int], list] = {}
+
+    def issue(self, stage: int, mb: int, ops: list) -> bool:
+        point = self.points.get((stage, mb))
+        if point is None or not ops:
+            return False
+        self.pinned.setdefault(point, []).extend(_batch_p2p(ops))
+        return True
+
+    def wait(self, stage: int, mb: int) -> None:
+        for work in self.pinned.pop((stage, mb), []):
+            work.wait()
+
+
 class AttnResPipelineStage(PipelineStage):
     """``PipelineStage`` whose hops carry the block residual's delta."""
 
@@ -93,10 +153,22 @@ class AttnResPipelineStage(PipelineStage):
         # per micro-batch: the stack's block order and the blocks the delta carried in
         self._order: dict[int, list[int]] = {}
         self._delta_in: dict[int, list[int]] = {}
+        self._wait_sends_at_backward = False
+        self._grad_send_waits: _GradSendWaits | None = None
+        self._fwd_send_works: dict[int, list] = {}
 
-    def set_routing(self, layout: BlockLayoutTables, store: PPRankLocalCache) -> None:
+    def set_routing(
+        self,
+        layout: BlockLayoutTables,
+        store: PPRankLocalCache,
+        *,
+        wait_sends_at_backward: bool = False,
+        grad_send_waits: _GradSendWaits | None = None,
+    ) -> None:
         self._layout = layout
         self._store = store
+        self._wait_sends_at_backward = wait_sends_at_backward
+        self._grad_send_waits = grad_send_waits
 
     def layout(self) -> BlockLayoutTables:
         if self._layout is None:
@@ -121,6 +193,57 @@ class AttnResPipelineStage(PipelineStage):
         layout = self.layout()
         mine = [s for s, r in layout.stage_to_rank.items() if r == self.group_rank]
         return self.stage_index == max(mine)
+
+    def _setup_forward_recv_info(
+        self, num_microbatches: int, has_backward: bool
+    ) -> None:
+        super()._setup_forward_recv_info(num_microbatches, has_backward)
+        if self.is_first:
+            return
+        for chunk_id in range(num_microbatches):
+            for info in self.args_recv_info[chunk_id]:
+                if info.buffer is not None:
+                    info.buffer = info.buffer.new_empty(0)
+
+    def _setup_backward_recv_info(self, num_microbatches: int) -> None:
+        super()._setup_backward_recv_info(num_microbatches)
+        if self.is_last:
+            return
+        for mb_index in range(num_microbatches):
+            for info in self.grad_recv_info[mb_index]:
+                if info.buffer is not None:
+                    info.buffer = info.buffer.new_empty(0)
+
+    def get_fwd_recv_ops(self, fwd_chunk_id: int):
+        if not self.is_first:
+            for info in self.args_recv_info[fwd_chunk_id]:
+                if info.tensor_meta is not None:
+                    info.buffer = _make_tensor_from_meta(info.tensor_meta, self.device)
+        return super().get_fwd_recv_ops(fwd_chunk_id)
+
+    def get_fwd_send_ops(self, fwd_chunk_id: int):
+        ops = super().get_fwd_send_ops(fwd_chunk_id)
+        if self._wait_sends_at_backward and self.has_backward and ops:
+            # The receiver has used the tensors once this stage's backward of the micro-batch starts.
+            self._fwd_send_works[fwd_chunk_id] = _batch_p2p(ops)
+            return []
+        return ops
+
+    def get_bwd_send_ops(self, bwd_chunk_id: int):
+        ops = super().get_bwd_send_ops(bwd_chunk_id)
+        # Pinned until waited: a forward that consumes what the receiver made afterwards proves it arrived.
+        if self._grad_send_waits is not None and self._grad_send_waits.issue(
+            self.stage_index, bwd_chunk_id, ops
+        ):
+            return []
+        return ops
+
+    def get_bwd_recv_ops(self, bwd_chunk_id: int):
+        if self.has_backward and not self.is_last:
+            for info in self.grad_recv_info[bwd_chunk_id]:
+                if info.buffer is not None and info.tensor_meta is not None:
+                    info.buffer = _make_tensor_from_meta(info.tensor_meta, self.device)
+        return super().get_bwd_recv_ops(bwd_chunk_id)
 
     def _assemble(
         self, mb: int, hidden_TD: torch.Tensor, delta_TND: torch.Tensor
@@ -163,12 +286,17 @@ class AttnResPipelineStage(PipelineStage):
         kwargs: dict[str, Any] | None = None,
         save_forward_output: bool = True,
     ):
+        if self._grad_send_waits is not None:
+            self._grad_send_waits.wait(self.stage_index, fwd_chunk_id)
         store = self.store()
         if self.is_first:
             composite_args: tuple[Any, ...] = args
             order_in: list[int] = []
         else:
             hidden_TD, delta_TND = self._retrieve_recv_activations(fwd_chunk_id)
+            for info in self.args_recv_info[fwd_chunk_id]:
+                if info.buffer is not None:
+                    info.buffer = info.buffer.new_empty(0)
             stack_TND = self._assemble(fwd_chunk_id, hidden_TD, delta_TND)
             composite_args = (hidden_TD, stack_TND)
             order_in = self._order[fwd_chunk_id]
@@ -201,6 +329,9 @@ class AttnResPipelineStage(PipelineStage):
         grads = super()._retrieve_recv_grads(bwd_chunk_id)
         if self.is_last:
             return grads
+        for info in self.grad_recv_info[bwd_chunk_id]:
+            if info.buffer is not None:
+                info.buffer = info.buffer.new_empty(0)
         layout = self.layout()
         grad_hidden, grad_delta = grads
         mine = set(layout.commits_at(self.stage_index))
@@ -248,6 +379,8 @@ class AttnResPipelineStage(PipelineStage):
         full_backward: bool = True,
         last_backward=False,
     ):
+        for work in self._fwd_send_works.pop(bwd_chunk_id, []):
+            work.wait()
         super().backward_one_chunk(
             bwd_chunk_id,
             loss=loss,
