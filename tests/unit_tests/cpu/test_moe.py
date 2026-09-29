@@ -34,6 +34,7 @@ from torchtitan.models.common.linear import (
 from torchtitan.models.common.moe import (
     MicrobatchWiseLoadBalanceLoss,
     MoE,
+    MoonEPRoutedExperts,
     TokenChoiceTopKRouter,
 )
 from torchtitan.models.common.moe_sharding import (
@@ -44,6 +45,7 @@ from torchtitan.models.common.moe_sharding import (
     set_moe_sharding_config,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.token_dispatcher import MoonEPTokenDispatcher
 
 
 class _PassthroughRoutedExperts(nn.Module):
@@ -142,6 +144,18 @@ class TestMoE(unittest.TestCase):
         expected_RF = activation_fn.build()(gate_RF, up_RF)
         actual_RF = experts.activation_fn(gate_RF, up_RF)
         torch.testing.assert_close(actual_RF, expected_RF)
+
+    def test_moonep_backend_builds_moonep_experts_and_dispatcher(self):
+        config = make_routed_experts_config(
+            dim=128,
+            hidden_dim=128,
+            num_experts=8,
+            top_k=2,
+            param_init={},
+            comm_backend="moonep",
+        )
+        self.assertIsInstance(config, MoonEPRoutedExperts.Config)
+        self.assertIsInstance(config.token_dispatcher, MoonEPTokenDispatcher.Config)
 
     def test_routed_experts_own_postprocess_before_combine(self):
         config = replace(
