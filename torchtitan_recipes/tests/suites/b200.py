@@ -113,3 +113,11 @@ def kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2_vpp4() -> Trainer.Config:
         optimizers=[AdamW.Config(pattern=r".*", lr=8e-4)]
     )
     return config
+
+
+def kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2_vpp4_vision_dep() -> Trainer.Config:
+    config = kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2_vpp4()
+    config.model.vision_dep.enabled = True
+    config.model.vision_dep.bubble = True
+    set_rank_conditional_image_presence(config)
+    return config
