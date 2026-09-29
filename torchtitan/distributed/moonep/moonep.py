@@ -45,6 +45,7 @@ def get_buffer(
                 "one token count, hidden size, top-k, expert count and EP group."
             )
         return _buffer
+    # Never destroyed: destroy() syncs the device and barriers, which a CUDA-graph capture cannot take.
     _buffer = moonep.Buffer(
         S=num_tokens_per_rank,
         H=hidden,
@@ -52,6 +53,7 @@ def get_buffer(
         E=num_experts,
         num_ep_ranks=group.size(),
         group=group,
+        explicitly_destroy=True,
     )
     _buffer_key = key
     return _buffer
@@ -138,6 +140,8 @@ def reduce_rows(
     rank = dist.get_rank(group)
     for name in _PROJECTIONS:
         pools[name][rank].copy_(row_grads[name])
+    # reduce_grad reads the peers' slot gradients without a barrier; every rank's writes must land first.
+    dist.all_reduce(torch.zeros(1, device=row_grads["down"].device), group=group)
     buffer.reduce_grad(
         plan=plan,
         **{
