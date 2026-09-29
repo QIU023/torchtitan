@@ -136,6 +136,7 @@ def test_h100_tests_are_registered_in_separate_suite() -> None:
         "fsdp+tp+pp+float8",
         "fsdp_symm_mem",
         "hsdp+cp+float8",
+        "kimi_k3_fsdp+moonep",
         "qwen3_fsdp+deepep",
         "qwen3_5_moe_float8_lora",
     }
