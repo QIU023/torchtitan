@@ -96,5 +96,18 @@ def qwen3_moe_deepep_fsdp4_ep4() -> Trainer.Config:
     return config
 
 
+def kimi_k3_moonep_fsdp4_ep4() -> Trainer.Config:
+    from torchtitan.models.kimi_k3 import model_registry
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+
+    config = kimi_k3_debugmodel(seq_len=512)
+    config.model = model_registry(
+        "debugmodel", enable_sp=True, seq_len=512, moe_comm_backend="moonep"
+    )
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.expert_parallel_degree = 4
+    return config
+
+
 def qwen35_debugmodel_moe_float8_lora() -> Trainer.Config:
     return _qwen35_debugmodel_moe_float8_lora(seq_len=512)
