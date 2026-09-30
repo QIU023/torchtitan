@@ -1,0 +1,2 @@
+# Install in the matching GPU runtime with --no-deps.
+torchao @ git+https://github.com/elfiegg/ao.git@6352062064145e9ca0d37b05a677c420ba5a7bb6

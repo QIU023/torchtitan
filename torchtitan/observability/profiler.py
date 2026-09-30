@@ -368,7 +368,7 @@ class Profiler(Configurable):
                 wait=wait, warmup=warmup, active=active, **additional_params
             ),
             on_trace_ready=trace_handler,
-            record_shapes=True,
+            record_shapes=False,
         )
         torch_profiler.__enter__()
         torch_profiler.step_num = global_step
