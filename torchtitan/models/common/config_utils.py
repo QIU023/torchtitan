@@ -386,7 +386,7 @@ def make_token_dispatcher_config(
     - "deepep": Uses DeepEP custom kernels for H100/NVLink Switch
     - "hybridep": Uses HybridEP with TMA optimization for GB200/NVLink72
     - "moonep": Uses MoonEP, which balances each rank's routed tokens with
-      prefetched expert copies (Hopper or newer behind an NVSwitch)
+      prefetched expert copies (Kimi K3 only; Hopper or newer behind an NVSwitch)
 
     DeepEP/HybridEP requires installation:
     https://github.com/deepseek-ai/DeepEP

@@ -1106,6 +1106,15 @@ def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
             continue
         dispatcher_cfgs.append(token_dispatcher_cfg)
 
+    if any(isinstance(cfg, MoonEPTokenDispatcher.Config) for cfg in dispatcher_cfgs):
+        from torchtitan.models.kimi_k3.model import KimiK3Model
+
+        if not isinstance(model_config, KimiK3Model.Config):
+            raise ValueError(
+                "moe_comm_backend='moonep' is enabled for Kimi K3 only; it has not "
+                f"been validated on {type(model_config).__qualname__}."
+            )
+
     required_num_max_tokens_per_rank = None
     if dispatcher_cfgs:
         training = config.training
