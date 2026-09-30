@@ -45,7 +45,21 @@ from torchtitan.models.common.moe_sharding import (
     set_moe_sharding_config,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.token_dispatcher import MoonEPTokenDispatcher
+from torchtitan.models.common.token_dispatcher import (
+    MoonEPTokenDispatcher,
+    update_ep_token_dispatcher_config,
+)
+
+
+def _ep_runtime(tokens: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        parallelism=SimpleNamespace(
+            expert_parallel_degree=4,
+            context_parallel_degree=1,
+            tensor_parallel_degree=1,
+        ),
+        training=SimpleNamespace(num_tokens_per_microbatch_per_dp_rank=tokens),
+    )
 
 
 class _PassthroughRoutedExperts(nn.Module):
@@ -156,6 +170,31 @@ class TestMoE(unittest.TestCase):
         )
         self.assertIsInstance(config, MoonEPRoutedExperts.Config)
         self.assertIsInstance(config.token_dispatcher, MoonEPTokenDispatcher.Config)
+
+    def test_moonep_is_refused_outside_kimi_k3(self):
+        from torchtitan.models.qwen3 import model_registry
+
+        config = model_registry(
+            "debugmodel_moe", seq_len=512, moe_comm_backend="moonep"
+        )
+        with self.assertRaisesRegex(ValueError, "Kimi K3 only"):
+            update_ep_token_dispatcher_config(config, _ep_runtime(512))
+
+    def test_moonep_on_kimi_k3_gets_its_per_rank_token_count(self):
+        from torchtitan.models.kimi_k3 import model_registry
+
+        config = model_registry(
+            "debugmodel", moe_comm_backend="moonep", enable_sp=False, seq_len=512
+        )
+        update_ep_token_dispatcher_config(config, _ep_runtime(512))
+        dispatchers = [
+            moe.routed_experts.token_dispatcher
+            for _, moe, _, _ in config.traverse(MoE.Config)
+        ]
+        self.assertTrue(dispatchers)
+        for dispatcher in dispatchers:
+            self.assertIsInstance(dispatcher, MoonEPTokenDispatcher.Config)
+            self.assertEqual(dispatcher.num_max_tokens_per_rank, 512)
 
     def test_routed_experts_own_postprocess_before_combine(self):
         config = replace(
