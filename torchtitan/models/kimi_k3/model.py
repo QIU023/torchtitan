@@ -624,7 +624,7 @@ class KimiK3Model(MultimodalModel):
     def forward(  # pyrefly: ignore[bad-param-name-override, bad-override]
         self,
         tokens: torch.Tensor,
-        block_residual_TND: torch.Tensor | None = None,
+        blocks_TD: list[torch.Tensor] | None = None,
         *,
         pixel_values: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
@@ -635,7 +635,7 @@ class KimiK3Model(MultimodalModel):
         attention_metadata: AttentionMetadataMap | None = None,
         padding_mask: torch.Tensor | None = None,
         vision_bank_indices_T: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
 
@@ -666,9 +666,8 @@ class KimiK3Model(MultimodalModel):
                 ),
             )
 
-        blocks_TD = (
-            [] if block_residual_TND is None else list(block_residual_TND.unbind(1))
-        )
+        if blocks_TD is None:
+            blocks_TD = []
         for layer in self.layers.values():
             h_TD, *blocks_TD = layer(
                 h_TD,
@@ -685,9 +684,7 @@ class KimiK3Model(MultimodalModel):
             )
 
         if self.output_res_proj is None:
-            if not blocks_TD:
-                return h_TD, h_TD.unsqueeze(1)[:, :0]
-            return h_TD, torch.stack(blocks_TD, dim=1)
+            return h_TD, blocks_TD
         h_TD = _checkpointed_attention_residual(
             "output_res",
             h_TD,
