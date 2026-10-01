@@ -59,6 +59,13 @@ def get_buffer(
     return _buffer
 
 
+def current_buffer() -> tuple["moonep.Buffer", ProcessGroup]:
+    """Return the ``Buffer`` that ``get_buffer`` created and its EP group."""
+    if _buffer is None or _buffer_key is None:
+        raise RuntimeError("get_buffer() must run before the first MoonEP dispatch.")
+    return _buffer, _buffer_key[0]
+
+
 def _pool(
     name: str,
     rows: int,
