@@ -6,7 +6,13 @@
 
 """Configurations for the H100 integration-test suite."""
 
-from torchtitan.config.transform import apply_transforms, ContextParallelTransform
+from dataclasses import replace
+
+from torchtitan.config.transform import (
+    apply_transforms,
+    ContextParallelTransform,
+    TokenDispatcherTransform,
+)
 from torchtitan.models.common.cp_attention import KVAllGatherCPFlexInnerAttention
 from torchtitan.trainer import Trainer
 
@@ -81,6 +87,28 @@ def qwen3_moe_deepep_fsdp4_ep4() -> Trainer.Config:
     config.parallelism.data_parallel_shard_degree = 4
     config.parallelism.expert_parallel_degree = 4
     return config
+
+
+def kimi_k3_moonep_fsdp4_ep4() -> Trainer.Config:
+    from torchtitan.models.common.moe import MoonEPRoutedExperts
+    from torchtitan.models.common.token_dispatcher import MoonEPTokenDispatcher
+
+    from torchtitan_recipes.tests.models.kimi_k3 import kimi_k3_debugmodel
+
+    config = kimi_k3_debugmodel(seq_len=512)
+    config = replace(
+        config,
+        parallelism=replace(config.parallelism, expert_parallel_degree=4),
+    )
+    config.parallelism.data_parallel_shard_degree = 4
+    return apply_transforms(
+        config,
+        [
+            TokenDispatcherTransform(
+                dispatcher=MoonEPTokenDispatcher, routed_experts=MoonEPRoutedExperts
+            )
+        ],
+    )
 
 
 def qwen35_debugmodel_moe_float8_lora() -> Trainer.Config:
