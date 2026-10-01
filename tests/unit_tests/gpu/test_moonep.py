@@ -14,9 +14,17 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
+from torchtitan.distributed.activation_checkpoint import (
+    ActivationCheckpointing,
+    FullAC,
+    RegionAC,
+    SelectiveAC,
+)
+from torchtitan.distributed.moonep import ops
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh, set_spmd_meshes
 from torchtitan.models.common.activation import SiTUGLU
 from torchtitan.models.common.config_utils import make_routed_experts_config
+from torchtitan.protocols.module import Module, ModuleDict
 
 pytestmark = pytest.mark.multi_gpu
 
@@ -36,6 +44,21 @@ def _moonep_runs_here() -> bool:
         _SymmetricMemory.has_multicast_support(torch._C._autograd.DeviceType.CUDA, i)
         for i in range(torch.cuda.device_count())
     )
+
+
+class _Block(Module):
+    def __init__(self, experts: nn.Module):
+        super().__init__()
+        self.experts = experts
+
+    def forward(self, *args: torch.Tensor) -> torch.Tensor:
+        return self.experts(*args)
+
+
+class _Model(Module):
+    def __init__(self, experts: nn.Module):
+        super().__init__()
+        self.layers = ModuleDict({"0": _Block(experts)})
 
 
 def _reference(x_TD, weights_TK, ids_TK, w13_E2FD, w2_EDF):
@@ -59,7 +82,9 @@ class TestMoonEPRoutedExperts(DTensorTestBase):
     def world_size(self) -> int:
         return 2
 
-    def _check(self, routing: str) -> None:
+    def _check(
+        self, routing: str, ac: ActivationCheckpointing.Config | None = None
+    ) -> None:
         rank, size = self.rank, self.world_size
         device = torch.device("cuda", torch.cuda.current_device())
         mesh = init_device_mesh("cuda", (size,), mesh_dim_names=("ep",))
@@ -82,6 +107,9 @@ class TestMoonEPRoutedExperts(DTensorTestBase):
         lo, hi = rank * (E // size), (rank + 1) * (E // size)
         experts.w13.weight = nn.Parameter(w13_E2FD[lo:hi].to(device, torch.bfloat16))
         experts.w2.weight = nn.Parameter(w2_EDF[lo:hi].to(device, torch.bfloat16))
+        model = _Model(experts)
+        if ac is not None:
+            ac.build().apply(model)
 
         torch.manual_seed(100 + rank)
         x_TD = (torch.randn(S, D, device=device) * 0.5).to(torch.bfloat16)
@@ -104,11 +132,14 @@ class TestMoonEPRoutedExperts(DTensorTestBase):
 
         experts.token_dispatcher.dispatch = recording_dispatch
         x_in_TD = x_TD.clone().requires_grad_(True)
+        first_plan = ops._next_plan_id
         with set_current_spmd_mesh(mesh):
             experts.token_dispatcher.init_buffer()
-            out_TD = experts(x_in_TD, weights_TK, ids_TK, counts_E)
+            out_TD = model.layers["0"](x_in_TD, weights_TK, ids_TK, counts_E)
             out_TD.float().sum().backward()
         torch.cuda.synchronize()
+        self.assertEqual(ops._next_plan_id - first_plan, 1, "the dispatch was replayed")
+        self.assertEqual(ops._plans, {}, "a plan outlived its combine")
 
         slot_rows = dispatched[0][1][E // size :].sum().reshape(1)
         dist.all_reduce(slot_rows)
@@ -147,6 +178,18 @@ class TestMoonEPRoutedExperts(DTensorTestBase):
     @with_comms
     def test_uniform_routing_matches_dense_reference(self):
         self._check("uniform")
+
+    @with_comms
+    def test_selective_ac_matches_dense_reference(self):
+        self._check("hot", SelectiveAC.Config())
+
+    @with_comms
+    def test_full_ac_matches_dense_reference(self):
+        self._check("hot", FullAC.Config())
+
+    @with_comms
+    def test_region_ac_matches_dense_reference(self):
+        self._check("hot", RegionAC.Config(save_regions=[]))
 
 
 if __name__ == "__main__":

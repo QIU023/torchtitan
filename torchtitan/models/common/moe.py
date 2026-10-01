@@ -162,62 +162,6 @@ class RoutedExperts(Module):
         return out_TD
 
 
-class _MoonEPExperts(torch.autograd.Function):
-    @staticmethod
-    def forward(  # pyrefly: ignore[bad-override]
-        ctx, experts, x_RD, w13_e2FD, w2_eDF, metadata
-    ):
-        from torchtitan.distributed.moonep.moonep import prefetch_rows
-
-        buffer = experts.token_dispatcher.buffer
-        group = experts.token_dispatcher.ep_mesh.get_group()
-        rows = prefetch_rows(buffer, metadata.plan, group, w13_e2FD, w2_eDF)
-        with torch.no_grad():
-            out_RD = experts._compute(x_RD, rows, metadata.cu_seqlens)
-        ctx.experts, ctx.dispatch, ctx.buffer, ctx.group = (
-            experts,
-            metadata,
-            buffer,
-            group,
-        )
-        ctx.save_for_backward(x_RD, w13_e2FD, w2_eDF)
-        return out_RD
-
-    @staticmethod
-    def backward(ctx, grad_out_RD):  # pyrefly: ignore[bad-override]
-        from torchtitan.distributed.moonep.moonep import prefetch_rows, reduce_rows
-
-        experts, metadata, buffer, group = (
-            ctx.experts,
-            ctx.dispatch,
-            ctx.buffer,
-            ctx.group,
-        )
-        x_RD, w13_e2FD, w2_eDF = ctx.saved_tensors
-        # The pools are shared by every layer: refill them for this plan and recompute.
-        rows = {
-            name: row.detach().requires_grad_()
-            for name, row in prefetch_rows(
-                buffer, metadata.plan, group, w13_e2FD, w2_eDF
-            ).items()
-        }
-        x_leaf_RD = x_RD.detach().requires_grad_()
-        with torch.enable_grad():
-            out_RD = experts._compute(x_leaf_RD, rows, metadata.cu_seqlens)
-        inputs: list[torch.Tensor] = [x_leaf_RD, *rows.values()]
-        grad_x_RD, *row_grads = torch.autograd.grad(out_RD, inputs, grad_out_RD)
-        grad_w13, grad_w2 = reduce_rows(
-            buffer, metadata.plan, group, dict(zip(rows, row_grads))
-        )
-        return (
-            None,
-            grad_x_RD,
-            grad_w13.to(w13_e2FD.dtype),
-            grad_w2.to(w2_eDF.dtype),
-            None,
-        )
-
-
 class MoonEPRoutedExperts(RoutedExperts):
     """Routed experts whose grouped GEMMs also cover the expert copies MoonEP
     prefetches into this rank's slots."""
@@ -247,6 +191,8 @@ class MoonEPRoutedExperts(RoutedExperts):
         topk_expert_ids_TK: torch.Tensor,
         num_local_tokens_per_expert_E: torch.Tensor,
     ) -> torch.Tensor:
+        from torchtitan.distributed.moonep.ops import routed_experts
+
         routed_input_RD, _, metadata = self.token_dispatcher.dispatch(
             x_TD,
             topk_scores_TK,
@@ -254,8 +200,13 @@ class MoonEPRoutedExperts(RoutedExperts):
             num_local_tokens_per_expert_E,
         )
         with maybe_set_sparse_mesh():
-            routed_output_RD = _MoonEPExperts.apply(
-                self, routed_input_RD, self.w13.weight, self.w2.weight, metadata
+            routed_output_RD = routed_experts(
+                self._compute,
+                routed_input_RD,
+                self.w13.weight,
+                self.w2.weight,
+                metadata.cu_seqlens,
+                metadata.plan_id,
             )
             if self.output_postprocess is not None:
                 routed_output_RD = self.output_postprocess(routed_output_RD)

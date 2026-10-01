@@ -10,23 +10,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-
-_lib = torch.library.Library("moonep", "DEF")
-_lib.define(
-    "dispatch(Tensor x, Tensor weights, Tensor ids, Tensor counts) "
-    "-> (Tensor, Tensor, Tensor, Tensor)"
-)
-_lib.define(
-    "experts(Tensor x, Tensor w13, Tensor w2, Tensor cu_seqlens, Tensor plan_id) "
-    "-> Tensor"
-)
-_lib.define("combine(Tensor x, Tensor plan_id, bool will_backward) -> Tensor")
+import torch_remat as remat
+from torch import Tensor
 
 
 @dataclass
 class _Plan:
     plan: object
-    compute: Callable[..., torch.Tensor] | None = None
+    compute: Callable[..., Tensor] | None = None
 
 
 # Ops take only tensors, so a plan crosses them as a CPU id into this table; combine removes it.
@@ -34,10 +25,10 @@ _plans: dict[int, _Plan] = {}
 _next_plan_id = 0
 
 
-@torch.library.impl(_lib, "dispatch", "CUDA")
-def _dispatch_impl(
-    x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor, counts: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+@torch.library.custom_op("moonep::dispatch", mutates_args=())
+def _dispatch(
+    x: Tensor, weights: Tensor, ids: Tensor, counts: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     from torchtitan.distributed.moonep.moonep import current_buffer
 
     global _next_plan_id
@@ -64,14 +55,10 @@ def _dispatch_backward(ctx, grad_hidden, grad_route_weights, *_):
     return grad_x, grad_weights, None, None
 
 
-@torch.library.impl(_lib, "experts", "CUDA")
-def _experts_impl(
-    x: torch.Tensor,
-    w13: torch.Tensor,
-    w2: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    plan_id: torch.Tensor,
-) -> torch.Tensor:
+@torch.library.custom_op("moonep::experts", mutates_args=())
+def _experts(
+    x: Tensor, w13: Tensor, w2: Tensor, cu_seqlens: Tensor, plan_id: Tensor
+) -> Tensor:
     from torchtitan.distributed.moonep.moonep import current_buffer, prefetch_rows
 
     buffer, group = current_buffer()
@@ -107,16 +94,14 @@ def _experts_backward(ctx, grad_out):
     x_leaf = x.detach().requires_grad_()
     with torch.enable_grad():
         out = compute(x_leaf, rows, cu_seqlens)
-    inputs: list[torch.Tensor] = [x_leaf, *rows.values()]
+    inputs: list[Tensor] = [x_leaf, *rows.values()]
     grad_x, *row_grads = torch.autograd.grad(out, inputs, grad_out)
     grad_w13, grad_w2 = reduce_rows(buffer, plan, group, dict(zip(rows, row_grads)))
     return grad_x, grad_w13.to(w13.dtype), grad_w2.to(w2.dtype), None, None
 
 
-@torch.library.impl(_lib, "combine", "CUDA")
-def _combine_impl(
-    x: torch.Tensor, plan_id: torch.Tensor, will_backward: bool
-) -> torch.Tensor:
+@torch.library.custom_op("moonep::combine", mutates_args=())
+def _combine(x: Tensor, plan_id: Tensor, will_backward: bool) -> Tensor:
     from torchtitan.distributed.moonep.moonep import current_buffer
 
     buffer, _ = current_buffer()
@@ -140,55 +125,55 @@ def _combine_backward(ctx, grad_out):
     return grad_x, None, None
 
 
-torch.library.register_autograd(
-    "moonep::dispatch", _dispatch_backward, setup_context=_dispatch_setup_context
-)
-torch.library.register_autograd(
-    "moonep::experts", _experts_backward, setup_context=_experts_setup_context
-)
-torch.library.register_autograd(
-    "moonep::combine", _combine_backward, setup_context=_combine_setup_context
-)
+for _op, _backward, _setup_context in (
+    (_dispatch, _dispatch_backward, _dispatch_setup_context),
+    (_experts, _experts_backward, _experts_setup_context),
+    (_combine, _combine_backward, _combine_setup_context),
+):
+    _op.register_autograd(_backward, setup_context=_setup_context)
+    # A recompute must not replay these ops: they share the plan table and the process-global pools.
+    _op.register_effect(torch.library.EffectType.ORDERED)
 
 
-@torch.compiler.disable
 def dispatch_tokens(
-    x_SH: torch.Tensor,
-    weights_SK: torch.Tensor,
-    ids_SK: torch.Tensor,
-    counts_E: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_SH: Tensor, weights_SK: Tensor, ids_SK: Tensor, counts_E: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Route tokens to expert rows; returns the rows, their weights, ``cu_seqlens`` and the plan id."""
-    return torch.ops.moonep.dispatch(
+    outputs = remat.region(_dispatch, "moonep_dispatch", recompute=False)(
         x_SH.to(torch.bfloat16),
         weights_SK.float(),
         ids_SK.to(torch.int32),
         counts_E.to(torch.int32),
     )
+    remat.recompute_needs_tensor(*outputs)
+    return outputs
 
 
-@torch.compiler.disable
 def routed_experts(
-    compute: Callable[..., torch.Tensor],
-    x_RD: torch.Tensor,
-    w13_e2FD: torch.Tensor,
-    w2_eDF: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    plan_id: torch.Tensor,
-) -> torch.Tensor:
+    compute: Callable[..., Tensor],
+    x_RD: Tensor,
+    w13_e2FD: Tensor,
+    w2_eDF: Tensor,
+    cu_seqlens: Tensor,
+    plan_id: Tensor,
+) -> Tensor:
     """Run ``compute`` over this rank's expert rows and the copies prefetched for the plan."""
     entry = _plans.get(int(plan_id))
-    # A selective-AC recompute replays the saved output after combine has removed the plan.
+    # A recompute serves the saved output, and combine has removed the plan by then.
     if entry is not None:
         entry.compute = compute
-    return torch.ops.moonep.experts(x_RD, w13_e2FD, w2_eDF, cu_seqlens, plan_id)
-
-
-@torch.compiler.disable
-def combine_tokens(hidden_NH: torch.Tensor, plan_id: torch.Tensor) -> torch.Tensor:
-    """Sum each token's expert rows; the backward is a dispatch on the same plan."""
-    return torch.ops.moonep.combine(
-        hidden_NH.to(torch.bfloat16).contiguous(),
-        plan_id,
-        torch.is_grad_enabled() and hidden_NH.requires_grad,
+    out_RD = remat.region(_experts, "moonep_experts", recompute=False)(
+        x_RD, w13_e2FD, w2_eDF, cu_seqlens, plan_id
     )
+    remat.recompute_needs_tensor(out_RD)
+    return out_RD
+
+
+def combine_tokens(hidden_NH: Tensor, plan_id: Tensor) -> Tensor:
+    """Sum each token's expert rows; the backward is a dispatch on the same plan."""
+    will_backward = torch.is_grad_enabled() and hidden_NH.requires_grad
+    out_SH = remat.region(_combine, "moonep_combine", recompute=False)(
+        hidden_NH.to(torch.bfloat16).contiguous(), plan_id, will_backward
+    )
+    remat.recompute_needs_tensor(out_SH)
+    return out_SH

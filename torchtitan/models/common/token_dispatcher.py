@@ -1005,7 +1005,7 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
 class MoonEPDispatchMetadata:
     """Metadata for MoonEP token dispatch."""
 
-    plan: object
+    plan_id: torch.Tensor
     weights_N: torch.Tensor  # noqa: N815
     cu_seqlens: torch.Tensor
 
@@ -1058,10 +1058,9 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
                 f"MoonEP's buffer holds {self.num_max_tokens_per_rank} tokens per "
                 f"rank and this dispatch carries {x_TD.shape[0]}."
             )
-        from torchtitan.distributed.moonep.moonep import dispatch_tokens
+        from torchtitan.distributed.moonep.ops import dispatch_tokens
 
-        hidden_ND, weights_N, cu_seqlens, plan = dispatch_tokens(
-            self.buffer,
+        hidden_ND, weights_N, cu_seqlens, plan_id = dispatch_tokens(
             x_TD,
             topk_scores_TK,
             topk_expert_ids_TK,
@@ -1069,7 +1068,7 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
         )
         num_tokens_per_row = torch.diff(cu_seqlens, prepend=cu_seqlens.new_zeros(1))
         metadata = MoonEPDispatchMetadata(
-            plan=plan, weights_N=weights_N, cu_seqlens=cu_seqlens
+            plan_id=plan_id, weights_N=weights_N, cu_seqlens=cu_seqlens
         )
         return hidden_ND, num_tokens_per_row, metadata
 
@@ -1081,10 +1080,10 @@ class MoonEPTokenDispatcher(BaseEPTokenDispatcher):
         x_TD: torch.Tensor,
     ) -> torch.Tensor:
         """Weight each expert row by its routing score, then sum each token's rows."""
-        from torchtitan.distributed.moonep.moonep import combine_tokens
+        from torchtitan.distributed.moonep.ops import combine_tokens
 
         weighted_RD = routed_output_RD.float() * metadata.weights_N[:, None]
-        return combine_tokens(self.buffer, metadata.plan, weighted_RD).to(x_TD.dtype)
+        return combine_tokens(weighted_RD, metadata.plan_id).to(x_TD.dtype)
 
 
 def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
