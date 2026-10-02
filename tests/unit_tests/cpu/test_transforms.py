@@ -24,6 +24,7 @@ from torchtitan.config.transform import (
     TokenDispatcherTransform,
     transform_model_config_,
 )
+from torchtitan.distributed.moonep.experts import MoonEPRoutedExperts
 from torchtitan.models.common.async_linear import (
     AsyncColumnParallelLinear,
     AsyncRowParallelLinear,
@@ -36,7 +37,7 @@ from torchtitan.models.common.linear import (
     RowParallelLinear,
     SharedExpertRowParallelLinear,
 )
-from torchtitan.models.common.moe import MoonEPRoutedExperts, RoutedExperts
+from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
     DeepEPTokenDispatcher,
     MoonEPTokenDispatcher,

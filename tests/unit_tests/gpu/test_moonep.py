@@ -22,10 +22,10 @@ from torchtitan.distributed.activation_checkpoint import (
     SelectiveAC,
 )
 from torchtitan.distributed.moonep import ops
+from torchtitan.distributed.moonep.experts import MoonEPRoutedExperts
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh, set_spmd_meshes
 from torchtitan.models.common.activation import SiTUGLU
 from torchtitan.models.common.config_utils import make_routed_experts_config
-from torchtitan.models.common.moe import MoonEPRoutedExperts
 from torchtitan.models.common.token_dispatcher import MoonEPTokenDispatcher
 from torchtitan.protocols.module import Module, ModuleDict
 

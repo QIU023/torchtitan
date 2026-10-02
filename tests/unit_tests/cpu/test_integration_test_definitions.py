@@ -163,7 +163,6 @@ def test_h100_tests_are_registered_in_separate_suite() -> None:
         "deepseek_v3_fsdp+hybridep",
         "dist_gemm",
         "fsdp_symm_mem",
-        "kimi_k3_fsdp+moonep",
         "qwen3_fsdp+deepep",
         "qwen3_5_moe_lora",
     }
@@ -185,7 +184,6 @@ def test_b200_tests_are_registered_in_separate_suite() -> None:
 def test_specialized_moe_backends_have_ep_coverage() -> None:
     specialized_names = {
         "deepseek_v3_fsdp+hybridep",
-        "kimi_k3_fsdp+moonep",
         "qwen3_fsdp+deepep",
     }
     h100_model_tests = [
