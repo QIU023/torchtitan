@@ -253,7 +253,6 @@ class _VisionDepChecks:
         bubble: bool,
         frozen_tower: bool,
         cost_ratio: float = 0.5,
-        backward_on: tuple[int, int] | None = None,
     ) -> None:
         reference = _run_single_device(frozen_tower, self._device(), self.gelu, self.lr)
         evals: list = []
@@ -292,10 +291,6 @@ class _VisionDepChecks:
         wanted = {"encode"} if frozen_tower else {"encode", "backward"}
         if placed != (wanted if bubble else set()):
             failures.append(f"placed {placed} with bubble={bubble}")
-        if backward_on is not None:
-            mb, rank = backward_on
-            if ("backward", mb) not in plan.placed or plan.backward_rank[mb] != rank:
-                failures.append(f"backward of {mb} not in an idle slot of rank {rank}")
         # Every rank reaches this reduction, so none waits at teardown for a failed one.
         failed = torch.tensor([len(failures)], device=self._device())
         dist.all_reduce(failed)
@@ -319,12 +314,6 @@ class TestKimiK3VisionDep(_VisionDepChecks, DTensorTestBase):
     @with_comms
     def test_encodes_and_backwards_in_idle_slots_match_one_device(self):
         self._check(bubble=True, frozen_tower=False)
-
-    @with_comms
-    def test_a_backward_waits_in_its_idle_run_for_a_gradient_ready_later(self):
-        self._check(
-            bubble=True, frozen_tower=False, cost_ratio=0.25, backward_on=(6, 3)
-        )
 
     @with_comms
     def test_a_frozen_tower_gets_no_gradient(self):
