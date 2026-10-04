@@ -472,6 +472,50 @@ class TestVisionDepPlan(unittest.TestCase):
         self.assertEqual(plan.placed[("backward", 0)], (1, 7.0, 8.5))
         self.assertEqual(plan.epilogue, {0: (), 1: ()})
 
+    def test_encodes_open_and_backwards_close_each_ranks_schedule(self):
+        for pp, vp, m in SHAPES:
+            for ratio in (0.1, 0.5, 1.0):
+                with self.subTest(pp=pp, vp=vp, m=m, ratio=ratio):
+                    order = _interleaved_order(pp, vp, m)
+                    plan = VisionDepPlan(
+                        _uneven(m),
+                        num_microbatches=m,
+                        num_ranks=pp,
+                        stage0_rank=0,
+                        trainable=True,
+                        pipeline_order=order,
+                        cost_ratio=ratio,
+                    )
+                    step_end = _step_end(order)
+                    times = _slot_times(order, step_end)
+                    for (kind, _), (rank, start, end) in plan.placed.items():
+                        busy = [
+                            slot
+                            for slot, action in enumerate(order[rank])
+                            if action is not None
+                        ]
+                        if kind == "encode":
+                            self.assertLessEqual(end, times[busy[0]])
+                        else:
+                            self.assertGreaterEqual(start, times[busy[-1] + 1])
+
+    def test_three_ranks_encode_six_microbatches_one_and_two_deep(self):
+        order = _interleaved_order(3, 4, 6)
+        plan = VisionDepPlan(
+            {mb: 100 for mb in range(6)},
+            num_microbatches=6,
+            num_ranks=3,
+            stage0_rank=0,
+            trainable=True,
+            pipeline_order=order,
+            cost_ratio=1.0,
+        )
+        self.assertEqual(plan.prologue, {0: (0,), 1: (1,), 2: (2,)})
+        self.assertEqual(
+            {mb: plan.placed[("encode", mb)] for mb in (3, 4, 5)},
+            {3: (1, 0.0, 1.0), 4: (2, 0.0, 1.0), 5: (2, 1.0, 2.0)},
+        )
+
     def test_the_plan_is_a_function_of_its_inputs(self):
         order = _interleaved_order(8, 4, 32)
         kwargs = dict(

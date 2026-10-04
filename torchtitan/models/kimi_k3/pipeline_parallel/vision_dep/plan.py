@@ -139,55 +139,55 @@ def _hook_at(actions: Sequence[Any] | None, boundary: int, step_end: int) -> Hoo
 
 
 def _encode_spot(
-    runs: dict[int, list[_Run]],
+    bands: Mapping[int, _Run],
     duration: float,
-    load: list[float],
     *,
     due: float,
     stage0_rank: int,
 ) -> tuple[int, _Run, float, float] | None:
-    best: tuple[tuple[float, float, int], int, _Run, float, float] | None = None
-    for rank, rank_runs in runs.items():
-        for run in rank_runs:
-            start, end = run.cursor, run.cursor + duration
-            # A remote encode's features leave the rank when its run ends.
-            arrival = end if rank == stage0_rank else run.stop + _TRANSFER
-            if arrival > due:
-                break
-            if end <= run.stop:
-                key = (load[rank], end, rank)
-                if best is None or key < best[0]:
-                    best = (key, rank, run, start, end)
-                break
-    return None if best is None else best[1:]
+    spots = []
+    for rank, run in bands.items():
+        start, end = run.cursor, run.cursor + duration
+        # A remote encode's features leave the rank when its run ends.
+        arrival = end if rank == stage0_rank else run.stop + _TRANSFER
+        if end <= run.stop and arrival <= due:
+            spots.append((end, rank, run, start))
+    if not spots:
+        return None
+    end, rank, run, start = min(spots, key=lambda spot: spot[:2])
+    return rank, run, start, end
 
 
 def _backward_spot(
-    runs: dict[int, list[_Run]],
+    bands: Mapping[int, _Run],
     duration: float,
-    load: list[float],
     *,
     ready: float,
     stage0_rank: int,
 ) -> tuple[int, _Run, float, float] | None:
-    best: tuple[tuple[float, float, int], int, _Run, float, float] | None = None
-    for rank, rank_runs in runs.items():
+    spots = []
+    for rank, run in bands.items():
         transfer = 0.0 if rank == stage0_rank else _TRANSFER
-        for run in rank_runs:
-            # The gradient changes ranks at the later of its readiness and the run's start.
-            start = max(run.cursor, max(run.begin, ready) + transfer)
-            end = start + duration
-            if end <= run.stop:
-                key = (load[rank], end, rank)
-                if best is None or key < best[0]:
-                    best = (key, rank, run, start, end)
-                break
-    return None if best is None else best[1:]
+        # The gradient changes ranks at the later of its readiness and the run's start.
+        start = max(run.cursor, max(run.begin, ready) + transfer)
+        end = start + duration
+        if end <= run.stop:
+            spots.append((end, rank, run, start))
+    if not spots:
+        return None
+    end, rank, run, start = min(spots, key=lambda spot: spot[:2])
+    return rank, run, start, end
 
 
 class VisionDepPlan:
     """Where and when each micro-batch is encoded and backpropagated, and where its
     features and gradient change ranks.
+
+    The first ``num_ranks`` micro-batches are encoded before the schedule, spread
+    over the ranks, and the others in the idle slots that open each rank's
+    schedule; the backwards run in the idle slots that close each rank's schedule.
+    Each goes where it finishes first, and what does not fit runs before or after
+    the schedule.
 
     ``loads`` maps each micro-batch that carries images to its patch count, and
     ``cost_ratio`` is an average micro-batch's encode in units of one text-stage
@@ -225,6 +225,14 @@ class VisionDepPlan:
                 )
             self._consume, self._ready = _stage0_slots(pipeline_order[stage0_rank])
             self._runs, self._step_end, self._times = _idle_runs(pipeline_order)
+        self._opening = {
+            r: runs[0] for r, runs in self._runs.items() if runs and runs[0].start == 0
+        }
+        self._closing = {
+            r: runs[-1]
+            for r, runs in self._runs.items()
+            if runs and runs[-1].end == self._step_end
+        }
         self._mbs = sorted(loads)
         missing = [
             m
@@ -240,7 +248,6 @@ class VisionDepPlan:
         self._backward_mbs = (
             sorted(self._mbs, key=lambda m: self._ready[m]) if trainable else []
         )
-        self._load = [0.0] * num_ranks
         self._run_of: dict[tuple[str, int], _Run] = {}
         self.encode_rank: dict[int, int] = {}
         self.backward_rank: dict[int, int] = {}
@@ -258,14 +265,10 @@ class VisionDepPlan:
         self._hook_transfers()
 
     def _place(
-        self,
-        work: tuple[str, int],
-        spot: tuple[int, _Run, float, float],
-        duration: float,
+        self, work: tuple[str, int], spot: tuple[int, _Run, float, float]
     ) -> int:
         rank, run, start, end = spot
         run.cursor = end
-        self._load[rank] += duration
         self.placed[work] = (rank, start, end)
         self._run_of[work] = run
         return rank
@@ -279,7 +282,6 @@ class VisionDepPlan:
             for m in sorted(batch, key=lambda mb: (-cost[mb], consume[mb])):
                 rank = min(self._ranks, key=lambda r: (busy[r], r))
                 busy[rank] += cost[m]
-                self._load[rank] += cost[m]
                 prologue[rank].append(m)
                 self.encode_rank[m] = rank
 
@@ -292,16 +294,15 @@ class VisionDepPlan:
         unplaced: list[int] = []
         for m in by_consume[len(upfront) :]:
             spot = _encode_spot(
-                self._runs,
+                self._opening,
                 cost[m],
-                self._load,
                 due=self._times[consume[m]],
                 stage0_rank=self._stage0_rank,
             )
             if spot is None:
                 unplaced.append(m)
             else:
-                self.encode_rank[m] = self._place(("encode", m), spot, cost[m])
+                self.encode_rank[m] = self._place(("encode", m), spot)
         to_prologue(unplaced)
         self.prologue = {
             r: tuple(sorted(prologue[r], key=lambda m: consume[m])) for r in self._ranks
@@ -315,16 +316,15 @@ class VisionDepPlan:
         for m in self._backward_mbs:
             duration = _BACKWARD_COST * cost[m]
             spot = _backward_spot(
-                self._runs,
+                self._closing,
                 duration,
-                self._load,
                 ready=self._times[ready[m]],
                 stage0_rank=self._stage0_rank,
             )
             if spot is None:
                 leftover.append(m)
             else:
-                self.backward_rank[m] = self._place(("backward", m), spot, duration)
+                self.backward_rank[m] = self._place(("backward", m), spot)
         for m in sorted(leftover, key=lambda mb: (-cost[mb], ready[mb])):
             rank = min(self._ranks, key=lambda r: (busy[r], r))
             busy[rank] += _BACKWARD_COST * cost[m]

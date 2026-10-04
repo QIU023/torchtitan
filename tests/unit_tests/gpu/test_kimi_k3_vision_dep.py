@@ -43,7 +43,7 @@ class TestKimiK3VisionDepNccl(_VisionDepChecks, DTensorTestBase):
     @with_comms
     def test_a_backward_waits_in_its_idle_run_for_its_gradient_under_nccl(self):
         self._check(
-            bubble=True, frozen_tower=False, cost_ratio=0.25, backward_on=(6, 3)
+            bubble=True, frozen_tower=False, cost_ratio=0.25, backward_on=(6, 1)
         )
 
 
