@@ -83,7 +83,7 @@ def _experts(
     gate = _rows_mm(x, rows["gate"], cu_seqlens)
     up = _rows_mm(x, rows["up"], cu_seqlens)
     out = _rows_mm(activation(gate, up, offsets=cu_seqlens), rows["down"], cu_seqlens)
-    return (out.float() * weights[:, None]).to(out.dtype), gate, up
+    return out.mul_(weights[:, None]), gate, up
 
 
 def _experts_setup_context(ctx, inputs, output) -> None:
@@ -113,10 +113,11 @@ def _experts_backward(ctx, grad_out, *_):
         hidden = activation(gate_leaf, up_leaf, offsets=cu_seqlens)
     # The routing-weight gradient <grad_out, out> equals <grad_out @ W_down, hidden>, so out is not kept.
     unscaled_grad_hidden = torch._grouped_mm(grad_out, rows["down"], offs=cu_seqlens)
-    unscaled_grad_hidden = unscaled_grad_hidden.float()
-    grad_weights = (unscaled_grad_hidden * hidden.detach().float()).sum(-1)
-    grad_hidden = (unscaled_grad_hidden * weights[:, None]).to(grad_out.dtype)
-    grad_down_out = (grad_out.float() * weights[:, None]).to(grad_out.dtype)
+    grad_weights = unscaled_grad_hidden.float().mul_(hidden.detach()).sum(-1)
+    grad_hidden = unscaled_grad_hidden.mul_(weights[:, None])
+    grad_down_out = torch.mul(
+        grad_out, weights[:, None], out=torch.empty_like(grad_out)
+    )
     grad_gate, grad_up = torch.autograd.grad(hidden, (gate_leaf, up_leaf), grad_hidden)
     row_grads = {
         "gate": torch._grouped_mm(grad_gate.t(), x, offs=cu_seqlens),
