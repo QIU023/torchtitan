@@ -13,11 +13,11 @@ from unittest.mock import patch
 
 import torch
 
-from torchtitan.models.kimi_k3 import model as k3_model, model_registry
+from torchtitan.models.kimi_k3 import build_model_config, model as k3_model
 from torchtitan.protocols.module import Module, ModuleDict
 
 _TOKENS = 8
-_DIM = model_registry("debugmodel", enable_sp=False).dim
+_DIM = build_model_config("debugmodel").dim
 # The attention kernels are CUDA-only; these CPU stand-ins keep the call signatures.
 
 
@@ -32,8 +32,8 @@ class _CpuKernel(Module):
         return self.operation(*args, **kwargs)
 
 
-def _mla_inner_attention(q_THK, k_THK, v_THV, *, attention_masks=None, scale=None):
-    del attention_masks
+def _mla_inner_attention(q_THK, k_THK, v_THV, *, attention_metadata=None, scale=None):
+    del attention_metadata
     return torch.nn.functional.scaled_dot_product_attention(
         q_THK.transpose(0, 1),
         k_THK.transpose(0, 1),
@@ -44,9 +44,15 @@ def _mla_inner_attention(q_THK, k_THK, v_THV, *, attention_masks=None, scale=Non
 
 
 def _kda_inner(
-    query_TC, key_TC, value_TC, raw_gate_THK, raw_beta_TH, *params, cu_seqlens=None
+    query_TC,
+    key_TC,
+    value_TC,
+    raw_gate_THK,
+    raw_beta_TH,
+    *params,
+    attention_metadata=None
 ):
-    del cu_seqlens
+    del attention_metadata
     num_tokens, num_heads = raw_beta_TH.shape
     q_THK, k_THK, v_THV = (
         t.view(num_tokens, num_heads, -1) for t in (query_TC, key_TC, value_TC)
@@ -61,7 +67,7 @@ class _TwoBlocks(Module):
 
     def __init__(self):
         super().__init__()
-        config = model_registry("debugmodel", enable_sp=False)
+        config = build_model_config("debugmodel")
         assert isinstance(config, k3_model.KimiK3Model.Config)
         layers = config.layers
         kda_config = layers[0]
@@ -83,7 +89,7 @@ class _TwoBlocks(Module):
     def forward(self, x_TD: torch.Tensor) -> torch.Tensor:
         blocks_TD: list[torch.Tensor] = []
         for block in self.layers.values():
-            x_TD, blocks_TD = block(x_TD, blocks_TD)
+            x_TD, *blocks_TD = block(x_TD, blocks_TD)
         return x_TD.pow(2).mean()
 
 
