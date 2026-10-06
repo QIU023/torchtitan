@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
-from torchtitan.models.kimi_k3 import kimi_k3_configs, model_registry
+from torchtitan.models.kimi_k3 import build_model_config, MODEL_FLAVORS
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 
 
@@ -49,7 +49,7 @@ def validate_shapes(metadata: Metadata, expected: dict[str, torch.Size]) -> None
 def validate_checkpoint(
     checkpoint: Path, *, model_flavor: str = "Kimi-K3", from_quantized: bool = True
 ) -> dict[str, int | str]:
-    config = model_registry(model_flavor, enable_sp=False, seq_len=128)
+    config = build_model_config(model_flavor, seq_len=128)
     adapter = KimiK3StateDictAdapter(config, hf_assets_path=None)
     with torch.device("meta"):
         model = config.build()
@@ -66,7 +66,9 @@ def validate_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--model-flavor", choices=kimi_k3_configs, default="Kimi-K3")
+    parser.add_argument(
+        "--model-flavor", choices=sorted(MODEL_FLAVORS), default="Kimi-K3"
+    )
     parser.add_argument("--unquantized", action="store_true")
     args = parser.parse_args()
     print(

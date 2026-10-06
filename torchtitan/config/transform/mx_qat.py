@@ -20,7 +20,7 @@ from torchtitan.quantization.mx_qat.experts import (
 )
 from torchtitan.quantization.mx_qat.linear import _get_mx_qat_linear_cls
 
-from .base import convert_config_type, ModelConfigTransform
+from .base import convert_config_type, ModelConfigTransform, ModelConfigTransformContext
 
 
 @dataclass(kw_only=True, slots=True)
@@ -67,7 +67,13 @@ class MXQATTransform(ModelConfigTransform):
             grouped_linear_fqns=tuple(groups), linear_fqns=tuple(linears), **kwargs
         )
 
-    def transform(self, model: Module.Config) -> Module.Config:
+    def transform(
+        self,
+        model: Module.Config,
+        *,
+        context: ModelConfigTransformContext | None = None,
+    ) -> Module.Config:
+        del context
         replacements = []
         missing = set()
         handlers: tuple[
@@ -121,8 +127,3 @@ class MXQATTransform(ModelConfigTransform):
             else:
                 setattr(parent, attr, config)
         return model
-
-
-# Repeating QAT in one transform sequence is an error; applying it again
-# to an existing tree is idempotent.
-MXQATTransform.conflicts_with = (MXQATTransform,)

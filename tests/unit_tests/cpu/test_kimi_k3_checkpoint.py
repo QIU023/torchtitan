@@ -23,7 +23,7 @@ from torchtitan.components.checkpointer.hf_storage import (
     HuggingFaceStorageReaderWithViews,
     LogicalPrefixSpec,
 )
-from torchtitan.models.kimi_k3 import model_registry as kimi_k3_model_registry
+from torchtitan.models.kimi_k3 import build_model_config
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 
 
@@ -35,7 +35,7 @@ def _run_kimi_vision_qkv_roundtrip(rank: int, rendezvous: str) -> None:
         world_size=2,
     )
     try:
-        config = kimi_k3_model_registry("debugmodel", enable_sp=False, seq_len=128)
+        config = build_model_config("debugmodel", seq_len=128)
         adapter = KimiK3StateDictAdapter(config, hf_assets_path=None)
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
         full = torch.arange(3 * 8 * 8, dtype=torch.float32).reshape(24, 8)
@@ -89,7 +89,7 @@ def _run_kimi_uneven_dt_bias_roundtrip(rank: int, rendezvous: str) -> None:
         world_size=2,
     )
     try:
-        config = kimi_k3_model_registry("debugmodel", enable_sp=False, seq_len=128)
+        config = build_model_config("debugmodel", seq_len=128)
         delta_config = config.layers[1].delta_attention
         assert delta_config is not None
         delta_config.num_heads = 1
@@ -220,7 +220,7 @@ class KimiK3CheckpointTest(unittest.TestCase):
             )
 
     def test_unquantized_reader_normalizes_release_padding(self):
-        config = kimi_k3_model_registry("debugmodel", enable_sp=False, seq_len=128)
+        config = build_model_config("debugmodel", seq_len=128)
         config.layers[1].delta_attention.num_heads = 96
         adapter = KimiK3StateDictAdapter(config, hf_assets_path=None)
         key = "language_model.model.layers.1.self_attn.A_log"

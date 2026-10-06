@@ -18,7 +18,7 @@ import torch
 import torchao
 from safetensors.torch import save_file
 from torchao.prototype.mx_formats.mx_tensor import MXTensor
-from torchtitan.models.kimi_k3 import model_registry
+from torchtitan.models.kimi_k3 import build_model_config
 from torchtitan.models.kimi_k3.quantization import MXFP4_QUANTIZATION_CONFIG
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from torchtitan.quantization.mx_qat.checkpoint import MXFP4CheckpointPolicy
@@ -134,7 +134,7 @@ def create_fixture(
     output.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(seed)
-    model_config = model_registry("debugmodel", enable_sp=False, seq_len=128)
+    model_config = build_model_config("debugmodel", seq_len=128)
     model = model_config.build()
     model.init_weights()
     model.to(dtype=torch.bfloat16)

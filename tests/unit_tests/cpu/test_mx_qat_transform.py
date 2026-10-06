@@ -9,9 +9,19 @@ from dataclasses import dataclass, replace
 
 import torch
 from torchao.quantization.quantize_.common import KernelPreference
-from torchtitan.config.transform import MXQATTransform, transform_model_config_
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import (
+    ModelConfigTransformContext,
+    MXQATTransform,
+    transform_model_config_,
+)
 from torchtitan.models.common.linear import CastLinear, GroupedLinear, Linear
 from torchtitan.protocols.module import Module
+
+_CONTEXT = ModelConfigTransformContext(
+    training=TrainingConfig(), parallelism=ParallelismConfig()
+)
 
 
 class _Model(Module):
@@ -160,7 +170,9 @@ class MXQATTransformTest(unittest.TestCase):
 
     def test_rejects_duplicate_transform_sequence(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
-            transform_model_config_(_config(), [MXQATTransform(), MXQATTransform()])
+            transform_model_config_(
+                _config(), [MXQATTransform(), MXQATTransform()], context=_CONTEXT
+            )
 
     def test_preserves_custom_linear_contract_by_rejecting_it(self):
         config = _config()
@@ -178,6 +190,7 @@ class MXQATTransformTest(unittest.TestCase):
                 LoRATransform(handlers=(LinearLoRAHandler(),), rank=4),
                 MXQATTransform(linear_fqns=("projection",)),
             ],
+            context=_CONTEXT,
         )
         module = config.projection.build()
         with torch.no_grad():

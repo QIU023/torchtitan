@@ -29,9 +29,7 @@ from torchtitan.models.deepseek_v4.model import DeepSeekV4Model
 from torchtitan.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from torchtitan.models.gpt_oss import MODEL_FLAVORS as GPT_OSS_MODEL_FLAVORS
 from torchtitan.models.gpt_oss.state_dict_adapter import GptOssStateDictAdapter
-from torchtitan.models.kimi_k3 import (
-    build_model_config as build_kimi_k3_model_config,
-)
+from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_model_config
 from torchtitan.models.kimi_k3.quantization import MXFP4_QUANTIZATION_CONFIG
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from torchtitan.models.llama3 import MODEL_FLAVORS as LLAMA3_MODEL_FLAVORS
@@ -246,7 +244,7 @@ class KimiK3StateDictAdapterTest(unittest.TestCase):
         )
 
     def test_qat_recipe_is_valid_with_and_without_initial_checkpoint(self) -> None:
-        from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mx_qat
+        from torchtitan_recipes.tests.models.kimi_k3 import kimi_k3_debugmodel_mx_qat
 
         recipe = kimi_k3_debugmodel_mx_qat(seq_len=16)
         self.assertFalse(recipe.checkpointer.initial_load_in_hf_quantized)

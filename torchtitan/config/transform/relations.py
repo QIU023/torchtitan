@@ -45,6 +45,9 @@ _BUILTIN_CONFLICTS: tuple[ConflictRelation, ...] = (
     # LoRA freezes every non-target config. Applying it more than once would
     # make freezing and adapter configuration depend on transform order.
     (LoRATransform, LoRATransform),
+    # Repeating MX QAT in one sequence is an error; applying it again to an
+    # existing tree is idempotent.
+    (MXQATTransform, MXQATTransform),
     # Dist-MoE owns token dispatch and combine instead of calling the selected
     # token dispatcher's runtime implementation.
     (DistMoeTransform, TokenDispatcherTransform),

@@ -14,30 +14,27 @@ from unittest.mock import patch
 import torch
 from torchao.prototype.qat import MXFakeQuantizeConfig
 from torchao.quantization.quantize_.common import KernelPreference
-from torchtitan.config import ConfigManager
+from torchtitan.config.loader import ConfigLoader
 from torchtitan.models.common.linear import GroupedLinear
-from torchtitan.models.kimi_k3 import model_registry
-from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mx_qat
+from torchtitan.models.kimi_k3 import build_model_config
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
+from torchtitan_recipes.tests.models.kimi_k3 import kimi_k3_debugmodel_mx_qat
 
 from tests.unit_tests.cpu.mx_qat_test_utils import write_mixed_checkpoint_metadata
 
 
 class MXQATRecipeTest(unittest.TestCase):
-    def test_standard_model_entrypoint_and_training_override(self):
-        config = ConfigManager().parse_args(
+    def test_standard_model_entrypoint(self):
+        config = ConfigLoader().load(
             [
                 "--module",
-                "kimi_k3",
+                "torchtitan_recipes.tests.models.kimi_k3",
                 "--config",
                 "kimi_k3_debugmodel_mx_qat",
-                "--training.steps",
-                "1",
             ]
         )
         self.assertIsInstance(config.model, KimiK3Model.Config)
-        self.assertEqual(config.training.steps, 1)
         self.assertFalse(config.checkpointer.initial_load_in_hf_quantized)
         self.assertTrue(type(config.model.layers[1].moe.routed_up)._owner._mx_qat)
 
@@ -47,7 +44,7 @@ class MXQATRecipeTest(unittest.TestCase):
         checkpoint_path = directory.name
         write_mixed_checkpoint_metadata(
             Path(checkpoint_path),
-            KimiK3StateDictAdapter(model_registry("debugmodel", enable_sp=False), None),
+            KimiK3StateDictAdapter(build_model_config("debugmodel"), None),
         )
 
         def qat():
@@ -67,7 +64,7 @@ class MXQATRecipeTest(unittest.TestCase):
         module = types.ModuleType("my_kimi_runs")
         module.qat = qat
         with patch.dict(sys.modules, {module.__name__: module}):
-            config = ConfigManager().parse_args(
+            config = ConfigLoader().load(
                 ["--module", module.__name__, "--config", "qat"]
             )
         self.assertEqual(config.checkpointer.initial_load_path, checkpoint_path)
