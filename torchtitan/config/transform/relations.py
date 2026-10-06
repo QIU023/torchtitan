@@ -13,6 +13,7 @@ from .base import ModelConfigTransform
 from .context_parallel import ContextParallelTransform
 from .dist_moe import DistMoeTransform
 from .lora import LoRATransform
+from .mx_qat import MXQATTransform
 from .token_dispatcher import TokenDispatcherTransform
 
 TransformType: TypeAlias = type[ModelConfigTransform]
@@ -30,6 +31,8 @@ _BUILTIN_PRECEDES: tuple[PrecedenceRelation, ...] = (
     (ContextParallelTransform, LoRATransform),
     # Dist-MoE must create DistMoeRoutedExperts.Config before LoRA can adapt it.
     (DistMoeTransform, LoRATransform),
+    # LoRA wraps the projection that MX QAT has already replaced.
+    (MXQATTransform, LoRATransform),
 )
 
 # Each pair is unordered.

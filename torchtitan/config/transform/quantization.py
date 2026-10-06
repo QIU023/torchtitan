@@ -31,7 +31,6 @@ from torchtitan.tools.utils import has_cuda_capability
 
 from .converter import ModelConfigConverter
 
-
 logger = logging.getLogger(__name__)
 
 _QUANTIZABLE_LINEAR_CLASSES = (
