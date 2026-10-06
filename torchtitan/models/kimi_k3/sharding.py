@@ -35,7 +35,7 @@ from torchtitan.models.kimi_k2_7.sharding import set_moonvit_sharding_config
 from torchtitan.protocols.sharding import ShardingConfig
 
 if TYPE_CHECKING:
-    from torchtitan.models.kimi_k3.kda import KDA
+    from torchtitan.models.common.attention.kda import KDA
     from torchtitan.models.kimi_k3.model import (
         KimiK3Model,
         KimiK3TransformerBlock,
