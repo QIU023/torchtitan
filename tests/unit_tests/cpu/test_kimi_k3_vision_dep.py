@@ -13,7 +13,10 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
+from torch.distributed.pipelining.schedules import (
+    _PipelineScheduleRuntime,
+    ScheduleInterleaved1F1B,
+)
 from torch.distributed.pipelining.stage import _PipelineStageBase
 from torch.distributed.tensor import distribute_tensor, Replicate, Shard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -75,7 +78,7 @@ class _Stage(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        stack: torch.Tensor | None = None,
+        blocks: list[torch.Tensor] | None = None,
         *,
         pixel_values: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
@@ -88,11 +91,11 @@ class _Stage(nn.Module):
                     vision_embeds = self.vision_encoder(pixel_values, grid_thw=grid_thw)
                 n = vision_embeds.shape[0]
                 hidden = torch.cat((hidden[:n] + vision_embeds, hidden[n:]))
-            return hidden, hidden.unsqueeze(1)
-        assert stack is not None
+            return hidden, [hidden.view_as(hidden)]
+        assert blocks is not None
         if self.index == NUM_STAGES - 1:
-            return (hidden + stack[:, 0]).sum(-1)
-        return hidden + (hidden + stack[:, 0]) * self.scale, stack
+            return (hidden + blocks[0]).sum(-1)
+        return hidden + (hidden + blocks[0]) * self.scale, blocks
 
 
 def _loss(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -223,7 +226,11 @@ class _VisionDepChecks:
         )
         store = PPRankLocalCache()
         for stage in stages:
-            stage.set_routing(layout, store)
+            stage.set_routing(
+                layout,
+                store,
+                wait_sends_at_backward=isinstance(schedule, _PipelineScheduleRuntime),
+            )
         replica = copy.deepcopy(every[0].vision_encoder)
         with torch.no_grad():
             replica.proj.zero_()
