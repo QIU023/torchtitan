@@ -292,6 +292,14 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         self.model_parts = model_parts
 
         for part_idx, model in enumerate(self.model_parts):
+            if not any(p.requires_grad for p in model.parameters()):
+                # A fully frozen model part, e.g. a LoRA pipeline stage without adapters.
+                logger.info(
+                    "Optimizer: model part %d has no trainable parameters; "
+                    "skipping optimizer construction for it.",
+                    part_idx,
+                )
+                continue
             claimed: set[str] = set()
             for optimizer_config in config.optimizers:
                 param_group = self._build_param_group(
@@ -425,7 +433,8 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
     def _post_init(self, all_params: list[nn.Parameter]) -> None:
         # We need to call Optimizer.__init__() to initialize some necessary optimizer
         # functionality such as hooks (e.g. register_step_pre_hook for MoE load balancing).
-        Optimizer.__init__(self, all_params, {})
+        # torch rejects an empty parameter list but accepts an empty parameter group.
+        Optimizer.__init__(self, all_params or [{"params": []}], {})
 
     def init_cache_state_dict(self) -> None:
         """Initialize cached state dict for TorchFT. No-op for base class."""
