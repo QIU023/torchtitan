@@ -547,7 +547,7 @@ def clip_grad_norm_(
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
     total_norm = torch.nn.utils.get_total_norm(
-        grads, norm_type, error_if_nonfinite, foreach
+        grads, norm_type, error_if_nonfinite, foreach, dtype=torch.float32
     )
 
     # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
@@ -606,14 +606,14 @@ def _clip_grad_norm_with_ep(
     #   so non_ep_grads would be empty
     # - In PP + EP setups, certain PP ranks may only own EP or non-EP layers
     ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        ep_grads, norm_type, error_if_nonfinite, foreach
+        ep_grads, norm_type, error_if_nonfinite, foreach, dtype=torch.float32
     )
     # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
     if isinstance(ep_grads_total_norm, DTensor):
         ep_grads_total_norm = ep_grads_total_norm.full_tensor()
 
     non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        non_ep_grads, norm_type, error_if_nonfinite, foreach
+        non_ep_grads, norm_type, error_if_nonfinite, foreach, dtype=torch.float32
     )
     # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
     if isinstance(non_ep_grads_total_norm, DTensor):
