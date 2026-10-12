@@ -790,8 +790,6 @@ def attention_residual_op(
 
 @spmd.register_local_autograd_function
 class _AttentionResidualOverSources(torch.autograd.Function):
-    """Runs the fused kernels on the stacked sources, keeping the sources, not the stack, for backward."""
-
     @staticmethod
     def forward(
         ctx,
