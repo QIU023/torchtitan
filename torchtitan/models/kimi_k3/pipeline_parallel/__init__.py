@@ -12,6 +12,7 @@ import logging
 
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
+    _PipelineScheduleRuntime,
     PipelineScheduleMulti,
     PipelineScheduleSingle,
 )
@@ -147,8 +148,10 @@ def pipeline_kimi_k3(model: BaseModel, *, attn_res_cache: bool = True, **kwargs)
         cache=attn_res_cache,
     )
     store = PPRankLocalCache()
+    # The action-list runtime issues each send as its own action, never fused with a receive.
+    wait_sends_at_backward = isinstance(pp_schedule, _PipelineScheduleRuntime)
     for stage in stages:
-        stage.set_routing(layout, store)
+        stage.set_routing(layout, store, wait_sends_at_backward=wait_sends_at_backward)
     if replica is not None:
         parallelism_context = kwargs["parallelism_context"]
         # Dynamic CP gives CP ranks different patches, so the replicas' gradients also sum over CP.
