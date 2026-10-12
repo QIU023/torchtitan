@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from torchtitan.models.common.linear import GroupedLinear, Linear
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 from torchtitan.quantization.mx_qat.experts import (
     _get_mx_qat_grouped_linear_cls,
     activation_config,
@@ -108,6 +108,9 @@ class MXQATTransform(ModelConfigTransform):
                     deltas[
                         "activation_fake_quant_config"
                     ] = self.activation_fake_quant_config
+                else:
+                    # The GEMM reads a fake-quantized copy, not the leaf weight.
+                    deltas["inplace_wgrad_accum"] = False
                 replacements.append((replace(new_config, **deltas), parent, attr))
                 matched.add(fqn)
             missing.update(set(targets or ()) - matched)
@@ -121,8 +124,3 @@ class MXQATTransform(ModelConfigTransform):
             else:
                 setattr(parent, attr, config)
         return model
-
-
-# Repeating QAT in one transform sequence is an error; applying it again
-# to an existing tree is idempotent.
-MXQATTransform.conflicts_with = (MXQATTransform,)

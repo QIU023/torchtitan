@@ -9,7 +9,8 @@ import unittest
 import torch
 import torch.nn.functional as F
 from torchtitan.components.loss import LinearCrossEntropyLoss
-from torchtitan.models.common.linear import CastLinear, Linear
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.linear import Linear
 
 
 class LinearCrossEntropyLossTest(unittest.TestCase):
@@ -32,7 +33,7 @@ class LinearCrossEntropyLossTest(unittest.TestCase):
 
     def test_rejects_custom_compute_and_stacked_heads(self):
         for config in (
-            CastLinear.Config(in_features=16, out_features=32),
+            HiMidLoLinear.Config(in_features=16, out_features=32),
             Linear.Config(in_features=16, out_features=32, num_linears=2),
         ):
             with self.subTest(config=config), self.assertRaisesRegex(

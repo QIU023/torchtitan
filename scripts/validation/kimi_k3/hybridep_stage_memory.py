@@ -26,7 +26,7 @@ import torch.distributed.checkpoint as dcp
 from pipeline_memory import enable_backward_resharding
 from torch.distributed.fsdp import FSDPModule
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
-from torchtitan.components.optimizer import DistMuon
+from torchtitan.components.optim import DistMuon
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from torchtitan.training_engine import TrainingEngine
 

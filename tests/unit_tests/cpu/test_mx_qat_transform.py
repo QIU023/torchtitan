@@ -10,8 +10,9 @@ from dataclasses import dataclass, replace
 import torch
 from torchao.quantization.quantize_.common import KernelPreference
 from torchtitan.config.transform import MXQATTransform, transform_model_config_
-from torchtitan.models.common.linear import CastLinear, GroupedLinear, Linear
-from torchtitan.protocols.module import Module
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.linear import GroupedLinear, Linear
+from torchtitan.models.base.module import Module
 
 
 class _Model(Module):
@@ -164,18 +165,18 @@ class MXQATTransformTest(unittest.TestCase):
 
     def test_preserves_custom_linear_contract_by_rejecting_it(self):
         config = _config()
-        config.projection = CastLinear.Config(in_features=64, out_features=32)
+        config.projection = HiMidLoLinear.Config(in_features=64, out_features=32)
         with self.assertRaisesRegex(ValueError, "custom linear compute"):
             MXQATTransform(linear_fqns=("projection",)).transform(config)
 
     def test_lora_wraps_qat_and_preserves_its_forward(self):
         from torchao.prototype.qat import mx_fake_quantize
-        from torchtitan.config.transform import LinearLoRAHandler, LoRATransform
+        from torchtitan.config.transform import LoRATransform
 
         config = transform_model_config_(
             _config(),
             [
-                LoRATransform(handlers=(LinearLoRAHandler(),), rank=4),
+                LoRATransform(rank=4, target_modules=["projection"]),
                 MXQATTransform(linear_fqns=("projection",)),
             ],
         )

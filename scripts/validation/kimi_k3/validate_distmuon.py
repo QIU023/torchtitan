@@ -22,20 +22,34 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.components.loss import CrossEntropyLoss, LinearCrossEntropyLoss
-from torchtitan.components.optimizer import DistMuon, LRSchedulersContainer
+from torchtitan.components.optim import DistMuon, LRSchedulersContainer
 from torchtitan.config import DebugConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.transform import MXQATTransform
+from torchtitan.config.transform import (
+    MXQATTransform,
+    TokenDispatcherTransform,
+    transform_model_config_,
+)
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.common.moe import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
-from torchtitan.models.kimi_k3 import model_registry
-from torchtitan.models.kimi_k3.config_registry import _dist_muon_optimizer
+from torchtitan.models.common.token_dispatcher import (
+    DeepEPTokenDispatcher,
+    HybridEPTokenDispatcher,
+)
+from torchtitan.models.kimi_k3 import build_model_config
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from torchtitan.observability.profiler import Profiler
 from torchtitan.training_engine import TrainingEngine
+from torchtitan_recipes.tests.models.kimi_k3 import _dist_muon_optimizer
+
+_DISPATCHERS = {
+    "standard": None,
+    "deepep": DeepEPTokenDispatcher,
+    "hybridep": HybridEPTokenDispatcher,
+}
 
 
 def local(tensor):
@@ -72,12 +86,18 @@ def save_debug_state(engine, output, rank, phase):
 
 
 def configs(args):
-    model = model_registry(
+    model = build_model_config(
         args.flavor,
-        enable_sp=False,
         seq_len=args.seq_len,
-        moe_comm_backend=args.dispatcher,
+        parallelism=ParallelismConfig(enable_sequence_parallel=False),
     )
+    dispatcher = _DISPATCHERS[args.dispatcher]
+    if dispatcher is not None:
+        transform = TokenDispatcherTransform(
+            dispatcher=dispatcher,
+            num_max_tokens_per_rank=args.seq_len * args.microbatch_size,
+        )
+        model = transform_model_config_(model, [transform])
     if args.balanced_routing:
         for _, router, parent, attr in model.traverse(
             QuantileBalancedTopKRouter.Config
@@ -173,7 +193,7 @@ def main():
     parser.add_argument("--reshard-after-backward", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--lr", type=float, default=8e-4)
-    parser.add_argument("--dispatcher", default="standard")
+    parser.add_argument("--dispatcher", choices=_DISPATCHERS, default="standard")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--fused-loss", action="store_true")
     parser.add_argument("--balanced-routing", action="store_true")

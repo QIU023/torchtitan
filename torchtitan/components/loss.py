@@ -347,7 +347,7 @@ class LinearCrossEntropyLoss(LMHeadLoss):
         batch_chunk_size: int = 128
         """Maximum token rows in the temporary logits buffer."""
 
-    def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+    def __init__(self, config: Config):
         if config.batch_chunk_size < 1:
             raise ValueError("batch_chunk_size must be positive")
         self.options = torch.nn.LinearCrossEntropyOptions(
@@ -356,13 +356,10 @@ class LinearCrossEntropyLoss(LMHeadLoss):
             acc_policy="accurate",
         )
         self.lm_head: Linear | None = None
-        if compile_config is not None and "loss" in compile_config.components:
-            raise ValueError(
-                "LinearCrossEntropyLoss does not yet support explicit loss compilation"
-            )
 
     def set_lm_head(self, lm_head: nn.Module) -> None:
         from torch.distributed.fsdp import register_fsdp_forward_method
+
         from torchtitan.models.common.linear import Linear
 
         if not isinstance(lm_head, Linear):

@@ -22,11 +22,12 @@ from torchtitan.components.checkpointer.hf_storage import (
     LogicalPrefixSpec,
     PackedPairSpec,
 )
+from torchtitan.models.base.state_dict_adapter import dtensor_safe
 from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.linear import GroupedLinear, Linear, RouterGateLinear
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.linear import GroupedLinear, Linear
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.moe_state_dict_adapter import MoEStateDictAdapter
-from torchtitan.protocols.state_dict_adapter import dtensor_safe
 from torchtitan.quantization.mx_qat.checkpoint import (
     decode_mxfp4,
     MXFP4CheckpointPolicy,
@@ -154,14 +155,14 @@ class KimiK3StateDictAdapter(MoEStateDictAdapter):
     def hf_linear_weight_mapping(self) -> dict[str, str | None]:
         """Map the supported HF Linear hierarchy to Titan parameter FQNs.
 
-        Reuse the adapter's architecture mapping. RouterGateLinear represents
+        Reuse the adapter's architecture mapping. The HiMidLoLinear router gate represents
         HF KimiMoEGate's raw parameter, not an HF Linear. Grouped expert tensors
         represent one HF Linear per expert; no quantization-name regex is used.
         """
         linear_weights = {
             f"{fqn}.weight": f"{fqn}.weight"
             for fqn, config, _, _ in self.kimi_config.traverse(Linear.Config)
-            if not isinstance(config, RouterGateLinear.Config)
+            if not isinstance(config, HiMidLoLinear.Config)
         }
         # MoonViT builds repeated layers from one block config and renames MLP
         # fields. Inspect one meta block to recover its actual parameter names.
