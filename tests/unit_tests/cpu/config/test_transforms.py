@@ -9,7 +9,7 @@
 import copy
 import inspect
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.config.transform import (
@@ -23,6 +23,7 @@ from torchtitan.config.transform import (
     transform_model_config_,
     TransformRelations,
 )
+from torchtitan.distributed.moonep.experts import MoonEPRoutedExperts
 from torchtitan.models.common.async_linear import (
     AsyncColumnParallelLinear,
     AsyncRowParallelLinear,
@@ -46,6 +47,7 @@ from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     DeepEPTokenDispatcher,
+    MoonEPTokenDispatcher,
 )
 from torchtitan.models.common.vision_encoder import InvariantRowParallelLinear
 
@@ -61,6 +63,13 @@ def _llama3_cp_ready():
     config.parallelism.context_parallel_degree = 2
     config.training.max_context_length = 512
     return config
+
+
+_MOONEP = TokenDispatcherTransform(
+    dispatcher=MoonEPTokenDispatcher,
+    routed_experts=MoonEPRoutedExperts,
+    num_max_tokens_per_rank=512,
+)
 
 
 class _Record(ModelConfigTransform):
@@ -383,6 +392,44 @@ class TestTransformModel(unittest.TestCase):
             TokenDispatcherTransform(
                 dispatcher=AllToAllTokenDispatcher, num_max_tokens_per_rank=128
             )
+
+    def test_token_dispatcher_transform_converts_routed_experts(self):
+        from torchtitan_recipes.tests.models.kimi_k3 import kimi_k3_debugmodel
+
+        config = kimi_k3_debugmodel(seq_len=512)
+        config = replace(
+            config,
+            parallelism=replace(config.parallelism, expert_parallel_degree=4),
+        )
+        transformed = apply_transforms(config, [_MOONEP])
+
+        experts = [
+            routed_experts
+            for _, routed_experts, _, _ in transformed.model.traverse(
+                RoutedExperts.Config
+            )
+        ]
+        self.assertTrue(experts)
+        for routed_experts in experts:
+            self.assertIsInstance(routed_experts, MoonEPRoutedExperts.Config)
+            self.assertIsInstance(
+                routed_experts.token_dispatcher, MoonEPTokenDispatcher.Config
+            )
+            self.assertEqual(
+                routed_experts.token_dispatcher.num_max_tokens_per_rank, 512
+            )
+
+    def test_moonep_is_refused_outside_kimi_k3(self):
+        from torchtitan_recipes.tests.models.qwen3 import qwen3_moe_debug
+
+        config = qwen3_moe_debug(seq_len=512)
+        config = replace(
+            config,
+            parallelism=replace(config.parallelism, expert_parallel_degree=4),
+        )
+        with self.assertRaisesRegex(ValueError, "Kimi K3 only"):
+            apply_transforms(config, [_MOONEP])
+
 
     def test_swap_keeps_the_tuning_of_the_kernel_it_replaces(self):
         config = _llama3_cp_ready()
