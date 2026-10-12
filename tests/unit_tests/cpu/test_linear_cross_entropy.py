@@ -9,7 +9,8 @@ import unittest
 import torch
 import torch.nn.functional as F
 from torchtitan.components.loss import LinearCrossEntropyLoss
-from torchtitan.models.common.linear import CastLinear, Linear
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.linear import Linear
 
 
 class LinearCrossEntropyLossTest(unittest.TestCase):
@@ -22,7 +23,7 @@ class LinearCrossEntropyLossTest(unittest.TestCase):
         labels = torch.tensor([2, 1, -100, 5, 4, 11, 0])
         expected = F.cross_entropy(head(x).float(), labels, reduction="sum") / 6
         expected_grads = torch.autograd.grad(expected, (x, head.weight, head.bias))
-        actual, metrics = loss_fn(x, labels, torch.tensor(6))
+        actual, metrics = loss_fn(x, labels, global_loss_token_counts=torch.tensor(6))
         actual_grads = torch.autograd.grad(actual, (x, head.weight, head.bias))
         torch.testing.assert_close(actual, expected)
         for result, reference in zip(actual_grads, expected_grads):
@@ -32,7 +33,7 @@ class LinearCrossEntropyLossTest(unittest.TestCase):
 
     def test_rejects_custom_compute_and_stacked_heads(self):
         for config in (
-            CastLinear.Config(in_features=16, out_features=32),
+            HiMidLoLinear.Config(in_features=16, out_features=32),
             Linear.Config(in_features=16, out_features=32, num_linears=2),
         ):
             with self.subTest(config=config), self.assertRaisesRegex(

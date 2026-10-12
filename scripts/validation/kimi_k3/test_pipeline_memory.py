@@ -5,12 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from pipeline_memory import enable_backward_resharding, RecomputeMatmulsSelectiveAC
 from torch import nn
+from torchtitan.models.base.module import Module
 
 
 class FakeFSDP(nn.Module):
@@ -60,9 +62,20 @@ class PipelineMemoryTests(unittest.TestCase):
     def test_policy_builds_and_retains_communication(self):
         policy = RecomputeMatmulsSelectiveAC.Config().build()
         self.assertIsInstance(policy, RecomputeMatmulsSelectiveAC)
-        ops = policy.get_save_ops()
-        self.assertNotIn(torch.ops.aten.bmm.default, ops)
-        self.assertIn(torch.ops._c10d_functional.all_to_all_single.default, ops)
+
+        def recomputed(qualified):
+            module = SimpleNamespace(
+                remat_region_name=lambda local: qualified,
+                _remat_save_patterns=policy.config.save_regions,
+                _remat_recompute_patterns=policy.config.recompute_regions,
+            )
+            return Module.remat_should_recompute(module, "")
+
+        self.assertTrue(recomputed("layers.16::attention.wq_b.linear"))
+        self.assertTrue(recomputed("layers.1::moe.routed_experts.w13.grouped_mm"))
+        self.assertFalse(recomputed("layers.1::moe.routed_experts.w2.grouped_mm"))
+        self.assertFalse(recomputed("layers.0::attention.wq_b.tp_gather"))
+        self.assertFalse(recomputed("layers.1::moe.token_dispatcher.dispatch"))
 
 
 if __name__ == "__main__":

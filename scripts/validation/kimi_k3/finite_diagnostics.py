@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 
 import torch
+import torch_remat as remat
 from torch.distributed.tensor import DTensor
 
 
@@ -126,6 +127,9 @@ def install(models, output, rank, step=None):
 
     def hook(name):
         def check(module, inputs, result):
+            # A saved region's output is only a placeholder while torch_remat recomputes.
+            if remat.is_recomputing():
+                return
             values = [
                 _local(t.detach()) for t in _tensors(result) if t.is_floating_point()
             ]

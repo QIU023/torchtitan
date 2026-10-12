@@ -75,7 +75,7 @@ ordinary Kimi debug recipe. Install a compatible TorchAO version that provides
 recipe:
 
 ```bash
-NGPU=1 MODULE=kimi_k3 CONFIG=kimi_k3_debugmodel_mx_qat ./run_train.sh
+NGPU=1 MODULE=torchtitan_recipes.tests.models.kimi_k3 CONFIG=kimi_k3_debugmodel_mx_qat ./run_train.sh
 ```
 
 The debug recipe starts from random initialization and uses `EMULATED` by
@@ -92,7 +92,7 @@ released checkpoint does not match the debug model.
 
 ```python
 # my_kimi_runs.py
-from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_mx_qat
+from torchtitan_recipes.tests.models.kimi_k3 import kimi_k3_debugmodel_mx_qat
 
 
 def qat():

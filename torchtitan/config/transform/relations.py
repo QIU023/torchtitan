@@ -13,6 +13,7 @@ from .base import ModelConfigTransform
 from .context_parallel import ContextParallelTransform
 from .dist_moe import DistMoeTransform
 from .lora import LoRATransform
+from .mx_qat import MXQATTransform
 from .token_dispatcher import TokenDispatcherTransform
 
 TransformType: TypeAlias = type[ModelConfigTransform]
@@ -30,6 +31,8 @@ _BUILTIN_PRECEDES: tuple[PrecedenceRelation, ...] = (
     (ContextParallelTransform, LoRATransform),
     # Dist-MoE must create DistMoeRoutedExperts.Config before LoRA can adapt it.
     (DistMoeTransform, LoRATransform),
+    # LoRA wraps the projection configs that MX QAT has already replaced.
+    (MXQATTransform, LoRATransform),
 )
 
 # Each pair is unordered.
@@ -42,6 +45,9 @@ _BUILTIN_CONFLICTS: tuple[ConflictRelation, ...] = (
     # LoRA freezes every non-target config. Applying it more than once would
     # make freezing and adapter configuration depend on transform order.
     (LoRATransform, LoRATransform),
+    # Repeating QAT in one transform sequence is an error; applying it again
+    # to an existing tree is idempotent.
+    (MXQATTransform, MXQATTransform),
     # Dist-MoE owns token dispatch and combine instead of calling the selected
     # token dispatcher's runtime implementation.
     (DistMoeTransform, TokenDispatcherTransform),

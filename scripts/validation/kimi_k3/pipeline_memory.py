@@ -9,25 +9,21 @@
 Use existing SAC and public FSDP hooks. Keep FP32 gradient accumulation and
 communication unchanged; trade extra dense recomputation/all-gathers for memory.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-import torch
 from torch.distributed.fsdp import FSDPModule
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_checkpoint import RegionAC
 
 
-class RecomputeMatmulsSelectiveAC(SelectiveAC):
+class RecomputeMatmulsSelectiveAC(RegionAC):
+    """SelectiveAC's regions plus every dense linear recomputed; communication regions stay saved."""
+
     @dataclass(kw_only=True, slots=True)
-    class Config(SelectiveAC.Config):
-        pass
-
-    def get_save_ops(self):
-        return super().get_save_ops() - {
-            torch.ops.aten.mm.default,
-            torch.ops.aten.mm.dtype,
-            torch.ops.aten.bmm.default,
-            torch.ops.aten.linear.default,
-        }
+    class Config(RegionAC.Config):
+        save_regions: list[str] = field(default_factory=lambda: ["*"])
+        recompute_regions: list[str] = field(
+            default_factory=lambda: ["*routed_experts.w13.*", "*.linear"]
+        )
 
 
 def enable_backward_resharding(model_parts):

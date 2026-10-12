@@ -21,21 +21,42 @@ from step_watchdog import watch_step
 from torch.distributed.tensor import DTensor
 
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
-from torchtitan.components.loss import CrossEntropyLoss, LinearCrossEntropyLoss
-from torchtitan.components.optimizer import DistMuon, LRSchedulersContainer
+from torchtitan.components.loss import (
+    CrossEntropyLoss,
+    IGNORE_INDEX,
+    LinearCrossEntropyLoss,
+)
+from torchtitan.components.optim import DistMuon, LRSchedulersContainer, Optim
 from torchtitan.config import DebugConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.transform import MXQATTransform
+from torchtitan.config.transform import (
+    MXQATTransform,
+    TokenDispatcherTransform,
+    transform_model_config_,
+)
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.common.moe import (
     QuantileBalancedTopKRouter,
+    RoundRobinTokenChoiceTopKRouter,
     TokenChoiceTopKRouter,
 )
-from torchtitan.models.kimi_k3 import model_registry
-from torchtitan.models.kimi_k3.config_registry import _dist_muon_optimizer
+from torchtitan.models.common.token_dispatcher import (
+    DeepEPTokenDispatcher,
+    HybridEPTokenDispatcher,
+)
+from torchtitan.models.deepseek_v3.mtp import get_mtp_token_counts
+from torchtitan.models.kimi_k3 import build_model_config
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from torchtitan.observability.profiler import Profiler
 from torchtitan.training_engine import TrainingEngine
+from torchtitan_recipes.tests.models.kimi_k3 import _dist_muon_optimizer
+
+_DISPATCHERS = {
+    "standard": None,
+    "deepep": DeepEPTokenDispatcher,
+    "hybridep": HybridEPTokenDispatcher,
+}
 
 
 def local(tensor):
@@ -72,26 +93,6 @@ def save_debug_state(engine, output, rank, phase):
 
 
 def configs(args):
-    model = model_registry(
-        args.flavor,
-        enable_sp=False,
-        seq_len=args.seq_len,
-        moe_comm_backend=args.dispatcher,
-    )
-    if args.balanced_routing:
-        for _, router, parent, attr in model.traverse(
-            QuantileBalancedTopKRouter.Config
-        ):
-            values = {
-                f.name: getattr(router, f.name)
-                for f in fields(TokenChoiceTopKRouter.Config)
-            }
-            values["_debug_force_load_balance"] = True
-            setattr(parent, attr, TokenChoiceTopKRouter.Config(**values))
-    adapter = KimiK3StateDictAdapter(model, None)
-    policy = adapter.mxfp4_policy(args.checkpoint)
-    selected = adapter.qat_weight_fqns(policy)
-    model = MXQATTransform.from_weight_fqns(model, selected).transform(model)
     world = int(os.environ.get("WORLD_SIZE", "8"))
     parallelism = ParallelismConfig(
         data_parallel_shard_degree=world // args.pp,
@@ -101,6 +102,29 @@ def configs(args):
         enable_sequence_parallel=False,
         fsdp_reshard_after_forward="always",
     )
+    model = build_model_config(
+        args.flavor, seq_len=args.seq_len, parallelism=parallelism
+    )
+    dispatcher = _DISPATCHERS[args.dispatcher]
+    if dispatcher is not None:
+        transform = TokenDispatcherTransform(
+            dispatcher=dispatcher,
+            num_max_tokens_per_rank=args.seq_len * args.microbatch_size,
+        )
+        model = transform_model_config_(model, [transform])
+    if args.balanced_routing:
+        for _, router, parent, attr in model.traverse(
+            QuantileBalancedTopKRouter.Config
+        ):
+            values = {
+                f.name: getattr(router, f.name)
+                for f in fields(TokenChoiceTopKRouter.Config)
+            }
+            setattr(parent, attr, RoundRobinTokenChoiceTopKRouter.Config(**values))
+    adapter = KimiK3StateDictAdapter(model, None)
+    policy = adapter.mxfp4_policy(args.checkpoint)
+    selected = adapter.qat_weight_fqns(policy)
+    model = MXQATTransform.from_weight_fqns(model, selected).transform(model)
     optimizer = _dist_muon_optimizer(
         model, muon_lr=args.lr, adamw_lr=args.lr, parallelism=parallelism
     )
@@ -115,7 +139,6 @@ def configs(args):
         max_context_length=args.seq_len,
         steps=args.steps,
         disable_cuda_graphs=True,
-        max_norm=1.0,
     )
     from pipeline_memory import RecomputeMatmulsSelectiveAC
 
@@ -126,7 +149,11 @@ def configs(args):
     )
     config = TrainingEngine.Config(
         debug=DebugConfig(seed=42, deterministic=args.deterministic),
-        optimizer=optimizer,
+        optim=Optim.Config(
+            optimizer=optimizer,
+            lr_scheduler=LRSchedulersContainer.Config(warmup_steps=0, decay_ratio=0.0),
+            max_norm=1.0,
+        ),
         parallelism=parallelism,
         training=training,
         activation_checkpoint=(
@@ -139,7 +166,6 @@ def configs(args):
                 global_vocab_size=model.tok_embeddings.num_embeddings
             )
         ),
-        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=0, decay_ratio=0.0),
         profiler=Profiler.Config(
             enable_profiling=True,
             profile_freq=2,
@@ -149,7 +175,6 @@ def configs(args):
             profiler_repeat=1,
         ),
     )
-    model.update_from_config(config=config)
     return model, config, selected
 
 
@@ -173,7 +198,7 @@ def main():
     parser.add_argument("--reshard-after-backward", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--lr", type=float, default=8e-4)
-    parser.add_argument("--dispatcher", default="standard")
+    parser.add_argument("--dispatcher", choices=_DISPATCHERS, default="standard")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--fused-loss", action="store_true")
     parser.add_argument("--balanced-routing", action="store_true")
@@ -202,7 +227,7 @@ def main():
             ),
             "parameters": sum(p.numel() for p in names.values()),
             "optimizer_types": [
-                type(c).__qualname__ for c in config.optimizer.optimizers
+                type(c).__qualname__ for c in config.optim.optimizer.optimizers
             ],
         }
         print(json.dumps(report), flush=True)
@@ -215,7 +240,7 @@ def main():
     )
     rank = dist.get_rank()
     print(f"RANK {rank} ENGINE_INITIALIZE", flush=True)
-    engine.initialize(compile_config=None, hf_assets_path="")
+    engine.initialize(hf_assets_path="")
     if args.reshard_after_backward:
         if args.pp <= 1:
             raise ValueError("Pipeline backward resharding requires pp > 1")
@@ -267,7 +292,7 @@ def main():
         )
     if args.diagnostic_state:
         save_debug_state(engine, args.output, rank, "initial")
-    muons = [o for o in engine.optimizers if isinstance(o, DistMuon)]
+    muons = [o for o in engine.optim.optimizers if isinstance(o, DistMuon)]
     assert muons, "DistMuon not engaged"
     muon_params = {id(p) for o in muons for g in o.param_groups for p in g["params"]}
     candidates = {}
@@ -297,6 +322,11 @@ def main():
         "distmuon_instances": len(muons),
         "settings": vars(args),
     }
+    dp_rank = (
+        engine.parallelism_context.get_mesh("dp").get_local_rank()
+        if engine.parallelism_context.dp_enabled
+        else 0
+    )
     engine.start_profiler()
     try:
         for step in range(args.steps):
@@ -304,11 +334,7 @@ def main():
                 diagnostic_step = step + 1
                 print(f"RANK {rank} STEP {step + 1} START", flush=True)
                 calls_before = counts["calls"]
-                gen = torch.Generator().manual_seed(
-                    20260928
-                    + step * 1000
-                    + engine.parallelism_context.get_mesh("dp").get_local_rank()
-                )
+                gen = torch.Generator().manual_seed(20260928 + step * 1000 + dp_rank)
                 group = []
                 n = args.seq_len * args.microbatch_size
                 for mb in range(args.microbatches):
@@ -318,27 +344,51 @@ def main():
                         (n + 1,),
                         generator=gen,
                     )
+                    labels = tokens[1:]
+                    positions = torch.arange(args.seq_len, dtype=torch.int32).repeat(
+                        args.microbatch_size
+                    )
+                    padding_mask = torch.zeros(n, dtype=torch.bool)
+                    loss_counts, routing_counts = get_mtp_token_counts(
+                        target_mask=labels != IGNORE_INDEX,
+                        positions=positions,
+                        padding_mask=padding_mask,
+                        num_mtp_layers=0,
+                    )
                     group.append(
                         TokenizedTrainingMicrobatch(
                             input=tokens[:-1],
-                            labels=tokens[1:],
-                            positions=torch.arange(
-                                args.seq_len, dtype=torch.int32
-                            ).repeat(args.microbatch_size),
-                            padding_mask=torch.zeros(n, dtype=torch.bool),
-                            num_valid_tokens=n,
+                            labels=labels,
+                            positions=positions,
+                            padding_mask=padding_mask,
+                            loss_token_counts=loss_counts[0],
+                            routing_token_counts=routing_counts,
                         )
                     )
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 start = time.perf_counter()
-                valid = engine.prepare_step(
-                    n * args.microbatches * (dist.get_world_size() // args.pp)
-                )
-                with torch.profiler.record_function("campaign_forward_backward"):
-                    loss = engine.forward_backward_microbatch(
-                        microbatch_group=group, global_valid_tokens=valid
+                # One group is one pipeline step; without PP each microbatch is its own group.
+                groups = [group] if args.pp > 1 else [[mb] for mb in group]
+                local_loss = sum(mb.loss_token_counts for mb in group)
+                local_routing = sum(mb.routing_token_counts for mb in group)
+                token_counts = torch.cat(
+                    (local_loss.reshape(-1), local_routing.reshape(-1))
+                ).to(engine.device)
+                if engine.parallelism_context.dp_enabled:
+                    token_counts = dist_utils.dist_sum_tensor(
+                        token_counts, engine.parallelism_context.get_mesh("dp")
                     )
+                with torch.profiler.record_function("campaign_forward_backward"):
+                    loss = engine.forward_backward(
+                        microbatch_groups=groups,
+                        global_loss_token_counts=token_counts[:1].reshape(
+                            local_loss.shape
+                        ),
+                        global_routing_token_counts=token_counts[1:].reshape(
+                            local_routing.shape
+                        ),
+                    ).loss
                 if step == 0:
                     log_memory(rank, "first_forward_backward_complete")
                     if args.release_cache_before_first_update:
@@ -383,7 +433,7 @@ def main():
                 if step == 0:
                     log_memory(rank, "first_optimizer_start")
                 with torch.profiler.record_function("campaign_optimizer"):
-                    grad_norm = engine.optimizer_step()
+                    grad_norm = engine.optim_step()
                 if step == 0:
                     log_memory(rank, "first_optimizer_complete")
                 assert math.isfinite(

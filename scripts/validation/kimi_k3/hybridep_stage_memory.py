@@ -26,7 +26,9 @@ import torch.distributed.checkpoint as dcp
 from pipeline_memory import enable_backward_resharding
 from torch.distributed.fsdp import FSDPModule
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
-from torchtitan.components.optimizer import DistMuon
+from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.optim import DistMuon
+from torchtitan.models.deepseek_v3.mtp import get_mtp_token_counts
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from torchtitan.training_engine import TrainingEngine
 
@@ -61,7 +63,7 @@ def main():
     reader_config = copy.deepcopy(model_config)
     model_config.layers = model_config.layers[:11]
     prefixes = tuple(f"layers.{i}." for i in range(11))
-    for opt in config.optimizer.optimizers:
+    for opt in config.optim.optimizer.optimizers:
         if isinstance(opt, DistMuon.Config):
             opt.compute_sharding_by_fqn = {
                 n: v
@@ -77,7 +79,7 @@ def main():
         config, model_config=model_config, max_num_documents=2, output_dir=str(out)
     )
     rank = dist.get_rank()
-    engine.initialize(compile_config=None, hf_assets_path="")
+    engine.initialize(hf_assets_path="")
     model = engine.model_parts[0]
     handles = enable_backward_resharding([model])
     adapter = KimiK3StateDictAdapter(reader_config, None)
@@ -132,12 +134,22 @@ def main():
         tokens = torch.randint(
             0, model_config.tok_embeddings.num_embeddings, (4097,), generator=gen
         )
+        labels = tokens[1:]
+        positions = torch.arange(2048, dtype=torch.int32).repeat(2)
+        padding_mask = torch.zeros(4096, dtype=torch.bool)
+        loss_counts, routing_counts = get_mtp_token_counts(
+            target_mask=labels != IGNORE_INDEX,
+            positions=positions,
+            padding_mask=padding_mask,
+            num_mtp_layers=0,
+        )
         batch = TokenizedTrainingMicrobatch(
             input=tokens[:-1],
-            labels=tokens[1:],
-            positions=torch.arange(2048, dtype=torch.int32).repeat(2),
-            padding_mask=torch.zeros(4096, dtype=torch.bool),
-            num_valid_tokens=4096,
+            labels=labels,
+            positions=positions,
+            padding_mask=padding_mask,
+            loss_token_counts=loss_counts[0],
+            routing_token_counts=routing_counts,
         )
         with engine.parallelism_context.activate_spmd(typechecking=False):
             inputs, _, kwargs = model.preprocess_inputs(
@@ -186,7 +198,10 @@ def main():
                         unsharded_bytes += unsharded.untyped_storage().nbytes()
                     if p.unsharded_accumulated_grad is None:
                         continue
-                    grad = p.unsharded_accumulated_grad_data.detach().reshape(-1)
+                    grad = p.unsharded_accumulated_grad.detach()
+                    grad = (
+                        grad.to_local() if hasattr(grad, "to_local") else grad
+                    ).reshape(-1)
                     assert grad.dtype == torch.float32, grad.dtype
                     grad_bytes += grad.numel() * grad.element_size()
                     positive = False
