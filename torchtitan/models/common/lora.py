@@ -20,6 +20,7 @@ import spmd_types as spmd
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.base.module import Module
@@ -382,15 +383,36 @@ def _state_dict_prefix(module_name: str, state_dict: dict[str, torch.Tensor]) ->
     )
 
 
-def _adapter_delta(module: _LoRAMixin) -> torch.Tensor:
+def _merged_weight(module: _LoRAMixin, base: torch.Tensor) -> torch.Tensor:
     module = cast(_LoRALinearMixin | _LoRAGroupedLinearMixin, module)
-    lora_a = module.lora_a.weight.float()
-    lora_b = module.lora_b.weight.float()
-    if isinstance(module, _LoRAGroupedLinearMixin):
-        delta = torch.bmm(lora_b.flatten(1, -2), lora_a)
+    grouped = isinstance(module, _LoRAGroupedLinearMixin)
+    lora_a, lora_b, weight = module.lora_a.weight, module.lora_b.weight, base
+    if isinstance(base, DTensor):
+        # B shares the base's output sharding; A is only cut on its rank dim, by FSDP.
+        rank_dim = 1 if grouped else 0
+        lora_a = lora_a.redistribute(
+            placements=[
+                Replicate() if placement.is_shard(rank_dim) else placement
+                for placement in lora_a.placements
+            ]
+        ).to_local()
+        lora_b, weight = lora_b.to_local(), base.to_local()
+    lora_a, lora_b = lora_a.float(), lora_b.float()
+    if grouped:
+        delta = torch.bmm(lora_b.flatten(1, -2), lora_a).view(weight.shape)
     else:
         delta = torch.matmul(lora_b, lora_a)
-    return module._lora_scaling * delta.view(module.weight.shape)
+    merged = (weight.float() + module._lora_scaling * delta).to(base.dtype)
+    if isinstance(base, DTensor):
+        return DTensor.from_local(
+            merged,
+            base.device_mesh,
+            base.placements,
+            run_check=False,
+            shape=base.shape,
+            stride=base.stride(),
+        )
+    return merged
 
 
 def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -410,9 +432,8 @@ def merge_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             if not isinstance(module, _LoRAMixin):
                 continue
             prefix = _state_dict_prefix(name, state_dict)
-            base = state_dict[_key(prefix, "weight")]
-            merged = base.float() + _adapter_delta(module)
-            state_dict[_key(prefix, "weight")] = merged.to(base.dtype)
+            key = _key(prefix, "weight")
+            state_dict[key] = _merged_weight(module, state_dict[key])
             del state_dict[_key(prefix, "lora_a.weight")]
             del state_dict[_key(prefix, "lora_b.weight")]
     return state_dict
