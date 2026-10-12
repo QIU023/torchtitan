@@ -292,6 +292,11 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         self.model_parts = model_parts
 
         for part_idx, model in enumerate(self.model_parts):
+            if not any(param.requires_grad for param in model.parameters()):
+                logger.info(
+                    f"Optimizer: model part {part_idx} has no trainable parameters"
+                )
+                continue
             claimed: set[str] = set()
             for optimizer_config in config.optimizers:
                 param_group = self._build_param_group(
