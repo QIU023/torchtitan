@@ -884,3 +884,22 @@ class TestMergeLoRAStateDictTensorParallel(DTensorTestBase):
         torch.testing.assert_close(
             merged["w2.weight"].cpu(), reference["w2.weight"][:, hidden]
         )
+
+
+@pytest.mark.parametrize("tp", [spmd.R, spmd.I])
+def test_lora_adapters_of_a_tp_unsharded_base_take_its_placement(tp):
+    placement = dense_param_placement(tp=tp)
+    linear = (
+        LoRATransform(rank=8)
+        .transform(
+            Linear.Config(
+                in_features=16,
+                out_features=8,
+                sharding_config=ShardingConfig(state_shardings={"weight": placement}),
+                param_init={"weight": torch.nn.init.normal_},
+            )
+        )
+        .build()
+    )
+    assert linear.lora_a._sharding_config.state_shardings["weight"] == placement
+    assert linear.lora_b._sharding_config.state_shardings["weight"] == placement
