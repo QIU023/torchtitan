@@ -10,9 +10,9 @@ from dataclasses import dataclass, replace
 import torch
 from torchao.quantization.quantize_.common import KernelPreference
 from torchtitan.config.transform import MXQATTransform, transform_model_config_
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.linear import GroupedLinear, Linear
-from torchtitan.models.base.module import Module
 
 
 class _Model(Module):
@@ -196,6 +196,32 @@ class MXQATTransformTest(unittest.TestCase):
         self.assertIsNone(module.weight.grad)
         self.assertGreater(torch.count_nonzero(module.lora_b.weight.grad), 0)
         self.assertTrue(torch.isfinite(value.grad).all())
+
+    def test_lora_merge_folds_the_adapters_into_the_qat_master(self):
+        from torchtitan.config.transform import LoRATransform
+        from torchtitan.models.common.lora import merge_lora_state_dict
+
+        config = transform_model_config_(
+            _config(),
+            [
+                LoRATransform(rank=4, target_modules=["projection"]),
+                MXQATTransform(linear_fqns=("projection",)),
+            ],
+        )
+        module = config.projection.build()
+        with torch.no_grad():
+            module.weight.normal_()
+            module.lora_a.weight.normal_()
+            module.lora_b.weight.normal_()
+
+        merged = merge_lora_state_dict(module)
+
+        self.assertEqual(set(merged), {"weight"})
+        torch.testing.assert_close(
+            merged["weight"],
+            module.weight
+            + module._lora_scaling * module.lora_b.weight @ module.lora_a.weight,
+        )
 
     def test_dense_qat_keeps_parameter_names_and_optimizer_identity(self):
         config = _config()
