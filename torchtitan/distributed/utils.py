@@ -563,6 +563,7 @@ def clip_grad_norm_(
             norm_type,
             error_if_nonfinite,
             foreach,
+            dtype=torch.float32,
         )
         # If norm is a DTensor, the placements must be
         # `torch.distributed._tensor.ops.math_ops._NormPartial`. We can simply
