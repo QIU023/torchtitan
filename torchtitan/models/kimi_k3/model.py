@@ -643,7 +643,10 @@ class KimiK3Model(MultimodalModel):
         vision_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
-            raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
+            raise NotImplementedError(
+                "Kimi K3 takes video chunks as pixel_values items, not "
+                "pixel_values_videos."
+            )
 
         if self.tok_embeddings is not None:
             with spmd_local_context("dp"):
