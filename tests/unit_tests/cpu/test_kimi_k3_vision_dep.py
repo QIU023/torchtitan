@@ -387,7 +387,7 @@ class TestKimiK3VisionDep(_VisionDepChecks, DTensorTestBase):
             torch.testing.assert_close(tower.bias.grad.full_tensor(), 3 * bias)
 
 
-class TestVisionReplicaSeed(DTensorTestBase):
+class TestVisionReplica(DTensorTestBase):
     @property
     def device_type(self) -> str:
         return "cpu"
@@ -396,8 +396,7 @@ class TestVisionReplicaSeed(DTensorTestBase):
     def world_size(self) -> int:
         return 1
 
-    @with_comms
-    def test_building_the_tower_copy_leaves_the_seeded_stream_alone(self):
+    def _model_and_context(self) -> tuple[nn.Module, ParallelismContext]:
         with torch.device("meta"):
             model = nn.Module()
             model.vision_encoder = Linear.Config(
@@ -413,6 +412,11 @@ class TestVisionReplicaSeed(DTensorTestBase):
             world_size=1,
             enable_sequence_parallel=False,
         )
+        return model, context
+
+    @with_comms
+    def test_building_the_tower_copy_leaves_the_seeded_stream_alone(self):
+        model, context = self._model_and_context()
         torch.manual_seed(0)
         expected = torch.rand(8)
         torch.manual_seed(0)
@@ -420,12 +424,32 @@ class TestVisionReplicaSeed(DTensorTestBase):
             model,
             parallelism_context=context,
             training=SimpleNamespace(
-                enable_cpu_offload=False, mixed_precision_param="float32"
+                enable_cpu_offload=False,
+                mixed_precision_param="float32",
+                mixed_precision_reduce="float32",
             ),
             activation_remat=None,
             device=torch.device("cpu"),
         )
         torch.testing.assert_close(torch.rand(8), expected, rtol=0, atol=0)
+
+    @with_comms
+    def test_the_tower_copy_accumulates_gradients_in_the_reduce_dtype(self):
+        model, context = self._model_and_context()
+        replica = build_vision_replica(
+            model,
+            parallelism_context=context,
+            training=SimpleNamespace(
+                enable_cpu_offload=False,
+                mixed_precision_param="bfloat16",
+                mixed_precision_reduce="float32",
+            ),
+            activation_remat=None,
+            device=torch.device("cpu"),
+        )
+        for param in replica.parameters():
+            self.assertEqual(param.dtype, torch.bfloat16)
+            self.assertEqual(param.grad_dtype, torch.float32)
 
 
 if __name__ == "__main__":

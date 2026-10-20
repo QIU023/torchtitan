@@ -51,8 +51,11 @@ def build_vision_replica(
         replica.init_states()
     with torch.no_grad():
         dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
+        grad_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
         for param in replica.parameters():
             param.data = param.data.to(dtype)
+            # As on the FSDP-wrapped tower, gradients accumulate in the reduce dtype.
+            param.grad_dtype = grad_dtype
     return replica.train()
 
 
