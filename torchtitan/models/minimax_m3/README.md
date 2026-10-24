@@ -34,10 +34,10 @@ The values below follow the
 | Feature | Notes |
 |---------|-------|
 | FSDP2 / HSDP | Supported |
-| Tensor / sequence parallelism | Not yet supported |
-| Context parallelism | Not yet supported |
-| Expert parallelism | Not yet supported |
-| Pipeline parallelism | Not yet supported |
+| Tensor / sequence parallelism | Supported; index query heads shard with their KV groups and the shared index key head replicates |
+| Expert parallelism | Supported |
+| Pipeline parallelism | Supported |
+| Context parallelism | Not yet supported: each query's block selection reads the index keys of its whole document |
 
 ## Numerical Parity
 
@@ -46,13 +46,13 @@ TorchTitan's local `debugmodel` configuration before initializing both models,
 and loads the TorchTitan weights through Hugging Face's checkpoint conversion.
 
 On a 333-token image and text prompt in bfloat16, the last-token KL divergence
-against the Hugging Face implementation is **1.50e-5** with a top-1 match;
-93.8% of the sparse attention block selections and 97.9% of the expert choices
+against the Hugging Face implementation is **2.21e-5** with a top-1 match;
+88.7% of the sparse attention block selections and 93.4% of the expert choices
 match. With Hugging Face's block selections and expert choices imposed, the
-KL divergence over all positions is **4.07e-5**.
+KL divergence over all positions is **4.74e-5**.
 
 Vision parity: pixel preprocessing max difference **4.8e-7**; projected vision
-features max difference **6.1e-5**.
+features max difference **1.2e-4**.
 
 Test scripts:
 
