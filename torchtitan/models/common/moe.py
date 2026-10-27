@@ -9,6 +9,8 @@ from typing import Literal
 
 import spmd_types as spmd
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -30,6 +32,23 @@ from .token_dispatcher import LocalTokenDispatcher
 #       per-local-expert token counts after EP dispatch /_permute),
 #   K = top-k, N = routed tokens (T*K),
 #   R = routed tokens assigned to local experts
+
+
+
+class _MatmulBwdFp64(torch.autograd.Function):  # LOCAL PROBE HACK (not committed)
+    """A @ W.t() with the float32 forward and a backward computed in float64 and rounded: the
+    same gradients up to float32 rounding, the forward (and so the routing) untouched."""
+
+    @staticmethod
+    def forward(ctx, A, W):
+        ctx.save_for_backward(A, W)
+        return A @ W.t()
+
+    @staticmethod
+    def backward(ctx, g):
+        A, W = ctx.saved_tensors
+        gd = g.double()
+        return (gd @ W.double()).float(), (gd.t() @ A.double()).float()
 
 
 class GroupedExperts(Module):
@@ -92,10 +111,10 @@ class GroupedExperts(Module):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
         h_RF = F.silu(
-            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
+            self._grouped_mm(A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()), weight_EOI=w1_EFD, offs=offsets_E)
         )
         h_RF = h_RF * self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
+            A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()), weight_EOI=w3_EFD, offs=offsets_E
         )
         return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
 
@@ -115,6 +134,19 @@ class GroupedExperts(Module):
         ``__torch_function__`` -- means it is captured by FX tracers such as
         graph_trainer's make_fx path.
         """
+        if os.environ.get("EXPERTS_FP32"):  # LOCAL PROBE HACK (not committed)
+            out = A.new_zeros(A.shape[0], weight_EOI.shape[1], dtype=torch.float32)
+            ends = offs.tolist(); start = 0
+            for e, end in enumerate(ends):
+                if end > start:
+                    if os.environ.get("EXPERTS_FP64"):  # the same product rounded once from float64
+                        out[start:end] = (A[start:end].double() @ weight_EOI[e].double().t()).float()
+                    elif os.environ.get("EXPERTS_BWD_FP64"):  # forward unchanged, backward rounded from float64
+                        out[start:end] = _MatmulBwdFp64.apply(A[start:end].float(), weight_EOI[e].float())
+                    else:
+                        out[start:end] = A[start:end].float() @ weight_EOI[e].float().t()
+                start = end
+            return out
         return torch._grouped_mm(A, weight_EOI.bfloat16().transpose(-2, -1), offs=offs)
 
 
@@ -339,6 +371,8 @@ class TokenChoiceTopKRouter(Module):
             denominator = topk_scores_TK.sum(dim=-1, keepdim=True) + 1e-20
             topk_scores_TK = topk_scores_TK / denominator
         topk_scores_TK = topk_scores_TK * self.route_scale
+        if os.environ.get("ROUTER_DUMP"):  # LOCAL PROBE HACK (not committed)
+            self._route_log = getattr(self, "_route_log", []) + [topk_expert_ids_TK.detach().to(torch.int16).cpu()]
 
         return (
             topk_scores_TK,
