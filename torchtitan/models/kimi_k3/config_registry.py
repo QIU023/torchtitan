@@ -12,7 +12,7 @@ from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.config import TrainingConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_checkpoint import RegionAC, SelectiveAC
 from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
 from torchtitan.hf_datasets.multimodal.mm_datasets import (
     MM_DATASETS,
@@ -92,5 +92,9 @@ def kimi_k3_debugmodel(
             interval=10,
             last_save_model_only=False,
         ),
-        activation_checkpoint=SelectiveAC.Config(),
+        activation_checkpoint=(
+            RegionAC.Config(save_regions=["*_res"])
+            if __import__("os").environ.get("K3_SAVE_RESIDUAL") == "1"
+            else SelectiveAC.Config()
+        ),
     )
