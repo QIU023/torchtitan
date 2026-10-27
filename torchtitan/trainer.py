@@ -896,6 +896,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 local_valid_tokens += input_dict.pop("num_valid_tokens")
                 microbatches.append(input_dict)
             microbatch_groups.append(microbatches)
+        # LOCAL PROBE HACK (not committed): accumulation order only. MB_ORDER is a
+        # permutation of the group indices; MB_REVERSE=1 is the reversal it
+        # supersedes. Each group's forward and backward is unchanged; only the
+        # order in which their gradients accumulate differs.
+        _mb_order = os.environ.get("MB_ORDER")
+        if _mb_order:
+            _perm = [int(i) for i in _mb_order.split(",")]
+            assert sorted(_perm) == list(range(len(microbatch_groups))), (
+                f"MB_ORDER={_mb_order} is not a permutation of "
+                f"{len(microbatch_groups)} groups"
+            )
+            microbatch_groups = [microbatch_groups[i] for i in _perm]
+        elif os.environ.get("MB_REVERSE") == "1":
+            microbatch_groups.reverse()
         sl.log_trace_scalar({"local_valid_tokens": local_valid_tokens})
 
         # Keep the global token count on device so loss normalization does not
@@ -979,6 +993,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(detached_loss)
 
         with sl.log_trace_span("optim"):
+            if os.environ.get("GRAD_DUMP") and self.step == 1:  # LOCAL PROBE HACK (not committed)
+                import torch.distributed as _dist
+
+                _d = {}
+                for _m in self.model_parts:
+                    for _n, _p in _m.named_parameters():
+                        if _p.grad is None:
+                            continue
+                        _g = _p.grad
+                        _g = _g.full_tensor() if hasattr(_g, "full_tensor") else _g
+                        _d[_n] = _g.detach().float().cpu()
+                torch.save(
+                    _d,
+                    f"{os.environ['GRAD_DUMP']}.ws{_dist.get_world_size()}.rank{_dist.get_rank()}.pt",
+                )
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
@@ -1062,6 +1091,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             **lr_metrics,
             **collect_aux_loss_metrics(parallel_dims),
         }
+        # LOCAL PROBE HACK (not committed): the printed loss rounds to five
+        # decimals, which hides a one-ulp difference. STEP1_DUMP names a file
+        # to write the step-1 loss and gradient norm into at full precision.
+        _s1 = os.environ.get("STEP1_DUMP")
+        if _s1 and self.step == 1:
+            import torch.distributed as _d
+
+            if not _d.is_initialized() or _d.get_rank() == 0:
+                with open(_s1, "w") as _f:
+                    _f.write(
+                        f"loss={float(global_avg_loss)!r}\n"
+                        f"max_loss={float(global_max_loss)!r}\n"
+                        f"grad_norm={float(grad_norm.item())!r}\n"
+                    )
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
