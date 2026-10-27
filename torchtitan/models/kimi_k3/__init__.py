@@ -552,6 +552,9 @@ kimi_k3_configs = {
     # (93 = 7 x 12 + 9); 35 units with the embedding and the head, which no
     # pipeline shape divides, so every split is uneven the way the real one is.
     "debugmodel": (partial(_debugmodel, num_layers=33), 16384),
+    "debugmodel17": (partial(_debugmodel, num_layers=17), 16384),  # run-worktree alias, not for commit
+    "debugmodel13": (partial(_debugmodel, num_layers=13), 16384),  # run-worktree alias, not for commit
+    "debugmodel9": (partial(_debugmodel, num_layers=9), 16384),  # run-worktree alias, not for commit
     "Kimi-K3": (_kimi_k3, 262144),
 }
 
