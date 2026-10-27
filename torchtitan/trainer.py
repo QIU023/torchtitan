@@ -15,6 +15,18 @@ from datetime import timedelta
 from typing import Annotated, Any
 
 import torch
+
+if __import__("os").environ.get("FP32_PROBE") == "1":  # LOCAL PROBE HACK (not committed): bf16 casts stay float32
+    torch.Tensor.bfloat16 = lambda self, *a, **k: self
+    _fp32_probe_to = torch.Tensor.to
+
+    def _fp32_probe_to_fn(self, *a, **k):
+        a = tuple(torch.float32 if x is torch.bfloat16 else x for x in a)
+        if k.get("dtype") is torch.bfloat16:
+            k["dtype"] = torch.float32
+        return _fp32_probe_to(self, *a, **k)
+
+    torch.Tensor.to = _fp32_probe_to_fn
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
 
@@ -348,6 +360,8 @@ class Trainer(Configurable):
                 local_valid_tokens += microbatch.num_valid_tokens
                 microbatch_group.append(microbatch)
             microbatch_groups.append(microbatch_group)
+        if os.environ.get("MB_REVERSE") == "1":  # LOCAL PROBE HACK (not committed): accumulation order only
+            microbatch_groups.reverse()
         sl.log_trace_scalar({"local_valid_tokens": local_valid_tokens})
 
         # Keep the global token count on device so loss normalization does not
@@ -380,7 +394,13 @@ class Trainer(Configurable):
                 global_valid_tokens=global_valid_tokens,
                 accumulation_index=fwd_bwd_index,
             )
-            if should_log:
+            if should_log and os.environ.get("NOSYNC_GA") == "1":  # LOCAL PROBE HACK (not committed): the reference logs its step loss the way the pipeline's last stage does, torch.sum(torch.stack(losses)), not a running add
+                _probe_losses = globals().setdefault("_PROBE_LOSSES", [])
+                _probe_losses.append(detached_loss.clone())
+                if fwd_bwd_index == len(microbatch_groups) - 1:
+                    accumulated_loss = torch.sum(torch.stack(_probe_losses)).to(detached_loss.device)
+                    _probe_losses.clear()
+            elif should_log:
                 if accumulated_loss is None:
                     # Take ownership before the next replay overwrites the
                     # graph-owned output. Later losses accumulate in place.
