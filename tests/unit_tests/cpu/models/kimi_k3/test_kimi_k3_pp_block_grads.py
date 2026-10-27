@@ -61,16 +61,11 @@ class _ExactStage(nn.Module):
             }
         )
 
-    def forward(self, hidden: torch.Tensor, blocks: list[torch.Tensor] | None = None):
+    def forward(self, hidden: torch.Tensor, stack: torch.Tensor | None = None):
         if self.first:
             hidden = F.pad(hidden, (INPUT, 0))
-            blocks = []
-        assert blocks is not None
-        stack = (
-            torch.stack(blocks, 1)
-            if blocks
-            else hidden.new_zeros(hidden.shape[0], 0, DIM)
-        )
+            stack = hidden.new_zeros(hidden.shape[0], 0, DIM)
+        assert stack is not None
         for layer in self.layers:
             if layer % LAYERS_PER_BLOCK == 0:
                 block = self.blocks[str(layer // LAYERS_PER_BLOCK)] * hidden[:, INPUT:]
@@ -80,7 +75,7 @@ class _ExactStage(nn.Module):
                 hidden = hidden + F.pad(read, (READOUT, DIM - READOUT - 1))
         if self.last:
             return hidden[:, READOUT] + _read(stack, HEAD)
-        return hidden, [block.contiguous() for block in stack.unbind(1)]
+        return hidden, stack
 
 
 def _read(stack: torch.Tensor, channel: int) -> torch.Tensor:
@@ -193,7 +188,7 @@ class TestKimiK3PipelineExactBlockGradients(DTensorTestBase):
         )
         store = PPRankLocalCache()
         for stage in stages:
-            stage.set_routing(layout, store, wait_sends_at_backward=True)
+            stage.set_routing(layout, store)
 
         def step(inputs, targets):
             losses: list[torch.Tensor] = []

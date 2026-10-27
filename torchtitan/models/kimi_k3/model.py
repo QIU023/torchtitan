@@ -628,7 +628,7 @@ class KimiK3Model(MultimodalModel):
     def forward(  # pyrefly: ignore[bad-param-name-override, bad-override]
         self,
         tokens: torch.Tensor,
-        blocks_TD: list[torch.Tensor] | None = None,
+        block_residual_TND: torch.Tensor | None = None,
         *,
         pixel_values: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
@@ -641,7 +641,7 @@ class KimiK3Model(MultimodalModel):
         vision_bank_indices_T: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
         vision_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
 
@@ -673,8 +673,9 @@ class KimiK3Model(MultimodalModel):
                 ),
             )
 
-        if blocks_TD is None:
-            blocks_TD = []
+        blocks_TD = (
+            [] if block_residual_TND is None else list(block_residual_TND.unbind(1))
+        )
         with spmd.no_typecheck():
             aux_loss_denominator = (
                 None if aux_loss_denominators is None else aux_loss_denominators[0]
@@ -696,7 +697,9 @@ class KimiK3Model(MultimodalModel):
             )
 
         if self.output_res_proj is None:
-            return h_TD, blocks_TD
+            if not blocks_TD:
+                return h_TD, h_TD.unsqueeze(1)[:, :0]
+            return h_TD, torch.stack(blocks_TD, dim=1)
         h_TD = self.attention_residual(
             [*blocks_TD, h_TD],
             self.output_res_proj,
