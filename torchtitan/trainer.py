@@ -914,6 +914,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(detached_loss)
 
         with sl.log_trace_span("optim"):
+            if os.environ.get("GRAD_TENSOR_DUMP") and self.step == 1:  # LOCAL PROBE HACK (not committed)
+                import torch.distributed as _dist
+
+                _d = {}
+                for _m in self.model_parts:
+                    for _n, _p in _m.named_parameters():
+                        if _p.grad is None:
+                            continue
+                        _g = _p.grad
+                        _g = _g.full_tensor() if hasattr(_g, "full_tensor") else _g
+                        _d[_n] = _g.detach().float().cpu()
+                if os.environ.get("ACT_DUMP"):
+                    from torchtitan.models.kimi_k3 import model as _k3m
+
+                    _d["__probe__"] = dict(_k3m._PROBE)
+                _tot = sum(float(_g.double().pow(2).sum()) for _n, _g in _d.items() if _n != "__probe__") ** 0.5
+                _al = accumulated_loss.to_local() if hasattr(accumulated_loss, "to_local") else accumulated_loss
+                print(f"PROBE step={self.step} rank={_dist.get_rank()} loss={float(_al.float().sum()):.9f} gradnorm={_tot:.9f}", flush=True)
+                if not os.environ.get("GRAD_TENSOR_DUMP_NOSAVE"):
+                    torch.save(_d, f"{os.environ['GRAD_TENSOR_DUMP']}.rank{_dist.get_rank()}.pt")
+                if os.environ.get("GRAD_TENSOR_DUMP_EXIT"):
+                    _dist.barrier()
+                    os._exit(0)
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
