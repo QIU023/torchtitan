@@ -252,9 +252,7 @@ def use_kimi_k3_cp_kernels(config: "KimiK3Model.Config") -> None:
                     "Kimi K3 context parallel runs Ulysses on FlexAttention; "
                     f"got {type(inner).__qualname__}."
                 )
-            layer.attention.inner_attention = _swap_kernel(
-                inner, UlyssesCPFlexAttention
-            )
+            pass  # VARIANT PROBE: MLA stays on the declared Ulysses boundary
         if layer.delta_attention is not None:
             layer.delta_attention.inner_kda = _swap_kernel(
                 layer.delta_attention.inner_kda, ContextParallelInnerKDA

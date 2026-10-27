@@ -141,7 +141,7 @@ def _set_mla_sharding(
             state_shardings={"weight": dense_param_placement(tp=spmd.R)}
         )
     if cp_kernel:
-        _set_cp_kernel_local_map(attention_cfg.inner_attention)
+        _set_ulysses_inner_attention(attention_cfg.inner_attention)  # VARIANT PROBE
     else:
         set_gqa_inner_attention_local_map(attention_cfg.inner_attention)
 
@@ -387,4 +387,32 @@ def _set_cp_kernel_local_map(inner_attention_cfg) -> None:
         local_map=LocalMapConfig(
             in_grad_placements=(placements, placements, placements)
         ),
+    )
+
+
+def _ulysses_head_placement() -> SpmdType:
+    """``(tokens, heads, dim)`` with the cp axis on the heads, inside TP's split."""
+    return SpmdType(
+        {DP: spmd.V, CP: spmd.V, TP: spmd.V},
+        partition_spec=spmd.PartitionSpec(DP, (TP, CP), None),
+    )
+
+
+def _set_ulysses_inner_attention(inner_attention_cfg) -> None:
+    """Ulysses context parallel for MLA, stated as the module boundary.
+
+    The stream arrives token-sharded on the cp axis. Trading that shard for a
+    head shard on the way in is one redistribution (an all-to-all); the body
+    then sees the full sequence for its head subset and the output trades
+    back. The full-sequence mask is supplied by ``preprocess_inputs``, which
+    keeps the masks out of the CP input sharding.
+    """
+    seq = attention_activation_placement()
+    heads = _ulysses_head_placement()
+    inner_attention_cfg.sharding_config = ShardingConfig(
+        in_src_shardings={"q_TNH": seq, "k_TNH": seq, "v_TNH": seq},
+        in_dst_shardings={"q_TNH": heads, "k_TNH": heads, "v_TNH": heads},
+        out_src_shardings=heads,
+        out_dst_shardings=seq,
+        local_map=LocalMapConfig(in_grad_placements=(heads, heads, heads)),
     )
