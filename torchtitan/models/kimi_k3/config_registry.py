@@ -228,3 +228,16 @@ def kimi_k3_debugmodel_mtp() -> Trainer.Config:
         ),
     )
     return config
+
+
+# PROBE ONLY (not committed): the text arm on the integration tree -- the multimodal debug
+# config with the text loader (c4_test, concat-then-split packing) in place of cc12m-test.
+def kimi_k3_debugmodel_text() -> Trainer.Config:
+    from torchtitan.components.data import ConcatThenSplitPackingConfig
+    from torchtitan.hf_datasets.text_datasets import DATASETS
+
+    config = kimi_k3_debugmodel()
+    config.dataloader = GrainDataLoader.Config(
+        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+    )
+    return config
