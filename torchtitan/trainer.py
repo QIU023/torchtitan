@@ -914,6 +914,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(detached_loss)
 
         with sl.log_trace_span("optim"):
+            if os.environ.get("GRAD_TENSOR_DUMP") and self.step == 1:  # LOCAL PROBE HACK (not committed)
+                import torch.distributed as _dist
+
+                _d = {}
+                for _m in self.model_parts:
+                    for _n, _p in _m.named_parameters():
+                        if _p.grad is None:
+                            continue
+                        _g = _p.grad
+                        _g = _g.full_tensor() if hasattr(_g, "full_tensor") else _g
+                        _d[_n] = _g.detach().to(torch.bfloat16).cpu()
+                torch.save(_d, f"{os.environ['GRAD_TENSOR_DUMP']}.rank{_dist.get_rank()}.pt")
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
