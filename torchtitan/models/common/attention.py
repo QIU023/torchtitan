@@ -778,7 +778,7 @@ class FusedQKVLinear(BaseQKVLinear):
         )
         * 3
     )
-    def forward(  # pyrefly: ignore[bad-override]
+    def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_tokens = x.shape[0]

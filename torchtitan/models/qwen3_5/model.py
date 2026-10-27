@@ -370,7 +370,6 @@ class Qwen35Model(Decoder):
             quadratic_attention = deltanet_metadata
         else:
             quadratic_attention = super().get_attention_masks(positions)
-        # pyrefly: ignore [bad-return]
         return {
             "quadratic_attention": quadratic_attention,  # pyrefly: ignore [bad-assignment]
             "deltanet": deltanet_metadata,

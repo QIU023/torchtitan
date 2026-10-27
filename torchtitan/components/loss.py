@@ -106,7 +106,6 @@ class _LossParallelCrossEntropy(torch.autograd.Function):
         return result
 
     @staticmethod
-    # pyrefly: ignore [bad-override]
     def forward(
         ctx,
         logits: torch.Tensor,
@@ -790,7 +789,6 @@ class _DecoderOutputGradientBackProp(torch.autograd.Function):
     """
 
     @staticmethod
-    # pyrefly: ignore [bad-override]
     def forward(
         ctx,
         hidden_states: torch.Tensor,
