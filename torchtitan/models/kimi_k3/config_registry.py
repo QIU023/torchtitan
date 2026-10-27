@@ -228,3 +228,44 @@ def kimi_k3_debugmodel_mtp() -> Trainer.Config:
         ),
     )
     return config
+
+
+# PROBE ONLY (not committed): the verl cp2 cell's flavor -- the rl model under the recipe's context
+# parallel transforms (KCP on every KDA layer, the packed Ulysses MLA kernel), reachable by the
+# engine through VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_cp2.
+def kimi_k3_rl_cp2() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("rl")
+    return kimi_k3_context_parallel(config, cp_degree=2, mla_kernel=MLAUlyssesCPFlexAttention)
+
+
+# PROBE ONLY (not committed): the verl LoRA cell's flavor -- the rl model under core's LoRA converter
+# (the debug LoRA target set), reachable through VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_lora.
+def kimi_k3_rl_lora() -> Trainer.Config:
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("rl", converters=[_kimi_k3_lora_converter()])
+    return config
+
+
+# PROBE ONLY (not committed): the verl QAT cells' flavors -- the rl model under the MXFP4-weight /
+# MXFP8-activation fake-quant converter (routed experts only, as kimi_k3_debugmodel_mx_qat), reachable
+# through VERL_TORCHTITAN_FLAVOR=kimi_k3_rl_mx_qat; the cp2 variant adds the Ulysses CP recipe.
+def kimi_k3_rl_mx_qat() -> Trainer.Config:
+    from torchtitan.components.quantization.mx_qat import MXFP4QATConverter
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("rl", converters=[MXFP4QATConverter.Config()])
+    return config
+
+
+def kimi_k3_rl_cp2_mx_qat() -> Trainer.Config:
+    from torchtitan.components.quantization.mx_qat import MXFP4QATConverter
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("rl", converters=[MXFP4QATConverter.Config()])
+    return kimi_k3_context_parallel(config, cp_degree=2, mla_kernel=MLAUlyssesCPFlexAttention)
