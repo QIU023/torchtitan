@@ -215,3 +215,91 @@ def kimi_k3_debugmodel_mtp() -> Trainer.Config:
         ),
     )
     return config
+# PROBE ONLY (not committed): the CP cells of the cp_review6 matrix by name, on the model registry so
+# --config finds them; the packed kernels are the branch's, the generic ones the copied stack's.
+def _cp_alias(mla_kernel, cp_degree=2):
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    return kimi_k3_context_parallel(kimi_k3_debugmodel(), cp_degree=cp_degree, mla_kernel=mla_kernel)
+
+
+def kimi_k3_debugmodel_cp2() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+
+    return _cp_alias(MLAUlyssesCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_allgather() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAAllGatherCPFlexAttention
+
+    return _cp_alias(MLAAllGatherCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_generic() -> Trainer.Config:
+    from torchtitan.models.common.cp_attention import UlyssesCPFlexAttention
+
+    return _cp_alias(UlyssesCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_allgather_generic() -> Trainer.Config:
+    from torchtitan.models.common.cp_attention import AllGatherCPFlexAttention
+
+    return _cp_alias(AllGatherCPFlexAttention)
+
+
+# PROBE ONLY (not committed): pipeline cells with the vision tower on its own stage, by name.
+def _vit_dep_alias(pp: int, schedule: str, layers_per_stage=None) -> Trainer.Config:
+    import dataclasses
+    from functools import partial
+
+    from torchtitan.models.kimi_k3.parallelize import pipeline_kimi_k3
+
+    config = kimi_k3_debugmodel()
+    config.parallelism.pipeline_parallel_degree = pp
+    config.parallelism.pipeline_parallel_schedule = schedule
+    config.parallelism.pipeline_parallel_layers_per_stage = layers_per_stage
+    config.parallelism.num_pp_microbatches = 8
+    assert config.model_spec is not None
+    config.model_spec = dataclasses.replace(
+        config.model_spec, pipelining_fn=partial(pipeline_kimi_k3, vit_dep=True)
+    )
+    return config
+
+
+def kimi_k3_debugmodel_pp2_vit_dep() -> Trainer.Config:
+    return _vit_dep_alias(2, "1F1B")
+
+
+def kimi_k3_debugmodel_pp4i_vit_dep() -> Trainer.Config:
+    return _vit_dep_alias(4, "Interleaved1F1B", 4)
+
+
+def kimi_k3_debugmodel_pp4i() -> Trainer.Config:
+    config = kimi_k3_debugmodel()
+    config.parallelism.pipeline_parallel_degree = 4
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+    config.parallelism.pipeline_parallel_layers_per_stage = 4
+    config.parallelism.num_pp_microbatches = 8
+    return config
+
+
+def _vit_dep_alias_with(**knobs) -> Trainer.Config:
+    import dataclasses
+    from functools import partial
+
+    from torchtitan.models.kimi_k3.parallelize import pipeline_kimi_k3
+
+    config = _vit_dep_alias(4, "Interleaved1F1B", 4)
+    assert config.model_spec is not None
+    config.model_spec = dataclasses.replace(
+        config.model_spec, pipelining_fn=partial(pipeline_kimi_k3, vit_dep=True, **knobs)
+    )
+    return config
+
+
+def kimi_k3_debugmodel_pp4i_vit_dep_bubble() -> Trainer.Config:
+    return _vit_dep_alias_with(vit_bubble=True, vit_bubble_cost_ratio=0.5)
+
+
+def kimi_k3_debugmodel_pp4i_vit_dep_prefetch() -> Trainer.Config:
+    return _vit_dep_alias_with(vit_prefetch=1)
