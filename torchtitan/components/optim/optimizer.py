@@ -430,7 +430,8 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
     def _post_init(self, all_params: list[nn.Parameter]) -> None:
         # We need to call Optimizer.__init__() to initialize some necessary optimizer
         # functionality such as hooks (e.g. register_step_pre_hook for MoE load balancing).
-        Optimizer.__init__(self, all_params, {})
+        # torch rejects an empty parameter list but accepts an empty group.
+        Optimizer.__init__(self, all_params or [{"params": []}], {})
 
     def init_cache_state_dict(self) -> None:
         """Initialize cached state dict for TorchFT. No-op for base class."""
