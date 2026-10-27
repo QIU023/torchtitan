@@ -80,13 +80,7 @@ class KDAKernel(Module):
     ) -> torch.Tensor:
         if not q_BTNK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
-        capability = torch.cuda.get_device_capability(q_BTNK.device)
-        if capability not in {(10, 0), (10, 3)}:
-            raise RuntimeError(
-                "Attention Gym KDA requires Blackwell SM100/SM103; "
-                f"got CUDA capability {capability}."
-            )
-
+        # LOCAL HACK (not committed): attn-gym routes SM120 through portable kernels since #442.
         gate_BTNK = bound_gate(
             raw_gate_BTNK,
             # TODO: The long-term solution is to specify mixed precision per FQN
@@ -172,6 +166,12 @@ class InnerKDA(Module):
             dim=0,
         )
         cp_group = self._cp_group
+        if cp_group is not None:
+            # VARIANT PROBE (not committed): take the group from the SPMD mesh,
+            # as the CP kernel does, keeping everything else declarative.
+            from torchtitan.distributed.spmd_types import current_spmd_mesh
+
+            cp_group = current_spmd_mesh().get_group("cp")
         cp_plan = None
         conv_state = None
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
