@@ -94,3 +94,21 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel17() -> Trainer.Config:  # run-worktree alias (17 layers), not for commit
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec = model_registry("debugmodel17")
+    return cfg
+
+
+def kimi_k3_debugmodel13() -> Trainer.Config:  # run-worktree alias (13 layers), not for commit
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec = model_registry("debugmodel13")
+    return cfg
+
+
+def kimi_k3_debugmodel9() -> Trainer.Config:  # run-worktree alias (9 layers), not for commit
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec = model_registry("debugmodel9")
+    return cfg
