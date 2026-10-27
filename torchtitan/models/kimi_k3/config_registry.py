@@ -228,3 +228,61 @@ def kimi_k3_debugmodel_mtp() -> Trainer.Config:
         ),
     )
     return config
+
+
+# PROBE ONLY (not committed): the CP cells of the cp_review6 matrix by name, on the model registry so
+# --config finds them; the packed kernels are the branch's, the generic ones the copied stack's.
+def _cp_alias(mla_kernel, cp_degree=2):
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    return kimi_k3_context_parallel(kimi_k3_debugmodel(), cp_degree=cp_degree, mla_kernel=mla_kernel)
+
+
+def kimi_k3_debugmodel_cp2() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+
+    return _cp_alias(MLAUlyssesCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_allgather() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAAllGatherCPFlexAttention
+
+    return _cp_alias(MLAAllGatherCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_generic() -> Trainer.Config:
+    from torchtitan.models.common.cp_attention import UlyssesCPFlexAttention
+
+    return _cp_alias(UlyssesCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_allgather_generic() -> Trainer.Config:
+    from torchtitan.models.common.cp_attention import AllGatherCPFlexAttention
+
+    return _cp_alias(AllGatherCPFlexAttention)
+
+
+# PROBE ONLY (not committed): the text arm on the integration tree -- the multimodal debug
+# config with the text loader (c4_test, concat-then-split packing) in place of cc12m-test.
+def kimi_k3_debugmodel_text() -> Trainer.Config:
+    from torchtitan.components.data import ConcatThenSplitPackingConfig
+    from torchtitan.hf_datasets.text_datasets import DATASETS
+
+    config = kimi_k3_debugmodel()
+    # A text-only model, as the old tree's text flavor was: no vision tower. With the tower
+    # present but never run, PP trips FSDP2's post_backward on its never-gathered parameters.
+    config.model_spec.model.vision_encoder = None
+    config.dataloader = GrainDataLoader.Config(
+        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+    )
+    return config
+
+
+# PROBE ONLY (not committed): the text arm's CP cells -- the text config under the recipe's CP transforms.
+def kimi_k3_debugmodel_text_cp2() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    return kimi_k3_context_parallel(
+        kimi_k3_debugmodel_text(), cp_degree=2, mla_kernel=MLAUlyssesCPFlexAttention
+    )
