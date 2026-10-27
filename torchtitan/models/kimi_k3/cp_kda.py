@@ -73,13 +73,13 @@ class ContextParallelInnerKDA(LoadBalancedCPInnerAttention, InnerKDA):
                 cu_seqlens_global = kda_metadata.varlen.cu_seq_q.tolist()
 
         group = partitioner.cp_mesh.get_group()
-        routing = ContextParallelRouting.from_fragments(
+        from attn_gym.linear.context_parallel import ContextParallelPlan  # LOCAL HACK: attn-gym 0.0.10 API
+
+        routing = ContextParallelPlan.from_fragments(
             cu_seqlens_global=cu_seqlens_global,
             fragments=partitioner.token_partition(cu_seqlens_global[-1]),
             cp_rank=dist.get_rank(group),
-            device=tokens_T.device,
-            conv_history=config.conv_kernel_size - 1,
-        )
+        ).routing(tokens_T.device, conv_history=config.conv_kernel_size - 1)
         input_dict["attention_masks"] = {
             **context_metadata,
             "kda": replace(kda_metadata, cp_routing=routing),
