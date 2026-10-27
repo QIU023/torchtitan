@@ -77,13 +77,7 @@ class KDAKernel(Module):
     ) -> torch.Tensor:
         if not q_BTNK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
-        capability = torch.cuda.get_device_capability(q_BTNK.device)
-        if capability not in {(10, 0), (10, 3)}:
-            raise RuntimeError(
-                "Attention Gym KDA requires Blackwell SM100/SM103; "
-                f"got CUDA capability {capability}."
-            )
-
+        # LOCAL HACK: attn-gym routes SM120 through portable kernels since #442.
         gate_BTNK = bound_gate(
             raw_gate_BTNK,
             # TODO: The long-term solution is to specify mixed precision per FQN
