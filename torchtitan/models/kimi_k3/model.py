@@ -147,6 +147,10 @@ class KimiMLAAttention(BaseAttention):
         return self.wo(out_TD)
 
 
+_PROBE_LID = [None]
+_PROBE_CALLS: dict = {}
+
+
 def _apply_attention_residual(
     partial_block_TD: torch.Tensor | None,
     block_residual_TND: torch.Tensor,
@@ -171,6 +175,34 @@ def _apply_attention_residual(
     scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
     probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
     output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
+    _fd = __import__("os").environ.get("FWD_DUMP")  # LOCAL PROBE HACK (not committed)
+    if _fd:
+        import torch.distributed as _dist
+
+        _ws = _dist.get_world_size() if _dist.is_initialized() else 1
+        _rk = _dist.get_rank() if _dist.is_initialized() else 0
+        _lid = _PROBE_LID[0]
+        _k = (_rk, _lid)
+        _c = _PROBE_CALLS.get(_k, 0)
+        _PROBE_CALLS[_k] = _c + 1
+        __import__("torch").save(
+            {
+                "layer": _lid,
+                "call": _c,
+                "values_float": values_float.detach().cpu(),
+                "values_stride": tuple(values_TND.stride()),
+                "values_contig": bool(values_TND.is_contiguous()),
+                "values_dtype": str(values_TND.dtype),
+                "values_shape": tuple(values_TND.shape),
+                "block_stride": tuple(block_residual_TND.stride()),
+                "block_contig": bool(block_residual_TND.is_contiguous()),
+                "block_shape": tuple(block_residual_TND.shape),
+                "has_partial": partial_block_TD is not None,
+                "probs": probs_T1N.detach().cpu(),
+                "out": output_TD.detach().cpu(),
+            },
+            f"{_fd}.ws{_ws}.rank{_rk}.l{_lid}.c{_c}.pt",
+        )
     return output_TD.to(values_TND.dtype)
 
 
@@ -256,6 +288,7 @@ class KimiK3TransformerBlock(Module):
             h_TD = x_TD
         else:
             assert self.attention_res_norm is not None
+            _PROBE_LID[0] = self.layer_id  # LOCAL PROBE HACK (not committed)
             h_TD = _apply_attention_residual(
                 partial_block_TD,
                 block_residual_TND,
