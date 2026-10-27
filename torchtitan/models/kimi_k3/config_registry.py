@@ -94,3 +94,75 @@ def kimi_k3_debugmodel(
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel_33() -> Trainer.Config:  # LOCAL PROBE ALIAS (not committed)
+    """The 33-layer stress shape, for the depth comparison only."""
+    from . import model_registry
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel_33_layers")
+    return config
+
+
+def _kimi_k3_pinned_split(num_layers: int, cut: int):  # LOCAL PROBE (not committed)
+    """A two-stage split with the boundary pinned at `cut`.
+
+    Spelled out by hand on purpose, to move the boundary on and off a block
+    start. The vision tower is placed explicitly because an explicit split
+    bypasses the entry that would otherwise pin it.
+    """
+    stage0 = ["vision_encoder", "tok_embeddings"] + [
+        f"layers.{i}" for i in range(cut)
+    ]
+    stage1 = [f"layers.{i}" for i in range(cut, num_layers)] + [
+        "norm",
+        "lm_head",
+        "output_res_proj",
+        "output_res_norm",
+    ]
+    return [stage0, stage1]
+
+
+def kimi_k3_debugmodel_33_cut24() -> Trainer.Config:  # LOCAL PROBE (not committed)
+    """33 layers, boundary moved ONTO a block start: no partial block crosses."""
+    from . import model_registry
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel_33_layers")
+    config.parallelism.module_fqns_per_model_part = _kimi_k3_pinned_split(33, 24)
+    return config
+
+
+def kimi_k3_debugmodel_24_cut13() -> Trainer.Config:  # LOCAL PROBE (not committed)
+    """24 layers, boundary moved OFF a block start: a partial block crosses."""
+    config = kimi_k3_debugmodel()
+    config.parallelism.module_fqns_per_model_part = _kimi_k3_pinned_split(24, 13)
+    return config
+
+
+def kimi_k3_debugmodel_deep() -> Trainer.Config:  # LOCAL PROBE ALIAS (not committed)
+    """The 33-layer shape under the name the other session's seed cache is keyed on.
+
+    Same configuration as kimi_k3_debugmodel_33; the name exists so mx3's seed
+    key -- sha1(SEED_CFG|BATCH) -- resolves to the checkpoint that session
+    already built, rather than building a second copy of the same weights.
+    """
+    from . import model_registry
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel_33_layers")
+    return config
+
+
+def kimi_k3_debugmodel_ppnaive() -> Trainer.Config:  # LOCAL PROBE (not committed)
+    """The debug model with the whole-stack pipeline transport."""
+    import functools
+
+    from .parallelize import pipeline_kimi_k3
+
+    config = kimi_k3_debugmodel()
+    config.model_spec.pipelining_fn = functools.partial(
+        pipeline_kimi_k3, attn_res_cache=False
+    )
+    return config

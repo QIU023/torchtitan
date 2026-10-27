@@ -477,3 +477,12 @@ def sft_debugmodel(
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def llama3_debugmodel_k3sized(  # LOCAL PROBE (not committed)
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    """llama3_debugmodel at Kimi K3's debug depth and width."""
+    config = llama3_debugmodel(seq_len=seq_len)
+    config.model_spec = model_registry("debugmodel_k3sized", seq_len=seq_len)
+    return config
