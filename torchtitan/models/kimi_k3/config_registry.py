@@ -178,3 +178,54 @@ def kimi_k3_debugmodel_qlora_mxfp4() -> Trainer.Config:
         ],
     )
     return config
+
+
+# PROBE ONLY (not committed): the CP cells of the cp_review6 matrix by name, on the model registry so
+# --config finds them; the packed kernels are the branch's, the generic ones the copied stack's.
+def _cp_alias(mla_kernel, cp_degree=2):
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    return kimi_k3_context_parallel(kimi_k3_debugmodel(), cp_degree=cp_degree, mla_kernel=mla_kernel)
+
+
+def kimi_k3_debugmodel_cp2() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+
+    return _cp_alias(MLAUlyssesCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_allgather() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAAllGatherCPFlexAttention
+
+    return _cp_alias(MLAAllGatherCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_generic() -> Trainer.Config:
+    from torchtitan.models.common.cp_attention import UlyssesCPFlexAttention
+
+    return _cp_alias(UlyssesCPFlexAttention)
+
+
+def kimi_k3_debugmodel_cp2_allgather_generic() -> Trainer.Config:
+    from torchtitan.models.common.cp_attention import AllGatherCPFlexAttention
+
+    return _cp_alias(AllGatherCPFlexAttention)
+
+
+# PROBE ONLY (not committed): the LoRA flavor under the cp2 recipe, for the mm_lora arm's CP cells.
+# The CP transform goes first (it retypes the attention kernels and needs their plain types), the
+# LoRA converter second (it wraps every base into a Frozen subclass, kernels included), the order
+# model_registry cannot express for a recipe-transformed config.
+def kimi_k3_debugmodel_lora_cp2() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+
+    from torchtitan_recipes.kimi_k3 import kimi_k3_context_parallel
+
+    config = kimi_k3_context_parallel(
+        kimi_k3_debugmodel(), cp_degree=2, mla_kernel=MLAUlyssesCPFlexAttention
+    )
+    assert config.model_spec is not None
+    config.model_spec.model = (
+        _kimi_k3_lora_converter().build().convert(config.model_spec.model)
+    )
+    return config
