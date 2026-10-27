@@ -631,13 +631,36 @@ class KimiK3Model(Decoder):
 
         # The empty stack is cut from the stream, so it carries its layout.
         block_residual_TND = h_TD.unsqueeze(1)[:, :0]
-        for layer in self.layers.values():
+        import os as _os  # LOCAL PROBE HACK (not committed): per-layer stream of the first forward
+        _dump = _os.environ.get("LAYER_DUMP") and not getattr(self, "_layer_dumped", False)
+        _rec = {"tokens": tokens.detach().cpu(), "embed": h_TD.detach().cpu()} if _dump else None
+        _hooks = []
+        if _dump:
+            _ls = list(self.layers.values())
+            def _cap(name):
+                def _h(mod, inp, out):
+                    _rec[name] = (out[0] if isinstance(out, tuple) else out).detach().cpu()
+                    _rec[name + "_in"] = inp[0].detach().cpu()
+                return _h
+            for _n, _m in (("kda0", getattr(_ls[0], "delta_attention", None)), ("kda1", getattr(_ls[1], "delta_attention", None)), ("mla3", getattr(_ls[3], "attention", None)), ("moe0", getattr(_ls[0], "moe", None)), ("moe0_router", getattr(getattr(_ls[0], "moe", None), "router", None))):
+                if _m is not None:
+                    _hooks.append(_m.register_forward_hook(_cap(_n)))
+        for _i, layer in enumerate(self.layers.values()):
             h_TD, block_residual_TND = layer(
                 h_TD,
                 block_residual_TND,
                 attention_masks,
                 positions,
             )
+            if _dump:
+                _rec[f"L{_i:02d}"] = h_TD.detach().cpu()
+        if _dump:
+            for _h in _hooks:
+                _h.remove()
+            import torch.distributed as _dist
+            _r = _dist.get_rank() if _dist.is_initialized() else 0
+            torch.save(_rec, f"{_os.environ['LAYER_DUMP']}.rank{_r}.pt")
+            self._layer_dumped = True
 
         h_TD = _apply_attention_residual(
             h_TD,
