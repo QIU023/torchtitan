@@ -646,6 +646,23 @@ class KimiK3Model(Decoder):
 
         # The empty stack is cut from the stream, so it carries its layout.
         block_residual_TND = h_TD.unsqueeze(1)[:, :0]
+        import os as _os  # LOCAL PROBE HACK (not committed): the MLA kernels' backward at layers 3 and 23
+        if _os.environ.get("ATTN_GRAD_DUMP") and not getattr(self, "_attn_hooked", False):
+            self._attn_hooked = True
+            import torch.distributed as _dist
+            _r = _dist.get_rank() if _dist.is_initialized() else 0
+            _ls = list(self.layers.values())
+            def _mk(i):
+                done = {"n": 0}
+                def _h(mod, gin, gout):
+                    if done["n"] == 0:
+                        torch.save({"grad_input": [g.detach().cpu() if g is not None else None for g in gin],
+                                    "grad_output": [g.detach().cpu() if g is not None else None for g in gout]},
+                                   f"{_os.environ['ATTN_GRAD_DUMP']}.L{i:02d}.rank{_r}.pt")
+                    done["n"] += 1
+                return _h
+            for _i in (3, 23):
+                _ls[_i].attention.inner_attention.register_full_backward_hook(_mk(_i))
         for layer in self.layers.values():
             h_TD, block_residual_TND = layer(
                 h_TD,
