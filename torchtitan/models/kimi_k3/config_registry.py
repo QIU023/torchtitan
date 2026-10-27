@@ -107,3 +107,23 @@ def kimi_k3_debugmodel_32l() -> Trainer.Config:
 
 
 
+
+
+def kimi_k3_debugmodel_32l_offload() -> Trainer.Config:
+    """LOCAL, not committed: the 32-layer flavor with attn_res_cache_offload on."""
+    config = kimi_k3_debugmodel_32l()
+    config.model_spec.model.attn_res_cache_offload = True
+    return config
+
+
+def kimi_k3_debugmodel_32l_ppbal() -> Trainer.Config:
+    """LOCAL, not committed: the 32-layer flavor with activation balancing on,
+    sources/dest/pool taken from K3_PPBAL_SRC (comma list), K3_PPBAL_DST, K3_PPBAL_POOL_GIB."""
+    import os
+
+    config = kimi_k3_debugmodel_32l()
+    m = config.model_spec.model
+    m.pp_balance_source_ranks = [int(x) for x in os.environ["K3_PPBAL_SRC"].split(",")]
+    m.pp_balance_dest_rank = int(os.environ["K3_PPBAL_DST"])
+    m.pp_balance_pool_gib = float(os.environ.get("K3_PPBAL_POOL_GIB", "4"))
+    return config
