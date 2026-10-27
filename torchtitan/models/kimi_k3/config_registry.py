@@ -94,3 +94,12 @@ def kimi_k3_debugmodel(
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel_deep() -> Trainer.Config:
+    """Local probe alias, uncommitted: the 33-layer shape, cached transport."""
+    from . import model_registry
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel_33_layers")
+    return config
