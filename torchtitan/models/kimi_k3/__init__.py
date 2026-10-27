@@ -57,6 +57,12 @@ KIMI_K3_SPECIAL_TOKENS = {
 }
 
 
+# The AttnRes pseudo-queries must start at zero. The block softmax is over the
+# per-block scores this projection produces, so a zero weight is what makes the
+# initial weights uniform and the residual reduce to the standard one at step 0
+# -- the report's requirement. The default trunc_normal leaves the block mixing
+# non-uniform from the first step.
+_RES_PROJ_INIT = {"weight": nn.init.zeros_}
 _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
     "bias": nn.init.zeros_,
@@ -254,6 +260,12 @@ def _latent_moe_config(
             # ep mesh is None, so EP=1 is unchanged. Selecting the dispatcher
             # by whether EP happens to be on splits one decision across two
             # places and leaves the model's config depending on the topology.
+            # Standard all-to-all dispatch only. MoonEP (the report's
+            # perfectly-balanced EP with redundant experts) is out of scope for
+            # this model: it needs a separate dispatcher and the online expert
+            # planning/migration that live in a dedicated backend, none of which
+            # is present here. This is pinned to "standard" rather than left as
+            # a config choice so that no run silently believes it is on MoonEP.
             token_dispatcher=make_token_dispatcher_config(
                 num_experts=num_experts,
                 top_k=top_k,
@@ -435,9 +447,11 @@ def _kimi_k3_config(
                 attention_norm=_norm(dim),
                 ffn_norm=_norm(dim),
                 attention_res_norm=None if layer_idx == 0 else _norm(dim),
-                attention_res_proj=None if layer_idx == 0 else _linear(dim, 1),
+                attention_res_proj=None
+                if layer_idx == 0
+                else _linear(dim, 1, param_init=_RES_PROJ_INIT),
                 ffn_res_norm=_norm(dim),
-                ffn_res_proj=_linear(dim, 1),
+                ffn_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
             )
         )
 
@@ -457,7 +471,7 @@ def _kimi_k3_config(
             param_init=_output_linear_init(dim),
         ),
         output_res_norm=_norm(dim),
-        output_res_proj=_linear(dim, 1),
+        output_res_proj=_linear(dim, 1, param_init=_RES_PROJ_INIT),
         vision_encoder=vision_encoder,
     )
 
@@ -510,6 +524,42 @@ def _debugmodel_text(attn_backend: str) -> KimiK3Model.Config:
     return config
 
 
+def _debugmodel_text_32l(attn_backend: str) -> KimiK3Model.Config:
+    """A 32-layer text debug decoder, for the pipeline x virtual-stage matrix.
+
+    The 24-layer flavor cannot express every pp x vp product: 24 is not
+    divisible by 16 (pp4 x vp4, pp8 x vp2) or 32 (pp8 x vp4), and virtual stages
+    are expressed as layers-per-stage. 32 divides all of them, so the same
+    3 KDA : 1 MLA pattern at 32 layers covers the whole cross product with an
+    integer split.
+    """
+    config = _debugmodel(attn_backend)
+    config.vision_encoder = None
+    return _kimi_k3_config(
+        dim=1024,
+        vocab_size=163840,
+        num_layers=32,
+        full_attention_layers={3, 7, 11, 15, 19, 23, 27, 31},
+        attn_res_block_size=16,
+        num_heads=16,
+        q_lora_rank=512,
+        kv_lora_rank=256,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        kda_head_dim=64,
+        conv_kernel_size=4,
+        dense_hidden_dim=4096,
+        latent_dim=512,
+        expert_hidden_dim=384,
+        num_experts=32,
+        top_k=4,
+        num_shared_experts=2,
+        vision_encoder=None,
+        attn_backend=attn_backend,
+    )
+
+
 def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
@@ -549,6 +599,7 @@ def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
 kimi_k3_configs = {
     "debugmodel": _debugmodel,
     "debugmodel_text": _debugmodel_text,
+    "debugmodel_text_32l": _debugmodel_text_32l,
     "Kimi-K3": _kimi_k3,
 }
 
