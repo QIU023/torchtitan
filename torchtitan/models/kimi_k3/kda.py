@@ -268,10 +268,15 @@ class KDA(Module):
             self.forget_b(self.forget_a(x_TD)), self.head_dim
         )
         raw_beta_TH = self.beta(x_TD)
+        q_TC, k_TC, v_TC = self.q_proj(x_TD), self.k_proj(x_TD), self.v_proj(x_TD)
+        _eps = float(__import__("os").environ.get("KDA_PERTURB", "0") or 0)  # LOCAL PROBE HACK (not committed)
+        if _eps:
+            _g = torch.Generator(device=x_TD.device).manual_seed(1234 + (id(self) % 100000))
+            q_TC, k_TC, v_TC = (t * (1 + _eps * torch.randn(t.shape, device=t.device, dtype=t.dtype, generator=_g)) for t in (q_TC, k_TC, v_TC))
         out_THV = self.inner_kda(
-            self.q_proj(x_TD),
-            self.k_proj(x_TD),
-            self.v_proj(x_TD),
+            q_TC,
+            k_TC,
+            v_TC,
             raw_gate_THK,
             raw_beta_TH,
             self.q_conv.weight,

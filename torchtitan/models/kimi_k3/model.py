@@ -56,6 +56,10 @@ from .vision_encoder import KimiK3VisionEncoder
 # N = attention-residual entries.
 
 
+_PROBE_MB: dict = {}  # LOCAL PROBE HACK (not committed)
+_PROBE_VE: list = []
+
+
 def _local_head_split(
     x_TE: torch.Tensor, num_tokens: int, heads: int, head_dim: int
 ) -> torch.Tensor:
@@ -382,6 +386,7 @@ class KimiK3Model(Decoder):
                     self,
                     enable_sp=enable_sp,
                     spmd_types=parallelism.spmd_backend == "spmd_types",
+                    enable_ep=parallelism.expert_parallel_degree > 1,
                 )
 
         def get_nparams_and_flops(
@@ -485,6 +490,8 @@ class KimiK3Model(Decoder):
 
         pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
         vision_embeds = self.vision_encoder(pixel_values, grid_thw=grid_thw)
+        if __import__("os").environ.get("ACT_DUMP"):  # LOCAL PROBE HACK (not committed)
+            _PROBE_VE.append((vision_embeds.full_tensor() if hasattr(vision_embeds, "full_tensor") else vision_embeds).detach().float().cpu())
         # MoonViT collapses time and merges spatially, so the text-side token
         # count per item is (h/kh)*(w/kw), independent of t.
         kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
@@ -590,14 +597,25 @@ class KimiK3Model(Decoder):
         if spmd.is_type_checking():
             spmd.assert_type(h_TD, {MeshAxisName.DP: spmd.S(0)})
 
+        _act_dump = __import__("os").environ.get("ACT_DUMP")  # LOCAL PROBE HACK (not committed)
+        _acts: dict[str, torch.Tensor] = {}
+
+        def _keep(name: str, t: torch.Tensor) -> None:
+            if _act_dump:
+                t = t.full_tensor() if hasattr(t, "full_tensor") else t
+                _acts[name] = t.detach().float().cpu()
+
+        _keep("embed", h_TD)
         block_residual_TND = h_TD.unsqueeze(1)[:, :0]
-        for layer in self.layers.values():
+        for _li, layer in enumerate(self.layers.values()):
             h_TD, block_residual_TND = layer(
                 h_TD,
                 block_residual_TND,
                 attention_masks,
                 positions,
             )
+            _keep(f"L{_li:02d}", h_TD)
+            _keep(f"L{_li:02d}.res", block_residual_TND)
 
         h_TD = _apply_attention_residual(
             h_TD,
@@ -606,6 +624,16 @@ class KimiK3Model(Decoder):
             self.output_res_norm,
         )
         h_TD = self.norm(h_TD) if self.norm is not None else h_TD
+        _keep("final", h_TD)
+        if _act_dump:
+            import torch.distributed as _dist
+
+            _PROBE_MB[0] = _PROBE_MB.get(0, -1) + 1
+            _acts["vision_embeds"] = _PROBE_VE.pop() if _PROBE_VE else torch.empty(0)
+            from torchtitan.models.common import moe as _moe_mod
+
+            _acts["routes"] = list(_moe_mod._PROBE_ROUTE); _moe_mod._PROBE_ROUTE.clear()
+            torch.save(_acts, f"{_act_dump}.mb{_PROBE_MB[0]}.rank{_dist.get_rank() if _dist.is_initialized() else 0}.pt")
         if self._skip_lm_head:
             return h_TD
         return self.lm_head(h_TD) if self.lm_head is not None else h_TD

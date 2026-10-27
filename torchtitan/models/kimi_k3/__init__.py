@@ -508,6 +508,80 @@ def _debugmodel(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     )
 
 
+def _debugmodel13(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:  # LOCAL PROBE FLAVOR (not committed)
+    dim = 1024
+    return _kimi_k3_config(
+        dim=dim,
+        moe_comm_backend=moe_comm_backend,
+        vocab_size=163840,
+        num_layers=13,
+        full_attention_layers={3, 7, 11, 12},
+        attn_res_block_size=12,
+        num_heads=16,
+        q_lora_rank=512,
+        kv_lora_rank=256,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=4096,
+        latent_dim=512,
+        expert_hidden_dim=384,
+        num_experts=32,
+        top_k=4,
+        num_shared_experts=2,
+        vision_encoder=_vision_encoder_config(
+            text_dim=dim,
+            dim=512,
+            qkv_dim=768,
+            hidden_dim=2048,
+            num_layers=8,
+            num_heads=6,
+            init_pos_emb_height=32,
+            init_pos_emb_width=32,
+        ),
+        attn_backend=attn_backend,
+    )
+
+
+def _debugmodel9(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:  # LOCAL PROBE FLAVOR (not committed)
+    dim = 1024
+    return _kimi_k3_config(
+        dim=dim,
+        moe_comm_backend=moe_comm_backend,
+        vocab_size=163840,
+        num_layers=9,
+        full_attention_layers={3, 7, 8},
+        attn_res_block_size=8,
+        num_heads=16,
+        q_lora_rank=512,
+        kv_lora_rank=256,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=4096,
+        latent_dim=512,
+        expert_hidden_dim=384,
+        num_experts=32,
+        top_k=4,
+        num_shared_experts=2,
+        vision_encoder=_vision_encoder_config(
+            text_dim=dim,
+            dim=512,
+            qkv_dim=768,
+            hidden_dim=2048,
+            num_layers=8,
+            num_heads=6,
+            init_pos_emb_height=32,
+            init_pos_emb_width=32,
+        ),
+        attn_backend=attn_backend,
+    )
+
+
 def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
@@ -547,6 +621,8 @@ def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
 
 kimi_k3_configs = {
     "debugmodel": (_debugmodel, 16384),
+    "debugmodel13": (_debugmodel13, 16384),  # LOCAL PROBE FLAVOR (not committed)
+    "debugmodel9": (_debugmodel9, 16384),  # LOCAL PROBE FLAVOR (not committed)
     "Kimi-K3": (_kimi_k3, 262144),
 }
 

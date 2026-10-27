@@ -92,3 +92,16 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel13() -> Trainer.Config:  # LOCAL PROBE FLAVOR (not committed)
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec = model_registry("debugmodel13")
+    return cfg
+
+
+
+def kimi_k3_debugmodel9() -> Trainer.Config:  # LOCAL PROBE FLAVOR (not committed)
+    cfg = kimi_k3_debugmodel()
+    cfg.model_spec = model_registry("debugmodel9")
+    return cfg
