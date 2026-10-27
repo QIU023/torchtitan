@@ -300,3 +300,40 @@ def deepseek_v3_671b_float8(seq_len: int | None = None) -> Trainer.Config:
         ],
     )
     return config
+
+
+# PROBE ONLY (not committed): DeepSeek-V3 debug under CP with the generic and the packed MLA Ulysses
+# kernels, to answer "does the packed kernel work with overrides/fused_mla.py" where the override
+# actually attaches (it is specific to DeepSeek-V3's Attention).
+def _deepseek_cp2(kernel, **overrides) -> Trainer.Config:
+    from torchtitan.transforms import apply_transforms, ContextParallelTransform
+
+    config = deepseek_v3_debugmodel()
+    # fused_mla mutates tensors selective AC caches ("Tensor cached during selective activation
+    # checkpoint has been mutated"), so every probe cell runs with AC off.
+    config.activation_checkpoint = None
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.context_parallel_load_balancer = None
+    config.parallelism.spmd_backend = "spmd_types"
+    return apply_transforms(
+        config,
+        [ContextParallelTransform.Config(kernel=kernel, kernel_config_overrides=overrides)],
+    )
+
+
+def deepseek_v3_debugmodel_cp2_generic() -> Trainer.Config:
+    from torchtitan.models.common.cp_attention import UlyssesCPFlexAttention
+
+    return _deepseek_cp2(UlyssesCPFlexAttention)
+
+
+def deepseek_v3_debugmodel_cp2_packed() -> Trainer.Config:
+    from torchtitan.models.kimi_k3.context_parallel import MLAUlyssesCPFlexAttention
+
+    return _deepseek_cp2(MLAUlyssesCPFlexAttention, rope_head_dim=64)
+
+
+def deepseek_v3_debugmodel_noac() -> Trainer.Config:
+    config = deepseek_v3_debugmodel()
+    config.activation_checkpoint = None
+    return config
