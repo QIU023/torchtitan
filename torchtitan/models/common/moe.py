@@ -9,6 +9,8 @@ from typing import Literal
 
 import spmd_types as spmd
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -92,10 +94,10 @@ class GroupedExperts(Module):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
         h_RF = F.silu(
-            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
+            self._grouped_mm(A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()), weight_EOI=w1_EFD, offs=offsets_E)
         )
         h_RF = h_RF * self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
+            A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()), weight_EOI=w3_EFD, offs=offsets_E
         )
         return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
 
@@ -115,6 +117,20 @@ class GroupedExperts(Module):
         ``__torch_function__`` -- means it is captured by FX tracers such as
         graph_trainer's make_fx path.
         """
+        if os.environ.get("EXPERTS_FP32"):  # LOCAL PROBE HACK (not committed)
+            out = A.new_zeros(A.shape[0], weight_EOI.shape[1], dtype=torch.float32)
+            if os.environ.get('EXPERTS_FP32_DEBUG'): print('EXPERTS_FP32 offs', type(offs).__name__, tuple(offs.shape), getattr(offs, 'placements', None), 'A', type(A).__name__, tuple(A.shape), flush=True)
+            ends = offs.flatten().tolist(); start = 0
+            if os.environ.get('EXPERTS_FP32_DEBUG'): print('EXPERTS_FP32 ends', type(ends).__name__, [type(e).__name__ for e in ends[:3]], ends[:3], flush=True)
+            try:
+                for e, end in enumerate(ends):
+                    if end > start:
+                        out[start:end] = A[start:end].float() @ weight_EOI[e].float().t()
+                    start = end
+            except TypeError:
+                print("EXPERTS_FP32 FAIL offs", type(offs), offs.shape, offs.dtype, "ends", ends, "A", type(A), A.shape, "W", type(weight_EOI), weight_EOI.shape, flush=True)
+                raise
+            return out
         return torch._grouped_mm(A, weight_EOI.bfloat16().transpose(-2, -1), offs=offs)
 
 

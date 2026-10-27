@@ -115,12 +115,7 @@ class KDAKernel(Module):
         """Apply the preprocessing shared by local and CP KDA cores."""
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
-        capability = torch.cuda.get_device_capability(q_1THK.device)
-        if capability not in {(9, 0), (10, 0), (10, 3)}:
-            raise RuntimeError(
-                "Attention Gym KDA requires Hopper SM90 or Blackwell SM100/SM103; "
-                f"got CUDA capability {capability}."
-            )
+        # LOCAL HACK (not committed): SM120 runs attn-gym's portable KDA kernels.
         gate_1THK = bound_gate(
             raw_gate_1THK,
             # TODO: The long-term solution is to specify mixed precision per FQN
@@ -285,6 +280,10 @@ class InnerKDA(Module):
         )
 
 
+_KDA_TRACE: list = []  # LOCAL PROBE HACK (not committed)
+_KDA_TRACE_STATE: dict = {}
+
+
 class KDA(Module):
     """Kimi Delta Attention with checkpoint-compatible Kimi K3 parameters."""
 
@@ -370,10 +369,15 @@ class KDA(Module):
             self.forget_b(self.forget_a(x_TD)), self.head_dim
         )
         raw_beta_TH = self.beta(x_TD)
+        q_TC, k_TC, v_TC = self.q_proj(x_TD), self.k_proj(x_TD), self.v_proj(x_TD)
+        _eps = float(__import__("os").environ.get("KDA_PERTURB", "0") or 0)  # LOCAL PROBE HACK (not committed)
+        if _eps:
+            _g = torch.Generator(device=x_TD.device).manual_seed(1234 + (id(self) % 100000))
+            q_TC, k_TC, v_TC = (t * (1 + _eps * torch.randn(t.shape, device=t.device, dtype=t.dtype, generator=_g)) for t in (q_TC, k_TC, v_TC))
         out_THV = self.inner_kda(
-            self.q_proj(x_TD),
-            self.k_proj(x_TD),
-            self.v_proj(x_TD),
+            q_TC,
+            k_TC,
+            v_TC,
             raw_gate_THK,
             raw_beta_TH,
             self.q_conv.weight,
@@ -386,4 +390,16 @@ class KDA(Module):
         )
 
         output_gate_THV = local_head_split(self.output_gate(x_TD), self.head_dim)
-        return self.output_proj(self.output_norm(out_THV, output_gate_THV).flatten(-2))
+        normed_THV = self.output_norm(out_THV, output_gate_THV)
+        y_TD = self.output_proj(normed_THV.flatten(-2))
+        if __import__("os").environ.get("ACT_DUMP"):  # LOCAL PROBE HACK (not committed)
+            def _f(t):
+                t = t.full_tensor() if hasattr(t, "full_tensor") else t
+                return t.detach().float().cpu()
+            if _KDA_TRACE_STATE.get("in_forward"):
+                _KDA_TRACE.append({"li": getattr(self, "_probe_li", -1), "mb": _KDA_TRACE_STATE.get("mb", -1), "x": _f(x_TD), "q": _f(q_TC), "k": _f(k_TC), "v": _f(v_TC), "gate": _f(raw_gate_THK), "beta": _f(raw_beta_TH),
+                                   "q_conv_w": _f(self.q_conv.weight), "A_log": _f(self.A_log), "dt_bias": _f(self.dt_bias),
+                                   "out": _f(out_THV), "ogate": _f(output_gate_THV), "normed": _f(normed_THV), "y": _f(y_TD), "W": _f(self.output_proj.weight),
+                                   "tf32": torch.tensor([float(torch.backends.cuda.matmul.allow_tf32), float(torch.get_float32_matmul_precision() == "highest")]),
+                                   "wdtype": str(self.output_proj.weight.dtype), "xdtype": str(normed_THV.dtype)})
+        return y_TD

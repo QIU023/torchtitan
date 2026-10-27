@@ -59,6 +59,9 @@ from .vision_encoder import KimiK3VisionEncoder
 # N = attention-residual entries.
 
 
+_PROBE: dict = {}  # LOCAL PROBE HACK (not committed)
+
+
 def _local_head_split(
     x_TE: torch.Tensor, num_tokens: int, heads: int, head_dim: int
 ) -> torch.Tensor:
@@ -683,8 +686,25 @@ class KimiK3Model(Decoder):
                 else dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
             )
 
+        _act_dump = __import__("os").environ.get("ACT_DUMP")  # LOCAL PROBE HACK (not committed)
+        _acts: dict[str, torch.Tensor] = {}
+
+        def _keep(name: str, t: torch.Tensor) -> None:
+            if _act_dump:
+                t = t.full_tensor() if hasattr(t, "full_tensor") else t
+                _acts[name] = t.detach().float().cpu()
+
+        if _act_dump:
+            from . import kda as _kda_mod0
+
+            _kda_mod0._KDA_TRACE_STATE["in_forward"] = True
+            _kda_mod0._KDA_TRACE_STATE["mb"] = _kda_mod0._KDA_TRACE_STATE.get("mb", -1) + 1
+            for _i, _l in enumerate(self.layers.values()):
+                if getattr(_l, "delta_attention", None) is not None:
+                    _l.delta_attention._probe_li = _i
+        _keep("embed", h_TD)
         block_residual_TND = h_TD.unsqueeze(1)[:, :0]
-        for layer in self.layers.values():
+        for _li, layer in enumerate(self.layers.values()):
             h_TD, block_residual_TND = layer(
                 h_TD,
                 block_residual_TND,
@@ -692,6 +712,8 @@ class KimiK3Model(Decoder):
                 positions,
                 kda_cp_routing,
             )
+            _keep(f"L{_li:02d}", h_TD)
+            _keep(f"L{_li:02d}.res", block_residual_TND)
 
         h_TD = _apply_attention_residual(
             h_TD,
@@ -700,6 +722,23 @@ class KimiK3Model(Decoder):
             self.output_res_norm,
         )
         h_TD = self.norm(h_TD) if self.norm is not None else h_TD
+        _keep("final", h_TD)
+        if _act_dump and h_TD.requires_grad:
+
+            def _store_final_grad(g: torch.Tensor) -> None:
+                g = g.full_tensor() if hasattr(g, "full_tensor") else g
+                _PROBE.setdefault("final_grad", []).append(g.detach().float().cpu())
+
+            h_TD.register_hook(_store_final_grad)
+        if _act_dump:
+            import torch.distributed as _dist
+            from . import kda as _kda_mod
+
+            _kda_mod._KDA_TRACE_STATE["in_forward"] = False
+            _prev = torch.load(f"{_act_dump}.rank{_dist.get_rank() if _dist.is_initialized() else 0}.pt")["kda_trace"] if _kda_mod._KDA_TRACE_STATE["mb"] > 0 else []
+            _acts["kda_trace"] = _prev + list(_kda_mod._KDA_TRACE)
+            _kda_mod._KDA_TRACE.clear()
+            torch.save(_acts, f"{_act_dump}.rank{_dist.get_rank() if _dist.is_initialized() else 0}.pt")
         if self._skip_lm_head:
             return h_TD
         return self.lm_head(h_TD) if self.lm_head is not None else h_TD
