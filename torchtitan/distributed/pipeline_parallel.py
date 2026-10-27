@@ -397,6 +397,10 @@ def _build_pipeline_schedule(
             ),
             "unshard_lookahead": parallelism.pp_num_unshard_lookahead_factor,
         }
+        import inspect  # LOCAL SHIM: torch 2.15.0.dev20260906 lacks unshard_lookahead
+
+        _accepted = inspect.signature(schedule_class.__init__).parameters
+        schedule_kwargs = {k: v for k, v in schedule_kwargs.items() if k in _accepted}
         schedule = schedule_class(
             stages,  # pyrefly: ignore [bad-argument-type]
             n_microbatches=num_microbatches,
