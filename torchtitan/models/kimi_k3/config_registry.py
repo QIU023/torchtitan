@@ -92,3 +92,10 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+# PROBE ONLY (not committed): the debug model with the MoonEP comm backend, by name.
+def kimi_k3_debugmodel_moonep() -> Trainer.Config:
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel", moe_comm_backend="moonep")
+    return config
