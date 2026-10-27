@@ -954,6 +954,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         is_last
                     )
 
+            if os.environ.get("NOSYNC_GA") == "1" and not self.parallel_dims.pp_enabled:  # LOCAL PROBE HACK (not committed)
+                # Accumulate micro-batches the way torch pipelining does under FSDP:
+                # no gradient sync until the last backward (FSDP2 then accumulates in the reduce dtype).
+                _last = fwd_bwd_index == self.gradient_accumulation_steps - 1
+                for _part in self.model_parts:
+                    _part.set_is_last_backward(_last)
+                    _part.set_reshard_after_backward(_last)
+                    _part.set_requires_gradient_sync(_last)
             if self.sdc_replayer is not None and fwd_bwd_index == 0:
                 # Only the step's first gradient-accumulation group is
                 # replay-checked; under PP one group is a complete pipeline
@@ -979,6 +987,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(detached_loss)
 
         with sl.log_trace_span("optim"):
+            if os.environ.get("GRAD_DUMP") and self.step == 1:  # LOCAL PROBE HACK (not committed)
+                import torch.distributed as _dist
+                _d = {}
+                for _m in self.model_parts:
+                    for _n, _p in _m.named_parameters():
+                        if _p.grad is not None:
+                            _g = _p.grad
+                            _g = _g.full_tensor() if hasattr(_g, "full_tensor") else _g
+                            _d[_n] = _g.detach().cpu()
+                _ws = _dist.get_world_size() if _dist.is_initialized() else 1
+                _rk = _dist.get_rank() if _dist.is_initialized() else 0
+                torch.save(_d, f"{os.environ['GRAD_DUMP']}.ws{_ws}.rank{_rk}.pt")
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
