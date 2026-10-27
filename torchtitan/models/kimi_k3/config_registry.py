@@ -94,3 +94,17 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel_cp2() -> Trainer.Config:  # PROBE ONLY (not committed)
+    from torchtitan_recipes.tests.features import kimi_k3_debugmodel_cp2 as flavor
+
+    return flavor()
+
+
+def kimi_k3_debugmodel_cp2_allgather() -> Trainer.Config:  # PROBE ONLY (not committed)
+    from torchtitan_recipes.tests.features import (
+        kimi_k3_debugmodel_cp2_allgather as flavor,
+    )
+
+    return flavor()
