@@ -1062,6 +1062,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             **lr_metrics,
             **collect_aux_loss_metrics(parallel_dims),
         }
+        # LOCAL PROBE HACK (not committed): the printed loss rounds to five
+        # decimals; STEPS_DUMP names steps to append at full precision.
+        _sd = os.environ.get("STEPS_DUMP")
+        if _sd and str(self.step) in _sd.split(","):
+            import torch.distributed as _d
+
+            if not _d.is_initialized() or _d.get_rank() == 0:
+                with open(os.environ["STEPS_FILE"], "a") as _f:
+                    _f.write(
+                        f"step={self.step} loss={float(global_avg_loss)!r} "
+                        f"grad_norm={float(grad_norm.item())!r}\n"
+                    )
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
