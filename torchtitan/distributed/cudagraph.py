@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
-from torch.cuda._annotate_cuda_graph_trace import annotate_trace
 from torch.cuda._graph_annotations import get_kernel_annotations
 from torch.nn.attention.flex_attention import BlockMask
 from torch.utils import _pytree as pytree
@@ -194,6 +193,9 @@ def get_cudagraph_annotations() -> dict[int, list[Any]]:
 
 
 def cudagraph_annotate_trace_post_processor(trace_path: str) -> None:
+    # LOCAL HACK (not committed): main removed this import in #4493; the torch nightly here lacks the module.
+    from torch.cuda._annotate_cuda_graph_trace import annotate_trace
+
     """Post-process a profiler trace with captured CUDA graph annotations."""
     annotations = get_cudagraph_annotations()
     if not annotations:

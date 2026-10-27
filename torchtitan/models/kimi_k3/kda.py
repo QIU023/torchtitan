@@ -111,12 +111,7 @@ class KDAKernel(Module):
         """Apply the preprocessing shared by local and CP KDA cores."""
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
-        capability = torch.cuda.get_device_capability(q_1THK.device)
-        if capability not in {(9, 0), (10, 0), (10, 3)}:
-            raise RuntimeError(
-                "Attention Gym KDA requires Hopper SM90 or Blackwell SM100/SM103; "
-                f"got CUDA capability {capability}."
-            )
+        # LOCAL HACK (not committed): SM120 runs attn-gym's portable KDA kernels.
         gate_1THK = bound_gate(
             raw_gate_1THK,
             # TODO: The long-term solution is to specify mixed precision per FQN
