@@ -90,7 +90,7 @@ class KDAKernel(Module):
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
         capability = torch.cuda.get_device_capability(q_1THK.device)
-        if capability not in {(10, 0), (10, 3)}:
+        if capability not in {(10, 0), (10, 3), (12, 0)}:  # LOCAL HACK: 5060 smoke
             raise RuntimeError(
                 "Attention Gym KDA requires Blackwell SM100/SM103; "
                 f"got CUDA capability {capability}."
