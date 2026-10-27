@@ -374,8 +374,49 @@ def _405b(
     )
 
 
+def _debugmodel_k3sized(  # LOCAL PROBE (not committed)
+    attn_backend: str,
+    tp_gemm_backend: TpGemmBackend = "default",
+    *,
+    seq_len: int,
+) -> Llama3Model.Config:
+    """The debug model at Kimi K3's debug depth and width, for a size-matched
+    comparison: 24 layers of width 1024 instead of 6 of width 256. Everything
+    else -- vocabulary, head count, FFN rule, RoPE -- is llama3's own."""
+    dim = 1024
+    n_heads = 16
+    n_layers = 24
+    return Llama3Model.Config(
+        dim=dim,
+        vocab_size=2048,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=2048, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim, out_features=2048, param_init=_output_linear_init(dim)
+        ),
+        layers=_build_llama3_layers(
+            fuse_qkv=True,
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=n_heads,
+            hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
+            rope=ComplexRoPE.Config(
+                dim=dim // n_heads,
+                max_context_length=seq_len,
+                theta=500000,
+                scaling="llama",
+            ),
+            attn_backend=attn_backend,
+            tp_gemm_backend=tp_gemm_backend,
+        ),
+    )
+
+
 llama3_configs = {
     "debugmodel": (_debugmodel, 131072),
+    "debugmodel_k3sized": (_debugmodel_k3sized, 131072),
     "1B": (_1b, 131072),
     "3B": (_3b, 131072),
     "8B": (_8b, 131072),
