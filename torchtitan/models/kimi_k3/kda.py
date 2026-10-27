@@ -69,9 +69,33 @@ class KimiKDAKernel(Module):
         dt_bias_HK: torch.Tensor,
         cp_context=None,
     ) -> torch.Tensor:
-        # cp_context turns the scan into fla's prefix-scan over rank-local
-        # fragments. output_final_state is unsupported there, and unneeded in
-        # training: the final state only matters for decoding.
+        if cp_context is None:
+            # Without CP the kernel goes through attention-gym's dispatch, on
+            # the fla backend: same triton kernels, reached through the
+            # contract that package exposes (q/k pre-normalized, the gate
+            # already bounded, beta already sigmoided).
+            from attn_gym.linear.kda import bound_gate, chunk_kda as ag_chunk_kda
+            from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
+
+            gate_bounded = bound_gate(
+                gate_BLHK,
+                A_log_H.float(),
+                dt_bias_HK.float(),
+                lower_bound=self.lower_bound,
+                impl="reference",
+            )
+            out_BLHV, _ = ag_chunk_kda(
+                l2norm(q_BLHK),
+                l2norm(k_BLHK),
+                v_BLHV,
+                gate_bounded,
+                torch.sigmoid(beta_BLH),
+                kernel_options={"backend": "fla"},
+            )
+            return out_BLHV
+
+        # Under CP the scan is fla's prefix-scan over rank-local fragments,
+        # which attention-gym's dispatch does not expose.
         out_BLHV, _ = chunk_kda(
             q_BLHK,
             k_BLHK,
