@@ -107,3 +107,10 @@ def kimi_k3_debugmodel_32l() -> Trainer.Config:
 
 
 
+
+
+def kimi_k3_debugmodel_pp_naive() -> Trainer.Config:  # PROBE ONLY (not committed)
+    config = kimi_k3_debugmodel()
+    assert config.model_spec is not None
+    config.model_spec.model.attn_res_cache = False
+    return config
