@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover - fallback for older torch
     _INTERLEAVED_1F1B_CLASS = None
 
-from torchtitan.models.kimi_k3.attn_res import unstack_blocks
+from torchtitan.models.kimi_k3.layout import unstack_blocks
 from torchtitan.models.kimi_k3.layout import (
     _infer_block_layout_tables_from_stages,
     BlockLayoutTables,
@@ -1102,72 +1102,16 @@ def _unwrap_multimodal_for_pp(model: nn.Module, kwargs: dict) -> nn.Module:
     if tower is None or inner is None:
         # A model whose tower is its own child needs no re-wrapping: core's
         # _split_module sees the tower directly, so DEP is expressed by the FQN
-        # split alone (see _inject_kimi_k3_fqns).
+        # split alone (see _inject_kimi_k3_fqns). That is every layout this
+        # model ships, so there is nothing else to do here. The wrapper form --
+        # a language_model sibling that _split_module cannot see through --
+        # does not exist in this tree.
         return model
-
-    from torchtitan.models.kimi_k3.multimodal_model import KimiK3MultimodalModel
-
-    mm_config = model.config
-    inner_parallelize = kwargs["parallelize_fn"]
-
-    step_inputs = None
-    if dep_enabled():
-        from torchtitan.models.kimi_k3.vit_prefetch import VisionStepInputs
-
-        # Marker submodules so each vision chunk knows WHICH share it is. They must
-        # really exist on the module being split: _split_module keeps children whose
-        # name is in the chunk's FQN list and sets the rest to None, so a marker that
-        # matched nothing (the previous scheme) leaves every share indistinguishable.
-        # They hold no parameters, so they add nothing to any stage.
-        for i in range(dep_vision_stages()):
-            inner.add_module(f"{_DEP_VISION_FQN}{i}", nn.Module())
-        step_inputs = VisionStepInputs()
-        # Read back by the pipelining_fn, which needs to hook the schedule that does
-        # not exist yet at this point.
-        inner._dep_step_inputs_holder = step_inputs
-
-    def _parallelize_with_tower(part: nn.Module, **pk):
-        if dep_enabled():
-            from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
-
-            # Which vision share is this? The marker submodule that survived
-            # _split_module carries the index, so identity comes from the chunk
-            # itself. Call order cannot be used: a rank holding several virtual
-            # stages sees them in an order this function is not told. And "holds
-            # embed_tokens and no layers" only identifies share 0 -- the later
-            # shares hold neither, so they are indistinguishable from a text chunk
-            # without the marker.
-            share = _dep_vision_share_index(part)
-            if share is not None:
-                n_vit = dep_vision_stages()
-                stage = KimiK3ViTStage.from_parts(mm_config, tower, part)
-                if n_vit > 1:
-                    bounds = stage.vision_encoder.block_bounds(n_vit)
-                    role = (
-                        "head"
-                        if share == 0
-                        else ("tail" if share == n_vit - 1 else "body")
-                    )
-                    stage.set_dep_role(
-                        role,
-                        bounds=bounds[share],
-                        num_shares=n_vit,
-                        step_inputs=step_inputs,
-                    )
-                return inner_parallelize(stage, **pk)
-            _register_mm_prefix_hooks(part)
-            return inner_parallelize(part, **pk)
-
-        # The embed_tokens-owning chunk is the first stage by construction.
-        if getattr(part, "embed_tokens", None) is not None:
-            part = KimiK3MultimodalModel.from_parts(mm_config, tower, part)
-        else:
-            _register_mm_prefix_hooks(part)
-        return inner_parallelize(part, **pk)
-
-    kwargs["parallelize_fn"] = _parallelize_with_tower
-    return inner
-
+    raise NotImplementedError(
+        "a multimodal wrapper layout (vision_encoder beside a language_model "
+        "child) is not supported: the pipeline split cannot see through it. "
+        "This model carries the tower as its own child."
+    )
 
 def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
     """Give every vision stage its micro-batch index, and the step its ``kwarg_mbs``.
@@ -1182,7 +1126,7 @@ def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
     Returns how many stages were wired, so a caller can assert engagement instead of
     inferring it from numerics.
     """
-    from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+    from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
     from torchtitan.models.kimi_k3.vit_prefetch import install_step_hook
 
     if step_inputs is not None:
@@ -1191,7 +1135,10 @@ def _install_vision_stage_wiring(pp_schedule, step_inputs) -> int:
     wired = 0
     for stage in _iter_schedule_stages(pp_schedule):
         submod = getattr(stage, "submod", None)
-        if not isinstance(submod, KimiK3ViTStage):
+        # Holds a tower, rather than is a particular class: the folded layout
+        # never constructs KimiK3ViTStage, so a type test wired nothing and the
+        # count check below then raised on a correct run.
+        if not (isinstance(submod, KimiK3ViTStage) or _holds_vision_tower(submod)):
             continue
         orig_fwd = stage.forward_one_chunk
 
@@ -1370,10 +1317,27 @@ def dep_vision_stages() -> int:
     ``embed_tokens``, the last share takes its blocks plus the projector and the
     splice, and what crosses each hop is a fixed-capacity patch stream alongside the
     text embeddings. See ``KimiK3ViTStage.set_dep_role``.
+
+    That split is NOT reachable on a model whose tower is its own child. Splitting
+    the tower needs the per-share stage class, and the only path that installs it
+    is ``_unwrap_multimodal_for_pp``, which returns early here because there is no
+    ``language_model`` child -- ``_split_module`` cannot cut into
+    ``vision_encoder.layers`` either, since it descends only into a ModuleDict or
+    ModuleList that is a DIRECT child of the model. So this raises rather than
+    silently running clause 1 while the config asked for clause 2.
     """
     from torchtitan.models.kimi_k3.knobs import topology
 
-    return max(1, topology().vit_dep_stages)
+    stages = max(1, topology().vit_dep_stages)
+    if stages > 1:
+        raise NotImplementedError(
+            f"vit_dep_stages={stages} splits the vision tower across pipeline "
+            "stages (report sec 5.2.3 clause 2), which this model layout does "
+            "not support yet: the tower is a child of the model, and the stage "
+            "split cannot reach into vision_encoder.layers. Use "
+            "vit_dep_stages=1, which gives the tower its own stage (clause 1)."
+        )
+    return stages
 
 
 def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
@@ -1511,6 +1475,21 @@ def _inject_kimi_k3_fqns(model: nn.Module, kwargs: dict) -> None:
     parallelism.module_fqns_per_model_part = fqns
 
 
+def _holds_vision_tower(module) -> bool:
+    """Whether this stage owns the vision tower, through any wrapper.
+
+    FSDP2 replaces the module's class (KimiK3Model becomes FSDPKimiK3Model), and
+    a plain getattr for ``vision_encoder`` on the wrapper misses it -- which read
+    as "this rank has no vision stage" on a rank that owns one. Walk the modules
+    instead of trusting either the type or a direct attribute.
+    """
+    if getattr(module, "vision_encoder", None) is not None:
+        return True
+    return any(
+        getattr(m, "vision_encoder", None) is not None for m in module.modules()
+    )
+
+
 def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     """Give the DEP vision stage a prefetcher and tell it which micro-batch it serves.
 
@@ -1523,7 +1502,7 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
     changes nothing here.
     """
     from torchtitan.models.kimi_k3.knobs import topology
-    from torchtitan.models.kimi_k3.multimodal_model import KimiK3ViTStage
+    from torchtitan.models.kimi_k3.dep_vision_stage import KimiK3ViTStage
     from torchtitan.models.kimi_k3.vit_prefetch import (
         install_step_hook,
         prefetch_depth,
@@ -1557,7 +1536,15 @@ def _install_vision_prefetch(pp_schedule, model_parts) -> None:
         if not bool(topology().vit_bubble):
             return
 
-    vision_stage_modules = [m for m in model_parts if isinstance(m, KimiK3ViTStage)]
+    # A stage owns the tower if it HOLDS one, not if it is a particular class.
+    # In the folded layout the tower is a child of KimiK3Model and the FQN split
+    # hands it to stage 0, so no KimiK3ViTStage is ever constructed -- keying on
+    # the type left this empty and the run-ahead silently off.
+    vision_stage_modules = [
+        m
+        for m in model_parts
+        if isinstance(m, KimiK3ViTStage) or _holds_vision_tower(m)
+    ]
     if not vision_stage_modules:
         # Normal on a text-only rank: the vision stage is global stage 0, so only
         # one rank holds it. Logged rather than silent because "the run-ahead did
@@ -1631,6 +1618,16 @@ def pipeline_kimi_k3_with_cache_adapter(model: nn.Module, **kwargs):
 
     model = _unwrap_multimodal_for_pp(model, kwargs)
     step_inputs = getattr(model, "_dep_step_inputs_holder", None)
+    if step_inputs is None and dep_enabled() and getattr(model, "vision_encoder", None) is not None:
+        # The folded layout has no wrapper to build this, but the run-ahead still
+        # needs it: a body/tail share -- and the prefetcher issuing micro-batch
+        # m+k -- reads grid_thw by micro-batch index, and pipelining hands the
+        # batch kwargs to the first stage only. Built here so the carrier exists
+        # for the layout that actually ships, rather than only for the wrapper.
+        from torchtitan.models.kimi_k3.vit_prefetch import VisionStepInputs
+
+        step_inputs = VisionStepInputs()
+        model._dep_step_inputs_holder = step_inputs
     _inject_kimi_k3_fqns(model, kwargs)
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, **kwargs

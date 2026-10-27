@@ -119,9 +119,16 @@ class KimiMLAAttention(BaseAttention):
         del positions
 
         num_tokens = x_TD.shape[0]
-        q_THK = self.wq_b(self.q_norm(self.wq_a(x_TD))).view(
-            num_tokens, self.n_heads, self.q_head_dim
-        )
+        # The head count is DERIVED from the projection width, not read off
+        # self.n_heads, because the two differ under TP: wq_b/wkv_b are
+        # column-parallel, so each rank produces n_heads/tp of them. Under
+        # partial_dtensor the view sees the global shape and the distinction
+        # stays hidden; under any local-tensor backend the global count fails.
+        # Deriving works either way and needs no branch on the backend (ported
+        # from the reference tree).
+        q_proj_TE = self.wq_b(self.q_norm(self.wq_a(x_TD)))
+        h_local = q_proj_TE.shape[-1] // self.q_head_dim
+        q_THK = q_proj_TE.view(num_tokens, h_local, self.q_head_dim)
 
         compressed_kv_TC = self.wkv_a(x_TD)
         kv_latent_TC, k_rope_TK = torch.split(
@@ -131,7 +138,7 @@ class KimiMLAAttention(BaseAttention):
         )
         kv_THC = self.wkv_b(self.kv_norm(kv_latent_TC)).view(
             num_tokens,
-            self.n_heads,
+            h_local,
             self.qk_nope_head_dim + self.v_head_dim,
         )
         k_nope_THK, v_THV = torch.split(
@@ -140,7 +147,7 @@ class KimiMLAAttention(BaseAttention):
             dim=-1,
         )
         k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-            -1, self.n_heads, -1
+            -1, h_local, -1
         )
         k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
 
@@ -157,7 +164,7 @@ class KimiMLAAttention(BaseAttention):
                 attention_masks=attention_masks,
                 scale=self.scale,
             )
-        out_TD = out_THV.reshape(num_tokens, self.n_heads * self.v_head_dim)
+        out_TD = out_THV.reshape(num_tokens, h_local * self.v_head_dim)
         out_TD = out_TD * torch.sigmoid(self.gate(x_TD))
         return self.wo(out_TD)
 
@@ -176,6 +183,24 @@ class KimiMLAAttention(BaseAttention):
         Cached per (length, device) because the shape is constant across layers
         and steps, and create_block_mask is compiled.
         """
+        # The mask the decoder builds at dp1 is causal AND packed-document
+        # (common/decoder._create_flex_attention_mask_for_document). This
+        # rebuild is causal only, which is equivalent exactly when the folded
+        # stream holds ONE document. Sample packing is already rejected in
+        # update_from_config, but a microbatch wider than the context window
+        # folds several documents into one stream as well, and then CP would
+        # let a sample attend to the previous one while dp1 would not --
+        # silently, since every shape stays valid. Caught here rather than
+        # documented.
+        limit = getattr(self, "_cp_max_context_length", None)
+        if limit is not None and num_tokens > limit:
+            raise NotImplementedError(
+                f"context parallel folds {num_tokens} tokens into one stream "
+                f"but the context window is {limit}, so the "
+                "stream holds more than one document. The CP path rebuilds a "
+                "causal-only mask and cannot see document boundaries; use a "
+                "microbatch no wider than the context window."
+            )
         key = (num_tokens, device)
         if self._cp_mask is None or self._cp_mask[0] != key:
             mask = create_attention_mask(
@@ -210,12 +235,16 @@ class KimiMLAAttention(BaseAttention):
         """
         import torch.distributed.nn.functional as dist_nn
 
+        from torchtitan.models.kimi_k3.dtensor_ops import to_local_partial_grad
+
         # Head divisibility is checked at wiring time, against tp*cp rather
         # than cp; see apply_cp_kimi_k3.
         cp_size = dist.get_world_size(cp_group)
         t_loc = q_LHQ.shape[0]
         t_full = t_loc * cp_size
-        h_cp = self.n_heads // cp_size
+        # Local head count: q_LHQ already carries this rank's TP-local heads
+        # (H/tp), so the CP split is over that, not over the global n_heads.
+        h_cp = q_LHQ.shape[1] // cp_size
 
         packed_LHW = torch.cat([q_LHQ, kv_LHC], dim=-1)
         src_dim, dst_dim = ULYSSES.in_dims()
@@ -227,6 +256,15 @@ class KimiMLAAttention(BaseAttention):
             [self.q_head_dim, self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
+
+        # wkv_a is replicated on the TP axis, so every TP rank ran it on the
+        # same input and its gradient is the SUM across TP ranks, i.e. Partial.
+        # Without this the sum never happens and wkv_a's gradient is
+        # rank-dependent while its placement still says Replicate -- measured on
+        # the reference tree as 1-6% gradient error on every MLA kv_a layer at
+        # tp2 x cp2, bit-identical at tp2 alone. A no-op when the input is a
+        # plain tensor (tp=1), so the reachable CP-only path is unchanged.
+        k_rope_LR = to_local_partial_grad(k_rope_LR)
 
         # Differentiable all-gather: the backward is a reduce-scatter, which is
         # what a value every rank consumed needs.
@@ -454,6 +492,29 @@ class KimiK3TransformerBlock(Module):
         return prefix_sum_TD + h_TD, block_residual_TND
 
 
+class _PlainGradBoundary(torch.autograd.Function):
+    """Identity forward; forces the incoming gradient to be a plain tensor.
+
+    The vision tower must stay plain in BOTH directions. Its TP and its dynamic
+    CP are separate mechanisms from the decoder's, and the CP path runs
+    hand-written collectives whose transpose is a reduce_scatter --
+    _c10d_functional.reduce_scatter_tensor has no DTensor sharding strategy.
+
+    to_local() alone is not enough and grad_placements is the wrong knob: the
+    first re-wraps the gradient with the forward placements, the second states
+    which placements to re-wrap WITH. Neither can say "do not re-wrap". That is
+    what this states, and only an autograd.Function can.
+    """
+
+    @staticmethod
+    def forward(ctx, x):  # type: ignore[override]
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        return grad.to_local() if isinstance(grad, DTensor) else grad
+
+
 class KimiK3Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
@@ -469,6 +530,13 @@ class KimiK3Model(Decoder):
         # layer implements both CP modes itself, and the preconditions that
         # replaces the backend check with are enforced below.
         cp_via_sharding_config: bool = False
+        # DEP (report sec 5.2.3): when the tower spans pipeline stages, the
+        # patch stream crossing a stage boundary must have a static shape --
+        # pipelining sizes its buffers once. These bound the padded payload;
+        # a batch exceeding them raises rather than silently truncating.
+        dep_max_images: int = 8
+        dep_max_grid_h: int = 64
+        dep_max_grid_w: int = 64
 
         def update_from_config(self, *, config, **kwargs) -> None:
             dataset = config.dataloader.dataset
@@ -649,104 +717,281 @@ class KimiK3Model(Decoder):
         return next(self.parameters()).device
 
 
+    def encode_images(self, pixel_values, grid_thw):
+        """Public entry the DEP prefetcher calls.
+
+        The run-ahead issues the encode for a later micro-batch on the vision
+        stream, so it needs a name it can call on whichever module owns the
+        tower. Delegates to the private path that the forward uses, so the two
+        cannot drift.
+        """
+        return self._encode_images(pixel_values, grid_thw)
+
+    def _vision_stream(self):
+        """A dedicated CUDA stream for the tower, created once per module.
+
+        Groundwork for DEP's concurrent design (report 5.2.3), and it is only
+        groundwork: running on a side stream and immediately waiting for it cannot
+        overlap anything. The overlap needs the encode for micro-batch m+k issued
+        during micro-batch m's text compute, which is a scheduling change. What this
+        establishes is the part that has to be right first -- cross-stream tensor
+        lifetime and the interaction with FSDP2's tower all-gather, neither of which
+        the AttnRes PP adapter has ever had to deal with (it touches no streams at
+        all).
+
+        Same THREAD, separate stream. Not a worker thread: the adapter keys its
+        per-microbatch cache in a ``threading.local``, and its forward reads a
+        missing key as "this call is PP's shape inference" and diverts WITHOUT
+        raising. A worker thread would therefore take the shape-inference path and
+        return wrong shapes with no error.
+        """
+        if not torch.cuda.is_available():
+            return None
+        # Only when no autograd graph is being recorded. A graph recorded here has its
+        # backward run here too, and with prefetch several micro-batches then accumulate
+        # into the same tower parameters from two streams with nothing ordering them --
+        # which cost mm_full/tp2_pp2_cp2 its reproducibility: seven runs, seven distinct
+        # traces. Forcing the encode onto the current stream gives one trace over three
+        # runs, bit-identical to the DEP-without-prefetch numbers, so the stream was only
+        # ever changing reduction order, never the result.
+        #
+        # Nothing is lost today because both callers join immediately, so the stream
+        # overlaps nothing while grad is on. The machinery stays for the deferred design
+        # (report 5.2.3), which needs cross-stream collective ordering this does not yet
+        # establish -- and will need ordered accumulation before it can carry gradients.
+        if torch.is_grad_enabled():
+            return None
+        s = getattr(self, "_vision_side_stream", None)
+        if s is None:
+            s = torch.cuda.Stream()
+            self._vision_side_stream = s
+        return s
+
+    def _issue_on_vision_stream(self, fn, *tensors):
+        """Issue ``fn`` on the vision stream and return ``(out, event)`` WITHOUT waiting.
+
+        This is the half that makes overlap possible. :meth:`_run_on_vision_stream` joins
+        immediately, which is correct for a synchronous encode but means the side stream
+        buys nothing -- the caller blocks on it before running anything else. The
+        run-ahead needs the encode for micro-batch m+k in flight WHILE m's text compute
+        runs, so it issues here and joins later, in :meth:`_join_vision_stream`.
+
+        The input-side edges are the same as the synchronous path and equally required:
+        the side stream waits for the current one because ``fn``'s inputs were produced
+        there, and each input is ``record_stream``'d so the caching allocator cannot hand
+        its memory to another allocation while the side stream still reads it.
+        """
+        side = self._vision_stream()
+        if side is None:
+            return fn(), None
+        cur = torch.cuda.current_stream()
+        side.wait_stream(cur)
+        for t in tensors:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(side)
+        # Bracket the encode ON THE SIDE STREAM so its own GPU time is measurable.
+        # Without this the only observable is the span between issue and join, which is
+        # dominated by text compute and PP communication and therefore reads the same
+        # whether or not the encode ran concurrently -- a metric that cannot be falsified.
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(side):
+            started.record(side)
+            out = fn()
+            finished.record(side)
+        done = finished
+        self._last_encode_span = (started, finished)
+        return out, done
+
+    def _join_vision_stream(self, out, done) -> None:
+        """Make the current stream wait for an issued encode, and hand the outputs over.
+
+        Both halves are needed: without the wait the consumer reads memory the side
+        stream is still writing, and without ``record_stream`` on the outputs the
+        allocator may reuse buffers the side stream produced while the current stream
+        still holds them.
+        """
+        if done is None:
+            return
+        cur = torch.cuda.current_stream()
+        cur.wait_event(done)
+        outs = out if isinstance(out, (list, tuple)) else [out]
+        for t in outs:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(cur)
+
     def _encode_images(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> torch.Tensor:
-        """Encode every image, splitting the large ones across CP ranks.
+        """Encode every image, partitioning the large ones (report sec 5.2.3).
 
-        Report sec 5.2.3: a single large image is partitioned along the patch
-        dimension and attention gathers key-value pairs across ranks, which is
-        what reduces the encoder latency of large samples and the cross-device
-        imbalance. Small images are left replicated -- splitting one buys a
-        gather per layer and saves nothing, so the threshold is on the image's
-        own patch count rather than on the batch.
+        Ported from the reference tree's ``_encode_images_dynamic_cp``. Report
+        5.2.3 has two halves and both are needed: a single large image is split
+        along the patch dimension with attention gathering key-value pairs
+        across ranks, AND each CP group is divided into sub-CP groups with the
+        large images distributed across them, which is what keeps the
+        communication fraction from growing with scale.
 
-        Without CP, or with every image below the threshold, this is exactly the
-        replicated call it replaces.
+        Every large image is encoded by one sub-CP group, with its patches split
+        across that sub-group's ranks. Images below the threshold, or whose grid
+        height does not divide the merge kernel, stay whole and are encoded
+        replicated -- splitting one buys a gather per layer and saves nothing.
         """
-        from torchtitan.models.kimi_k3.vit_cp_plan import classify
-        from torchtitan.models.kimi_k3.vision_encoder import make_cp_patch_plan
+        import torch.distributed._functional_collectives as funcol
 
-        group = self._cp_group
-        cp_size = dist.get_world_size(group) if group is not None else 1
+        from torchtitan.models.kimi_k3.vision_encoder import CPPatchPlan
+        from torchtitan.models.kimi_k3.vit_cp_plan import (
+            balance_images,
+            classify,
+            merged_tokens,
+            row_partition,
+            subgroup_layout,
+        )
+
         grids = grid_thw.tolist()
         counts = [t * h * w for t, h, w in grids]
-        kernel_h, kernel_w = self.vision_encoder.merge_kernel_size
-        big = set(classify(counts, cp_size, min_patches=self.dynamic_cp_min_patches))
-        # Only images whose height divides the merge kernel: a band boundary
-        # inside a (kh, kw) block would ask two ranks to merge halves of one.
-        big = {i for i in big if grids[i][1] % kernel_h == 0}
-        if not big:
-            return self.vision_encoder(pixel_values, grid_thw=grid_thw)
+        kh, kw = self.vision_encoder.merge_kernel_size
+        offsets = [0]
+        for c in counts:
+            offsets.append(offsets[-1] + c)
+
+        def _replicated(which: list[int]) -> dict[int, torch.Tensor]:
+            """Encode a subset redundantly on every rank."""
+            out = {}
+            for i in which:
+                item = pixel_values[offsets[i] : offsets[i + 1]]
+                item_grid = torch.tensor(
+                    [grids[i]], dtype=grid_thw.dtype, device=grid_thw.device
+                )
+                out[i] = self.vision_encoder(item, grid_thw=item_grid)
+            return out
+
+        subgroups = getattr(self, "_cp_subgroups", None)
+        group_all = self._cp_group
+        cp_size = dist.get_world_size(group_all) if group_all is not None else 1
+        if not subgroups or cp_size <= 1:
+            return torch.cat([_replicated(list(range(len(counts))))[i]
+                              for i in range(len(counts))], dim=0)
+
+        large = classify(counts, cp_size, min_patches=self.dynamic_cp_min_patches)
+        # Grid heights must divide the merge kernel for a partition to be legal.
+        # An image that fails it is left replicated instead of being cut unsafely.
+        large = [i for i in large if grids[i][1] % kh == 0]
+        if not large:
+            return torch.cat([_replicated(list(range(len(counts))))[i]
+                              for i in range(len(counts))], dim=0)
+
+        n_sub, g = subgroup_layout(len(large), cp_size)
+        group = subgroups.get(n_sub)
+        if group is None or g <= 1:
+            # No usable sub-group of size > 1 means there is nothing to partition
+            # across.
+            return torch.cat([_replicated(list(range(len(counts))))[i]
+                              for i in range(len(counts))], dim=0)
+
+        cp_rank = dist.get_rank(group_all)
+        my_sub = cp_rank // g
+        rank_in_sub = cp_rank % g
+        group_of = balance_images([counts[i] for i in large], n_sub)
+        my_large = [img for img, sub in zip(large, group_of) if sub == my_sub]
+
         if not self._dyncp_logged:
-            # Said once, because "dynamic CP is on" and "dynamic CP fired" are
-            # different claims: with the debug data every image sits under the
-            # threshold, so the path is wired and inert, and only a count tells
-            # the two apart.
             self._dyncp_logged = True
             logger.info(
-                "Dynamic CP partitioning %d of %d image(s) across %d rank(s); "
-                "patch counts %s, threshold %d.",
-                len(big), len(grids), cp_size, counts, self.dynamic_cp_min_patches,
+                "Dynamic CP: %d large image(s) of %d over %d sub-CP group(s) of "
+                "%d rank(s); min_patches=%d.",
+                len(large), len(counts), n_sub, g, self.dynamic_cp_min_patches,
             )
 
-        rank = dist.get_rank(group)
-        outputs = []
-        offset = 0
-        for i, (grid, count) in enumerate(zip(grids, counts, strict=True)):
-            item = pixel_values[offset : offset + count]
-            item_grid = torch.tensor([grid], dtype=grid_thw.dtype, device=grid_thw.device)
-            offset += count
-            if i not in big:
-                outputs.append(self.vision_encoder(item, grid_thw=item_grid))
-                continue
-            plan, ranges = make_cp_patch_plan(
-                tuple(grid), group=group, rank=rank, merge_kernel_h=kernel_h
-            )
-            # Padded to the band, per frame, because _slice_for_shard pads the
-            # position tables the same way and the two are added together. A
-            # rank short of rows otherwise meets a table longer than its pixels
-            # -- which is what "mirroring how the caller lays out the pixels"
-            # in that helper means. The padding repeats the last real row
-            # rather than being zeroed, so nothing out of range reaches a norm;
-            # the padded queries are discarded and the padded keys are masked.
-            _, _, grid_w = grid
-            per_frame = []
-            for lo, hi in ranges:
-                rows = item[lo:hi]
-                pad = plan.band * grid_w - rows.shape[0]
-                if pad > 0:
-                    # Zeros, matching the implementation this was ported from.
-                    # The padded rows form whole merge blocks -- bands and real
-                    # row counts are both multiples of the kernel height -- so
-                    # nothing real is averaged with them, and the padded queries
-                    # are discarded while the padded keys are masked.
-                    rows = torch.cat(
-                        [rows, rows.new_zeros(pad, *item.shape[1:])], dim=0
+        out: dict[int, torch.Tensor] = {}
+        # Every sub-group must run the same NUMBER of passes or the collectives
+        # inside them desynchronise. The count is the max over sub-groups, and a
+        # sub-group with fewer images pads with an empty pass.
+        per_sub = [sum(1 for s in group_of if s == k) for k in range(n_sub)]
+        n_passes = max(per_sub) if per_sub else 0
+
+        for p in range(n_passes):
+            img = my_large[p] if p < len(my_large) else None
+            if img is None:
+                # An empty pass still joins this sub-group's collectives. One
+                # merge block keeps every shape valid; the output is discarded.
+                local = pixel_values.new_zeros(kh * kw, *pixel_values.shape[1:])
+                local_grid = torch.tensor(
+                    [[1, kh, kw]], dtype=grid_thw.dtype, device=grid_thw.device
+                )
+                plan = CPPatchPlan(
+                    group=group,
+                    valid_total=kh * kw * g,
+                    full_grid=(1, kh * g, kw),
+                    row_start=0,
+                    band=kh,
+                    real_rows=kh,
+                )
+            else:
+                t, h, w = grids[img]
+                shards = row_partition(t, h, w, kh=kh, group_size=g)
+                sh = shards[rank_in_sub]
+                bands = [s.row_end - s.row_start for s in shards]
+                band = max(bands)
+                # The ceiling split keeps any deficit on the TRAILING ranks, so
+                # every rank's padding lands at the end of the gathered stream
+                # rather than inside it. Taking a prefix below depends on that.
+                if bands != sorted(bands, reverse=True):
+                    raise AssertionError(
+                        f"bands {bands} are not non-increasing; padding would land "
+                        "inside the gathered token stream and corrupt the order"
                     )
-                per_frame.append(rows)
-            shard = torch.cat(per_frame, dim=0)
-            mine = self.vision_encoder(shard, grid_thw=item_grid, cp_plan=plan)
-            # Every rank needs the whole image's tokens: the text side splices
-            # them at positions this rank may or may not hold, and the CP
-            # sentinel selection downstream cuts to what it does hold.
-            parts = [torch.empty_like(mine) for _ in range(cp_size)]
-            dist.all_gather(parts, mine.contiguous())
-            # Each rank emitted band-worth of rows, padded; only its real rows
-            # carry tokens the text side expects. The counts follow the same
-            # ceiling split row_partition performs, so trimming needs no extra
-            # collective -- and it cannot be a single trailing trim, because
-            # every rank's padding sits at the end of ITS chunk.
-            _, full_h, full_w = plan.full_grid
-            kernel_w = self.vision_encoder.merge_kernel_size[1]
-            per_row = full_w // kernel_w
-            trimmed = []
-            for r_i, part in enumerate(parts):
-                real_rows = min(plan.band, max(0, full_h - r_i * plan.band))
-                trimmed.append(part[: (real_rows // kernel_h) * per_row])
-            outputs.append(torch.cat(trimmed, dim=0))
-        return torch.cat(outputs, dim=0)
+                flat = pixel_values[offsets[img] : offsets[img + 1]]
+                # This rank's rows of EVERY frame: the projector's temporal mean
+                # spans all frames, so splitting by frame would give each rank the
+                # mean of its own frames instead.
+                pad_rows = band - (sh.row_end - sh.row_start)
+                pieces = []
+                for a, b in sh.ranges:
+                    pieces.append(flat[a:b])
+                    if pad_rows:
+                        pieces.append(
+                            flat.new_zeros(pad_rows * w, *flat.shape[1:])
+                        )
+                local = torch.cat(pieces, dim=0)
+                local_grid = torch.tensor(
+                    [[t, band, w]], dtype=grid_thw.dtype, device=grid_thw.device
+                )
+                plan = CPPatchPlan(
+                    group=group,
+                    valid_total=counts[img],
+                    full_grid=(t, h, w),
+                    row_start=sh.row_start,
+                    band=band,
+                    real_rows=sh.row_end - sh.row_start,
+                )
 
+            local = local.to(self.vision_encoder.patch_embed.weight.dtype)
+            feats = self.vision_encoder(local, grid_thw=local_grid, cp_plan=plan)
+            # to_local unwraps the value but its backward re-wraps the gradient,
+            # and the all_gather below has a reduce_scatter transpose with no
+            # DTensor rule.
+            if isinstance(feats, DTensor):
+                feats = feats.to_local()
+            local_feat = _PlainGradBoundary.apply(feats)
+            # The boundary belongs on the OUTPUT too: the gradient arrives from
+            # downstream, so sealing only the input leaves the transpose
+            # receiving a DTensor.
+            gathered = _PlainGradBoundary.apply(
+                funcol.all_gather_tensor(
+                    local_feat.contiguous(), gather_dim=0, group=group
+                )
+            )
+            if img is not None:
+                t, h, w = grids[img]
+                # NOT counts // merge: the projector collapses time, so a video's
+                # token count carries no t.
+                out[img] = gathered[: merged_tokens(h, w, kh, kw)]
+
+        rest = [i for i in range(len(counts)) if i not in out]
+        if rest:
+            out.update(_replicated(rest))
+        return torch.cat([out[i] for i in range(len(counts))], dim=0)
 
     def _prepare_multimodal_embeds(
         self,

@@ -140,6 +140,46 @@ def kimi_k3_debugmodel_text() -> Trainer.Config:
 
 
 
+def kimi_k3_debugmodel_text_32l() -> Trainer.Config:
+    model_spec = model_registry("debugmodel_text_32l")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
+        tokenizer=MultiModalTokenizer.Config(**KIMI_K3_SPECIAL_TOKENS),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model_spec=model_spec,
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=TEXT_DATASETS["c4_test"]),
+        ),
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        # TODO: Kimi K3 has no spmd_types annotations yet.
+        parallelism=ParallelismConfig(spmd_backend="partial_dtensor"),
+        training=TrainingConfig(
+            num_tokens_per_microbatch_per_dp_rank=256,
+            max_context_length=256,
+            steps=10,
+            dtype="bfloat16",
+            disable_cuda_graphs=True,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=SelectiveAC.Config(),
+    )
+
+
+
 def kimi_k3_debugmodel_dyncp() -> Trainer.Config:
     """The multimodal debug model with the dynamic-CP threshold lowered.
 
@@ -157,10 +197,18 @@ def kimi_k3_debugmodel_lora() -> Trainer.Config:
     """The multimodal debug model with LoRA adapters on the attention output.
 
     Uses core's LoRAConverter rather than a model-local implementation. The
-    targets are named by the last segment of the FQN, so wo covers MLA and
-    output_proj covers KDA; the KDA adapters are trainable but its kernels read
-    the merged weight, which is why the target list names them explicitly
-    rather than defaulting to every Linear.
+    Targets are matched on the last segment of the FQN. The set mirrors the
+    reference tree's DEFAULT_LORA_TARGETS: the MLA projections, and -- the part
+    that matters structurally -- the dense FFN and latent-MoE projections.
+    Every decoder layer carries an FFN or MoE, while only one layer in four is
+    MLA (K3 is 3 KDA : 1 MLA), so an MLA-only target set leaves an all-KDA
+    pipeline stage with zero trainable parameters and the optimizer then raises
+    "param_groups pattern matched no parameters". That is what pp8 hit.
+
+    Not covered: the reference also adapts the MLA output gate. Here that module
+    is named ``gate``, which is also the router's gate in every MoE layer, and
+    last-segment matching cannot separate them -- adding it would silently adapt
+    the routers too. Left out rather than guessed.
     """
     from torchtitan.components.lora import LoRAConverter
 
@@ -171,7 +219,21 @@ def kimi_k3_debugmodel_lora() -> Trainer.Config:
             LoRAConverter.Config(
                 rank=8,
                 alpha=16.0,
-                target_modules=["wq_b", "wkv_b", "wo"],
+                target_modules=[
+                    # MLA
+                    "wq_a",
+                    "wq_b",
+                    "wkv_a",
+                    "wkv_b",
+                    "wo",
+                    # dense FFN and shared experts
+                    "w1",
+                    "w2",
+                    "w3",
+                    # latent MoE down/up projections
+                    "routed_down",
+                    "routed_up",
+                ],
             )
         ],
     )
