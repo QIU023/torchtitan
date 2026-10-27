@@ -65,6 +65,25 @@ from torchtitan.tools.logging import logger
 from torchtitan.tools.profiler import Profiler
 
 
+# LOCAL PROBE HACK (not committed): print the input-gradient metas each stage records.
+import torch.distributed as _dd
+from torch.distributed.pipelining import stage as _stage_mod
+from torch._prims_common import is_non_overlapping_and_dense_or_false as _nod
+
+_orig_bmi = _stage_mod.PipelineStage._backward_metadata_inference
+
+
+def _bmi(self, *a, **k):
+    r = _orig_bmi(self, *a, **k)
+    ig = self._stage_meta.input_grads
+    og = self._stage_meta.output_grads
+    fmt = lambda ms: [None if m is None else (tuple(m.shape), tuple(m.stride)) for m in (ms or ())]
+    print(f"[GRADMETA rank {_dd.get_rank()} stage {self.stage_index}] input_grads {fmt(ig)} output_grads {fmt(og)}", flush=True)
+    return r
+
+
+_stage_mod.PipelineStage._backward_metadata_inference = _bmi
+
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
