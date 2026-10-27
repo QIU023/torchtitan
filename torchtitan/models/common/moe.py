@@ -9,6 +9,8 @@ from typing import Literal
 
 import spmd_types as spmd
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -339,6 +341,8 @@ class TokenChoiceTopKRouter(Module):
             denominator = topk_scores_TK.sum(dim=-1, keepdim=True) + 1e-20
             topk_scores_TK = topk_scores_TK / denominator
         topk_scores_TK = topk_scores_TK * self.route_scale
+        if os.environ.get("ROUTER_DUMP"):  # LOCAL PROBE HACK (not committed)
+            self._route_log = getattr(self, "_route_log", []) + [topk_expert_ids_TK.detach().to(torch.int16).cpu()]
 
         return (
             topk_scores_TK,
