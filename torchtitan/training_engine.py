@@ -523,6 +523,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             for part in self.model_parts:
                 part.set_requires_all_reduce(is_last)  # pyrefly: ignore[not-callable]
 
+        if __import__("os").environ.get("NOSYNC_GA") == "1" and not self.parallel_dims.pp_enabled:  # LOCAL PROBE HACK (not committed)
+            # Accumulate micro-batches the way torch pipelining does under FSDP: no sync until the last backward.
+            _last = accumulation_index == self.num_accumulation_steps - 1
+            for _part in self.model_parts:
+                _part.set_is_last_backward(_last)
+                _part.set_reshard_after_backward(_last)
+                _part.set_requires_gradient_sync(_last)
+
         def forward_backward() -> torch.Tensor:
             if self.parallel_dims.pp_enabled:
                 if any(microbatch.loss_kwargs() for microbatch in microbatch_group):
