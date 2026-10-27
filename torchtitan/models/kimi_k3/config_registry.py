@@ -96,3 +96,47 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         activation_checkpoint=SelectiveAC.Config(),
     )
 
+
+
+# PROBE ONLY (not committed): the two hooks with per-step expert-load logging.
+def kimi_k3_debugmodel_probe() -> Trainer.Config:
+    from torchtitan.components.load_probe import register_load_probe
+
+    config = kimi_k3_debugmodel()
+    assert config.model_spec is not None
+    core_hook = config.model_spec.post_optimizer_build_fn  # core's sign-rule registration: the trainer calls ONE fn
+
+    def both(optimizers, model_parts, parallel_dims):
+        if core_hook is not None:
+            core_hook(optimizers, model_parts, parallel_dims)
+        return register_load_probe(optimizers, model_parts, parallel_dims)
+
+    config.model_spec.post_optimizer_build_fn = both
+    return config
+
+
+def kimi_k3_debugmodel_qb_probe() -> Trainer.Config:
+    from torchtitan.components.load_probe import register_load_probe
+    from torchtitan.components.quantile_balance import register_quantile_balancing
+
+    def both(optimizers, model_parts, parallel_dims):
+        # QB's step hook first (registration order), then the probe reads the loads and the solved bias
+        balancer = register_quantile_balancing(optimizers, model_parts, parallel_dims)
+        return register_load_probe(optimizers, model_parts, parallel_dims, balancer)
+
+    config = kimi_k3_debugmodel()
+    assert config.model_spec is not None
+    config.model_spec.post_optimizer_build_fn = both
+    return config
+
+
+def kimi_k3_debugmodel_probe_frozen() -> Trainer.Config:  # LOCAL PROBE FLAVOR (not committed): lr 0, the hook alone moves the loads
+    config = kimi_k3_debugmodel_probe()
+    config.optimizer = default_adamw(lr=0.0)
+    return config
+
+
+def kimi_k3_debugmodel_qb_probe_frozen() -> Trainer.Config:  # LOCAL PROBE FLAVOR (not committed)
+    config = kimi_k3_debugmodel_qb_probe()
+    config.optimizer = default_adamw(lr=0.0)
+    return config
