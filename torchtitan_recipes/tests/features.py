@@ -454,3 +454,13 @@ def kimi_k3_debugmodel_pp8_vp4() -> Trainer.Config:
     config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
     config.parallelism.num_pp_microbatches = 8
     return config
+
+
+def kimi_k3_debugmodel_pp_naive() -> Trainer.Config:
+    """PROBE ONLY (not committed): the debug flavor with the delta transport off."""
+    from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel
+
+    config = kimi_k3_debugmodel()
+    assert config.model_spec is not None
+    config.model_spec.model.attn_res_cache = False
+    return config
