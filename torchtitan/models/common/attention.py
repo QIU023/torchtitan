@@ -252,6 +252,8 @@ class FlexAttention(Module):
         "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
     }
+    if __import__("os").environ.get("FLEX_NOAUTOTUNE") == "1":  # LOCAL PROBE HACK (not committed): one kernel per shape in every process
+        inductor_configs = {**inductor_configs, "max_autotune": False, "coordinate_descent_tuning": False}
 
     # pyrefly: ignore[no-matching-overload]
     _compiled_flex_attn: ClassVar[Callable] = torch.compile(

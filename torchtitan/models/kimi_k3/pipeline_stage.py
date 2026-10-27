@@ -315,7 +315,7 @@ class AttnResPipelineStage(PipelineStage):
                 f"{count} gradient deposit(s) but {expected} expected; a "
                 "later stage on this rank did not run its backward"
             )
-        if deposit is not None:
+        if deposit is not None and __import__('os').environ.get('MUTATE') != 'drop_deposit':  # LOCAL MUTATION PROBE (not committed)
             grad_col_TD.add_(deposit)
 
     def backward_one_chunk(
