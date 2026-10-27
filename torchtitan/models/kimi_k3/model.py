@@ -10,6 +10,7 @@ from typing import Any, cast
 import spmd_types as spmd
 import torch
 from torch import nn
+import torch_remat as remat
 from torch.autograd.function import once_differentiable
 from torch.nn.attention.flex_attention import BlockMask
 
@@ -291,6 +292,11 @@ def _apply_attention_residual(
     )
 
 
+def _checkpointed_attention_residual(name: str, *args) -> torch.Tensor:
+    """PR 4656's residual checkpoint, isolated onto this tree for measurement."""
+    return remat.checkpoint(region_name=name)(_apply_attention_residual)(*args)
+
+
 class KimiK3TransformerBlock(Module):
     """Hybrid KDA/MLA decoder block with Kimi attention residuals."""
 
@@ -352,6 +358,25 @@ class KimiK3TransformerBlock(Module):
         )
         self.ffn_res_norm = config.ffn_res_norm.build()
         self.ffn_res_proj = config.ffn_res_proj.build()
+        self.checkpoint_residual = __import__("os").environ.get("K3_CKPT_RESIDUAL") == "1"
+        self._region_ac = False
+
+    def configure_remat_regions(self, save_patterns: list[str]) -> None:
+        # Called by RegionAC on every block it checkpoints.
+        self._region_ac = True
+        super().configure_remat_regions(save_patterns)
+
+    def _attention_residual(self, name: str, *args) -> torch.Tensor:
+        if getattr(self, "_region_ac", False):
+            # A torch_remat checkpoint cannot nest inside RegionAC's block checkpoint.
+            return remat.region(
+                _apply_attention_residual,
+                self.remat_region_name(name),
+                recompute=self.remat_should_recompute(name),
+            )(*args)
+        if not self.checkpoint_residual:
+            return _apply_attention_residual(*args)
+        return _checkpointed_attention_residual(name, *args)
 
     def forward(
         self,
@@ -375,12 +400,14 @@ class KimiK3TransformerBlock(Module):
             h_TD = x_TD
         else:
             assert self.attention_res_norm is not None
-            h_TD = _apply_attention_residual(
+            h_TD = self._attention_residual(
+                "attention_res",
                 partial_block_TD,
                 block_residual_TND,
                 self.attention_res_proj,
                 self.attention_res_norm,
             )
+            remat.recompute_needs_tensor(h_TD)
         h_TD = self.attention_norm(h_TD)
         layer_mask = (
             attention_masks[self.attn_mask_key] if attention_masks is not None else None
@@ -392,12 +419,14 @@ class KimiK3TransformerBlock(Module):
             h_TD = self.delta_attention(h_TD, layer_mask, positions)
         prefix_sum_TD = h_TD if self.first_layer_in_block else x_TD + h_TD
 
-        h_TD = _apply_attention_residual(
+        h_TD = self._attention_residual(
+            "ffn_res",
             prefix_sum_TD,
             block_residual_TND,
             self.ffn_res_proj,
             self.ffn_res_norm,
         )
+        remat.recompute_needs_tensor(h_TD)
         h_TD = self.ffn_norm(h_TD)
         if self.moe is not None:
             h_TD = self.moe(h_TD, padding_mask_T=padding_mask)
@@ -635,7 +664,8 @@ class KimiK3Model(Decoder):
         # hands the stack on, since a block residual spans the whole stack.
         if self.output_res_proj is None:
             return h_TD, block_residual_TND
-        h_TD = _apply_attention_residual(
+        h_TD = _checkpointed_attention_residual(
+            "output_res",
             h_TD,
             block_residual_TND,
             self.output_res_proj,
