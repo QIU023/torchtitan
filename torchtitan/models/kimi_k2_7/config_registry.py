@@ -534,3 +534,13 @@ class _KimiTrainerConfig(Trainer.Config):
         # nothing and OptimizersContainer rejects the empty param group -- needs
         # the stage count to approach the layer count. See README, Supported
         # Parallelisms.
+
+
+def kimi_k2_5_debugmodel_tpcheck():  # PROBE ONLY (not committed): the K2.5 tp type-check smoke
+    from torchtitan.components.optimizer import default_adamw
+
+    config = kimi_k2_5_debugmodel()
+    config.optimizer = default_adamw()  # DistMuon refuses tensor parallel
+    config.activation_checkpoint = None  # type checking refuses selective AC with flex attention
+    config.debug.spmd_typechecking = True
+    return config
