@@ -4,8 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+<<<<<<< ours
 from typing import cast
 
+=======
+import torch.distributed as dist
+>>>>>>> theirs
 import torch.nn as nn
 
 from torch.distributed.pipelining.schedules import (
@@ -269,6 +273,7 @@ def pipeline_kimi_k3(
     pool on another rank's GPU through the Mooncake Transfer Engine
     (``pp_balance.py``); a recipe sets it the same way.
     """
+<<<<<<< ours
     import dataclasses
 
     parallelism = kwargs["parallelism"]
@@ -287,6 +292,34 @@ def pipeline_kimi_k3(
                 parallelism,
                 module_fqns_per_model_part=fqns,
                 pipeline_parallel_layers_per_stage=None,
+=======
+    cp_group = parallel_dims.get_mesh("cp").get_group()
+    cp_degree = parallel_dims.cp
+    model._cp_group = cp_group
+    model._cp_subgroups = _build_cp_subgroups(cp_group)
+
+    num_mla = 0
+    kda_modules = []
+    for module in model.modules():
+        if isinstance(module, KimiMLAAttention):
+            if module.n_heads % cp_degree != 0:
+                raise ValueError(
+                    f"MLA n_heads={module.n_heads} must be divisible by "
+                    f"cp={cp_degree} for Ulysses head sharding"
+                )
+            module._cp_group = cp_group
+            num_mla += 1
+        elif isinstance(module, KimiDeltaAttention):
+            kda_modules.append(module)
+
+    if kda_modules:
+        # Checked at wiring time so the message is actionable, rather than an
+        # ImportError from inside a layer's first forward.
+        try:
+            from attn_gym.linear.kda.fla_cp import (  # noqa: F401
+                build_fla_cp_context,
+                causal_conv1d_cp,
+>>>>>>> theirs
             )
     pp_schedule, model_parts, has_first_stage, has_last_stage = pipeline_llm(
         model, stage_class=AttnResPipelineStage, **kwargs
@@ -353,3 +386,60 @@ def _apply_ac_outside_attention(ac_policy, model: nn.Module) -> None:
         "attention and the residual math stay outside (ac_reuse_attention).",
         len(layers),
     )
+
+
+def _build_cp_subgroups(cp_group) -> dict[int, object]:
+    """Pre-create every sub-CP group layout this CP group could use.
+
+    Report 5.2.3 divides each CP group into sub-CP groups so gather-KV runs inside
+    a sub-group instead of across the whole group. Which layout a step wants
+    depends on how many large images the BATCH holds, and building a process group
+    per batch is not an option: ``new_group`` must be called by every process in
+    the default group, with the same rank list, in the same order. A per-batch call
+    would have each rank passing its own CP group's ranks, which is exactly the
+    mismatch that hangs.
+
+    So every layout is built once here and looked up per batch. The layouts are the
+    divisors of ``cp_size`` -- for cp=8 that is 1, 2, 4, 8 sub-groups -- so the set
+    is small, and an unused group costs nothing because NCCL creates its
+    communicator lazily on first use.
+
+    Uniformity across ranks is achieved by all-gathering the CP rank lists first,
+    so every rank iterates the same global list of sub-groups in the same order and
+    keeps the one it belongs to. Returns ``{num_subgroups: this rank's group}``.
+    """
+    if cp_group is None:
+        return {}
+    cp_ranks = dist.get_process_group_ranks(cp_group)
+    cp_size = len(cp_ranks)
+    if cp_size <= 1:
+        return {}
+
+    # Every rank needs every CP group's membership, or the new_group calls below
+    # would differ between ranks.
+    world = dist.get_world_size()
+    all_cp: list[list[int] | None] = [None] * world
+    dist.all_gather_object(all_cp, cp_ranks)
+    # Deduplicate while keeping a deterministic order: identical CP groups appear
+    # once per member rank.
+    seen: list[list[int]] = []
+    for entry in all_cp:
+        if entry and list(entry) not in seen:
+            seen.append(list(entry))
+    seen.sort()
+
+    my_rank = dist.get_rank()
+    out: dict[int, object] = {}
+    for n_sub in [d for d in range(1, cp_size + 1) if cp_size % d == 0]:
+        g = cp_size // n_sub
+        mine = None
+        for ranks in seen:
+            for s in range(n_sub):
+                members = ranks[s * g : (s + 1) * g]
+                # Called on every rank, same order, same lists.
+                pg = dist.new_group(ranks=members)
+                if my_rank in members:
+                    mine = pg
+        if mine is not None:
+            out[n_sub] = mine
+    return out
