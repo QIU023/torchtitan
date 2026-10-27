@@ -8,6 +8,8 @@
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 from torch.distributed.tensor import DTensor
 
@@ -88,12 +90,12 @@ class KimiGroupedExperts(GroupedExperts):
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
 
         gate_RF = self._grouped_mm(
-            A=x_RD.bfloat16(),
+            A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()),
             weight_EOI=w1_EFD,
             offs=offsets_E,
         )
         up_RF = self._grouped_mm(
-            A=x_RD.bfloat16(),
+            A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()),
             weight_EOI=w3_EFD,
             offs=offsets_E,
         )

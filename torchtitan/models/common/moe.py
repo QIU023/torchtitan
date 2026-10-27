@@ -9,6 +9,8 @@ from typing import Literal
 
 import spmd_types as spmd
 
+import os
+
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
@@ -97,10 +99,10 @@ class GroupedExperts(Module):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
         h_RF = F.silu(
-            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
+            self._grouped_mm(A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()), weight_EOI=w1_EFD, offs=offsets_E)
         )
         h_RF = h_RF * self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
+            A=(x_RD if os.environ.get("EXPERTS_FP32") else x_RD.bfloat16()), weight_EOI=w3_EFD, offs=offsets_E
         )
         return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
 
@@ -120,6 +122,14 @@ class GroupedExperts(Module):
         ``__torch_function__`` -- means it is captured by FX tracers such as
         graph_trainer's make_fx path.
         """
+        if os.environ.get("EXPERTS_FP32"):  # LOCAL PROBE HACK (not committed)
+            out = A.new_zeros(A.shape[0], weight_EOI.shape[1], dtype=torch.float32)
+            ends = offs.tolist(); start = 0
+            for e, end in enumerate(ends):
+                if end > start:
+                    out[start:end] = A[start:end].float() @ weight_EOI[e].float().t()
+                start = end
+            return out
         return torch._grouped_mm(A, weight_EOI.bfloat16().transpose(-2, -1), offs=offs)
 
 
@@ -181,6 +191,9 @@ class RoutedExperts(Module):
         self.token_dispatcher.wire_meshes(
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
         )
+
+
+_PROBE_ROUTE: list = []  # LOCAL PROBE HACK (not committed)
 
 
 class TokenChoiceTopKRouter(Module):
@@ -290,6 +303,8 @@ class TokenChoiceTopKRouter(Module):
             scores_for_choice_TE = self._get_node_limited_routing_scores(
                 scores_for_choice_TE
             )
+        if __import__("os").environ.get("ACT_DUMP"):  # LOCAL PROBE HACK (not committed)
+            _PROBE_ROUTE.append({"choice": scores_for_choice_TE.detach().float().cpu()})
         return torch.topk(
             scores_for_choice_TE, k=self.top_k, dim=-1, sorted=False
         ).indices
@@ -345,6 +360,8 @@ class TokenChoiceTopKRouter(Module):
             topk_scores_TK = topk_scores_TK / denominator
         topk_scores_TK = topk_scores_TK * self.route_scale
 
+        if __import__("os").environ.get("ACT_DUMP") and _PROBE_ROUTE:  # LOCAL PROBE HACK (not committed)
+            _PROBE_ROUTE[-1].update(ids=topk_expert_ids_TK.detach().cpu(), scores=scores_TE.detach().float().cpu(), topk_scores=topk_scores_TK.detach().float().cpu())
         return (
             topk_scores_TK,
             topk_expert_ids_TK,

@@ -503,6 +503,9 @@ class GradAccumulator:
         return self._buffer
 
 
+_LOSS_TRACE: dict = {}  # LOCAL PROBE HACK (not committed)
+
+
 class ChunkedLossWrapper(BaseLoss):
     """Chunked loss wrapper that splits the sequence dimension to reduce peak memory.
 
@@ -691,6 +694,15 @@ class ChunkedLossWrapper(BaseLoss):
                 )
                 metrics = self._combine_chunk_metrics(metrics, chunk_metrics)
                 total_loss = total_loss + chunk_loss.detach()
+                if __import__("os").environ.get("ACT_DUMP"):  # LOCAL PROBE HACK (not committed)
+                    import torch.distributed as _dist
+                
+                    _f = lambda t: (t.full_tensor() if hasattr(t, "full_tensor") else t).detach().float().cpu()
+                    _rec = _LOSS_TRACE.setdefault("chunks", [])
+                    _rec.append({"h": _f(h_chunk), "logits": _f(logits), "labels": (label_chunk.full_tensor() if hasattr(label_chunk, "full_tensor") else label_chunk).detach().cpu(), "loss": _f(chunk_loss), "gvt": _f(global_valid_tokens) if torch.is_tensor(global_valid_tokens) else torch.tensor(float(global_valid_tokens)), "lm_head_w": _f(lm_head.weight)})
+                    if i == last_idx:
+                        torch.save(_rec, f"{__import__('os').environ['ACT_DUMP']}.loss{len(_LOSS_TRACE.get('saved', []))}.rank{_dist.get_rank() if _dist.is_initialized() else 0}.pt")
+                        _LOSS_TRACE.setdefault("saved", []).append(1); _LOSS_TRACE["chunks"] = []
 
                 if requires_grad:
                     with spmd.no_typecheck():
