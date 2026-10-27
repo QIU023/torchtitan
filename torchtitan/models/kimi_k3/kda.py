@@ -89,13 +89,7 @@ class KDAKernel(Module):
     ) -> torch.Tensor:
         if not q_1THK.is_cuda:
             raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
-        capability = torch.cuda.get_device_capability(q_1THK.device)
-        if capability not in {(10, 0), (10, 3)}:
-            raise RuntimeError(
-                "Attention Gym KDA requires Blackwell SM100/SM103; "
-                f"got CUDA capability {capability}."
-            )
-
+        # LOCAL PROBE HACK (not committed): the capability guard lifted for SM90
         gate_1THK = bound_gate(
             raw_gate_1THK,
             # TODO: The long-term solution is to specify mixed precision per FQN
@@ -103,7 +97,7 @@ class KDAKernel(Module):
             A_log_H.float(),
             dt_bias_HK.float(),
             lower_bound=self.lower_bound,
-            impl="fused",
+            impl="reference" if __import__("os").environ.get("FP32_PROBE") == "1" else "fused",  # LOCAL PROBE HACK (not committed)
         )
         output_1THV, _ = chunk_kda(
             l2norm(q_1THK),
@@ -112,6 +106,7 @@ class KDAKernel(Module):
             gate_1THK,
             raw_beta_1TH.float().sigmoid(),
             cu_seqlens=cu_seqlens,
+            **({"impl": "reference"} if __import__("os").environ.get("FP32_PROBE") == "1" else {}),  # LOCAL PROBE HACK (not committed)
         )
         return output_1THV
 

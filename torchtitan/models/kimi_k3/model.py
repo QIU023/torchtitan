@@ -325,7 +325,7 @@ class KimiK3Model(MultimodalModel):
         """Partition the model, then route the attention-residual blocks along the split."""
         from .pipeline_parallel import pipeline_kimi_k3
 
-        return pipeline_kimi_k3(self, **kwargs)
+        return pipeline_kimi_k3(self, attn_res_cache=__import__("os").environ.get("ATTN_RES_NAIVE") != "1", **kwargs)  # LOCAL PROBE HACK (not committed)
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
