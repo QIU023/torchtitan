@@ -62,7 +62,7 @@ KIMI_K3_SPECIAL_TOKENS = {
 # what makes AttnRes reduce to a standard residual at step 0 (report requirement,
 # and the reference tree's init_weights zero-inits every one of them). Without it
 # the block mixing is non-uniform from the first step.
-_RES_PROJ_INIT = {"weight": nn.init.zeros_}
+_RES_PROJ_INIT = None  # A/B: revert to default init
 _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
     "bias": nn.init.zeros_,
