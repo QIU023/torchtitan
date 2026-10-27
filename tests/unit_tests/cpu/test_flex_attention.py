@@ -11,12 +11,12 @@ from unittest.mock import patch
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
-from torchtitan.models.common.attention import FlexInnerAttention
+from torchtitan.models.common.attention import FlexAttention
 
 
-class TestFlexInnerAttentionLayouts(unittest.TestCase):
+class TestFlexAttentionLayouts(unittest.TestCase):
     def setUp(self) -> None:
-        self.attention = FlexInnerAttention(FlexInnerAttention.Config())
+        self.attention = FlexAttention(FlexAttention.Config())
 
     @staticmethod
     def _mask(seq_len: int, batch_size: int):
@@ -42,7 +42,7 @@ class TestFlexInnerAttentionLayouts(unittest.TestCase):
             lse_1HT = torch.randn(1, num_heads, num_tokens)
             return q_1HTK, SimpleNamespace(lse=lse_1HT)
 
-        with patch.object(FlexInnerAttention, "compiled_flex_attn", side_effect=kernel):
+        with patch.object(FlexAttention, "compiled_flex_attn", side_effect=kernel):
             out_THV = self.attention(
                 q_THK,
                 k_THK,
@@ -66,7 +66,7 @@ class TestFlexInnerAttentionLayouts(unittest.TestCase):
             torch.testing.assert_close(lse_TH, expected_lse_TH)
             return out_THV
 
-        with patch.object(FlexInnerAttention, "compiled_flex_attn", side_effect=kernel):
+        with patch.object(FlexAttention, "compiled_flex_attn", side_effect=kernel):
             out_THV = self.attention(
                 q_THK,
                 q_THK,

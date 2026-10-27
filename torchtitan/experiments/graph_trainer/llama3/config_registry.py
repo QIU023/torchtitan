@@ -4,9 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
+
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.distributed.context_parallel import HeadTailCPLoadBalancer
+from torchtitan.components.quantization import MXFP8LinearConverter
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     to_graph_trainer_config,
@@ -21,18 +23,15 @@ from torchtitan.models.llama3.config_registry import (
     llama3_8b,
     llama3_debugmodel,
     llama3_debugmodel_dist_gemm,
-    llama3_mxfp8_linear_converter_config,
 )
 from torchtitan.observability.sdc_replayer import SDCReplayer
 
-from .model import GraphTrainerLlama3Model
+from . import model_registry
 
 
 def graph_trainer_llama3_debugmodel() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(
-        llama3_debugmodel(), GraphTrainerLlama3Model.Config
-    )
-    config.compile = GraphTrainerCompileConfig()
+    config = to_graph_trainer_config(llama3_debugmodel(seq_len=2048), model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 
 
@@ -51,27 +50,14 @@ def graph_trainer_llama3_debugmodel_dist_gemm() -> GraphTrainer.Config:
 
     The point of running dist-GEMM here rather than only under the eager trainer:
     GraphTrainer traces the whole model, so this is what proves the fused autograd
-    Functions survive tracing. Needs tensor_parallel_degree > 1 and CUDA.
+    Functions survive tracing. Needs tensor_parallel_degree > 1 and CUDA; the base
+    config pins spmd_backend to spmd_types.
     """
     config = to_graph_trainer_config(
-        llama3_debugmodel_dist_gemm(),
-        GraphTrainerLlama3Model.Config,
+        llama3_debugmodel_dist_gemm(seq_len=2048),
+        partial(model_registry, tp_gemm_backend="dist_gemm"),
     )
-    config.compile = GraphTrainerCompileConfig()
-    return config
-
-
-def graph_trainer_llama3_debugmodel_mxfp8() -> GraphTrainer.Config:
-    base = llama3_debugmodel()
-    base.model = llama3_model_registry(
-        "debugmodel_mxfp8",
-        seq_len=base.training.max_context_length,
-        converters=[
-            llama3_mxfp8_linear_converter_config(model_compile_enabled=True),
-        ],
-    )
-    config = to_graph_trainer_config(base, GraphTrainerLlama3Model.Config)
-    config.compile = GraphTrainerCompileConfig()
+    config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 
 
@@ -79,39 +65,50 @@ def graph_trainer_llama3_debugmodel_sdpa() -> GraphTrainer.Config:
     """Debug model on the test-only SDPA backend.
 
     Used by graph machinery tests (precompile artifact serialization, context
-    parallel) that can't run on the default FlexInnerAttention backend: its BlockMask
+    parallel) that can't run on the default FlexAttention backend: its BlockMask
     is unpicklable (mask_mod code objects) and is not a tensor. SDPA exercises
     the same machinery without those obstacles. See
     ``build_decoder_config_for_backend``.
     """
-    base = llama3_debugmodel()
-    from . import model_registry
-
-    base.parallelism.context_parallel_load_balancer = HeadTailCPLoadBalancer.Config()
-    base.model = model_registry(
+    base = llama3_debugmodel(seq_len=2048)
+    base.parallelism.context_parallel_load_balancer = "headtail"
+    base.model_spec = model_registry(
         "debugmodel",
         seq_len=base.training.max_context_length,
         attn_backend="sdpa",
     )
-    config = to_graph_trainer_config(base, GraphTrainerLlama3Model.Config)
-    config.compile = GraphTrainerCompileConfig()
+    config = to_graph_trainer_config(base, model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 
 
 def graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss() -> GraphTrainer.Config:
     """SDPA debug model with standard cross-entropy loss."""
     config = graph_trainer_llama3_debugmodel_sdpa()
+    assert config.model_spec is not None
     config.loss = CrossEntropyLoss.Config(
-        global_vocab_size=decoder_vocab_size(config.model),
+        global_vocab_size=decoder_vocab_size(config.model_spec),
     )
     return config
 
 
+def graph_trainer_llama3_debugmodel_sdpa_eager() -> GraphTrainer.Config:
+    """SDPA debug model run eagerly (no graph tracing).
+
+    Serves as the eager reference for the AutoParallel SDPA loss-compare test:
+    with ``mode=None`` GraphTrainer.forward_backward_step delegates to the core
+    (eager) Trainer path, so this is a plain eager FSDP+TP run of the same SDPA
+    model the AutoParallel test traces. The default FlexAttention backend can't
+    fill this role — flex + AutoParallel is unsupported (BlockMask flattening).
+    """
+    config = graph_trainer_llama3_debugmodel_sdpa()
+    config.compile = GraphTrainerCompileConfig(enable=False, mode=None)
+    return config
+
+
 def graph_trainer_llama3_8b() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(
-        llama3_8b(seq_len=8192), GraphTrainerLlama3Model.Config
-    )
-    config.compile = GraphTrainerCompileConfig()
+    config = to_graph_trainer_config(llama3_8b(seq_len=8192), model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 
 
@@ -128,28 +125,22 @@ def graph_trainer_llama3_8b_mxfp8() -> GraphTrainer.Config:
     # Swap dense Linear layers for MXFP8Linear before wrapping in the
     # graph_trainer config. graph_trainer always compiles the model, so the
     # MXFP8 converter's compile requirement is satisfied.
-    base.model = llama3_model_registry(
+    base.model_spec = llama3_model_registry(
         "8B",
-        converters=[
-            llama3_mxfp8_linear_converter_config(model_compile_enabled=True),
-        ],
+        converters=[MXFP8LinearConverter.Config(model_compile_enabled=True)],
     )
-    config = to_graph_trainer_config(base, GraphTrainerLlama3Model.Config)
-    config.compile = GraphTrainerCompileConfig()
+    config = to_graph_trainer_config(base, model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 
 
 def graph_trainer_llama3_70b() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(
-        llama3_70b(seq_len=8192), GraphTrainerLlama3Model.Config
-    )
-    config.compile = GraphTrainerCompileConfig()
+    config = to_graph_trainer_config(llama3_70b(seq_len=8192), model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 
 
 def graph_trainer_llama3_405b() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(
-        llama3_405b(seq_len=8192), GraphTrainerLlama3Model.Config
-    )
-    config.compile = GraphTrainerCompileConfig()
+    config = to_graph_trainer_config(llama3_405b(seq_len=8192), model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
     return config

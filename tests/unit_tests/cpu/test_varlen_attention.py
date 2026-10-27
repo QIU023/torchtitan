@@ -20,40 +20,13 @@ from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
     GQAttention,
     QKVLinear,
-    VarlenInnerAttention,
-    VarlenMetadata,
+    VarlenAttention,
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import ComplexRoPE
 
 
 class TestPackedVarlenMetadata(unittest.TestCase):
-    def test_spmd_annotation_includes_partition_spec(self):
-        metadata = VarlenMetadata(
-            cu_seq_q=torch.tensor([0, 2], dtype=torch.int32),
-            cu_seq_k=torch.tensor([0, 3], dtype=torch.int32),
-            max_q=2,
-            max_k=3,
-        )
-        expected_type = spmd.SpmdType(
-            {
-                MeshAxisName.DP: spmd.V,
-                MeshAxisName.TP: spmd.R,
-            },
-            partition_spec=spmd.PartitionSpec(MeshAxisName.DP),
-        )
-
-        with patch(
-            "torchtitan.models.common.attention.spmd.assert_type"
-        ) as assert_type:
-            metadata.annotate_spmd_types()
-
-        self.assertEqual(assert_type.call_count, 2)
-        self.assertIs(assert_type.call_args_list[0].args[0], metadata.cu_seq_q)
-        self.assertIs(assert_type.call_args_list[1].args[0], metadata.cu_seq_k)
-        self.assertEqual(assert_type.call_args_list[0].args[1], expected_type)
-        self.assertEqual(assert_type.call_args_list[1].args[1], expected_type)
-
     def test_document_boundaries(self):
         positions_T = torch.tensor([0, 1, 2, 0, 1, 0, 1, 2, 3])
         metadata = create_varlen_metadata_for_document(positions_T)
@@ -64,48 +37,8 @@ class TestPackedVarlenMetadata(unittest.TestCase):
         self.assertEqual(metadata.max_q, 4)
         self.assertEqual(metadata.max_k, 4)
 
-    def test_document_cap_produces_fixed_shape_metadata(self):
-        three_documents = create_varlen_metadata_for_document(
-            torch.tensor([0, 1, 2, 0, 1, 0, 1, 2, 3]),
-            max_num_documents=5,
-            max_context_length=4,
-        )
-        two_documents = create_varlen_metadata_for_document(
-            torch.tensor([0, 1, 2, 3, 0, 1, 2, 3, 4]),
-            max_num_documents=5,
-            max_context_length=5,
-        )
 
-        torch.testing.assert_close(
-            three_documents.cu_seq_q,
-            torch.tensor([0, 3, 5, 9, 9, 9], dtype=torch.int32),
-        )
-        torch.testing.assert_close(
-            two_documents.cu_seq_q,
-            torch.tensor([0, 4, 9, 9, 9, 9], dtype=torch.int32),
-        )
-        self.assertEqual(three_documents.cu_seq_q.shape, two_documents.cu_seq_q.shape)
-        self.assertEqual(three_documents.max_q, 4)
-        self.assertEqual(two_documents.max_q, 5)
-
-    def test_document_cap_reserves_padding_segments_separately(self):
-        metadata = create_varlen_metadata_for_document(
-            torch.tensor([0, 1, 0, 1, 0, 1, 2, 3]),
-            padding_mask=torch.tensor(
-                [False, False, False, False, True, True, True, True]
-            ),
-            max_num_documents=2,
-            max_context_length=4,
-        )
-
-        torch.testing.assert_close(
-            metadata.cu_seq_q,
-            torch.tensor([0, 2, 4, 8, 8], dtype=torch.int32),
-        )
-        self.assertEqual(metadata.max_q, 4)
-
-
-class TestPackedVarlenInnerAttention(unittest.TestCase):
+class TestPackedVarlenAttention(unittest.TestCase):
     def test_gqa_preserves_td_shape(self):
         torch.manual_seed(42)
         num_tokens, dim, num_heads, head_dim = 6, 8, 2, 4
@@ -116,12 +49,11 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
             dim=dim,
             qkv_linear=QKVLinear.Config(
                 head_dim=head_dim,
-                n_heads=num_heads,
-                n_kv_heads=num_heads,
-                wqkv=Linear.Config(in_features=dim, out_features=3 * dim),
+                wq=Linear.Config(in_features=dim, out_features=dim),
+                wkv=Linear.Config(in_features=dim, out_features=dim),
             ),
             wo=Linear.Config(in_features=dim, out_features=dim),
-            inner_attention=VarlenInnerAttention.Config(),
+            inner_attention=VarlenAttention.Config(),
             rope=ComplexRoPE.Config(dim=head_dim, max_context_length=num_tokens),
         ).build()
         x_TD = torch.randn(num_tokens, dim)
@@ -162,18 +94,14 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
         self.assertEqual(axis_types[MeshAxisName.DP], spmd.S(0))
         self.assertEqual(axis_types[MeshAxisName.CP], spmd.S(0))
         self.assertEqual(axis_types[MeshAxisName.TP], spmd.S(1))
-        self.assertEqual(_per_axis_types(k_dst_layout)[MeshAxisName.CP], spmd.S(0))
-        self.assertEqual(
-            _per_axis_types(k_dst_layout),
-            _per_axis_types((sharding.in_src_shardings or {})["k_THK"]),
-        )
+        self.assertEqual(_per_axis_types(k_dst_layout)[MeshAxisName.CP], spmd.R)
 
     def test_out_transform_receives_th_lse(self):
         num_tokens, num_heads, head_dim = 5, 2, 4
         q_THK = torch.randn(num_tokens, num_heads, head_dim)
         positions_T = torch.tensor([0, 1, 0, 1, 2])
         metadata = create_varlen_metadata_for_document(positions_T)
-        inner_attention = VarlenInnerAttention.Config().build()
+        inner_attention = VarlenAttention.Config().build()
 
         def _varlen_with_lse(q, k, v, *args, **kwargs):
             lse_HT = torch.randn(num_heads, num_tokens)

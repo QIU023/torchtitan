@@ -19,7 +19,8 @@ from typing import Any, ClassVar, NamedTuple
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
-import torch_remat as remat
+from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor.experimental import local_map
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
@@ -41,8 +42,7 @@ from torch.nn.attention.varlen import (
 )
 
 from torchtitan.distributed.compile import maybe_regional_inductor
-from torchtitan.distributed.parallel_dims import MeshAxisName
-from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.distributed.utils import get_spmd_backend, is_in_batch_invariant_mode
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -51,12 +51,13 @@ from torchtitan.tools.utils import round_up
 
 
 __all__ = [
-    "FlexInnerAttention",
+    "FlexAttention",
+    "BaseQKVLinear",
+    "FusedQKVLinear",
     "GQAttention",
-    "InnerAttention",
     "QKVLinear",
-    "ScaledDotProductInnerAttention",
-    "VarlenInnerAttention",
+    "ScaledDotProductAttention",
+    "VarlenAttention",
     "VarlenMetadata",
     "create_attention_mask",
     "create_varlen_metadata_for_document",
@@ -80,30 +81,12 @@ class VarlenMetadata(NamedTuple):
     max_q: int
     max_k: int
 
-    _OFFSETS_SPMD_TYPE = spmd.SpmdType(
-        {
-            MeshAxisName.DP: spmd.V,
-            MeshAxisName.TP: spmd.R,
-        },
-        partition_spec=spmd.PartitionSpec(MeshAxisName.DP),
-    )
 
-    def annotate_spmd_types(self) -> None:
-        """Annotate offsets under the active dense model-parallel mesh."""
-        spmd.assert_type(self.cu_seq_q, self._OFFSETS_SPMD_TYPE)
-        if self.cu_seq_k is not self.cu_seq_q:
-            spmd.assert_type(self.cu_seq_k, self._OFFSETS_SPMD_TYPE)
-
-
-# Mapping (not dict) lets covariant value types accept dictionaries containing
-# one or more BlockMasks. A None value marks an unused mask.
-# TODO(acisseJZhong): Map each attention backend to its metadata type.
-FlexAttentionMetadata = Mapping[str, BlockMask] | BlockMask
-VarlenAttentionMetadata = VarlenMetadata
-
-# Hybrid models may carry metadata for more than one attention implementation.
-HybridAttentionMetadata = Mapping[str, BlockMask | VarlenMetadata | None]
-AttentionMasksType = HybridAttentionMetadata | BlockMask | VarlenMetadata
+# Mapping (not dict) lets covariant value types accept both BlockMask-only
+# dictionaries and mixed dictionaries. A None value marks an unused mask.
+AttentionMasksType = (
+    Mapping[str, BlockMask | VarlenMetadata | None] | BlockMask | VarlenMetadata
+)
 
 
 @spmd.no_typecheck(out_types=spmd.PartitionSpec(("dp", "cp"), "tp", None))
@@ -128,28 +111,21 @@ def local_head_split(
     dp_shard_dim: int = 0,
 ) -> torch.Tensor:
     # TODO(pianpwk): Remove once spmd_types tracks sharding evenness.
+    use_spmd = get_spmd_backend() == "spmd_types" and spmd.is_type_checking()
     input_type = {"dp": spmd.S(dp_shard_dim), "tp": spmd.S(t.ndim - 1)}
     output_type = {"dp": spmd.S(dp_shard_dim), "tp": spmd.S(t.ndim - 1)}
     with spmd.local():
-        if spmd.is_type_checking():
+        if use_spmd:
             spmd.assert_type(t, input_type)
         out = t.view(*t.shape[:-1], -1, head_dim)
-        if spmd.is_type_checking():
+        if use_spmd:
             spmd.assert_type(out, output_type)
     return out
 
 
-class InnerAttention(Module):
-    """Base class for attention kernels used by outer attention modules."""
-
+class VarlenAttention(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        pass
-
-
-class VarlenInnerAttention(InnerAttention):
-    @dataclass(kw_only=True, slots=True)
-    class Config(InnerAttention.Config):
         window_size: tuple[int, int] = (-1, 0)
         """ window_size=(left, right) controls the attention window relative to each
             query position. 'left' is how many tokens before the query to attend to,
@@ -243,11 +219,11 @@ class VarlenInnerAttention(InnerAttention):
         return out_transform(out_THV, lse_TH)
 
 
-class FlexInnerAttention(InnerAttention):
-    """Inner attention using ``flex_attention`` with torch.compile.
+class FlexAttention(Module):
+    """Inner attention using ``flex_attention`` with torch.compile and CP support.
 
     Query/key inputs use ``[T, H, K]`` and value inputs use ``[T, H, V]``.
-    The FlexInnerAttention kernel requires a batch dimension, so inputs are adapted
+    The FlexAttention kernel requires a batch dimension, so inputs are adapted
     to ``[1, H, T, K]`` and ``[1, H, T, V]`` only at the kernel boundary.
 
     Note:
@@ -256,7 +232,7 @@ class FlexInnerAttention(InnerAttention):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(InnerAttention.Config):
+    class Config(Module.Config):
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         kernel_options: dict = field(default_factory=dict)
 
@@ -312,7 +288,7 @@ class FlexInnerAttention(InnerAttention):
         return_aux: AuxRequest,
         kernel_options: dict,
     ):
-        """Run compiled FlexInnerAttention outside SPMD typechecking.
+        """Run compiled FlexAttention outside SPMD typechecking.
 
         Compiled regions are not currently compatible with SPMD typechecking, so
         the opaque kernel output is re-typed at the boundary instead of
@@ -324,7 +300,7 @@ class FlexInnerAttention(InnerAttention):
         TODO(pianpwk): Move flex-typechecking into pytorch/spmd_types.
         """
         with spmd.no_typecheck():
-            out, aux = FlexInnerAttention._compiled_flex_attn(
+            out, aux = FlexAttention._compiled_flex_attn(
                 q,
                 k,
                 v,
@@ -335,7 +311,7 @@ class FlexInnerAttention(InnerAttention):
                 return_aux=return_aux,
                 kernel_options=kernel_options,
             )
-        if spmd.is_type_checking():
+        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
             q_local = spmd.get_local_type(q)
             q_ps = spmd.get_partition_spec(q)
             spmd.assert_type(out, q_local, q_ps)
@@ -376,13 +352,13 @@ class FlexInnerAttention(InnerAttention):
         #    be multiple compiled flex_attention instances, which can be slow.
         # 2. `self._compiled_flex_attn` is not correct, `self` will be passed in
         #    as the first argument, which will cause an error.
-        #    `FlexInnerAttention._compiled_flex_attn` is correct.
+        #    `FlexAttention._compiled_flex_attn` is correct.
         # Mark the flex region so that, when the enclosing model is compiled with
         # a non-inductor backend, regional_inductor scoops just this region into
         # an inductor sub-compile (see distributed/compile.py). A null context on
         # the default inductor / eager paths, so no dead metadata is emitted.
-        with maybe_regional_inductor(FlexInnerAttention.inductor_configs):
-            out_1HTV, aux = FlexInnerAttention.compiled_flex_attn(
+        with maybe_regional_inductor(FlexAttention.inductor_configs):
+            out_1HTV, aux = FlexAttention.compiled_flex_attn(
                 q_1HTK,
                 k_1HTK,
                 v_1HTV,
@@ -403,7 +379,7 @@ class FlexInnerAttention(InnerAttention):
 
 # TODO: Verify whether SDPA support can be removed without losing performance
 # after folding: https://github.com/pytorch/torchtitan/pull/4218#pullrequestreview-4977638012
-class ScaledDotProductInnerAttention(InnerAttention):
+class ScaledDotProductAttention(Module):
     """Inner attention using ``F.scaled_dot_product_attention`` with CP support.
 
     ``forward()`` adapts Q/K from ``(B, L, H, K)`` to ``(B, H, L, K)`` and V
@@ -416,14 +392,14 @@ class ScaledDotProductInnerAttention(InnerAttention):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(InnerAttention.Config):
+    class Config(Module.Config):
         pass
 
     sdpa_backends: list[SDPBackend] = []
 
     def __init__(self, config: Config) -> None:
         if config is None:
-            config = ScaledDotProductInnerAttention.Config()
+            config = ScaledDotProductAttention.Config()
         super().__init__()
         if not self.sdpa_backends:
             self.sdpa_backends = [
@@ -446,7 +422,7 @@ class ScaledDotProductInnerAttention(InnerAttention):
     ) -> torch.Tensor:
         if attention_masks is not None:
             raise ValueError(
-                "ScaledDotProductInnerAttention does not support attention_masks; it "
+                "ScaledDotProductAttention does not support attention_masks; it "
                 "only supports causal/non-causal attention via is_causal."
             )
         q_BHLK, k_BHLK, v_BHLV = (
@@ -615,10 +591,6 @@ def create_attention_mask(*args, **kwargs):
 
 def create_varlen_metadata_for_document(
     positions: torch.Tensor,
-    *,
-    padding_mask: torch.Tensor | None = None,
-    max_num_documents: int | None = None,
-    max_context_length: int | None = None,
 ) -> VarlenMetadata:
     """Creates cumulative sequence length indices needed for variable length attention.
 
@@ -628,16 +600,6 @@ def create_varlen_metadata_for_document(
     Args:
         positions: Per-token position tensor with shape ``[T]``. Positions
             reset to 0 at each document start.
-        padding_mask: Per-token boolean tensor that is true for padding. This
-            distinguishes padding position resets from real document starts so
-            their fixed metadata capacity can be reserved separately.
-        max_num_documents: Upper bound on non-padding document segments in the
-            local token batch. When set, the device offsets have a fixed shape
-            as required for CUDA graph capture. Padding segments are reserved
-            separately when ``padding_mask`` is provided.
-        max_context_length: Maximum length of one document segment. Required
-            with ``max_num_documents`` so the fixed-shape metadata can avoid a
-            device-to-host synchronization.
 
     Returns:
         VarlenMetadata containing cumulative sequence length indices for q, k,
@@ -645,69 +607,25 @@ def create_varlen_metadata_for_document(
     """
     num_tokens = positions.shape[0]
     device = positions.device
-
-    real_doc_starts = positions == 0
-    padding_doc_starts = None
-    if padding_mask is None:
-        is_doc_start = real_doc_starts
-    else:
-        padding_mask = padding_mask.to(torch.bool)
-        real_doc_starts = real_doc_starts & ~padding_mask
-        padding_doc_starts = (positions == 0) & padding_mask
-        is_doc_start = real_doc_starts | padding_doc_starts
-
-    if max_num_documents is not None:
-        if max_context_length is None:
-            raise ValueError(
-                "max_context_length is required when max_num_documents is set"
-            )
-
-        max_num_padding_segments = (
-            (num_tokens + max_context_length - 1) // max_context_length
-            if padding_mask is not None
-            else 0
-        )
-        max_num_segments = max_num_documents + max_num_padding_segments
-        num_slots = max_num_segments + 1
-        slot = torch.cumsum(is_doc_start, 0) - 1
-        scatter_index = torch.where(
-            is_doc_start & (slot < max_num_segments),
-            slot,
-            torch.full_like(slot, num_slots),
-        )
-        packed_cu_seqlens = torch.full(
-            (num_slots + 1,), num_tokens, dtype=torch.int32, device=device
-        )
-        packed_cu_seqlens.scatter_(
-            0,
-            scatter_index,
-            torch.arange(num_tokens, dtype=torch.int32, device=device),
-        )
-        torch._assert_async(real_doc_starts.sum() <= max_num_documents)
-        if padding_doc_starts is not None:
-            torch._assert_async(padding_doc_starts.sum() <= max_num_padding_segments)
-        packed_cu_seqlens = packed_cu_seqlens[:num_slots]
-        max_seqlen = max_context_length
-    else:
-        doc_starts = is_doc_start.nonzero(as_tuple=True)[0].to(torch.int32)
-        packed_cu_seqlens = torch.cat(
-            [
-                doc_starts,
-                torch.tensor([num_tokens], dtype=torch.int32, device=device),
-            ]
-        )
-        seq_lengths = torch.diff(packed_cu_seqlens)
-
-        if seq_lengths.numel() > 0:
-            # device to host sync but only done once per model forward
-            max_seqlen = int(seq_lengths.max().item())
-        else:
-            max_seqlen = 0
-
-    if spmd.is_type_checking():
+    doc_starts = (positions == 0).nonzero(as_tuple=True)[0].to(torch.int32)
+    packed_cu_seqlens = torch.cat(
+        [
+            doc_starts,
+            torch.tensor([num_tokens], dtype=torch.int32, device=device),
+        ]
+    )
+    if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
         # Packed document boundaries are rank-local ragged metadata, so they
         # vary across DP ranks even when construction initially infers R.
         spmd.mutate_type(packed_cu_seqlens, "dp", src=spmd.R, dst=spmd.V)
+    seq_lengths = torch.diff(packed_cu_seqlens)
+
+    if seq_lengths.numel() > 0:
+        # device to host sync but only done once per model forward
+        max_seqlen = int(seq_lengths.max().item())
+    else:
+        max_seqlen = 0
+
     return VarlenMetadata(
         cu_seq_q=packed_cu_seqlens,
         cu_seq_k=packed_cu_seqlens,
@@ -726,7 +644,76 @@ class BaseAttention(Module):
             assert self.n_heads > 0, "n_heads must be > 0"
 
 
-class QKVLinear(Module):
+class BaseQKVLinear(Module):
+    """Base class for Q/K/V projection strategies.
+
+    Subclasses implement different projection approaches (separate or fused)
+    while providing a uniform interface to :class:`GQAttention`.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        head_dim: int
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.head_dim = config.head_dim
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project input into Q, K, V tensors.
+
+        Returns:
+            xq and xk have shape ``[T, H, K]``; xv has shape ``[T, H, V]``.
+        """
+        raise NotImplementedError
+
+
+class QKVLinear(BaseQKVLinear):
+    """Three separate linear projections for Q, K, V."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseQKVLinear.Config):
+        wq: Linear.Config
+        wkv: Linear.Config
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.wq = config.wq.build()
+        self.wk = config.wkv.build()
+        self.wv = config.wkv.build()
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens = x.shape[0]
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        # Use -1 instead of n_heads (or n_kv_heads) to infer the
+        # actual local heads from sizes as TP may have sharded them.
+
+        def local_qkv_head_split(x):
+            # Drop into local region, we can't propagate S(1) -> qkv head unflatten.
+            # TODO(pianpwk): this should be doable once spmd_types tracks sharding evenness.
+            with spmd.local():
+                x = x.view(num_tokens, -1, self.head_dim)
+                if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                    spmd.assert_type(
+                        x,
+                        spmd.V,
+                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
+                    )
+            return x
+
+        xq, xk, xv = (
+            local_qkv_head_split(xq),
+            local_qkv_head_split(xk),
+            local_qkv_head_split(xv),
+        )
+        return xq, xk, xv
+
+
+class FusedQKVLinear(BaseQKVLinear):
     """Single fused linear projection, split along R dimension.
 
     Uses a single linear layer and splits the output along the R dimension,
@@ -735,21 +722,19 @@ class QKVLinear(Module):
 
     Compatible with ColwiseParallel on the ``wqkv`` linear layer.
 
-    Native state dicts retain the physical ``wqkv`` parameter. Hugging Face
-    state-dict adapters split and merge the logical Q/K/V projections at the
-    external checkpoint boundary.
+    Checkpoints in the stock ``QKVLinear`` layout (``wq.weight`` / ``wk.weight`` /
+    ``wv.weight``) via state_dict hooks, so checkpoints interoperate with the
+    non-fused module and the HF adapter.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        head_dim: int
+    class Config(BaseQKVLinear.Config):
         n_heads: int
         n_kv_heads: int
         wqkv: Linear.Config
 
     def __init__(self, config: Config):
-        super().__init__()
-        self.head_dim = config.head_dim
+        super().__init__(config)
         if config.n_heads % config.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({config.n_heads}) must be divisible by "
@@ -758,6 +743,8 @@ class QKVLinear(Module):
         self.wqkv = config.wqkv.build()
         self.heads_per_kv = config.n_heads // config.n_kv_heads
         self.r_dim = self.heads_per_kv + 2
+        self.register_state_dict_post_hook(self._split_qkv_on_save)
+        self.register_load_state_dict_pre_hook(self._merge_qkv_on_load)
 
     @spmd.local_map(
         out_types=(
@@ -768,55 +755,131 @@ class QKVLinear(Module):
         )
         * 3
     )
-    def forward(
+    def forward(  # pyrefly: ignore[bad-override]
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens = x.shape[0]
         # Fused QKV: single matmul, then reshape and split along R dim.
         # [T, n_kv_heads * R * head_dim] -> [T, n_kv_heads, R, head_dim]
         # Use -1 for n_kv_heads so TP sharding is handled automatically.
         qkv = self.wqkv(x)
-        num_tokens = qkv.shape[0]
         with spmd.local():  # TODO(pianpwk): same QKV:S(1) unflatten case handled by even sharding
             qkv = qkv.view(num_tokens, -1, self.r_dim, self.head_dim)
-            if spmd.is_type_checking():
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
                 spmd.assert_type(
                     qkv,
                     spmd.V,
                     spmd.PartitionSpec(("dp", "cp"), "tp", None, None),
                 )
 
-        local_num_tokens = qkv.shape[0]
-        xq, xk, xv = torch.split(qkv, [self.heads_per_kv, 1, 1], dim=-2)
-        # split leaves xk/xv as strided views into the fused buffer; vLLM
-        # attention/KV-cache kernels read raw memory assuming a contiguous
-        # head-major layout, so materialize all three contiguously here.
-        return (
-            xq.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
-            xk.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
-            xv.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
-        )
+        hpk, hd = self.heads_per_kv, self.head_dim
+
+        def _split(t):
+            local_num_tokens = t.shape[0]
+            xq, xk, xv = torch.split(t, [hpk, 1, 1], dim=-2)
+            # split leaves xk/xv as strided views into the fused buffer; vLLM
+            # attention/KV-cache kernels read raw memory assuming a contiguous
+            # head-major layout, so materialize all three contiguously here.
+            return (
+                xq.reshape(local_num_tokens, -1, hd).contiguous(),
+                xk.reshape(local_num_tokens, -1, hd).contiguous(),
+                xv.reshape(local_num_tokens, -1, hd).contiguous(),
+            )
+
+        if isinstance(qkv, DTensor):
+            # TEMPORARY: run the split on local tensors so its backward (cat)
+            # does not mix DTensor and plain grads under CP+PP. The asymmetric
+            # q vs k/v paths (RoPE on q/k; CP all-gathers k/v) otherwise feed
+            # cat() inconsistent grad types in PP's backward metadata inference.
+            # q/k/v reuse qkv's placements (symmetric at the split: TP shards the
+            # head axis, CP shards tokens). TODO: remove once the partial_dtensor
+            # backend is gone.
+            _split = local_map(
+                _split,
+                out_placements=(qkv.placements,) * 3,
+                in_placements=(qkv.placements,),
+                in_grad_placements=(qkv.placements,),
+                device_mesh=qkv.device_mesh,
+            )
+        return _split(qkv)
+
+    @staticmethod
+    def _split_qkv_on_save(module, state_dict, prefix, local_metadata) -> None:
+        """Split fused ``wqkv`` into stock ``wq``/``wk``/``wv`` (weight and bias)."""
+        hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
+
+        for param, ndim in (("weight", 4), ("bias", 3)):
+            key = f"{prefix}wqkv.{param}"
+            if key not in state_dict:
+                continue
+            tensor = state_dict.pop(key)
+            # Gather to Replicate so the n_kv-leading reshape is local (dim 0
+            # unsharded) when a Shard(0) split would not divide n_kv_heads
+            # (e.g. dp_shard=8, n_kv_heads=4); stays a DTensor for the copy.
+            if isinstance(tensor, DTensor):
+                tensor = tensor.redistribute(
+                    tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
+                )
+            n_kv = tensor.shape[0] // (r * hd)
+            tail = (tensor.shape[1],) if ndim == 4 else ()
+            w = tensor.reshape(n_kv, r, hd, *tail)
+            state_dict[f"{prefix}wq.{param}"] = (
+                w[:, :hpk].reshape(-1, *tail).contiguous()
+            )
+            state_dict[f"{prefix}wk.{param}"] = (
+                w[:, hpk].reshape(-1, *tail).contiguous()
+            )
+            state_dict[f"{prefix}wv.{param}"] = (
+                w[:, hpk + 1].reshape(-1, *tail).contiguous()
+            )
+
+    @staticmethod
+    def _merge_qkv_on_load(module, state_dict, prefix, *args) -> None:
+        """Merge stock ``wq``/``wk``/``wv`` back into fused ``wqkv`` (weight and bias)."""
+        hd, hpk = module.head_dim, module.heads_per_kv
+
+        for param, ndim in (("weight", 4), ("bias", 3)):
+            keys = [f"{prefix}{w}.{param}" for w in ("wq", "wk", "wv")]
+            if not all(k in state_dict for k in keys):
+                continue
+            wq, wk, wv = (state_dict.pop(k) for k in keys)
+            # TODO: check if we could avoid this All-gather
+            # Gather to Replicate so the n_kv reshape is local; stays a DTensor so the
+            # fused result can be copied into the sharded wqkv param.
+            if isinstance(wq, DTensor):
+                wq, wk, wv = (
+                    t.redistribute(t.device_mesh, [Replicate()] * t.device_mesh.ndim)
+                    for t in (wq, wk, wv)
+                )
+            n_kv = wk.shape[0] // hd
+            tail = (wq.shape[1],) if ndim == 4 else ()
+            q = wq.reshape(n_kv, hpk, hd, *tail)
+            k = wk.reshape(n_kv, 1, hd, *tail)
+            v = wv.reshape(n_kv, 1, hd, *tail)
+            state_dict[f"{prefix}wqkv.{param}"] = torch.cat([q, k, v], dim=1).reshape(
+                -1, *tail
+            )
 
 
 class GQAttention(BaseAttention):
-    """Grouped-Query Attention with a fused Q/K/V projection.
+    """Grouped-Query Attention with pluggable Q/K/V projection.
 
-    ``rope=None`` selects NoPE (no positional encoding) for this layer: q/k go to
-    the inner attention unrotated, and positional information reaches the layer
-    only through the attention mask. Interleaved RoPE/NoPE models (iRoPE) set it
-    per layer.
+    The QKV projection strategy is determined by the ``qkv_linear`` config field:
+    use :class:`QKVLinear` for three independent projections, or
+    :class:`FusedQKVLinear` for a single fused projection.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         n_heads: int
         dim: int
-        qkv_linear: QKVLinear.Config
+        qkv_linear: BaseQKVLinear.Config
         wo: Linear.Config
         qk_norm: RMSNorm.Config | None = None
         n_kv_heads: int | None = None
         head_dim: int | None = None
         inner_attention: Module.Config
-        rope: RoPE.Config | None
+        rope: RoPE.Config
 
         def __post_init__(self) -> None:
             BaseAttention.Config.__post_init__(self)
@@ -845,7 +908,7 @@ class GQAttention(BaseAttention):
             else config.dim // config.n_heads
         )
         self.enable_gqa = self.n_heads > self.n_kv_heads
-        self.rope: RoPE | None = None if config.rope is None else config.rope.build()
+        self.rope = config.rope.build()
 
         # Pluggable QKV projection
         self.qkv_linear = config.qkv_linear.build()
@@ -868,44 +931,24 @@ class GQAttention(BaseAttention):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        xq_THK, xk_THK, xv_THV = remat.region(
-            self.qkv_linear,
-            self.remat_region_name("qkv"),
-            recompute=self.remat_should_recompute("qkv"),
-        )(x_TD)
+        xq_THK, xk_THK, xv_THV = self.qkv_linear(x_TD)
 
         # Optional QK normalization (before RoPE, per Qwen3)
         if self.q_norm is not None or self.k_norm is not None:
             assert self.q_norm is not None and self.k_norm is not None
-            remat.recompute_needs_tensor(xq_THK)
             xq_THK = self.q_norm(xq_THK)
-            remat.recompute_needs_tensor(xk_THK)
             xk_THK = self.k_norm(xk_THK)
 
         # Apply rotary embeddings
-        if self.rope is not None:
-            remat.recompute_needs_tensor(xq_THK, xk_THK)
-            xq_THK, xk_THK = self.rope(xq_THK, xk_THK, positions)
+        xq_THK, xk_THK = self.rope(xq_THK, xk_THK, positions)
 
-        out_THV = remat.region(
-            self.inner_attention,
-            self.remat_region_name("inner_attention"),
-            recompute=self.remat_should_recompute("inner_attention"),
-        )(
+        out_THV = self.inner_attention(
             xq_THK,
             xk_THK,
             xv_THV,
             attention_masks=attention_masks,
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
-        )
-        remat.recompute_needs_tensor(out_THV)
-        out_THV = out_THV.contiguous()
+        ).contiguous()
         out_TD = out_THV.view(out_THV.shape[0], -1)
-        out_TD = remat.region(
-            self.wo,
-            self.remat_region_name("wo"),
-            recompute=self.remat_should_recompute("wo"),
-        )(out_TD)
-        remat.recompute_needs_tensor(out_TD)
-        return out_TD
+        return self.wo(out_TD)

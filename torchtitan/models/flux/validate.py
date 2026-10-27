@@ -4,33 +4,33 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 import os
 from dataclasses import dataclass, field, replace
 
 import torch
+import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.loss import LossFunction
+from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.components.validate import iterate_and_close_dataloader, Validator
-from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed import context_parallel, ParallelDims, utils as dist_utils
-from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.protocols.model import BaseModel
+from torchtitan.components.validate import (
+    iterate_and_close_dataloader,
+    ValidationContext,
+    Validator,
+)
+from torchtitan.config import ParallelismConfig
+from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.tools.logging import logger
 
 from .configs import SamplingConfig
 from .flux_datasets import FluxValidationDatasetConfig
 from .inference.sampling import generate_image, save_image
 from .model.autoencoder import AutoEncoder
 from .model.hf_embedder import FluxEmbedder
-from .sharding import flux_input_sharding
 from .tokenizer import FluxTokenizerContainer
 from .utils import create_position_encoding_for_latents, pack_latents, preprocess_data
-
-
-logger = logging.getLogger(__name__)
 
 
 class FluxValidator(Validator):
@@ -45,6 +45,7 @@ class FluxValidator(Validator):
         tokenizer: Tokenizer
         parallel_dims: Parallel dimensions
         loss_fn: Loss function to use for validation
+        validation_context: Context manager for validation
         metrics_processor: Metrics processor
     """
 
@@ -75,8 +76,9 @@ class FluxValidator(Validator):
         tokenizer: BaseTokenizer,
         parallel_dims: ParallelDims,
         loss_fn: LossFunction,
+        validation_context: ValidationContext,
         seq_len: int,
-        num_tokens_per_microbatch: int,
+        num_tokens_per_batch: int,
         metrics_processor: MetricsProcessor | None = None,
         pp_schedule: _PipelineSchedule | None = None,
         pp_has_first_stage: bool | None = None,
@@ -108,7 +110,8 @@ class FluxValidator(Validator):
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
         self.seq_len = seq_len
-        self.num_tokens_per_microbatch = num_tokens_per_microbatch
+        self.num_tokens_per_batch = num_tokens_per_batch
+        self.validation_context = validation_context
         # pyrefly: ignore [bad-assignment]
         self.metrics_processor = metrics_processor
 
@@ -138,7 +141,7 @@ class FluxValidator(Validator):
     @torch.no_grad()
     def validate(
         self,
-        model_parts: list[BaseModel],
+        model_parts: list[nn.Module],
         step: int,
     ) -> None:
         # Set model to eval mode
@@ -162,15 +165,13 @@ class FluxValidator(Validator):
             dp_rank=self.dp_rank,
             tokenizer=self.tokenizer,
             max_context_length=self.seq_len,
-            num_tokens_per_microbatch=self.num_tokens_per_microbatch,
+            num_tokens_per_batch=self.num_tokens_per_batch,
         )
 
-        for microbatch in iterate_and_close_dataloader(validation_dataloader):
+        for input_dict, labels in iterate_and_close_dataloader(validation_dataloader):
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
-            input_dict = microbatch.to_input_dict(self.device)
-            labels = input_dict.pop("labels")
             prompt = input_dict.pop("prompt")
             if not isinstance(prompt, list):
                 prompt = [prompt]
@@ -179,24 +180,23 @@ class FluxValidator(Validator):
                 assert isinstance(p, str), f"prompt must be a string, got {type(p)}"
                 if max_saved_images != -1 and image_idx >= max_saved_images:
                     break
-                with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
-                    image = generate_image(
-                        device=self.device,
-                        dtype=self._dtype,
-                        img_height=img_height,
-                        img_width=img_width,
-                        enable_classifier_free_guidance=self.config.sampling.enable_classifier_free_guidance,
-                        denoising_steps=self.config.sampling.denoising_steps,
-                        classifier_free_guidance_scale=self.config.sampling.classifier_free_guidance_scale,
-                        # pyrefly: ignore [bad-argument-type]
-                        model=model,
-                        prompt=p,
-                        autoencoder=self.autoencoder,
-                        # pyrefly: ignore [bad-argument-type]
-                        tokenizer=self.tokenizer,
-                        t5_encoder=self.t5_encoder,
-                        clip_encoder=self.clip_encoder,
-                    )
+                image = generate_image(
+                    device=self.device,
+                    dtype=self._dtype,
+                    img_height=img_height,
+                    img_width=img_width,
+                    enable_classifier_free_guidance=self.config.sampling.enable_classifier_free_guidance,
+                    denoising_steps=self.config.sampling.denoising_steps,
+                    classifier_free_guidance_scale=self.config.sampling.classifier_free_guidance_scale,
+                    # pyrefly: ignore [bad-argument-type]
+                    model=model,
+                    prompt=p,
+                    autoencoder=self.autoencoder,
+                    # pyrefly: ignore [bad-argument-type]
+                    tokenizer=self.tokenizer,
+                    t5_encoder=self.t5_encoder,
+                    clip_encoder=self.clip_encoder,
+                )
 
                 save_image(
                     name=(
@@ -271,45 +271,23 @@ class FluxValidator(Validator):
 
             # Apply CP sharding if enabled
             if parallel_dims.cp_enabled:
-                cp_inputs = {
-                    "img": latents,
-                    "img_ids": latent_pos_enc,
-                    "txt": t5_encodings,
-                    "txt_ids": text_pos_enc,
-                    "target": target,
-                }
-                input_sharding = flux_input_sharding()
-                with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
-                    load_balancer_config = (
-                        self.parallelism.context_parallel_load_balancer
-                    )
-                    load_balancer = (
-                        load_balancer_config.build(
-                            seq_len=context_parallel.get_cp_input_seq_len(
-                                cp_inputs, input_shardings=input_sharding
-                            ),
-                            attention_metadata=None,
-                        )
-                        if load_balancer_config is not None
-                        else None
-                    )
-                    permutation = (
-                        load_balancer.generate_permutation()
-                        if load_balancer is not None
-                        else None
-                    )
-                    cp_inputs = context_parallel.shard_tensors(
-                        cp_inputs,
-                        input_shardings=input_sharding,
-                        permutation=permutation,
-                    )
-                latents = cp_inputs["img"]
-                latent_pos_enc = cp_inputs["img_ids"]
-                t5_encodings = cp_inputs["txt"]
-                text_pos_enc = cp_inputs["txt_ids"]
-                target = cp_inputs["target"]
+                from torchtitan.distributed.context_parallel import cp_shard
 
-            with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
+                (
+                    latents,
+                    latent_pos_enc,
+                    t5_encodings,
+                    text_pos_enc,
+                    target,
+                ), _ = cp_shard(
+                    parallel_dims.get_mesh("cp"),
+                    (latents, latent_pos_enc, t5_encodings, text_pos_enc, target),
+                    None,  # No attention masks for Flux
+                    load_balancer_type=None,
+                    input_seq_dims=1,
+                )
+
+            with self.validation_context():
                 latent_noise_pred = model(
                     img=latents,
                     img_ids=latent_pos_enc,
@@ -337,7 +315,7 @@ class FluxValidator(Validator):
         # additional elements to the denominator.
         if parallel_dims.dp_enabled:
             total_global_elements = dist_utils.dist_sum_tensor(
-                total_local_elements, parallel_dims.get_mesh("dp")
+                total_local_elements, parallel_dims.get_mesh("batch")
             )
         else:
             total_global_elements = total_local_elements

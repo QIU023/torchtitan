@@ -10,7 +10,6 @@ import spmd_types as spmd
 import torch
 
 from torchtitan.config import apply_overrides, OverrideConfig
-from torchtitan.config.override import _REGISTRY
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.qwen3_5 import model_registry
 from torchtitan.models.qwen3_5.model import OffsetRMSNorm
@@ -21,16 +20,9 @@ from torchtitan.overrides.offset_rmsnorm import (
 from torchtitan.protocols.sharding import ShardingConfig
 
 
-_OVERRIDE_TARGET = "torchtitan.overrides.offset_rmsnorm.triton_offset_rmsnorm"
-_OFFSET_RMSNORM_OVERRIDE = _REGISTRY[_OVERRIDE_TARGET]
-
-
 class TestTritonOffsetRMSNormOverride(unittest.TestCase):
-    def setUp(self):
-        _REGISTRY.setdefault(_OVERRIDE_TARGET, _OFFSET_RMSNORM_OVERRIDE)
-
     def test_override_replaces_all_qwen35_offset_norms(self):
-        config = model_registry("debugmodel", enable_sp=True, attn_backend="flex")
+        config = model_registry("debugmodel", attn_backend="flex").model
         num_offset_norms = len(list(config.traverse(OffsetRMSNorm.Config)))
 
         replacements = apply_overrides(
@@ -85,7 +77,18 @@ class TestTritonOffsetRMSNormOverride(unittest.TestCase):
 
         self.assertIsNotNone(replacement.sharding_config)
         assert replacement.sharding_config is not None
-        self.assertTrue(replacement.sharding_config.local_spmd)
+        self.assertIsNotNone(replacement.sharding_config.local_map)
+        assert replacement.sharding_config.local_map is not None
+        self.assertEqual(
+            replacement.sharding_config.local_map.in_grad_placements,
+            (activation,),
+        )
+        self.assertIsNotNone(replacement.weight_grad_sharding)
+        assert replacement.weight_grad_sharding is not None
+        self.assertEqual(
+            replacement.weight_grad_sharding.local_type["tp"],
+            spmd.P,
+        )
 
     def test_cpu_fallback_matches_stock_module(self):
         config = OffsetRMSNorm.Config(dim=32, eps=1e-6)

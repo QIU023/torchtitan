@@ -10,9 +10,8 @@ import spmd_types as spmd
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.distributed.parallel_dims import MeshAxisName
-from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
-from torchtitan.models.common.attention import BaseAttention, FlexInnerAttention
+from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.models.common.attention import BaseAttention, FlexAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -21,14 +20,14 @@ from .compressor import Compressor, Indexer
 
 
 def _assert_spmd_attention_type(tensor, *, tp):
-    if spmd.is_type_checking():
+    if get_spmd_backend() == "spmd_types":
         spmd.assert_type(
             tensor,
             {"dp": spmd.S(0), "cp": spmd.S(1), "tp": tp},
         )
 
 
-class DSV4FlexInnerAttention(FlexInnerAttention):
+class DSV4FlexAttention(FlexAttention):
     """DeepSeek sparse attention core for DeepSeek-V4.
 
     The core attends over the concatenated KV sequence ``[0, L + n_cmp + 1)``,
@@ -60,7 +59,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(FlexInnerAttention.Config):
+    class Config(FlexAttention.Config):
         window_size: int
         compress_ratio: int
         softmax_scale: float
@@ -135,7 +134,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         selected_indices: torch.Tensor,
         device,
     ) -> BlockMask:
-        """Build a FlexInnerAttention block mask from selected KV indices.
+        """Build a FlexAttention block mask from selected KV indices.
 
         Args:
             bsz: Batch size.
@@ -206,11 +205,11 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         """Run DSV4 sparse attention over a folded token stream."""
         if attention_masks is not None:
             raise ValueError(
-                "DSV4FlexInnerAttention does not accept attention_masks; "
+                "DSV4FlexAttention does not accept attention_masks; "
                 "the DSA block mask is built internally."
             )
         if attn_sink is None:
-            raise ValueError("DSV4FlexInnerAttention requires attn_sink")
+            raise ValueError("DSV4FlexAttention requires attn_sink")
 
         seqlen, _, head_dim = q.size()
         n_cmp = 0 if cmp_k is None else cmp_k.size(0)
@@ -230,7 +229,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             if self.compress_ratio == 4:
                 if idx_q is None or idx_k is None or idx_w is None:
                     raise ValueError(
-                        "DSV4FlexInnerAttention requires idx_q, idx_k, "
+                        "DSV4FlexAttention requires idx_q, idx_k, "
                         "and idx_w when compress_ratio=4"
                     )
                 cmp_topk = Indexer.select(
@@ -278,9 +277,9 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             )
 
 
-class SlidingWindowAttention(DSV4FlexInnerAttention):
+class SlidingWindowAttention(DSV4FlexAttention):
     @dataclass(kw_only=True, slots=True)
-    class Config(DSV4FlexInnerAttention.Config):
+    class Config(DSV4FlexAttention.Config):
         pass
 
     def forward(  # pyrefly: ignore[bad-param-name-override]
@@ -299,9 +298,9 @@ class SlidingWindowAttention(DSV4FlexInnerAttention):
         )
 
 
-class HeavilyCompressedAttention(DSV4FlexInnerAttention):
+class HeavilyCompressedAttention(DSV4FlexAttention):
     @dataclass(kw_only=True, slots=True)
-    class Config(DSV4FlexInnerAttention.Config):
+    class Config(DSV4FlexAttention.Config):
         pass
 
     def forward(  # pyrefly: ignore[bad-param-name-override]
@@ -322,9 +321,9 @@ class HeavilyCompressedAttention(DSV4FlexInnerAttention):
         )
 
 
-class CompressedSparseAttention(DSV4FlexInnerAttention):
+class CompressedSparseAttention(DSV4FlexAttention):
     @dataclass(kw_only=True, slots=True)
-    class Config(DSV4FlexInnerAttention.Config):
+    class Config(DSV4FlexAttention.Config):
         pass
 
     def forward(  # pyrefly: ignore[bad-param-name-override]
@@ -356,14 +355,14 @@ class Attention(BaseAttention):
 
     The module projects Q/KV, applies pre- and post-phase RoPE, prepares
     optional compressed/indexer tensors, and delegates sparse attention to
-    ``DSV4FlexInnerAttention``.
+    ``DSV4FlexAttention``.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         dim: int
         n_heads: int
-        inner_attention: DSV4FlexInnerAttention.Config  # pyrefly: ignore [bad-override]
+        inner_attention: DSV4FlexAttention.Config  # pyrefly: ignore [bad-override]
         rope: RoPE.Config
         head_dim: int = 512
         rope_head_dim: int = 64
@@ -431,18 +430,6 @@ class Attention(BaseAttention):
 
     def forward(self, x, attention_masks=None, positions=None):
         """Apply one DeepSeek V4 attention layer over folded tokens."""
-        tp_group = spmd_mesh_group(MeshAxisName.TP)
-        if tp_group is not None:
-            # Query, KV, compressor, and indexer branches consume x. Gather
-            # once at their common attention boundary.
-            x = spmd.redistribute(
-                x,
-                tp_group,
-                src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
-                dst=spmd.R,
-                backward_options={"op_dtype": x.dtype},
-            )
-
         num_tokens = x.size(0)
         rd = self.rope_head_dim
 
@@ -509,7 +496,7 @@ class Attention(BaseAttention):
             o = o.view(num_tokens, n_local_groups, -1)
             _assert_spmd_attention_type(o, tp=spmd.S(1))
             wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-            if spmd.is_type_checking():
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
                 spmd.assert_type(
                     wo_a,
                     {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)},

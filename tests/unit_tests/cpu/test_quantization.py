@@ -4,13 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import inspect
-from dataclasses import dataclass
 
 import pytest
 import spmd_types as spmd
 import torch
 import torch.distributed.checkpoint as dcp
-import torchtitan.config.transform.quantization as quantization_transform
 from spmd_types import SpmdType
 
 from torchtitan.components.data import (
@@ -19,53 +17,15 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
+from torchtitan.components.quantization import Float8Linear
+from torchtitan.components.quantization.float8 import _get_float8_grouped_experts_cls
+from torchtitan.components.quantization.mx import _get_mxfp8_grouped_experts_cls
+from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import ConfigManager
-from torchtitan.config.transform import (
-    Float8LinearConverter,
-    MXFP8LinearConverter,
-    NVFP4LinearConverter,
-)
-from torchtitan.models.common.activation import Sigmoid
-from torchtitan.models.common.attention import QKVLinear
-from torchtitan.models.common.config_utils import make_router_config
-from torchtitan.models.common.decoder_sharding import (
-    colwise_config,
-    dense_sequence_parallel_placement,
-    rowwise_config,
-)
-from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.linear import (
-    CastLinear,
-    ColumnParallelLinear,
-    GroupedLinear,
-    Linear,
-    RouterGateLinear,
-    RowParallelLinear,
-)
-from torchtitan.models.common.vision_encoder import InvariantRowParallelLinear
-from torchtitan.models.gpt_oss.moe import GptOssGroupedLinear
-from torchtitan.quantization import Float8Linear, MXFP8Linear, NVFP4Linear
-from torchtitan.quantization.float8 import _get_float8_grouped_linear_cls
-from torchtitan.quantization.mxfp8.experts import _get_mxfp8_grouped_linear_cls
-from torchtitan.quantization.utils import get_quantized_linear, has_quantization
-
-
-class _ScaledLinear(Linear):
-    @dataclass(kw_only=True, slots=True)
-    class Config(Linear.Config):
-        scale: float = 2.0
-
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self.scale = config.scale
-
-    def _linear(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        return self.scale * super()._linear(input, weight, bias)
+from torchtitan.models.common.decoder_sharding import colwise_config, rowwise_config
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.gpt_oss.moe import GptOssGroupedExperts
 
 
 def test_no_float8_by_default():
@@ -73,198 +33,12 @@ def test_no_float8_by_default():
     config = config_manager.parse_args(
         ["--module", "llama3", "--config", "llama3_debugmodel"]
     )
-    model_config = config.model
+    model_config = config.model_spec.model
     assert not has_quantization(model_config)
     # All Linear.Config instances should remain Linear.Config
     if Float8Linear is not None:
         for _fqn, lc, _parent, _attr in model_config.traverse(Linear.Config):
             assert not isinstance(lc, Float8Linear.Config)
-
-
-def _router_config_for_quantization(dim: int):
-    return make_router_config(
-        dim=dim,
-        num_experts=dim,
-        score_func=Sigmoid.Config(),
-        gate_param_init={"weight": torch.nn.init.zeros_},
-    )
-
-
-def test_quantization_preserves_invariant_row_parallel_linear():
-    config_cls = get_quantized_linear(_ScaledLinear, InvariantRowParallelLinear).Config
-    converted = config_cls(in_features=16, out_features=16, bias=True, scale=3.0)
-
-    assert converted._owner is not None
-    assert issubclass(converted._owner, InvariantRowParallelLinear)
-    assert issubclass(converted._owner, _ScaledLinear)
-
-    linear = converted.build()
-    input = torch.randn(2, 16)
-    expected = 3.0 * torch.nn.functional.linear(input, linear.weight, linear.bias)
-    torch.testing.assert_close(linear(input), expected)
-
-
-@pytest.mark.parametrize("config_cls", [CastLinear.Config, RouterGateLinear.Config])
-def test_quantization_rejects_unsupported_linear_wrapper(config_cls):
-    config = config_cls(in_features=16, out_features=16)
-
-    with pytest.raises(ValueError, match=f"does not support {config._owner.__name__}"):
-        quantization_transform._validate_quantizable_linear(config, "projection")
-
-
-@pytest.mark.parametrize("parallel_cls", [ColumnParallelLinear, RowParallelLinear])
-def test_get_quantized_linear_preserves_compute_and_tp_role(parallel_cls):
-    quantized_cls = get_quantized_linear(_ScaledLinear, parallel_cls)
-    config = quantized_cls.Config(
-        in_features=4, out_features=2, num_linears=2, scale=3.0
-    )
-    linear = config.build()
-
-    assert quantized_cls is get_quantized_linear(_ScaledLinear, parallel_cls)
-    assert issubclass(quantized_cls, parallel_cls)
-    assert issubclass(quantized_cls, _ScaledLinear)
-    assert issubclass(quantized_cls.Config, _ScaledLinear.Config)
-
-    input = torch.randn(3, 4)
-    expected = 3.0 * torch.nn.functional.linear(
-        input, linear.weight.flatten(0, -2), linear.bias
-    ).unflatten(-1, linear.weight.shape[:-1])
-    torch.testing.assert_close(linear(input), expected)
-
-
-def test_float8_converter_rejects_router_gate():
-    pytest.importorskip("torchao")
-    if Float8Linear is None:
-        pytest.skip("torchao Float8Linear is unavailable")
-    converter = Float8LinearConverter(
-        Float8LinearConverter.Config(emulate=True, model_compile_enabled=False)
-    )
-    with pytest.raises(ValueError, match="does not support RouterGateLinear"):
-        converter.convert(_router_config_for_quantization(16))
-
-
-def test_float8_converter_preserves_recipe_when_emulating(monkeypatch):
-    pytest.importorskip("torchao")
-    if Float8Linear is None:
-        pytest.skip("torchao Float8Linear kernels are unavailable")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = Float8LinearConverter(
-        Float8LinearConverter.Config(
-            recipe_name="rowwise_with_gw_hp",
-            emulate=True,
-        )
-    )
-
-    converted = converter.convert(
-        Linear.Config(in_features=128, out_features=128, bias=False)
-    )
-
-    assert isinstance(converted, Float8Linear.Config)
-    assert converted.recipe_name == "rowwise_with_gw_hp"
-    assert converted.emulate
-
-
-def test_float8_auto_filter_uses_config_dimensions(monkeypatch):
-    pytest.importorskip("torchao")
-    if Float8Linear is None:
-        pytest.skip("torchao Float8Linear kernels are unavailable")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = Float8LinearConverter(
-        Float8LinearConverter.Config(filter_fqns=["auto_filter_small_kn"])
-    )
-
-    large = converter.convert(Linear.Config(in_features=4096, out_features=4096))
-    small = converter.convert(Linear.Config(in_features=1024, out_features=4096))
-
-    assert isinstance(large, Float8Linear.Config)
-    assert type(small) is Linear.Config
-
-
-@pytest.mark.parametrize(
-    ("config_cls", "parallel_cls"),
-    [
-        (ColumnParallelLinear.Config, ColumnParallelLinear),
-        (RowParallelLinear.Config, RowParallelLinear),
-    ],
-)
-def test_float8_converter_preserves_tensor_parallel_role(config_cls, parallel_cls):
-    pytest.importorskip("torchao")
-    if Float8Linear is None:
-        pytest.skip("torchao Float8Linear is unavailable")
-    converter = Float8LinearConverter(
-        Float8LinearConverter.Config(emulate=True, model_compile_enabled=False)
-    )
-    converted = converter.convert(config_cls(in_features=16, out_features=16))
-
-    assert converted._owner is not None
-    assert issubclass(converted._owner, Float8Linear)
-    assert issubclass(converted._owner, parallel_cls)
-
-
-def test_mxfp8_converter_rejects_router_gate(monkeypatch):
-    pytest.importorskip("torchao")
-    if MXFP8Linear is None:
-        pytest.skip("torchao MXFP8Linear is unavailable")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = MXFP8LinearConverter(MXFP8LinearConverter.Config())
-    with pytest.raises(ValueError, match="does not support RouterGateLinear"):
-        converter.convert(_router_config_for_quantization(128))
-
-
-@pytest.mark.parametrize(
-    ("config_cls", "parallel_cls"),
-    [
-        (ColumnParallelLinear.Config, ColumnParallelLinear),
-        (RowParallelLinear.Config, RowParallelLinear),
-    ],
-)
-def test_mxfp8_converter_preserves_tensor_parallel_role(
-    monkeypatch, config_cls, parallel_cls
-):
-    if MXFP8Linear is None:
-        pytest.skip("torchao MXFP8Linear is unavailable")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = MXFP8LinearConverter(
-        MXFP8LinearConverter.Config(model_compile_enabled=True)
-    )
-    converted = converter.convert(config_cls(in_features=128, out_features=128))
-
-    assert converted._owner is not None
-    assert issubclass(converted._owner, MXFP8Linear)
-    assert issubclass(converted._owner, parallel_cls)
-
-
-def test_nvfp4_converter_rejects_router_gate(monkeypatch):
-    pytest.importorskip("torchao")
-    if NVFP4Linear is None:
-        pytest.skip("torchao NVFP4 training prototype not available")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = NVFP4LinearConverter(NVFP4LinearConverter.Config())
-    with pytest.raises(ValueError, match="does not support RouterGateLinear"):
-        converter.convert(_router_config_for_quantization(128))
-
-
-@pytest.mark.parametrize(
-    ("config_cls", "parallel_cls"),
-    [
-        (ColumnParallelLinear.Config, ColumnParallelLinear),
-        (RowParallelLinear.Config, RowParallelLinear),
-    ],
-)
-def test_nvfp4_converter_preserves_tensor_parallel_role(
-    monkeypatch, config_cls, parallel_cls
-):
-    if NVFP4Linear is None:
-        pytest.skip("torchao NVFP4Linear is unavailable")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = NVFP4LinearConverter(
-        NVFP4LinearConverter.Config(model_compile_enabled=True)
-    )
-    converted = converter.convert(config_cls(in_features=128, out_features=128))
-
-    assert converted._owner is not None
-    assert issubclass(converted._owner, NVFP4Linear)
-    assert issubclass(converted._owner, parallel_cls)
 
 
 def test_float8_applied_by_model_registry():
@@ -273,7 +47,7 @@ def test_float8_applied_by_model_registry():
     config = config_manager.parse_args(
         ["--module", "llama3", "--config", "llama3_debugmodel_float8_emulate_lora"]
     )
-    model_config = config.model
+    model_config = config.model_spec.model
     assert has_quantization(model_config)
     # Some Linear.Config instances should be swapped to Float8Linear
     converted = [
@@ -305,18 +79,20 @@ def test_nvfp4_converter_targets_layers_not_lm_head(
     monkeypatch, module, recipe, expected_num_layers
 ):
     pytest.importorskip("torchao")
-    from torchtitan.quantization import NVFP4Linear
+    from torchtitan.components.quantization import NVFP4Linear
 
     if NVFP4Linear is None:
         pytest.skip("torchao NVFP4 training prototype not available")
     # Exercise convert() targeting independent of GPU: bypass the sm100 gate
     # that NVFP4LinearConverter.__init__ enforces (hardware is irrelevant to the
     # config-tree transform under test).
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
 
     config_manager = ConfigManager()
     config = config_manager.parse_args(["--module", module, "--config", recipe])
-    model_config = config.model
+    model_config = config.model_spec.model
     assert has_quantization(model_config)
 
     converted, stock = [], []
@@ -333,7 +109,7 @@ def test_nvfp4_converter_targets_layers_not_lm_head(
 
 
 def test_nvfp4_bf16_tail_fqns():
-    from torchtitan.quantization.nvfp4 import nvfp4_bf16_tail_fqns
+    from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_tail_fqns
 
     # 32 layers, 15% tail -> ceil(4.8)=5 bf16, convert layers 0..26.
     fqns = nvfp4_bf16_tail_fqns(32, 0.15)
@@ -367,16 +143,18 @@ def test_nvfp4_first_85_pct_layers_converts_only_leading_layers(
     monkeypatch, module, recipe, expected_cutoff
 ):
     pytest.importorskip("torchao")
-    from torchtitan.quantization import NVFP4Linear
+    from torchtitan.components.quantization import NVFP4Linear
 
     if NVFP4Linear is None:
         pytest.skip("torchao NVFP4 training prototype not available")
     import math
 
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
 
     config = ConfigManager().parse_args(["--module", module, "--config", recipe])
-    model_config = config.model
+    model_config = config.model_spec.model
     n_layers = len(model_config.layers)
     cutoff = n_layers - math.ceil(n_layers * 0.15)
     assert cutoff == expected_cutoff
@@ -400,7 +178,7 @@ def test_nvfp4_first_85_pct_layers_converts_only_leading_layers(
 
 def _nvfp4_linear_cls():
     pytest.importorskip("torchao")
-    from torchtitan.quantization import NVFP4Linear
+    from torchtitan.components.quantization import NVFP4Linear
 
     if NVFP4Linear is None:
         pytest.skip("torchao NVFP4 training prototype not available")
@@ -417,21 +195,20 @@ def test_nvfp4_config_rejects_non_128_dims(in_features, out_features):
 
 
 @pytest.mark.parametrize(
-    "sharding_config_factory, input_tp",
+    "sharding_config_factory, input_tp, input_grad_tp",
     [
+        pytest.param(lambda: colwise_config(), spmd.R, spmd.P, id="colwise"),
         pytest.param(
-            lambda: colwise_config(input_layout=dense_sequence_parallel_placement()),
-            spmd.R,
-            id="colwise",
-        ),
-        pytest.param(
-            lambda: rowwise_config(output_layout=dense_sequence_parallel_placement()),
+            lambda: rowwise_config(output_sp=True),
+            spmd.S(-1),
             spmd.S(-1),
             id="rowwise",
         ),
     ],
 )
-def test_nvfp4_build_configures_local_spmd_sharding(sharding_config_factory, input_tp):
+def test_nvfp4_build_configures_local_spmd_sharding(
+    sharding_config_factory, input_tp, input_grad_tp
+):
     # Config.build() folds the stock colwise/rowwise sharding into the local
     # SPMD region for the opaque NVFP4 GEMM.
     NVFP4Linear = _nvfp4_linear_cls()
@@ -444,11 +221,13 @@ def test_nvfp4_build_configures_local_spmd_sharding(sharding_config_factory, inp
         sharding_config=sharding_config_factory(),
     ).build()
     sc = module._sharding_config
-    assert sc.local_spmd
+    assert sc.local_map is not None
     input_layout = dense_activation_placement(tp=input_tp, cp=spmd.S(0))
-    assert sc.in_src_shardings == {"input": input_layout}
-    assert sc.in_dst_shardings == {"input": input_layout}
-    assert list(inspect.signature(module.forward).parameters) == ["input"]
+    assert sc.in_src_shardings == {"x": input_layout}
+    assert sc.in_dst_shardings == {"x": input_layout}
+    assert sc.local_map.in_grad_placements == (
+        dense_activation_placement(tp=input_grad_tp, cp=spmd.S(0)),
+    )
     assert "weight" in sc.state_shardings
     assert sc.state_shardings["_sr_seed"] == SpmdType(
         {
@@ -457,34 +236,6 @@ def test_nvfp4_build_configures_local_spmd_sharding(sharding_config_factory, inp
             MeshAxisName.TP: spmd.V,
         }
     )
-
-
-@pytest.mark.parametrize("parallel_cls", [ColumnParallelLinear, RowParallelLinear])
-def test_nvfp4_parallel_build_preserves_collective_boundary(parallel_cls):
-    if NVFP4Linear is None:
-        pytest.skip("torchao NVFP4 training prototype not available")
-
-    boundary_layout = dense_sequence_parallel_placement()
-    linear_cls = get_quantized_linear(NVFP4Linear, parallel_cls)
-    sharding_config = (
-        colwise_config(input_layout=boundary_layout)
-        if parallel_cls is ColumnParallelLinear
-        else rowwise_config(output_layout=boundary_layout)
-    )
-    module = linear_cls.Config(
-        in_features=512,
-        out_features=1024,
-        sharding_config=sharding_config,
-    ).build()
-
-    assert not module._sharding_config.local_spmd
-    assert module._sharding_config.in_src_shardings == (
-        sharding_config.in_src_shardings
-    )
-    assert module._sharding_config.out_src_shardings == (
-        sharding_config.out_src_shardings
-    )
-    assert "_sr_seed" in module._sharding_config.state_shardings
 
 
 @pytest.mark.parametrize(
@@ -498,12 +249,22 @@ def test_nvfp4_parallel_build_preserves_collective_boundary(parallel_cls):
         ("qwen3", "qwen3_8b_first_85_pct_layers_nvfp4"),
     ],
 )
-def test_nvfp4_recipes_parse(monkeypatch, module, recipe):
+def test_nvfp4_recipes_default_to_spmd_types_and_allow_cli_override(
+    monkeypatch, module, recipe
+):
     _nvfp4_linear_cls()
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
     base_args = ["--module", module, "--config", recipe]
 
-    ConfigManager().parse_args(base_args)
+    config = ConfigManager().parse_args(base_args)
+    assert config.parallelism.spmd_backend == "spmd_types"
+
+    overridden = ConfigManager().parse_args(
+        [*base_args, "--parallelism.spmd_backend", "partial_dtensor"]
+    )
+    assert overridden.parallelism.spmd_backend == "partial_dtensor"
 
 
 @pytest.mark.parametrize(
@@ -516,9 +277,11 @@ def test_nvfp4_recipes_parse(monkeypatch, module, recipe):
 )
 def test_qwen3_recipes_resolve(monkeypatch, recipe):
     _nvfp4_linear_cls()
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
     config = ConfigManager().parse_args(["--module", "qwen3", "--config", recipe])
-    assert type(config.model).__qualname__ == "Qwen3Model.Config"
+    assert config.model_spec.name == "qwen3"
     if recipe == "qwen3_8b_first_85_pct_layers_nvfp4":
         assert isinstance(config.dataloader, GrainDataLoader.Config)
         packed_dataset = config.dataloader.dataset
@@ -527,8 +290,8 @@ def test_qwen3_recipes_resolve(monkeypatch, recipe):
         assert isinstance(dataset, SingleDatasetConfig)
         assert isinstance(dataset.source, HuggingFaceRandomAccessSource.Config)
         assert dataset.source.path == "openai/gsm8k"
-        assert config.checkpointer.initial_load_in_hf
-        assert config.compile is not None
+        assert config.checkpoint.initial_load_in_hf
+        assert config.compile.enable
         assert "model" in config.compile.components
 
 
@@ -538,7 +301,7 @@ def test_nvfp4_module_buffers_and_native_checkpoint():
     constant and the SR seed is per-rank -- so a native checkpoint carries only
     the stock weight."""
     NVFP4Linear = _nvfp4_linear_cls()
-    from torchtitan.quantization.nvfp4 import _HARDCODED_SIGN_VECTOR
+    from torchtitan.components.quantization.nvfp4 import _HARDCODED_SIGN_VECTOR
 
     module = NVFP4Linear.Config(in_features=512, out_features=1024).build()
     assert {name for name, _ in module.named_parameters()} == {"weight"}
@@ -573,16 +336,18 @@ def test_nvfp4_stock_checkpoint_loads_before_init_states():
 def test_nvfp4_hf_export_strips_buffers(monkeypatch):
     """The HF export boundary contains only stock keys -- no NVFP4 runtime buffers."""
     NVFP4Linear = _nvfp4_linear_cls()
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
 
     config = ConfigManager().parse_args(
         ["--module", "llama3", "--config", "llama3_debugmodel_nvfp4"]
     )
-    model_config = config.model
+    model_config = config.model_spec.model
     model = model_config.build()
     model.init_states()
-    assert isinstance(model.get_submodule("layers.0.feed_forward.w13"), NVFP4Linear)
+    assert isinstance(model.get_submodule("layers.0.feed_forward.w1"), NVFP4Linear)
 
     sd = model.state_dict()
     # Both NVFP4 runtime buffers are non-persistent, so neither the RHT vector
@@ -595,46 +360,31 @@ def test_nvfp4_hf_export_strips_buffers(monkeypatch):
     assert not any("_rht_sign_vector" in k for k in hf_sd)
 
 
-def test_quantized_grouped_linear():
-    """Quantized grouped linears preserve base and specialized module types."""
-    MXFP8GroupedLinear = _get_mxfp8_grouped_linear_cls(GroupedLinear)
-    Float8GroupedLinear = _get_float8_grouped_linear_cls(GroupedLinear)
+def test_quantized_grouped_experts():
+    """Quantized GroupedExperts: _owner, subclass handling, extra config fields."""
+    # Base case
+    MXFP8GroupedExperts = _get_mxfp8_grouped_experts_cls(GroupedExperts)
+    Float8GroupedExperts = _get_float8_grouped_experts_cls(GroupedExperts)
 
-    assert MXFP8GroupedLinear.Config._owner is MXFP8GroupedLinear
-    assert Float8GroupedLinear.Config._owner is Float8GroupedLinear
+    assert MXFP8GroupedExperts.Config._owner is MXFP8GroupedExperts
+    assert Float8GroupedExperts.Config._owner is Float8GroupedExperts
 
-    mxfp8_cls = _get_mxfp8_grouped_linear_cls(GptOssGroupedLinear)
-    float8_cls = _get_float8_grouped_linear_cls(GptOssGroupedLinear)
+    # Subclass case (GptOssGroupedExperts has extra swiglu_limit field)
+    mxfp8_cls = _get_mxfp8_grouped_experts_cls(GptOssGroupedExperts)
+    float8_cls = _get_float8_grouped_experts_cls(GptOssGroupedExperts)
 
     assert mxfp8_cls.Config._owner is mxfp8_cls
     assert float8_cls.Config._owner is float8_cls
-    assert issubclass(mxfp8_cls, GptOssGroupedLinear)
-    assert issubclass(float8_cls, GptOssGroupedLinear)
-
-    from torchtitan.quantization.float8.tensor import (
-        _GroupedLinearShardedTensorWithFloat8Compute,
-    )
-
-    for parent_cls in (GroupedLinear, GptOssGroupedLinear):
-        quantized_cls = _get_float8_grouped_linear_cls(parent_cls)
-        module = quantized_cls.Config(
-            group_size=4,
-            in_features=128,
-            out_features=128,
-            num_linears=2,
-        ).build()
-        assert isinstance(
-            module.weight,
-            _GroupedLinearShardedTensorWithFloat8Compute,
-        )
-        if isinstance(module, GptOssGroupedLinear):
-            assert type(module.bias) is torch.nn.Parameter
+    assert issubclass(mxfp8_cls, GptOssGroupedExperts)
+    assert issubclass(float8_cls, GptOssGroupedExperts)
+    assert hasattr(mxfp8_cls.Config, "swiglu_limit")
+    assert hasattr(float8_cls.Config, "swiglu_limit")
 
 
-@pytest.mark.parametrize("parent_cls", [GroupedLinear, GptOssGroupedLinear])
+@pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])
 @pytest.mark.parametrize(
     "make_quantized_cls",
-    [_get_mxfp8_grouped_linear_cls, _get_float8_grouped_linear_cls],
+    [_get_mxfp8_grouped_experts_cls, _get_float8_grouped_experts_cls],
     ids=["mxfp8", "float8"],
 )
 def test_grouped_mm_overrides_keep_the_seam_signature(make_quantized_cls, parent_cls):
@@ -654,54 +404,14 @@ def test_grouped_mm_overrides_keep_the_seam_signature(make_quantized_cls, parent
         assert override.parameters[name].kind == parameter.kind
 
 
-def test_mxfp8_grouped_linear_flattens_structured_w13(monkeypatch):
-    """MXFP8 receives flattened W13 and returns its structured output."""
-    from torchao.prototype.moe_training import utils as moe_training_utils
-
-    captured = {}
-
-    def grouped_mm(input_RI, weight_EIO, *, config, offs):
-        del config, offs
-        captured["weight_shape"] = weight_EIO.shape
-        return input_RI.new_zeros(input_RI.shape[0], weight_EIO.shape[-1])
-
-    monkeypatch.setattr(
-        moe_training_utils,
-        "_quantize_then_scaled_grouped_mm",
-        grouped_mm,
-    )
-    grouped_linear_cls = _get_mxfp8_grouped_linear_cls(GroupedLinear)
-    grouped_linear = grouped_linear_cls.Config(
-        group_size=4,
-        in_features=128,
-        out_features=64,
-        num_linears=2,
-    ).build()
-
-    output_R2O = grouped_linear(
-        torch.zeros(8, 128),
-        torch.tensor([2, 4, 6, 8], dtype=torch.int32),
-    )
-
-    assert captured["weight_shape"] == torch.Size([4, 128, 128])
-    assert output_R2O.shape == torch.Size([8, 2, 64])
-
-
-@pytest.mark.parametrize("parent_cls", [GroupedLinear, GptOssGroupedLinear])
-def test_float8_grouped_linear_checkpoint_state_uses_plain_tensors(parent_cls):
+@pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])
+def test_float8_grouped_experts_checkpoint_state_uses_plain_tensors(parent_cls):
     pytest.importorskip("torchao")
-    from torchtitan.quantization.float8.tensor import (
-        _GroupedLinearShardedTensorWithFloat8Compute,
-    )
+    stock = parent_cls.Config(dim=16, hidden_dim=32, num_experts=2).build()
+    float8_cls = _get_float8_grouped_experts_cls(parent_cls)
+    module = float8_cls.Config(dim=16, hidden_dim=32, num_experts=2).build()
 
-    config = dict(group_size=2, in_features=16, out_features=32, num_linears=2)
-    stock = parent_cls.Config(**config).build()
-    float8_cls = _get_float8_grouped_linear_cls(parent_cls)
-    module = float8_cls.Config(**config).build()
-
-    assert isinstance(module.weight, _GroupedLinearShardedTensorWithFloat8Compute)
-    if isinstance(module, GptOssGroupedLinear):
-        assert type(module.bias) is torch.nn.Parameter
+    assert all(type(param) is torch.nn.Parameter for param in module.parameters())
     stock_state = stock.state_dict()
     float8_state = module.state_dict()
     assert float8_state.keys() == stock_state.keys()
@@ -712,15 +422,10 @@ def test_float8_grouped_linear_checkpoint_state_uses_plain_tensors(parent_cls):
 
 
 @pytest.mark.filterwarnings("ignore:torch.distributed is disabled")
-def test_float8_grouped_linear_dcp_round_trip_needs_no_safe_globals(tmp_path):
+def test_float8_grouped_experts_dcp_round_trip_needs_no_safe_globals(tmp_path):
     pytest.importorskip("torchao")
-    float8_cls = _get_float8_grouped_linear_cls(GroupedLinear)
-    config = float8_cls.Config(
-        group_size=2,
-        in_features=16,
-        out_features=32,
-        num_linears=2,
-    )
+    float8_cls = _get_float8_grouped_experts_cls(GroupedExperts)
+    config = float8_cls.Config(dim=16, hidden_dim=32, num_experts=2)
     source = config.build()
     target = config.build()
 
@@ -734,9 +439,7 @@ def test_float8_grouped_linear_dcp_round_trip_needs_no_safe_globals(tmp_path):
     try:
         torch.serialization.clear_safe_globals()
         dcp.save(source.state_dict(), checkpoint_id=tmp_path, no_dist=True)
-        target_state = target.state_dict()
-        dcp.load(target_state, checkpoint_id=tmp_path, no_dist=True)
-        target.load_state_dict(target_state)
+        dcp.load(target.state_dict(), checkpoint_id=tmp_path, no_dist=True)
     finally:
         torch.serialization.clear_safe_globals()
         torch.serialization.add_safe_globals(saved_safe_globals)
@@ -745,230 +448,3 @@ def test_float8_grouped_linear_dcp_round_trip_needs_no_safe_globals(tmp_path):
         source.parameters(), target.parameters(), strict=True
     ):
         torch.testing.assert_close(target_parameter, source_parameter)
-
-
-def test_mxfp8_linear_validates_config_and_installs_weight_wrapper():
-    pytest.importorskip("torchao")
-    if MXFP8Linear is None:
-        pytest.skip("torchao MXFP8Linear is unavailable")
-    from torchtitan.quantization._fsdp_tensor import _UnshardedFSDPTensor
-    from torchtitan.quantization.mxfp8.tensor import (
-        _LinearShardedTensorWithMXFP8Compute,
-    )
-
-    with pytest.raises(ValueError, match="in_features divisible by 32"):
-        MXFP8Linear.Config(in_features=127, out_features=128)
-    with pytest.raises(ValueError, match="out_features divisible by 32"):
-        MXFP8Linear.Config(in_features=128, out_features=127)
-    with pytest.raises(
-        ValueError,
-        match="input_activation_format_for_backward must be one of",
-    ):
-        MXFP8Linear.Config(
-            in_features=128,
-            out_features=128,
-            input_activation_format_for_backward="missing",
-        )
-    with pytest.raises(ValueError, match="out_features divisible by 32"):
-        MXFP8Linear.Config(
-            in_features=128,
-            out_features=127,
-            num_linears=2,
-        )
-
-    local_stacked_weight = _LinearShardedTensorWithMXFP8Compute(
-        torch.empty(3, 16, 128, dtype=torch.bfloat16)
-    )
-    with pytest.raises(ValueError, match="local matrix out_features divisible by 32"):
-        local_stacked_weight._build_operands(local_stacked_weight._tensor)
-
-    for sharding_config in (
-        colwise_config(input_layout=dense_sequence_parallel_placement()),
-        rowwise_config(output_layout=dense_sequence_parallel_placement()),
-    ):
-        linear = MXFP8Linear.Config(
-            in_features=128,
-            out_features=128,
-            bias=False,
-            sharding_config=sharding_config,
-        ).build()
-        assert linear._sharding_config is not None
-        # The wrapper is installed at construction, so no caller has to opt
-        # in. Until a data parallel implementation drives its lifecycle it is
-        # the sharded state, which holds the BF16 weight; the unsharded tensor
-        # is a separate type the post-all-gather hook produces.
-        assert isinstance(linear.weight, _LinearShardedTensorWithMXFP8Compute)
-        assert not isinstance(linear.weight, _UnshardedFSDPTensor)
-
-
-def test_mxfp8_converter_replaces_a_root_linear_config(monkeypatch):
-    """A Linear.Config with no parent is returned, not mutated in place.
-
-    ``convert`` writes into ``parent`` for nested configs, so the root case is
-    the one branch that has to return the replacement. Not covered by the FQN
-    test below, which passes a FeedForward and so always has a parent.
-    """
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = MXFP8LinearConverter(
-        MXFP8LinearConverter.Config(
-            model_compile_enabled=True,
-        )
-    )
-
-    converted = converter.convert(
-        Linear.Config(in_features=128, out_features=128, bias=False)
-    )
-
-    assert isinstance(converted, MXFP8Linear.Config)
-    assert converted.input_activation_format_for_backward == "bf16"
-
-
-def test_mxfp8_converter_rejects_unaligned_fused_qkv_head_dim(monkeypatch):
-    if MXFP8Linear is None:
-        pytest.skip("torchao MXFP8Linear is unavailable")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = MXFP8LinearConverter(
-        MXFP8LinearConverter.Config(model_compile_enabled=True)
-    )
-    head_dim = 48
-    n_heads = 4
-    n_kv_heads = 2
-    qkv_config = QKVLinear.Config(
-        head_dim=head_dim,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        wqkv=Linear.Config(
-            in_features=128,
-            out_features=(n_heads + 2 * n_kv_heads) * head_dim,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="head_dim divisible by 32"):
-        converter.convert(qkv_config)
-
-
-def test_mxfp8_converter_applies_mxfp8_saved_input_fqns(monkeypatch):
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = MXFP8LinearConverter(
-        MXFP8LinearConverter.Config(
-            model_compile_enabled=True,
-            linears_saving_inputs_for_backward_in_mxfp8=["w2"],
-        )
-    )
-    converted = converter.convert(
-        FeedForward.Config(
-            w13=Linear.Config(in_features=128, out_features=128, num_linears=2),
-            w2=Linear.Config(in_features=128, out_features=128),
-        )
-    )
-
-    assert isinstance(converted.w13, MXFP8Linear.Config)
-    assert isinstance(converted.w2, MXFP8Linear.Config)
-    assert converted.w13.input_activation_format_for_backward == "bf16"
-    assert converted.w2.input_activation_format_for_backward == "mxfp8"
-
-
-def test_mxfp8_converter_rejects_unmatched_saved_input_fqns(monkeypatch):
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    converter = MXFP8LinearConverter(
-        MXFP8LinearConverter.Config(
-            model_compile_enabled=True,
-            linears_saving_inputs_for_backward_in_mxfp8=["missing"],
-        )
-    )
-    model_config = FeedForward.Config(
-        w13=Linear.Config(in_features=128, out_features=128, num_linears=2),
-        w2=Linear.Config(in_features=128, out_features=128),
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="selectors did not match any converted Linear.Config",
-    ):
-        converter.convert(model_config)
-
-
-def test_mxfp8_converter_rejects_empty_saved_input_fqn():
-    with pytest.raises(ValueError, match="cannot contain an empty FQN selector"):
-        MXFP8LinearConverter.Config(
-            model_compile_enabled=True,
-            linears_saving_inputs_for_backward_in_mxfp8=[""],
-        )
-
-
-@pytest.mark.parametrize(
-    "config_factory, mxfp8_fqns",
-    [
-        (
-            "llama3",
-            ("attention.qkv_linear.wqkv", "feed_forward.w2"),
-        ),
-        (
-            "llama3_graph",
-            ("attention.qkv_linear.wqkv", "feed_forward.w2"),
-        ),
-        (
-            "deepseek_v3",
-            ("attention.wkv_b", "feed_forward.w2", "shared_experts.w2"),
-        ),
-        (
-            "deepseek_v3_graph",
-            ("attention.wkv_b", "feed_forward.w2", "shared_experts.w2"),
-        ),
-    ],
-)
-def test_builtin_mxfp8_configs_assign_input_activation_format_for_backward(
-    monkeypatch, config_factory, mxfp8_fqns
-):
-    if MXFP8Linear is None:
-        pytest.skip("torchao MXFP8Linear is unavailable")
-    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
-    if config_factory == "llama3":
-        from torchtitan.models.llama3.config_registry import (
-            llama3_debugmodel_mxfp8 as build_config,
-        )
-    elif config_factory == "llama3_graph":
-        from torchtitan.experiments.graph_trainer.llama3.config_registry import (
-            graph_trainer_llama3_debugmodel_mxfp8 as build_config,
-        )
-    elif config_factory == "deepseek_v3":
-        from torchtitan.models.deepseek_v3.config_registry import (
-            deepseek_v3_debugmodel_mxfp8 as build_config,
-        )
-    else:
-        from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
-            graph_trainer_deepseek_v3_debugmodel_mxfp8 as build_config,
-        )
-
-    trainer_config = build_config()
-    model_config = trainer_config.model
-    assignments = {
-        fqn: config.input_activation_format_for_backward
-        for fqn, config, _parent, _attr in model_config.traverse(MXFP8Linear.Config)
-    }
-    assert assignments
-    assert "bf16" in assignments.values()
-    assert "mxfp8" in assignments.values()
-    for fqn, save_format in assignments.items():
-        expected = (
-            "mxfp8" if any(selector in fqn for selector in mxfp8_fqns) else "bf16"
-        )
-        assert save_format == expected, f"Unexpected policy for {fqn}"
-
-
-def test_mxfp8_linear_loads_stock_checkpoint():
-    pytest.importorskip("torchao")
-    if MXFP8Linear is None:
-        pytest.skip("torchao MXFP8Linear is unavailable")
-    from torchtitan.quantization.mxfp8.tensor import (
-        _LinearShardedTensorWithMXFP8Compute,
-    )
-
-    stock = Linear.Config(in_features=128, out_features=96).build()
-    mxfp8 = MXFP8Linear.Config(in_features=128, out_features=96).build()
-    with torch.no_grad():
-        stock.weight.normal_()
-
-    mxfp8.load_state_dict(stock.state_dict())
-    assert isinstance(mxfp8.weight, _LinearShardedTensorWithMXFP8Compute)
-    assert torch.equal(mxfp8.weight._tensor, stock.weight)

@@ -5,10 +5,10 @@ Launch training job with the following command (or alternatively set configs in 
 MODULE=llama3 CONFIG=llama3_debugmodel ./run_train.sh --profiler.enable_memory_snapshot --profiler.save_memory_snapshot_folder memory_snapshot
 ```
 * `--profiler.enable_memory_snapshot`: to enable memory profiling
-* `--profiler.save_memory_snapshot_folder`: configures the folder which memory snapshots are dumped into (`profiling/memory_snapshot` under the dump folder by default)
+* `--profiler.save_memory_snapshot_folder`: configures the folder which memory snapshots are dumped into (`./outputs/memory_snapshot/` by default)
 * `--profiler.memory_snapshot_freq`: controls how often regular memory snapshots are taken. When unset, it defaults to `--profiler.profile_freq` for backward compatibility.
-	+ In case of OOMs, the snapshots will be in `step_{step:012d}_exit` under that folder.
-	+ Regular snapshots will be in `step_{step:012d}`.
+	+ In case of OOMs, the snapshots will be in `./outputs/memory_snapshot/iteration_x_exit`.
+	+ Regular snapshots will be in `memory_snapshot/iteration_x`.
 	+ For example, set `--profiler.memory_snapshot_freq 3` to take a snapshot every three iterations independently of trace profiling.
 
 You can find the saved pickle files in your output folder.
@@ -60,144 +60,31 @@ This will print a structured configuration to `stdout`, allowing you to verify t
 
 ## Fake Backend Debugging
 
-TorchTitan has two fake-process-group modes because they answer different
-debugging questions. They intentionally do not share a fallback path:
-
-| Mode | Physical processes | Real communication | Use it to validate |
-| --- | --- | --- | --- |
-| `fake` | One | None | Configuration, logical mesh construction, rank-local model ownership, tensor shapes, and PyTorch-managed memory for one selected PP rank at SPMD coordinate zero. |
-| `real_pp_fake_spmd` | Exactly one per PP rank | PP send/receive only | Pipeline scheduling, real PP buffers and transport, CUDA-graph capture, and rank-local memory while DP, TP, CP, and EP remain logically scaled. |
-
-Use pure fake mode first when a full logical model would require more ranks than
-are locally available. Escalate to real-PP/fake-SPMD when the question involves
-pipeline transport or pipeline buffer lifetime. A real distributed run is still
-required for SPMD communication, numerical, and performance evidence.
-
-### Logical topology
-
-`NGPU` is always the logical world size, not necessarily the number of launched
-processes. For a pipeline degree `P`, each pipeline coordinate contains
-`NGPU / P` flattened SPMD coordinates. These debugging modes always represent
-SPMD coordinate zero, so the selected logical global rank is:
-
-```text
-logical_rank = pp_rank * (NGPU / P)
-```
-
-The logical world size must be divisible by `P`. The environment contract is:
-
-| Variable | Pure fake | Real PP / fake SPMD | Meaning |
-| --- | --- | --- | --- |
-| `NGPU` | Required | Required | Complete logical world size used to construct the model mesh. |
-| `FAKE_PP_RANK` | Required when `P > 1` | Invalid | Logical PP coordinate represented by the single process. |
-| `RANK` | Unused | Set by `torchrun` | Physical rank and PP coordinate in hybrid mode. |
-| `WORLD_SIZE` | Unused | Set by `torchrun` | Physical process count, which must equal `P`. |
-| `LOCAL_RANK` | Set to `0` by `run_train.sh` | Set by `torchrun` | Physical device index for the process. |
-| `MASTER_ADDR`, `MASTER_PORT` | Unused | Set by `torchrun` | Standard rendezvous settings for the real PP group. |
-| `COMM_BACKEND` | `run_train.sh` convenience variable | Do not use | The shell launcher recognizes `fake`; hybrid mode is selected with `--comm.backend`. |
-
-### Fully fake example
-
-This command constructs logical rank `1 * 2 = 2` of a four-rank job with
-PP2 on one physical GPU. It validates that rank's stage, shards, prepared
-weights, pipeline metadata, and memory ownership without creating NCCL process
-groups or transferring peer data.
+Set `COMM_MODE="fake_backend"` to validate your configuration, model setup, and rank-0 program logic without requiring full multi-GPU distributed execution:
 
 ```bash
-NGPU=4 \
-FAKE_PP_RANK=1 \
-COMM_BACKEND=fake \
-MODULE=llama3 \
-CONFIG=llama3_debugmodel \
-./run_train.sh \
-  --parallelism.pipeline_parallel_degree 2 \
-  --parallelism.data_parallel_shard_degree 2
+NGPU=32 COMM_MODE="fake_backend" ./run_train.sh
 ```
 
-Without PP, omit `FAKE_PP_RANK`; the represented rank is logical rank zero.
-`run_train.sh` limits a pure-fake invocation to one training step by default so
-this path remains a diagnostic rather than an accidental benchmark.
+**What it does:**
+- Uses fake process groups that simulate distributed communication without actual data transfer
+- Runs on a single GPU without `torchrun` or NCCL initialization
+- Validates configuration parsing, model initialization, and overall training workflow
+- Executes only one training step by default
 
-### Real PP / fake SPMD example
+**When to use it:**
+- Quick validation of configuration files before launching expensive multi-GPU jobs
+- Debugging training and parallelism logic that doesn't require actual communication. Note that No data-dependent logic should be validated with "fake_backend".
 
-This command launches two physical processes for PP2. Each process represents
-SPMD coordinate zero of its PP rank in a four-rank logical job. `torchrun`
-assigns physical ranks 0 and 1; those ranks are the PP coordinates. TorchTitan
-creates one real NCCL PP group across them and fake groups for every other axis.
-
+**Example use case:**
 ```bash
-NGPU=4 \
-PYTORCH_ALLOC_CONF=expandable_segments:True \
-torchrun \
-  --nproc_per_node=2 \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint=localhost:0 \
-  --role=rank \
-  --tee=3 \
-  -m torchtitan.train \
-  --module llama3 \
-  --config llama3_debugmodel \
-  --comm.backend real_pp_fake_spmd \
-  --parallelism.pipeline_parallel_degree 2 \
-  --parallelism.data_parallel_shard_degree 2 \
-  --training.steps 1
+# Validate a 128-GPU configuration on a single GPU
+NGPU=128 COMM_MODE="fake_backend" MODULE=llama3 CONFIG=llama3_70b ./run_train.sh
 ```
 
-The physical world size must equal the PP degree. Do not set `FAKE_PP_RANK`:
-the physical `RANK` already supplies that coordinate. All physical ranks use
-SPMD coordinate zero and therefore form one PP line through the logical mesh.
+### Limitations
 
-### Memory debugging workflow
-
-Keep the model, dtype, batch geometry, parallel degrees, activation
-checkpointing, FSDP policy, and CUDA-graph settings identical to the intended
-real job. Then:
-
-1. Select the logical PP coordinate whose SPMD-zero ownership is under
-   investigation.
-2. Record allocator summaries or snapshots after initialization, after complete
-   optimizer warmup, during steady-state forward/backward, and after optimizer
-   completion.
-3. Compare the same logical coordinate and observation point across candidate
-   configurations.
-4. Re-run with real PP/fake SPMD if PP transport or buffer lifetime matters.
-5. Finish with a real distributed run when the claim depends on communication,
-   numerics, or performance.
-
-Fake execution represents PyTorch-managed parameters, optimizer state,
-prepared quantized weights, activations, gradients, pipeline buffers, and
-explicit model arenas such as DistMoE scratch and activation storage. It does
-not faithfully represent NCCL communicator allocations, network registration,
-collective scratch, SPMD collective latency, or communication overlap.
-
-### Interpreting failures
-
-- A divisibility or coordinate error is a launch-contract failure. Correct the
-  logical topology instead of changing model shapes to bypass it.
-- A hybrid world-size error means there is not exactly one physical process per
-  PP rank.
-- Pure fake success followed by hybrid failure isolates the problem to PP
-  transport, PP buffer ownership, communicator initialization, or another path
-  exercised only by real pipeline communication.
-- Hybrid success followed by real-run failure points to a real SPMD collective,
-  communication memory, or scale-dependent scheduling behavior.
-- Success in either fake mode does not prove loss equivalence, distributed
-  correctness, throughput, or communication overlap.
-
-The [fake distributed backend skill](../.claude/skills/fake_distributed_backend/SKILL.md)
-contains the operational checklist used for repeatable memory investigations.
-
-## Distributed Breakpoints and LOG_RANK
-
-`run_train.sh` defaults `LOG_RANK` to `0` and passes it to `torchrun` as `--local-ranks-filter`, so only rank 0's stdin/stdout are teed to the console. `torch.distributed.breakpoint(rank=N)` on a filtered rank therefore hangs and never prints a prompt.
-
-To debug rank N, set `LOG_RANK` to N (or a comma-separated list that includes N) before launching. Do not change the default `LOG_RANK` in `run_train.sh`.
-
-```bash
-LOG_RANK=1 ./run_train.sh
-# or, to keep rank 0 visible as well:
-LOG_RANK=0,1 ./run_train.sh
-```
+- **Performance testing**: Fake backend mode does not provide accurate performance metrics; use actual distributed runs for benchmarking
 
 ## Troubleshooting jobs that timeout
 
@@ -258,17 +145,19 @@ For multiple experimental runs with different parallelism configs, we need to us
 
 #### Creating a Seed Checkpoint
 
-Create a registry configuration with `create_seed_checkpoint=True`, a
-non-`None` `checkpointer`, and every parallelism degree set to 1, then run it
-on one device.
+```bash
+NGPU=1 MODULE=llama3 CONFIG=llama3_debugmodel ./run_train.sh --checkpoint.enable --checkpoint.create_seed_checkpoint --parallelism.data_parallel_replicate_degree 1 --parallelism.data_parallel_shard_degree 1 --parallelism.tensor_parallel_degree 1 --parallelism.pipeline_parallel_degree 1 --parallelism.context_parallel_degree 1 --parallelism.expert_parallel_degree 1
+```
 
 #### Loading Seed Checkpoints for Debugging
 
 When using seed checkpoints for debugging or validation purposes, you can enable the `load_only` configuration to load checkpoints without saving any new ones during training. This is particularly useful when you only want to verify model correctness or compare different configurations without cluttering your disk:
 
-Set `checkpointer=CheckpointManager.Config(load_only=True)` in the config
-registry. The `load_only` setting prevents the training process from saving
-any checkpoints, allowing you to:
+```bash
+MODULE=llama3 CONFIG=llama3_debugmodel ./run_train.sh --checkpoint.enable --checkpoint.load_only
+```
+
+The `--checkpoint.load_only` flag prevents the training process from saving any checkpoints, allowing you to:
 - Run debugging sessions without generating unwanted checkpoint files
 - Compare model behaviors using the same initial weights without checkpoint overhead
 

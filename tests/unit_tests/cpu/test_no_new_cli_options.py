@@ -23,32 +23,33 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "activation_checkpoint.force_recompute_mm_shapes_by_fqns",
         "activation_checkpoint.memory_budget",
         "activation_checkpoint.preserve_rng_state",
-        "activation_checkpoint.save_regions",
         "activation_checkpoint.visualize_memory_budget_pareto",
-        "checkpointer.async_mode",
-        "create_seed_checkpoint",
-        "checkpointer.enable_first_step_checkpoint",
-        "checkpointer.exclude_from_loading",
-        "checkpointer.export_dtype",
-        "checkpointer.folder",
-        "checkpointer.initial_load_in_hf",
-        "checkpointer.initial_load_in_hf_quantized",
-        "checkpointer.initial_load_model_only",
-        "checkpointer.initial_load_path",
-        "checkpointer.interval",
-        "checkpointer.keep_latest_k",
-        "checkpointer.last_save_in_hf",
-        "checkpointer.last_save_model_only",
-        "checkpointer.load_only",
-        "checkpointer.load_step",
+        "checkpoint.async_mode",
+        "checkpoint.create_seed_checkpoint",
+        "checkpoint.enable",
+        "checkpoint.enable_first_step_checkpoint",
+        "checkpoint.exclude_from_loading",
+        "checkpoint.export_dtype",
+        "checkpoint.folder",
+        "checkpoint.initial_load_in_hf",
+        "checkpoint.initial_load_in_hf_quantized",
+        "checkpoint.initial_load_model_only",
+        "checkpoint.initial_load_path",
+        "checkpoint.interval",
+        "checkpoint.keep_latest_k",
+        "checkpoint.last_save_in_hf",
+        "checkpoint.last_save_model_only",
+        "checkpoint.load_only",
+        "checkpoint.load_step",
         "comm.init_timeout_seconds",
-        "comm.backend",
+        "comm.mode",
         "comm.save_traces_file_prefix",
         "comm.save_traces_folder",
         "comm.trace_buf_size",
         "comm.train_timeout_seconds",
         "compile.backend",
         "compile.components",
+        "compile.enable",
         "compile.enable_async_tensor_parallel",
         "dataloader.build_mrope_positions",
         "dataloader.dataset",
@@ -60,7 +61,7 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "dataloader.img_size",
         "dataloader.infinite",
         "dataloader.load_dataset_kwargs",
-        "dataloader.max_images_per_microbatch",
+        "dataloader.max_images_per_batch",
         "dataloader.max_patches",
         "dataloader.max_patches_per_side",
         "dataloader.max_pixels",
@@ -106,13 +107,6 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "encoder.clip_encoder",
         "encoder.random_init",
         "encoder.t5_encoder",
-        "ema.buffer_patterns",
-        "ema.decay",
-        "ema.half_life_fraction",
-        "ema.offload_to_cpu",
-        "ema.start_step",
-        "ema.step_bias",
-        "ema.update_every_n_steps",
         "hf_assets_path",
         "inference.img_size",
         "inference.local_batch_size",
@@ -145,22 +139,23 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "optimizer.param_groups.pattern",
         "override.imports",
         "parallelism.context_parallel_degree",
+        "parallelism.context_parallel_load_balancer",
+        "parallelism.context_parallel_ptrr_mask_key",
         "parallelism.data_parallel_replicate_degree",
         "parallelism.data_parallel_shard_degree",
         "parallelism.enable_fsdp_symm_mem",
         "parallelism.enable_sequence_parallel",
         "parallelism.expert_parallel_degree",
         "parallelism.fsdp_reshard_after_forward",
+        "parallelism.module_fqns_per_model_part",
         "parallelism.pipeline_parallel_degree",
         "parallelism.pipeline_parallel_first_stage_less_layers",
         "parallelism.pipeline_parallel_last_stage_less_layers",
         "parallelism.pipeline_parallel_layers_per_stage",
-        "parallelism.pipeline_parallel_module_fqns_per_model_part",
         "parallelism.num_pp_microbatches",
-        "parallelism.pp_max_unsharded_active_stages",
-        "parallelism.pp_num_unshard_lookahead_factor",
         "parallelism.pipeline_parallel_schedule",
         "parallelism.pipeline_parallel_schedule_csv",
+        "parallelism.spmd_backend",
         "parallelism.tensor_parallel_degree",
         "profiler.enable_memory_snapshot",
         "profiler.enable_profiling",
@@ -206,7 +201,7 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "validator.dataloader.img_size",
         "validator.dataloader.infinite",
         "validator.dataloader.load_dataset_kwargs",
-        "validator.dataloader.max_images_per_microbatch",
+        "validator.dataloader.max_images_per_batch",
         "validator.dataloader.max_patches",
         "validator.dataloader.max_patches_per_side",
         "validator.dataloader.max_pixels",
@@ -237,6 +232,7 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "validator.dataloader.video_max_frames",
         "validator.dataloader.video_min_frames",
         "validator.dataloader.weight",
+        "validator.enable",
         "validator.freq",
         "validator.sampling.classifier_free_guidance_scale",
         "validator.sampling.denoising_steps",
@@ -273,7 +269,7 @@ def _cli_options(config, prefix: str = "") -> set[str]:
     options = set()
     # Resolved rather than raw: a module using ``from __future__ import
     # annotations`` stores its field types as strings, which would hide the
-    # Suppress annotation. checkpointer.py is one such module.
+    # Suppress annotation. checkpoint.py is one such module.
     hints = typing.get_type_hints(type(config), include_extras=True)
     for f in dataclasses.fields(config):
         field_type = hints.get(f.name, f.type)
@@ -297,13 +293,13 @@ def _subclasses(config_cls: type) -> set[type]:
     """``config_cls`` and every imported subclass of it defined in core.
 
     ``__subclasses__`` sees whatever the process has imported, so an
-    application-specific config subclass would otherwise appear in the
-    snapshot for any test run that happened to import it first. The freeze
-    covers the dataset-driven training loop, not experiments or RL.
+    experiment's config subclass would otherwise appear in the snapshot for
+    any test run that happened to import it first. The freeze covers core, and
+    ``torchtitan/experiments`` sets its own rules.
     """
     found = {config_cls}
     for sub in config_cls.__subclasses__():
-        if sub.__module__.startswith(("torchtitan.experiments.", "torchtitan.rl.")):
+        if sub.__module__.startswith("torchtitan.experiments."):
             continue
         found |= _subclasses(sub)
     return found
@@ -369,7 +365,6 @@ _GUARDED_CONFIGS = (
     ("deepseek_v4", "deepseek_v4_debugmodel"),
     ("qwen3", "qwen3_debugmodel"),
     ("qwen3_5", "qwen35_debugmodel_moe"),
-    ("qwen3_6", "qwen36_debugmodel_moe"),
     ("qwen3_8", "qwen38_debugmodel_moe"),
     ("gpt_oss", "gpt_oss_debugmodel"),
     ("flux", "flux_debugmodel"),
@@ -431,8 +426,8 @@ class TestCliOptionsFrozen(unittest.TestCase):
         """The escape hatch the freeze depends on."""
         hints = typing.get_type_hints(Trainer.Config, include_extras=True)
         self.assertTrue(
-            _is_suppressed(hints["model"]),
-            "Trainer.Config.model must stay tyro.conf.Suppress: it is "
+            _is_suppressed(hints["model_spec"]),
+            "Trainer.Config.model_spec must stay tyro.conf.Suppress: it is "
             "what keeps the model config tree off the command line, and "
             "therefore what makes the frozen CLI workable.",
         )

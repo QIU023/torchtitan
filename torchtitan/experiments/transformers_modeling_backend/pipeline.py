@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import copy
-import logging
 import math
 from collections.abc import Callable
 
@@ -21,8 +20,7 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from torchtitan.components.loss import LossFunction
-from torchtitan.config import CompileConfig, TrainingConfig
-from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.pipeline_parallel import (
@@ -31,12 +29,11 @@ from torchtitan.distributed.pipeline_parallel import (
 )
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.model import BaseModel
+from torchtitan.protocols.model_spec import ParallelizeFunction
 from torchtitan.protocols.module import ModuleDict, ModuleList
+from torchtitan.tools.logging import logger
 
 # NOTE(3outeille): the only modifications comes from replacing None to nn.Identity and adding rotary_emb per model_part
-
-
-logger = logging.getLogger(__name__)
 
 
 def generate_llm_fqn_per_model_part(
@@ -149,13 +146,13 @@ def generate_llm_fqn_per_model_part(
 
 
 def pipeline_module_split(
-    whole_model: BaseModel,
+    whole_model: nn.Module,
     pp_mesh: DeviceMesh,
     pp_schedule: str,
     device: torch.device,
     module_names_per_stage: list[list[str]],
     get_mesh: Callable | None = None,
-) -> tuple[list[PipelineStage], list[BaseModel]]:
+) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API creates pipeline stages based on specified module names for each stage.
 
@@ -291,18 +288,19 @@ def pipeline_module_split(
 
 
 def pipeline_hf_transformers(
-    model: BaseModel,
+    model: nn.Module,
     parallel_dims: ParallelDims,
     *,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig | None,
+    compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     device: torch.device,
     model_config: BaseModel.Config,
+    parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
-) -> tuple[_PipelineSchedule, list[BaseModel], bool, bool]:
+) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
     pp_mesh = parallel_dims.get_mesh("pp")
 
     # Determine the number of virtual stages based on schedule type
@@ -368,7 +366,7 @@ def pipeline_hf_transformers(
         stages_per_rank = 1 if is_single_stage_schedule else 2
         num_virtual_stages = parallel_dims.pp * stages_per_rank
 
-    module_names_per_stage = parallelism.pipeline_parallel_module_fqns_per_model_part
+    module_names_per_stage = parallelism.module_fqns_per_model_part
     if module_names_per_stage is None:
         module_names_per_stage = generate_llm_fqn_per_model_part(
             num_virtual_stages, num_layers, input_weight, output_weight
@@ -388,7 +386,8 @@ def pipeline_hf_transformers(
     # optimizer, and checkpointing
     for i, m in enumerate(model_parts):
         # apply SPMD-style PT-D techniques
-        m = m.parallelize(
+        m = parallelize_fn(
+            m,
             parallel_dims=parallel_dims,
             training=training,
             parallelism=parallelism,

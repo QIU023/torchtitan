@@ -37,7 +37,7 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             configs=[recipes.llama3_debugmodel_float8_fsdp2_tp2_pp2_asynctp_compile],
             test_descr="FSDP+async TP+PP+torch.compile+Float8",
-            test_name="fsdp+tp+pp+compile+float8",
+            test_name="fsdp+tp+cp+compile+float8",
             ngpu=8,
         ),
         OverrideDefinitions(
@@ -47,17 +47,27 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
             ngpu=8,
         ),
         OverrideDefinitions(
-            configs=[recipes.deepseek_v3_debugmodel_float8_grouped_fsdp2_ep2_compile],
-            test_descr="Float8 grouped experts with expert FSDP and torch.compile",
-            test_name="float8_grouped_experts_fsdp",
-            ngpu=4,
-        ),
-        OverrideDefinitions(
             configs=[recipes.deepseek_v3_debugmodel_hybridep_fsdp4_ep2_compile],
             test_descr="DeepSeek V3 FSDP+HybridEP+compile",
             test_name="deepseek_v3_fsdp+hybridep+compile",
             ngpu=4,
             # deep_ep/NVSHMEM is CUDA-only, so skip on ROCm.
+            skip_rocm_test=True,
+        ),
+        OverrideDefinitions(
+            configs=[
+                recipes.deepseek_v3_debugmodel_minimal_async_ep_fsdp2_tp2_cp2_ep8_sdc_replay
+            ],
+            test_descr="DeepSeek V3 FSDP+CP+TP+MinimalAsyncEP with SDC replay",
+            test_name="deepseek_v3_fsdp+cp+tp+minimal_async_ep+sdc_replay",
+            ngpu=8,
+            skip_rocm_test=True,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.deepseek_v3_debugmodel_minimal_async_ep_fsdp2_tp2_cp2_ep8],
+            test_descr="DeepSeek V3 FSDP+CP+TP+MinimalAsyncEP",
+            test_name="deepseek_v3_fsdp+cp+tp+minimal_async_ep",
+            ngpu=8,
             skip_rocm_test=True,
         ),
         OverrideDefinitions(
@@ -75,12 +85,5 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
             test_name="qwen3_fsdp+deepep",
             ngpu=4,
             skip_rocm_test=True,
-        ),
-        OverrideDefinitions(
-            configs=[recipes.qwen35_debugmodel_moe_float8_lora],
-            test_descr="Qwen3.5 MoE Float8 + LoRA",
-            test_name="qwen3_5_moe_float8_lora",
-            ngpu=8,
-            use_real_pg=True,
         ),
     ]

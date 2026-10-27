@@ -4,44 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from .activation import (
-    BinaryActivationFn,
-    Sigmoid,
-    SiTUGLU,
-    Softmax,
-    SqrtSoftplus,
-    SwiGLU,
-    UnaryActivationFn,
-)
 from .attention import (
+    BaseQKVLinear,
     create_attention_mask,
     create_varlen_metadata_for_document,
-    FlexInnerAttention,
+    FlexAttention,
+    FusedQKVLinear,
     get_causal_mask_mod,
     get_document_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_fixed_block_mask_mod,
     get_sliding_window_mask_mod,
     GQAttention,
-    InnerAttention,
     QKVLinear,
-    ScaledDotProductInnerAttention,
-    VarlenInnerAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
     VarlenMetadata,
 )
 from .decoder import Decoder, TransformerBlock
 from .embedding import Embedding
-from .feed_forward import compute_ffn_hidden_dim, FeedForward
-from .linear import (
-    CastLinear,
-    ColumnParallelLinear,
-    GroupedLinear,
-    Linear,
-    RouterGateLinear,
-    RowParallelLinear,
-)
-from .moe import MicrobatchWiseLoadBalanceLoss, MoE
-from .multimodal import MultimodalModel
+from .feed_forward import compute_ffn_hidden_dim, FeedForward, SigmoidGatedFeedForward
+from .linear import Linear, ScaledBiasRowwiseLinear
+from .moe import MoE
 from .nn_modules import (
     Conv1d,
     Conv2d,
@@ -58,16 +42,16 @@ __all__ = [
     "Conv1d",
     "Conv2d",
     "ComplexRoPE",
-    "CastLinear",
-    "ColumnParallelLinear",
     "CosSinRoPE",
     "create_attention_mask",
     "create_varlen_metadata_for_document",
     "Decoder",
     "Embedding",
     "FeedForward",
-    "FlexInnerAttention",
-    "QKVLinear",
+    "SigmoidGatedFeedForward",
+    "FlexAttention",
+    "BaseQKVLinear",
+    "FusedQKVLinear",
     "GELU",
     "get_causal_mask_mod",
     "get_document_mask_mod",
@@ -76,29 +60,18 @@ __all__ = [
     "get_sliding_window_mask_mod",
     "GQAttention",
     "GroupNorm",
-    "GroupedLinear",
     "Identity",
-    "InnerAttention",
     "LayerNorm",
     "Linear",
     "MoE",
-    "MicrobatchWiseLoadBalanceLoss",
-    "MultimodalModel",
+    "QKVLinear",
     "RMSNorm",
     "RoPE",
-    "RowParallelLinear",
-    "RouterGateLinear",
-    "ScaledDotProductInnerAttention",
-    "Sigmoid",
+    "ScaledBiasRowwiseLinear",
+    "ScaledDotProductAttention",
     "SiLU",
-    "BinaryActivationFn",
-    "SiTUGLU",
-    "Softmax",
-    "SqrtSoftplus",
-    "SwiGLU",
     "TransformerBlock",
-    "UnaryActivationFn",
-    "VarlenInnerAttention",
+    "VarlenAttention",
     "VarlenMetadata",
     "compute_ffn_hidden_dim",
 ]

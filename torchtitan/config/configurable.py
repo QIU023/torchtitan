@@ -8,13 +8,11 @@ import dataclasses
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
-from typing import ClassVar, TypeVar
+from typing import ClassVar
 
 from torchtitan.observability import structured_logger as sl
 
 logger = logging.getLogger(__name__)
-
-_ConfigT = TypeVar("_ConfigT", bound="Configurable.Config")
 
 
 class Configurable:
@@ -52,7 +50,7 @@ class Configurable:
                 if hasattr(val, "to_dict"):
                     return val.to_dict()
                 elif dataclasses.is_dataclass(val):
-                    return {f.name: _convert(getattr(val, f.name)) for f in fields(val)}
+                    return _convert(dataclasses.asdict(val))
                 elif isinstance(val, (list, tuple)):
                     return type(val)(_convert(v) for v in val)
                 elif isinstance(val, dict):
@@ -75,12 +73,10 @@ class Configurable:
             }
 
         def traverse(
-            self,
-            config_cls: type[_ConfigT],
-            *,
-            recurse: bool = False,
-            _prefix: str = "",
-        ) -> Iterator[tuple[str, _ConfigT, object | None, str | int | None]]:
+            self, config_cls: type, *, recurse: bool = False, _prefix: str = ""
+        ) -> Iterator[
+            tuple[str, "Configurable.Config", object | None, str | int | None]
+        ]:
             """Yield ``(fqn, config, parent, field_name)`` for every nested config of *config_cls*.
 
             Recursively traverses dataclass fields, including items inside lists.

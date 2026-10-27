@@ -19,8 +19,6 @@ import torch.nn.functional as F
 from attn_gym.linear import causal_conv1d, chunk_gdn, l2norm, recurrent_gdn
 from torch import nn
 
-from torchtitan.distributed.parallel_dims import MeshAxisName
-from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import VarlenMetadata
@@ -209,8 +207,8 @@ _recurrent_gdn_fwd.register_autograd(
 class GatedDeltaKernel(Module):
     """Run GDN on rank-local tensors.
 
-    This module provides a local SPMD boundary for the sharding code. A
-    pure-torch reference implementation lives in
+    This module provides the boundary that sharding wraps with DTensor-to-local
+    conversion. A pure-torch reference implementation lives in
     ``tests/unit_tests/gpu/test_qwen3_5_deltanet.py``.
     """
 
@@ -410,18 +408,6 @@ class GatedDeltaNet(Module):
         x_TD: torch.Tensor,
         attention_masks: VarlenMetadata | None = None,
     ) -> torch.Tensor:
-        tp_group = spmd_mesh_group(MeshAxisName.TP)
-        if tp_group is not None:
-            # All six input projections consume x, so gather it once before
-            # entering their separate compute paths.
-            x_TD = spmd.redistribute(
-                x_TD,
-                tp_group,
-                src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
-                dst=spmd.R,
-                backward_options={"op_dtype": x_TD.dtype},
-            )
-
         num_tokens = x_TD.shape[0]
         if attention_masks is not None:
             cu_seqlens = attention_masks.cu_seq_q

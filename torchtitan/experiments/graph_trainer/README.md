@@ -13,6 +13,14 @@ This experiment demonstrates graph-based distributed training in torchtitan thro
 - **Composable parallelism** — FSDP + TP + EP in the graph, with async tensor parallel (micro-pipeline TP via symmetric memory) as an opt-in graph pass.
 - **Debug tooling** — tlparse integration for browser-based graph inspection, and CUDA graph kernel annotations in profiler traces.
 
+<details>
+<summary>Legacy compilation modes (deprecated)</summary>
+
+In addition to the default `aot_fx_trace` mode, two legacy modes exist but are deprecated and will be removed:
+- **AOT mode** (`--compile.mode aot`): Explicit joint graph export with a custom graph pass pipeline.
+- **JIT mode** (`--compile.mode jit`): Standard `torch.compile()` with graph passes registered to custom backends.
+</details>
+
 ### Prerequisites
 
 GraphTrainer requires the latest PyTorch nightly, which can be installed (e.g., for CUDA 13.0) via:
@@ -54,7 +62,7 @@ NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b ./r
 
 ### GraphPP Pipeline Parallelism
 
-GraphPP is the pipeline-parallel path for GraphTrainer models.
+GraphPP is the `aot_fx_trace` pipeline-parallel path for GraphTrainer models.
 It reuses TorchTitan's eager PP module splitting and PyTorch PP schedules, then
 traces one representative microbatch per local stage with GraphTrainer's
 `minimal_fx_tracer`. The resulting per-stage graph bundles are reused for later
@@ -63,11 +71,12 @@ schedule action.
 
 Design references:
 - GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3780
-- CUDA-graph-compatible GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3820
+- CUDAGraphable GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3820
 
 ```bash
 NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel ./run_train.sh \
   --training.disable_cuda_graphs \
+  --compile.mode aot_fx_trace \
   --parallelism.pipeline_parallel_degree 2 \
   --parallelism.num_pp_microbatches 8 \
   --parallelism.pipeline_parallel_schedule Interleaved1F1B \
@@ -101,7 +110,7 @@ and EP-overlap annotations will be composed with GraphPP in a later PR.
 
 ### Compiler Optimizations
 
-GraphTrainer has a built-in pass pipeline controlled by dedicated flags.
+The `aot_fx_trace` mode has a built-in pass pipeline controlled by dedicated flags.
 
 ```bash
 # Full Inductor compilation (default is regional — compiles only tagged regions)
@@ -114,16 +123,16 @@ MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --comp
 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_671b ./run_train.sh \
   --compile.memory_policy full \
   --compile.full_recompute_save_ops \
-  'layers.*.moe.router.gate::aten.mm.dtype | layers.*.attention.wkv_a::aten.mm.default'
+  'layers.*.moe.router.gate::aten.mm.default | layers.*.attention.wkv_a::aten.mm.default'
 
 # CPU activation offloading
 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.memory_policy cpu_offload_all
 
 # Disable CUDA graphs (for debugging)
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.disable_passes cuda_graph_pass
+MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.disable_passes cudagraph_pass
 
 # Disable specific passes by name
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.disable_passes custom_codegen_pass,cuda_graph_pass
+MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.disable_passes custom_codegen_pass,cudagraph_pass
 
 # Disable all graph passes (for debugging)
 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.no-enable_passes
@@ -132,12 +141,13 @@ MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --comp
 ### Expert Parallel Overlap
 
 EP overlap is an experimental graph-trainer optimization for MoE models with
-real expert-parallel collectives. Enable it only with
+real expert-parallel collectives. Enable it only with `aot_fx_trace` and
 `expert_parallel_degree > 1`:
 
 ```bash
 NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel \
     ./run_train.sh \
+    --compile.mode aot_fx_trace \
     --compile.ep_overlap.enabled \
     --compile.ep_overlap.strategy graph \
     --compile.ep_overlap.chunk_dim batch \
@@ -174,13 +184,15 @@ Current limitations:
 ### Experimental AutoParallel Sharding
 
 GraphTrainer can use AutoParallel to solve SPMD placement for supported models,
-then trace and compile the placed model through the regular GraphRuntime flow.
-Enable it with `--compile.enable_autoparallel`.
+then trace and compile the placed model through the regular `aot_fx_trace`
+flow. Enable it with `--compile.enable_autoparallel`; `--compile.mode
+aot_fx_trace` is required.
 
 Llama 3 debug model:
 
 ```bash
 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_debugmodel ./run_train.sh \
+  --compile.mode aot_fx_trace \
   --compile.enable_autoparallel \
   --parallelism.data_parallel_shard_degree 2 \
   --parallelism.tensor_parallel_degree 2
@@ -190,6 +202,7 @@ DeepSeek V3 debug model:
 
 ```bash
 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel ./run_train.sh \
+  --compile.mode aot_fx_trace \
   --compile.enable_autoparallel \
   --parallelism.data_parallel_shard_degree 4 \
   --parallelism.expert_parallel_degree 2
@@ -197,7 +210,7 @@ MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel ./r
 
 AutoParallel is only responsible for producing the placed model. After that,
 GraphTrainer captures the full train step with `minimal_fx_tracer` and applies
-the normal graph pass pipeline: the configured memory policy, selective
+the normal `aot_fx_trace` pipeline: the configured memory policy, selective
 activation remat, CPU offload, bucketing and overlap passes, regional or full
 Inductor compilation, CUDA graph compatibility checks, and any other enabled
 GraphTrainer passes. This keeps AutoParallel placement composable with the same
@@ -280,7 +293,7 @@ filesystem path for the artifact directory in multi-node setups.
 
 ### Composability Support
 
-GraphRuntime composability status:
+Composability status for `aot_fx_trace` mode:
 
 | Feature | Support |
 | :--------: | :--------: |

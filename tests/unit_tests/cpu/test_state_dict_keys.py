@@ -52,13 +52,13 @@ _ADAMW_STATE_NAMES = ("step", "exp_avg", "exp_avg_sq")
 # failure, but a rename in the model would.
 _TOP_LEVEL_ANCHORS = ("tok_embeddings.weight", "norm.weight", "lm_head.weight")
 _LAYER0_ANCHORS = (
-    # debugmodel uses fused QKV by default, and native state dicts retain its
-    # single packed ``wqkv`` parameter.
+    # debugmodel uses fused QKV by default, so named_parameters() exposes the
+    # single fused ``wqkv`` (state_dict() splits it back to wq/wk/wv via a hook).
     "layers.0.attention.qkv_linear.wqkv.weight",
     "layers.0.attention.wo.weight",
-    # FeedForward stores gate/up in one physical w13 parameter.
-    "layers.0.feed_forward.w13.weight",
+    "layers.0.feed_forward.w1.weight",
     "layers.0.feed_forward.w2.weight",
+    "layers.0.feed_forward.w3.weight",
     "layers.0.attention_norm.weight",
     "layers.0.ffn_norm.weight",
 )
@@ -223,32 +223,6 @@ class TestStateDictKeys(unittest.TestCase):
                 )
             else:
                 self.assertEqual(v1, v2, f"value mismatch at {key}")
-
-    def test_init_optim_state_materializes_missing_state(self) -> None:
-        initialized = torch.nn.Parameter(torch.ones(1))
-        missing = torch.nn.Parameter(torch.ones(1))
-        optim = torch.optim.AdamW([initialized, missing])
-        initialized.grad = torch.ones_like(initialized)
-        optim.step()
-        saved_grad = initialized.grad
-        saved_params = [param.detach().clone() for param in (initialized, missing)]
-        saved_lr = optim.param_groups[0]["lr"]
-        saved_state = {
-            key: value.clone() for key, value in optim.state[initialized].items()
-        }
-
-        init_optim_state(optim)
-
-        self.assertIs(initialized.grad, saved_grad)
-        self.assertIsNone(missing.grad)
-        for key, value in saved_state.items():
-            self.assertTrue(torch.equal(optim.state[initialized][key], value))
-        self.assertEqual(optim.state[missing]["step"].item(), 0)
-        self.assertEqual(optim.state[missing]["exp_avg"].count_nonzero().item(), 0)
-        self.assertEqual(optim.state[missing]["exp_avg_sq"].count_nonzero().item(), 0)
-        for param, value in zip((initialized, missing), saved_params):
-            self.assertTrue(torch.equal(param, value))
-        self.assertEqual(optim.param_groups[0]["lr"], saved_lr)
 
 
 if __name__ == "__main__":

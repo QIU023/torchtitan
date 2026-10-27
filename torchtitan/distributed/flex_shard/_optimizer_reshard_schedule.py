@@ -340,15 +340,9 @@ def _validate_disjoint_regions_in_bounds(
         f"{direction} regions must be in bounds",
     )
 
-    positive_regions = sorted(
-        (region for region in regions if region.numel),
-        key=lambda region: region.offsets,
-    )
+    positive_regions = tuple(region for region in regions if region.numel)
     for index, first in enumerate(positive_regions):
-        for other_index in range(index + 1, len(positive_regions)):
-            second = positive_regions[other_index]
-            if bounds_shape and second.offsets[0] >= first.offsets[0] + first.shape[0]:
-                break
+        for second in positive_regions[index + 1 :]:
             _require_valid_plan(
                 not all(
                     max(first_offset, second_offset)

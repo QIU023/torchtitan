@@ -6,12 +6,14 @@
 
 from dataclasses import dataclass
 
+import torch
+
 from torchtitan.models.muse_glimmer import MuseGlimmerModel
 
-from ..model import GraphTrainerModel
+from ..simple_fsdp import disable_active_parametrization
 
 
-class GraphTrainerMuseGlimmerModel(GraphTrainerModel, MuseGlimmerModel):
+class GraphTrainerMuseGlimmerModel(MuseGlimmerModel):
     @dataclass(kw_only=True, slots=True)
     class Config(MuseGlimmerModel.Config):
         pass
@@ -19,9 +21,10 @@ class GraphTrainerMuseGlimmerModel(GraphTrainerModel, MuseGlimmerModel):
     def __init__(self, config: Config):
         super().__init__(config)
 
-    def parallelize(self, *, parallel_dims, **kwargs):
-        if parallel_dims.cp_enabled:
-            raise ValueError(
-                "Context parallelism is not supported for GraphTrainer MuseGlimmer."
-            )
-        return super().parallelize(parallel_dims=parallel_dims, **kwargs)
+    def init_states(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        with disable_active_parametrization():
+            super().init_states(buffer_device=buffer_device)

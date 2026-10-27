@@ -11,9 +11,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from torchtitan.config import TrainingConfig
-from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.experiments.graph_trainer.configs import (
+    GraphTrainerCompileConfig,
+    validate_autoparallel_config,
+)
 
 
 class _FakeMesh:
@@ -39,7 +41,7 @@ class _FakeParallelDims:
         self.tp_enabled = not sparse
 
     def get_optional_mesh(self, name):
-        enabled = {"dp_shard", "tp"} if not self.sparse else {"efsdp", "ep"}
+        enabled = {"fsdp", "tp"} if not self.sparse else {"efsdp", "ep"}
         return _FakeMesh((name,)) if name in enabled else None
 
     def get_mesh(self, names):
@@ -110,6 +112,22 @@ def test_autoparallel_integration_matrix():
     assert all(test.ngpu == 4 for tests in suites.values() for test in tests)
 
 
+def test_autoparallel_config_validation():
+    with pytest.raises(ValueError, match="only supports --compile.mode aot_fx_trace"):
+        validate_autoparallel_config(
+            GraphTrainerCompileConfig(
+                mode="jit",
+                enable_autoparallel=True,
+            )
+        )
+
+    compile_config = GraphTrainerCompileConfig(
+        inductor_compilation="regional",
+        enable_autoparallel=True,
+    )
+    validate_autoparallel_config(compile_config)
+
+
 def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
     from torchtitan.experiments.graph_trainer import passes
 
@@ -121,9 +139,9 @@ def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
         compile=GraphTrainerCompileConfig(
             enable_autoparallel=True,
             enable_async_tensor_parallel=False,
-            disable_passes=["cuda_graph_pass"],
+            disable_passes=["cudagraph_pass"],
         ),
-        model=SimpleNamespace(layers=[object()]),
+        model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
         parallelism=SimpleNamespace(
             fsdp_reshard_after_forward="always",
             pipeline_parallel_degree=1,

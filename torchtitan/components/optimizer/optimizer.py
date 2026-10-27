@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -12,14 +11,17 @@ from dataclasses import dataclass, field
 from typing import Any, cast, Generic, Literal, overload, Protocol, TypeVar
 
 import torch
+import torch.distributed.tensor
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import Replicate
 from torch.optim import Optimizer
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.flex_shard import build_dist_muon
+from torchtitan.tools.logging import logger
 
 from .utils import (
     get_flat_optim_state_dict,
@@ -27,15 +29,11 @@ from .utils import (
     load_flat_optim_state_dict,
 )
 
-logger = logging.getLogger(__name__)
-
-
 __all__ = [
     "OptimizersContainer",
     "ParamGroupConfig",
     "default_adamw",
     "register_moe_load_balancing_hook",
-    "register_moe_quantile_balancing_hook",
 ]
 
 
@@ -72,14 +70,10 @@ class ParamGroupConfig:
 T = TypeVar("T", bound=Optimizer)
 
 
-class _MoERouterLike(Protocol):
-    tokens_per_expert_E: torch.Tensor  # noqa: N815
-
-
 class _MoELike(Protocol):
     load_balance_coeff: float | None
+    tokens_per_expert_E: torch.Tensor  # noqa: N815
     expert_bias_E: torch.Tensor  # noqa: N815
-    router: _MoERouterLike
 
 
 class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
@@ -126,8 +120,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         - 'fused_opt_states_bf16': Like 'fused', but initialize Adam/AdamW
           momentum and variance in bfloat16 via a step pre-hook so the fused
           CUDA kernel uses its mixed-precision path (fp32 params + bf16 states).
-          Only supported for Adam/AdamW. See
-          torchtitan/components/optimizer/bf16_optimizer_states.md.
+          Only supported for Adam/AdamW. See docs/bf16_optimizer_states.md.
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
@@ -337,16 +330,13 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         Optimizer.__init__(self, all_params, {})
 
     def _register_bf16_optimizer_state_hook(self) -> None:
-        """Create and restore Adam optimizer states in bfloat16.
+        """Register a step pre-hook to create Adam optimizer states in bfloat16.
 
         The hook pre-populates optimizer state before Adam's lazy initialization
         runs, so that ``_init_group`` finds non-empty state and skips its own
         fp32 allocation. The fused CUDA kernel then sees the dtype mismatch
         between fp32 params and bf16 states, dispatching to the mixed-precision
         kernel (``FusedAdamMathFunctorMP``).
-
-        A load post-hook reapplies the state dtype after PyTorch's
-        ``load_state_dict`` casts floating-point states to the parameter dtype.
         """
 
         def _bf16_state_init_hook(
@@ -376,19 +366,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
                                 memory_format=torch.preserve_format,
                             )
 
-        def _bf16_state_load_hook(optimizer: Optimizer) -> None:
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    state = optimizer.state.get(p, {})
-                    # Keep step's dtype/device policy and any other state intact.
-                    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                        if key in state:
-                            state[key] = state[key].to(dtype=torch.bfloat16)
-
         for optim in self.optimizers:
             if isinstance(optim, (torch.optim.Adam, torch.optim.AdamW)):
                 optim.register_step_pre_hook(_bf16_state_init_hook)
-                optim.register_load_state_dict_post_hook(_bf16_state_load_hook)
 
     def init_cache_state_dict(self) -> None:
         """Initialize cached state dict for TorchFT. No-op for base class."""
@@ -439,20 +419,11 @@ def register_moe_load_balancing_hook(
         model_parts: list[nn.Module],
     ) -> Iterator[tuple[nn.Module, _MoELike]]:
         for model_part in model_parts:
-            # MTP decoder blocks live in ``mtp_layers`` after FSDP wrapping;
-            # they are only temporarily inserted into ``layers`` while FSDP
-            # is applied. Keep both containers in the runtime hook so MTP
-            # expert bias and usage counters receive the same update as the
-            # main decoder layers.
-            layer_containers = [model_part.get_submodule("layers")]
-            mtp_layers = getattr(model_part, "mtp_layers", None)
-            if mtp_layers is not None:
-                layer_containers.append(mtp_layers)
-            for layers in layer_containers:
-                assert isinstance(layers, (nn.ModuleDict, nn.ModuleList))
-                for transformer_block in layers.children():
-                    if getattr(transformer_block, "moe_enabled", False):
-                        yield transformer_block, cast(_MoELike, transformer_block.moe)
+            layers = model_part.get_submodule("layers")
+            assert isinstance(layers, nn.ModuleDict)
+            for transformer_block in layers.values():
+                if getattr(transformer_block, "moe_enabled", False):
+                    yield transformer_block, cast(_MoELike, transformer_block.moe)
 
     def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
         moe_layers = list(_iter_moe_layers(model_parts))
@@ -481,8 +452,12 @@ def register_moe_load_balancing_hook(
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
         tokens_per_expert_E_list = []
+        dtensor_mesh = None
         for transformer_block, moe in _iter_moe_layers(model_parts):
-            tokens_per_expert_E = moe.router.tokens_per_expert_E
+            tokens_per_expert_E = moe.tokens_per_expert_E
+            if isinstance(tokens_per_expert_E, torch.distributed.tensor.DTensor):
+                dtensor_mesh = tokens_per_expert_E.device_mesh
+                tokens_per_expert_E = tokens_per_expert_E.to_local()
             if _is_recomputation_enabled(transformer_block):
                 # TODO: This is a hack, we assume with full AC, the tokens_per_expert_E is counted twice.
                 # This does not affect to expert choice, but affects the experts usage metrics.
@@ -507,25 +482,41 @@ def register_moe_load_balancing_hook(
                 group=loss_mesh.get_group(),
                 op=torch.distributed.ReduceOp.SUM,
             )
+        if dtensor_mesh is not None:
+            tokens_per_expert_E_by_layer = torch.distributed.tensor.DTensor.from_local(
+                tokens_per_expert_E_by_layer,
+                device_mesh=dtensor_mesh,
+                placements=[Replicate()] * dtensor_mesh.ndim,
+                run_check=False,
+            )
+
         moe_layer_idx = 0
         with torch.no_grad():
-            for _transformer_block, moe in _iter_moe_layers(model_parts):
-                load_balance_coeff = moe.load_balance_coeff
-                assert load_balance_coeff is not None
+            for model_part in model_parts:
+                layers = model_part.get_submodule("layers")
+                assert isinstance(layers, nn.ModuleDict)
+                for transformer_block in layers.values():
+                    if not transformer_block.moe_enabled:
+                        continue
+                    moe = cast(_MoELike, transformer_block.moe)
+                    load_balance_coeff = moe.load_balance_coeff
+                    assert load_balance_coeff is not None
 
-                tokens_per_expert_E = tokens_per_expert_E_by_layer[
-                    moe_layer_idx
-                ].float()
-                moe_layer_idx += 1
+                    tokens_per_expert_E = tokens_per_expert_E_by_layer[
+                        moe_layer_idx
+                    ].float()
+                    moe_layer_idx += 1
 
-                # update the expert bias
-                # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
-                expert_bias_delta_E = load_balance_coeff * torch.sign(
-                    tokens_per_expert_E.mean() - tokens_per_expert_E
-                )
-                expert_bias_delta_E = expert_bias_delta_E - expert_bias_delta_E.mean()
-                moe.expert_bias_E.add_(expert_bias_delta_E)
-                moe.router.tokens_per_expert_E.zero_()
+                    # update the expert bias
+                    # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+                    expert_bias_delta_E = load_balance_coeff * torch.sign(
+                        tokens_per_expert_E.mean() - tokens_per_expert_E
+                    )
+                    expert_bias_delta_E = (
+                        expert_bias_delta_E - expert_bias_delta_E.mean()
+                    )
+                    moe.expert_bias_E.add_(expert_bias_delta_E)
+                    moe.tokens_per_expert_E.zero_()
 
     if _should_register_moe_balancing_hook(model_parts):
         optimizers.register_step_pre_hook(
@@ -533,66 +524,3 @@ def register_moe_load_balancing_hook(
                 model_parts, parallel_dims=parallel_dims
             )
         )
-
-
-def register_moe_quantile_balancing_hook(
-    optimizers: OptimizersContainer,
-    model_parts: list[nn.Module],
-    parallel_dims: ParallelDims,
-) -> None:
-    """Update quantile-balanced expert biases before each optimizer step."""
-    from torchtitan.models.common.moe import MoE, QuantileBalancedTopKRouter
-
-    moe_layers: list[tuple[MoE, QuantileBalancedTopKRouter]] = []
-    for model_part in model_parts:
-        for module in model_part.modules():
-            if isinstance(module, MoE) and isinstance(
-                module.router, QuantileBalancedTopKRouter
-            ):
-                moe_layers.append((module, module.router))
-
-    if not moe_layers:
-        return
-
-    @torch.no_grad()
-    def _update_expert_bias() -> None:
-        reduction_groups = []
-        # With EP, the router is token-sharded on the dense TP axis even when
-        # model-wide sequence parallelism is disabled.
-        if parallel_dims.ep_enabled and parallel_dims.tp > 1:
-            reduction_groups.append(parallel_dims.get_dense_tp_mesh().get_group())
-        loss_mesh = parallel_dims.get_optional_mesh("loss")
-        if loss_mesh is not None:
-            reduction_groups.append(loss_mesh.get_group())
-
-        histograms = [
-            router.quantile_balancer.required_bias_histogram_EB
-            for _moe, router in moe_layers
-        ]
-        if reduction_groups:
-            reduced_histograms_LEB = torch.stack(histograms)
-            for group in reduction_groups:
-                torch.distributed.all_reduce(
-                    reduced_histograms_LEB,
-                    group=group,
-                    op=torch.distributed.ReduceOp.SUM,
-                )
-            histograms = list(reduced_histograms_LEB.unbind())
-
-        for histogram_EB, (moe, router) in zip(
-            histograms,
-            moe_layers,
-            strict=True,
-        ):
-            expert_bias_E = moe.expert_bias_E
-            assert expert_bias_E is not None
-            quantile_balancer = router.quantile_balancer
-            next_expert_bias_E = quantile_balancer.estimate_expert_bias(
-                histogram_EB,
-                expert_bias_E,
-            )
-            expert_bias_E.copy_(next_expert_bias_E)
-            quantile_balancer.required_bias_histogram_EB.zero_()
-            router.tokens_per_expert_E.zero_()
-
-    optimizers.register_step_pre_hook(lambda *args, **kwargs: _update_expert_bias())

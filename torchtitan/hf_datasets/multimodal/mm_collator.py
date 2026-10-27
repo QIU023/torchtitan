@@ -12,11 +12,8 @@ from typing import Any, cast, Literal
 
 import torch
 
-from torchtitan.components.data.collators import Collator
-from torchtitan.components.data.types import (
-    DatasetBuildContext,
-    TokenizedTrainingMicrobatch,
-)
+from torchtitan.components.data.collators import Collator, TrainerBatch
+from torchtitan.components.data.types import DatasetBuildContext
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import MultiModalTokenizer
 from .utils.image import vision_to_patches
@@ -31,7 +28,7 @@ class MultiModalCollator(Collator):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Collator.Config):
-        max_images_per_microbatch: int = 128
+        max_images_per_batch: int = 128
         patch_size: int = 16
         temporal_patch_size: int = 2
         spatial_merge_size: int = 2
@@ -39,9 +36,9 @@ class MultiModalCollator(Collator):
         patch_order: Literal["block", "raster"] = "block"
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
-        self._num_tokens_per_microbatch = context.num_tokens_per_microbatch
+        self._num_tokens_per_batch = context.num_tokens_per_batch
         self._max_context_length = context.max_context_length
-        self.max_images_per_microbatch = config.max_images_per_microbatch
+        self.max_images_per_batch = config.max_images_per_batch
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.spatial_merge_size = config.spatial_merge_size
@@ -83,25 +80,15 @@ class MultiModalCollator(Collator):
 
     def collate_text(
         self,
-        rows: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Concatenate whole samples and pad only the token-microbatch tail."""
-        input_ids = torch.cat([sample["input_ids"] for sample in rows])
-        labels = torch.cat([sample["labels"] for sample in rows])
-        positions = torch.cat([sample["positions"] for sample in rows])
-        padding_mask = torch.cat(
-            [
-                (
-                    sample["padding_mask"]
-                    if "padding_mask" in sample
-                    else torch.zeros(sample["input_ids"].shape[0], dtype=torch.bool)
-                )
-                for sample in rows
-            ]
-        )
-        pad_len = self._num_tokens_per_microbatch - input_ids.shape[0]
+        batch: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Concatenate whole samples and pad only the token-batch tail."""
+        input_ids = torch.cat([sample["input_ids"] for sample in batch])
+        labels = torch.cat([sample["labels"] for sample in batch])
+        positions = torch.cat([sample["positions"] for sample in batch])
+        pad_len = self._num_tokens_per_batch - input_ids.shape[0]
         if pad_len < 0:
-            raise ValueError("multimodal rows exceed the configured token microbatch")
+            raise ValueError("multimodal rows exceed the configured token batch")
         if pad_len:
             input_ids = torch.nn.functional.pad(
                 input_ids,
@@ -114,11 +101,8 @@ class MultiModalCollator(Collator):
                 torch.arange(pad_len, dtype=positions.dtype) % self._max_context_length
             )
             positions = torch.cat([positions, padding_positions])
-            padding_mask = torch.nn.functional.pad(
-                padding_mask, (0, pad_len), value=True
-            )
 
-        return input_ids, labels, positions, padding_mask
+        return input_ids, labels, positions
 
     def _build_mrope_positions(
         self,
@@ -290,12 +274,12 @@ class MultiModalCollator(Collator):
 
         return mrope_positions.squeeze(0)
 
-    def __call__(self, rows: Sequence[dict[str, Any]]) -> TokenizedTrainingMicrobatch:
-        """Collate rows into one multimodal training microbatch."""
+    def __call__(self, batch: Sequence[dict[str, Any]]) -> TrainerBatch:
+        """Collate batch with patch-based approach."""
         # Count media in each sample.
-        rows = list(rows)
+        batch = list(batch)
         images_per_sample: list[int] = []
-        for sample in rows:
+        for sample in batch:
             num_images = len(sample.get("pixel_values", []))
             for vid in sample.get("pixel_values_videos", []):
                 num_images += (
@@ -304,16 +288,16 @@ class MultiModalCollator(Collator):
             images_per_sample.append(num_images)
 
         total_images = sum(images_per_sample)
-        if total_images > self.max_images_per_microbatch:
+        if total_images > self.max_images_per_batch:
             raise ValueError(
-                f"multimodal microbatch has {total_images} vision entries, exceeding "
-                f"max_images_per_microbatch={self.max_images_per_microbatch}"
+                f"multimodal batch has {total_images} vision entries, exceeding "
+                f"max_images_per_batch={self.max_images_per_batch}"
             )
 
         # Collate image and video patches.
         all_images = [
             img
-            for sample in rows
+            for sample in batch
             if "pixel_values" in sample
             for img in sample["pixel_values"]
         ]
@@ -321,7 +305,7 @@ class MultiModalCollator(Collator):
 
         all_videos = [
             vid
-            for sample in rows
+            for sample in batch
             if "pixel_values_videos" in sample
             for vid in sample["pixel_values_videos"]
         ]
@@ -330,8 +314,10 @@ class MultiModalCollator(Collator):
         )
 
         # Pad text.
-        input_ids, labels, positions, padding_mask = self.collate_text(rows)
-        model_kwargs = {
+        input_ids, labels, positions = self.collate_text(batch)
+        input_dict = {
+            "input": input_ids,
+            "positions": positions,
             "pixel_values": patches,
             "grid_thw": grids,
             "pixel_values_videos": video_patches,
@@ -340,14 +326,15 @@ class MultiModalCollator(Collator):
                 f"{name}_id": getattr(self.tokenizer, f"{name}_id")
                 for name in self.tokenizer.TOKEN_FIELDS
             },
+            "num_valid_tokens": int((labels != IGNORE_INDEX).sum()),
         }
 
         # Build multimodal RoPE positions.
         if self.build_mrope_positions and (
             grids is not None or video_grids is not None
         ):
-            special_tokens = cast(dict[str, int], model_kwargs["special_tokens"])
-            model_kwargs["mrope_positions"] = self._build_mrope_positions(
+            special_tokens = input_dict["special_tokens"]
+            input_dict["mrope_positions"] = self._build_mrope_positions(
                 input_ids,
                 grids,
                 video_grids,
@@ -356,11 +343,4 @@ class MultiModalCollator(Collator):
                 video_token_id=special_tokens["video_id"],
             )
 
-        return TokenizedTrainingMicrobatch(
-            input=input_ids,
-            labels=labels,
-            positions=positions,
-            padding_mask=padding_mask,
-            num_valid_tokens=int((labels != IGNORE_INDEX).sum()),
-            model_kwargs=model_kwargs,
-        )
+        return input_dict, labels

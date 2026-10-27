@@ -24,7 +24,7 @@ try:
         sys.modules["triton"] = MagicMock()
         sys.modules["triton.language"] = MagicMock()
 
-    from torchtitan.config.parallelism import ParallelismConfig
+    from torchtitan.config import ParallelismConfig
     from torchtitan.models.common import (
         ComplexRoPE,
         compute_ffn_hidden_dim,
@@ -54,7 +54,7 @@ def _make_trainer_config(tp: int, seq_len: int = 2048):
 
 def _make_llama3_config(n_heads: int, n_kv_heads: int | None) -> "Llama3Model.Config":
     """Build a minimal Llama3Model.Config with the given head counts."""
-    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+    from torchtitan.models.common.attention import ScaledDotProductAttention
     from torchtitan.models.common.config_utils import make_ffn_config, make_gqa_config
 
     _LINEAR_INIT = {"weight": lambda t: t}
@@ -74,7 +74,7 @@ def _make_llama3_config(n_heads: int, n_kv_heads: int | None) -> "Llama3Model.Co
                     n_kv_heads=n_kv_heads,
                     wqkv_param_init=_LINEAR_INIT,
                     wo_param_init=_LINEAR_INIT,
-                    inner_attention=ScaledDotProductInnerAttention.Config(),
+                    inner_attention=ScaledDotProductAttention.Config(),
                     rope=ComplexRoPE.Config(
                         dim=_DIM // n_heads,
                         max_context_length=4096,
@@ -92,7 +92,6 @@ def _make_llama3_config(n_heads: int, n_kv_heads: int | None) -> "Llama3Model.Co
         )
 
     return Llama3Model.Config(
-        max_context_length=4096,
         dim=_DIM,
         vocab_size=_VOCAB_SIZE,
         tok_embeddings=Embedding.Config(num_embeddings=_VOCAB_SIZE, embedding_dim=_DIM),

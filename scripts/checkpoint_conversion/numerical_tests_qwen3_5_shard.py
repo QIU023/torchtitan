@@ -24,12 +24,13 @@ from typing import cast
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
-from torchtitan.config import CompileConfig, TrainingConfig
-from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
+from torchtitan.models.qwen3_5.parallelize import parallelize_qwen3_5
 from torchtitan.tools import utils
 
 CONFIGS = [
@@ -55,10 +56,7 @@ def run_worker(args):
 
     build_config, max_context_length = qwen3_5_configs["debugmodel_moe"]
     config = build_config(
-        attn_backend="flex",
-        moe_comm_backend="standard",
-        enable_sp=True,
-        seq_len=max_context_length,
+        attn_backend="flex", moe_comm_backend="standard", seq_len=max_context_length
     )
 
     parallel_dims = ParallelDims(
@@ -69,7 +67,6 @@ def run_worker(args):
         pp=1,
         ep=args.ep,
         world_size=world_size,
-        enable_sequence_parallel=True,
     )
     parallel_dims.build_mesh()
 
@@ -102,7 +99,8 @@ def run_worker(args):
     model.to_empty(device="cuda")
     model.init_weights(buffer_device=torch.device("cuda"))
 
-    model = model.parallelize(
+    model = parallelize_qwen3_5(
+        model,
         parallel_dims=parallel_dims,
         training=training,
         parallelism=parallelism,
@@ -129,6 +127,9 @@ def run_worker(args):
             attention_masks=attention_masks,
             special_tokens={"image_id": 248056, "video_id": 248057},
         )
+
+    if isinstance(output, DTensor):
+        output = output.full_tensor()
 
     logits = output[0, 0, :10].float().tolist()
 

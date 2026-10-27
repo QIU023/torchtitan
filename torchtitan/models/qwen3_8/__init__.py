@@ -4,10 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.config.transform import (
-    ModelConfigConverter,
-    validate_converter_compatibility,
-)
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.distributed.pipeline_parallel import pipeline_vlm
 from torchtitan.models.common import Embedding, Linear
 from torchtitan.models.qwen3_5 import (
     _27b,
@@ -17,15 +15,21 @@ from torchtitan.models.qwen3_5 import (
     _EMBEDDING_INIT,
     _offset_norm,
     _output_linear_init,
+    parallelize_qwen3_5,
     Qwen35Model,
     QWEN3_5_SPECIAL_TOKENS,
 )
 from torchtitan.models.qwen3_5.rope import MRoPE
+from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
+from torchtitan.models.utils import validate_converter_order
+from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
     "model_registry",
     "QWEN3_8_SPECIAL_TOKENS",
     "Qwen35Model",
+    "Qwen35StateDictAdapter",
     "qwen3_8_configs",
 ]
 
@@ -36,7 +40,6 @@ def _qwen3_8_2_4t_a95b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
     seq_len: int,
 ) -> Qwen35Model.Config:
     """Qwen3.8-2.4T-A95B text-only MoE config."""
@@ -46,7 +49,6 @@ def _qwen3_8_2_4t_a95b(
     num_layers = 92
     vocab_size = 248320
     return Qwen35Model.Config(
-        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         # pyrefly: ignore [bad-argument-type]
@@ -62,7 +64,6 @@ def _qwen3_8_2_4t_a95b(
             param_init=_output_linear_init(dim),
         ),
         layers=_build_qwen35_moe_layers(
-            enable_sp=enable_sp,
             rope=MRoPE.Config(
                 dim=rotary_dim,
                 max_context_length=seq_len,
@@ -100,12 +101,11 @@ qwen3_8_configs = {
 def model_registry(
     flavor: str,
     *,
-    enable_sp: bool,
     seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> Qwen35Model.Config:
+) -> ModelSpec:
     get_config, max_context_len = qwen3_8_configs[flavor]
     context_len = seq_len or max_context_len
     if context_len > max_context_len:
@@ -115,7 +115,6 @@ def model_registry(
         )
     config = get_config(
         attn_backend=attn_backend,
-        enable_sp=enable_sp,
         seq_len=context_len,
         **(
             {"moe_comm_backend": moe_comm_backend}
@@ -124,8 +123,17 @@ def model_registry(
         ),
     )
     if converters is not None:
-        validate_converter_compatibility(converters)
+        validate_converter_order(converters)
         for converter_config in converters:
             config = converter_config.build().convert(config)
 
-    return config
+    return ModelSpec(
+        name="qwen3_8",
+        flavor=flavor,
+        model=config,
+        max_context_length=context_len,
+        parallelize_fn=parallelize_qwen3_5,
+        pipelining_fn=pipeline_vlm,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
+        state_dict_adapter=Qwen35StateDictAdapter,
+    )

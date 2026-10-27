@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
-import logging
 import warnings
 from collections.abc import Callable
 
@@ -18,14 +17,12 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan.config import CompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.tools.logging import logger
 
 
 # TODO: Remove this monkeypatch once FakeTensorMode.__init__ is decorated with
 # @torch.compiler.disable(recursive=True) upstream.
 # See https://github.com/pytorch/pytorch/issues/178887
-logger = logging.getLogger(__name__)
-
-
 FakeTensorMode.__init__ = torch.compiler.disable(  # type: ignore[method-assign]
     FakeTensorMode.__init__, recursive=True
 )
@@ -33,7 +30,7 @@ FakeTensorMode.__init__ = torch.compiler.disable(  # type: ignore[method-assign]
 
 # Toggled on by ``_maybe_regional_inductor_backend`` when the model is compiled
 # with a non-inductor backend that needs inductor-only regions (e.g.
-# FlexInnerAttention) scooped into an inductor sub-compile. Read by
+# FlexAttention) scooped into an inductor sub-compile. Read by
 # ``maybe_regional_inductor`` at trace time; left False on the default inductor
 # / eager paths so no annotation metadata is emitted.
 _regional_inductor_enabled: bool = False
@@ -42,16 +39,13 @@ _regional_inductor_enabled: bool = False
 def apply_compile(
     model: nn.Module,
     *,
-    compile_config: CompileConfig | None,
+    compile_config: CompileConfig,
     parallel_dims: ParallelDims,
 ) -> None:
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    if compile_config is None:
-        return
-
     _maybe_enable_async_tp(
         compile_config,
         parallel_dims.get_dense_tp_mesh() if parallel_dims.tp_enabled else None,
@@ -79,15 +73,11 @@ def apply_compile(
 
 
 def _maybe_enable_async_tp(
-    compile_config: CompileConfig | None,
+    compile_config: CompileConfig,
     tp_mesh: DeviceMesh | None,
 ) -> None:
     """Configure Inductor's async TP pass for the provided TP mesh."""
-    if (
-        compile_config is None
-        or not compile_config.enable_async_tensor_parallel
-        or tp_mesh is None
-    ):
+    if not compile_config.enable_async_tensor_parallel or tp_mesh is None:
         return
 
     group_name = tp_mesh.get_group().group_name
@@ -110,26 +100,26 @@ def _maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Ca
     """Wrap the ``aot_eager`` backend so inductor-only flex regions are scooped out.
 
     ``regional_inductor`` lowers just the regions annotated with ``compile_with_inductor`` (see
-    ``FlexInnerAttention.forward``) to inductor while the rest stays in aot_eager.
+    ``FlexAttention.forward``) to inductor while the rest stays in aot_eager.
 
-    Only applied for ``aot_eager`` on models that actually use FlexInnerAttention, so
+    Only applied for ``aot_eager`` on models that actually use FlexAttention, so
     dense/non-flex aot_eager paths are left untouched. Other non-inductor backends
     can't be scooped here and raise rather than silently degrading.
     """
-    from torchtitan.models.common.attention import FlexInnerAttention
+    from torchtitan.models.common.attention import FlexAttention
 
-    uses_flex = any(isinstance(m, FlexInnerAttention) for m in model.modules())
+    uses_flex = any(isinstance(m, FlexAttention) for m in model.modules())
     # Non-flex models never need the scoop; the default inductor backend already
     # lowers the flex region directly. Both are left on the unmodified backend.
     if not uses_flex or backend == "inductor":
         return backend
 
-    # FlexInnerAttention only has an inductor lowering. Under a non-inductor backend
+    # FlexAttention only has an inductor lowering. Under a non-inductor backend
     # other than aot_eager it would decompose to eager aten ops (no Triton
     # kernel), which we can't transparently scoop here -- fail loudly.
     if backend != "aot_eager":
         raise ValueError(
-            f"Model uses FlexInnerAttention but compile backend {backend!r} is neither "
+            f"Model uses FlexAttention but compile backend {backend!r} is neither "
             f"'inductor' nor 'aot_eager'; the flex region would decompose to eager "
             f"aten ops (no Triton kernel). Use 'inductor' or 'aot_eager'."
         )

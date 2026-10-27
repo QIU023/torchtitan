@@ -9,8 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
 from torchtitan_recipes.tests.features import llama3_debugmodel_hf_checkpoint_load
 from torchtitan_recipes.tests.models import llama3_debugmodel_fsdp2_tp2_pp2
@@ -30,7 +28,7 @@ def test_hf_checkpoint_load_path_comes_from_test_config(monkeypatch) -> None:
 
     config = llama3_debugmodel_hf_checkpoint_load()
 
-    assert config.checkpointer.initial_load_path == (
+    assert config.checkpoint.initial_load_path == (
         f"{test_output_dir}/hf_checkpoint/step-10/"
     )
 
@@ -58,35 +56,6 @@ def test_integration_run_exports_test_output_dir(monkeypatch, tmp_path: Path) ->
     )
 
 
-def test_numerics_run_uses_seed_config(monkeypatch, tmp_path: Path) -> None:
-    captured_command = None
-
-    def seed_config():
-        return llama3_debugmodel()
-
-    def fake_run(command, **kwargs):
-        nonlocal captured_command
-        captured_command = command
-        return subprocess.CompletedProcess(command, 0, stdout="")
-
-    golden_path = tmp_path / "golden.txt"
-    golden_path.write_text("# step loss\n1 1.0\n")
-    monkeypatch.setattr("tests.integration_tests.run_tests.subprocess.run", fake_run)
-    test = OverrideDefinitions(
-        configs=[llama3_debugmodel],
-        test_name="seed_config_test",
-        ngpu=1,
-        golden_numerics_path=str(golden_path),
-        loss_compare_seed_config=seed_config,
-    )
-
-    run_single_test(test, str(tmp_path))
-
-    assert captured_command is not None
-    assert f"--seed-module={seed_config.__module__}" in captured_command
-    assert f"--seed-config={seed_config.__name__}" in captured_command
-
-
 def test_llama3_pp_numerics_has_one_microbatch_per_stage() -> None:
     config = llama3_debugmodel_fsdp2_tp2_pp2()
 
@@ -94,27 +63,6 @@ def test_llama3_pp_numerics_has_one_microbatch_per_stage() -> None:
         config.parallelism.num_pp_microbatches
         >= config.parallelism.pipeline_parallel_degree
     )
-
-
-def test_split_backward_pp_cases_exercise_varlen_cuda_graphs() -> None:
-    tests_by_name = {test.test_name: test for test in build_features_test_list()}
-
-    for test_name in ("pp_looped_zero_bubble", "pp_zbv", "pp_custom_csv"):
-        test = tests_by_name[test_name]
-        config = test.configs[0]()
-        assert not test.disabled
-        assert not config.training.disable_cuda_graphs
-        assert isinstance(
-            config.model.layers[0].attention.inner_attention,
-            VarlenInnerAttention.Config,
-        )
-
-
-def test_llama3_debug_config_defaults_to_short_context() -> None:
-    config = llama3_debugmodel()
-
-    assert config.model.max_context_length == 2048
-    assert config.training.max_context_length == 2048
 
 
 def test_parse_multiple_integration_test_suites() -> None:
@@ -127,40 +75,32 @@ def test_parse_multiple_integration_test_suites() -> None:
 
 
 def test_h100_tests_are_registered_in_separate_suite() -> None:
-    h100_tests = build_h100_tests_list()
-    assert {test.test_name for test in h100_tests} == {
+    assert {test.test_name for test in build_h100_tests_list()} == {
         "2d_asynctp_compile",
+        "deepseek_v3_fsdp+cp+tp+minimal_async_ep",
+        "deepseek_v3_fsdp+cp+tp+minimal_async_ep+sdc_replay",
         "deepseek_v3_fsdp+hybridep+compile",
         "dist_gemm",
         "float8",
-        "float8_grouped_experts_fsdp",
-        "fsdp+tp+pp+compile+float8",
+        "fsdp+tp+cp+compile+float8",
         "fsdp_symm_mem",
         "hsdp+cp+compile+float8",
         "qwen3_fsdp+deepep",
-        "qwen3_5_moe_float8_lora",
     }
-    qwen35_lora_test = next(
-        test for test in h100_tests if test.test_name == "qwen3_5_moe_float8_lora"
-    )
-    assert qwen35_lora_test.configs[0].__module__ == "torchtitan_recipes.tests.h100"
     assert all(not hasattr(test, "use_h100") for test in build_features_test_list())
     assert all(not hasattr(test, "use_h100") for test in build_model_tests_list())
 
 
 def test_b200_tests_are_registered_in_separate_suite() -> None:
-    assert {test.test_name for test in build_b200_tests_list()} == {
-        "kimi_k3_fsdp2_tp2_ep2_pp2_vpp4",
-        "kimi_k3_mm",
-        "kimi_k3_mm_muon",
-        "mxfp8_linear_fsdp",
-        "nvfp4_linear_fsdp",
+    assert {test.test_name for test in build_b200_tests_list()} == {"kimi_k3_mm_fsdp"}
+    assert "kimi_k3_mm_fsdp" not in {
+        test.test_name for test in build_model_tests_list()
     }
-    assert "kimi_k3_mm" not in {test.test_name for test in build_model_tests_list()}
 
 
 def test_specialized_moe_backends_have_ep_coverage() -> None:
     specialized_names = {
+        "deepseek_v3_fsdp+cp+tp+minimal_async_ep",
         "deepseek_v3_fsdp+hybridep+compile",
         "qwen3_fsdp+deepep",
     }
@@ -187,10 +127,7 @@ def test_models_select_fake_and_real_pg_cases() -> None:
         "muse_glimmer_text_fsdp",
         "muse_glimmer_mm_fsdp+tp+sp",
     } <= fake_pg_model_tests
-    assert {
-        "deepseek_v3_fsdp+cp+pp+ep",
-        "deepseek_v4_fsdp+tp+ep",
-    } <= real_pg_model_tests
+    assert {"deepseek_v3_fsdp+cp+pp+ep"} <= real_pg_model_tests
 
 
 def test_flux_fake_pg_filters_real_collective_cases() -> None:
@@ -213,7 +150,7 @@ def test_fake_pg_incompatible_test_requires_explicit_marker(
 ) -> None:
     config = llama3_debugmodel(seq_len=2048)
     if test_name == "checkpoint":
-        config.checkpointer = CheckpointManager.Config()
+        config.checkpoint.enable = True
     elif test_name == "pipeline_parallel":
         config.parallelism.pipeline_parallel_degree = 2
 

@@ -9,8 +9,6 @@
 from __future__ import annotations
 
 import ast
-
-import logging
 import os
 import re
 import sys
@@ -20,8 +18,7 @@ import torch
 import torch.distributed as dist
 from torch._logging import trace_structured
 
-
-logger = logging.getLogger(__name__)
+from torchtitan.tools.logging import logger
 
 
 class _CodegenGraphModule(torch.fx.GraphModule):

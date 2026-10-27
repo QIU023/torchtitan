@@ -7,10 +7,6 @@
 
 import torchtitan_recipes.tests.models as recipes
 
-from torchtitan.models.deepseek_v3.config_registry import deepseek_v3_debugmodel
-from torchtitan.models.gpt_oss.config_registry import gpt_oss_debugmodel_flex
-from torchtitan.models.llama3.config_registry import llama3_debugmodel
-
 from tests.integration_tests import OverrideDefinitions
 
 
@@ -28,26 +24,15 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_name="llama3_fsdp+tp+cp",
             ngpu=8,
             golden_numerics_path=(
-                "tests/assets/losses/{execution_mode}/{gpu_arch}/llama3.txt"
+                "tests/assets/losses/{execution_mode}/llama3_a10g.txt"
             ),
-            loss_compare_seed_config=llama3_debugmodel,
-        ),
-        OverrideDefinitions(
-            configs=[recipes.llama3_debugmodel_region_ac_fsdp2_tp2_cp2],
-            test_descr="Llama 3 FSDP+TP+CP+RegionAC",
-            test_name="llama3_fsdp+tp+cp+region_ac",
-            ngpu=8,
-            golden_numerics_path=(
-                "tests/assets/losses/{execution_mode}/{gpu_arch}/llama3.txt"
-            ),
-            loss_compare_seed_config=llama3_debugmodel,
         ),
         OverrideDefinitions(
             configs=[recipes.llama3_debugmodel_fsdp2_tp2_pp2],
             test_descr="Llama 3 FSDP+TP+PP",
             test_name="llama3_fsdp+tp+pp",
             ngpu=8,
-            golden_numerics_path="tests/assets/losses/real_pg/{gpu_arch}/llama3_pp.txt",
+            golden_numerics_path="tests/assets/losses/real_pg/llama3_pp_a10g.txt",
             use_real_pg=True,
         ),
         # Integration Test Cases for DeepSeek V3
@@ -61,19 +46,12 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             skip_rocm_test=True,
         ),
         OverrideDefinitions(
-            configs=[recipes.deepseek_v3_debugmodel_mtp_tp2_cp2],
-            test_descr="DeepSeek V3 MTP TP+CP with SP",
-            test_name="deepseek_v3_mtp_tp+cp",
-            ngpu=4,
-            use_real_pg=True,
-        ),
-        OverrideDefinitions(
             configs=[recipes.deepseek_v3_debugmodel_fsdp8_ep8],
             test_descr="DeepSeek V3 FSDP+EP",
             test_name="deepseek_v3_fsdp+ep",
             ngpu=8,
             golden_numerics_path=(
-                "tests/assets/losses/{execution_mode}/{gpu_arch}/deepseek_v3.txt"
+                "tests/assets/losses/{execution_mode}/deepseek_v3_a10g.txt"
             ),
         ),
         OverrideDefinitions(
@@ -82,9 +60,8 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_name="deepseek_v3_fsdp+cp+pp+ep",
             ngpu=8,
             golden_numerics_path=(
-                "tests/assets/losses/real_pg/{gpu_arch}/deepseek_v3_cp_pp.txt"
+                "tests/assets/losses/real_pg/deepseek_v3_cp_pp_a10g.txt"
             ),
-            loss_compare_seed_config=deepseek_v3_debugmodel,
             use_real_pg=True,
         ),
         OverrideDefinitions(
@@ -100,22 +77,6 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             ngpu=4,
             skip_rocm_test=True,
         ),
-        OverrideDefinitions(
-            configs=[recipes.deepseek_v4_debugmodel_fsdp2_tp2_ep2],
-            test_descr="DeepSeek V4 FSDP+TP+EP",
-            test_name="deepseek_v4_fsdp+tp+ep",
-            ngpu=4,
-            # Sparse attention / indexer kernels are CUDA-only and unvalidated
-            # on ROCm.
-            skip_rocm_test=True,
-            # Runs on a real PG. Under Fake PG this config's sequence-parallel
-            # collectives return activations that alias their inputs, which
-            # corrupts a saved-for-backward tensor and blows up grad_norm at
-            # step 1. The same config trains cleanly on a real 4-GPU PG
-            # (grad_norm ~3.8), so keep it on a real PG until the Fake PG
-            # collective aliasing under spmd_types is fixed.
-            use_real_pg=True,
-        ),
         # Integration Test Cases for Qwen3 dense and MoE model
         OverrideDefinitions(
             configs=[recipes.qwen3_debugmodel_moe_param_groups_fsdp2_tp2_cp2_ep8],
@@ -123,9 +84,8 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_name="qwen3_moe_fsdp+tp+cp+ep_param_groups",
             ngpu=8,
             golden_numerics_path=(
-                "tests/assets/losses/{execution_mode}/{gpu_arch}/qwen3.txt"
+                "tests/assets/losses/{execution_mode}/qwen3_a10g.txt"
             ),
-            loss_compare_seed_config=recipes.qwen3_debugmodel_moe_param_groups_seed,
         ),
         OverrideDefinitions(
             configs=[
@@ -146,6 +106,14 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             # unvalidated (see torchtitan/overrides/helion_rope.py).
             skip_rocm_test=True,
         ),
+        OverrideDefinitions(
+            configs=[recipes.qwen3_debugmodel_non_fused_qkv_fsdp2_tp2_cp2],
+            # Reverse test: fused QKV is the debugmodel default, so exercise the
+            # separate wq/wk/wv projection path under FSDP+TP+CP.
+            test_descr="Qwen3 non-fused QKV FSDP+TP+CP",
+            test_name="qwen3_non_fused_qkv_fsdp+tp+cp",
+            ngpu=8,
+        ),
         # Integration Test Cases for Qwen3.5
         OverrideDefinitions(
             configs=[recipes.qwen35_debugmodel_moe_fsdp2_tp2_pp2_ep4],
@@ -153,8 +121,6 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_name="qwen3_5_moe_fsdp+tp+ep+pp",
             ngpu=8,
             use_real_pg=True,
-            # short_conv's CuTe/CUTLASS kernel (attn_gym) is CUDA-only.
-            skip_rocm_test=True,
         ),
         OverrideDefinitions(
             configs=[recipes.qwen35_debugmodel_moe_fsdp4_tp2_ep4],
@@ -163,8 +129,6 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             ngpu=8,
             # NOTE: This topology is not bitwise deterministic with Real PG on
             # A10G, so this case provides end-to-end coverage without a golden.
-            # short_conv's CuTe/CUTLASS kernel (attn_gym) is CUDA-only.
-            skip_rocm_test=True,
         ),
         OverrideDefinitions(
             configs=[recipes.qwen35_debugmodel_varlen_attn_fsdp2_tp2_sac],
@@ -187,7 +151,7 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_name="gpt_oss_fsdp+tp+ep",
             ngpu=8,
             golden_numerics_path=(
-                "tests/assets/losses/{execution_mode}/{gpu_arch}/gpt_oss.txt"
+                "tests/assets/losses/{execution_mode}/gpt_oss_a10g.txt"
             ),
         ),
         OverrideDefinitions(
@@ -195,13 +159,12 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_descr="GPT-OSS PP+FSDP+CP+EP+SACOP",
             test_name="gpt_oss_pp+fsdp+cp+ep+sacop",
             ngpu=8,
-            golden_numerics_path="tests/assets/losses/real_pg/{gpu_arch}/gpt_oss_pp.txt",
-            loss_compare_seed_config=gpt_oss_debugmodel_flex,
+            golden_numerics_path="tests/assets/losses/real_pg/gpt_oss_pp_a10g.txt",
             use_real_pg=True,
         ),
         OverrideDefinitions(
             configs=[recipes.gpt_oss_debugmodel_fsdp4_pp2_ep4_sac],
-            test_descr="Gpt-oss PP+FSDP+EP+SACOP with VarlenInnerAttention",
+            test_descr="Gpt-oss PP+FSDP+EP+SACOP with VarlenAttention",
             test_name="gpt_oss_pp+fsdp+ep+sacop",
             ngpu=8,
             use_real_pg=True,
@@ -228,7 +191,7 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_name="muse_glimmer_text_fsdp",
             ngpu=8,
             golden_numerics_path=(
-                "tests/assets/losses/{execution_mode}/{gpu_arch}/muse_glimmer.txt"
+                "tests/assets/losses/{execution_mode}/muse_glimmer_a10g.txt"
             ),
         ),
         OverrideDefinitions(

@@ -5,33 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Callable
-from dataclasses import replace
 from functools import partial
 
 import torch
 import torch.nn as nn
 
-from torchtitan.config.transform import (
-    ModelConfigConverter,
-    validate_converter_compatibility,
-)
-from torchtitan.models.common import (
-    Conv1d,
-    Embedding,
-    FeedForward,
-    Linear,
-    RouterGateLinear,
-    RowParallelLinear,
-    Sigmoid,
-    SiTUGLU,
-)
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.models.common import Conv1d, Embedding, Linear
 from torchtitan.models.common.config_utils import (
     get_attention_config,
-    make_ffn_config,
-    make_routed_experts_config,
-    make_shared_expert_ffn_config,
+    make_token_dispatcher_config,
 )
-from torchtitan.models.common.moe import QuantileBalancedTopKRouter
+from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.nn_modules import GELU, RMSNorm
 from torchtitan.models.common.vision_encoder import (
     VisionAttention,
@@ -39,17 +24,25 @@ from torchtitan.models.common.vision_encoder import (
     VisionTransformerBlock,
 )
 from torchtitan.models.kimi_k2_7.vision_encoder import VisionRotaryEmbedding2D
+from torchtitan.models.utils import validate_converter_order
+from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.protocols.model_spec import ModelSpec
+
 from .kda import InnerKDA, KDA, KDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
-from .moe import KimiLatentMoE
+from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
+from .parallelize import parallelize_kimi_k3, pipeline_kimi_k3
+from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import KimiK3VisionEncoder, KimiK3VisionProjector
 
 __all__ = [
     "KIMI_K3_SPECIAL_TOKENS",
     "KimiK3Model",
+    "KimiK3StateDictAdapter",
     "KimiK3VisionEncoder",
     "kimi_k3_configs",
     "model_registry",
+    "parallelize_kimi_k3",
 ]
 
 
@@ -127,15 +120,13 @@ def _feed_forward_config(
     *,
     dim: int,
     hidden_dim: int,
-) -> FeedForward.Config:
-    return replace(
-        make_ffn_config(
-            dim=dim,
-            hidden_dim=hidden_dim,
-            w1_param_init=_LINEAR_INIT,
-            w2w3_param_init=_LINEAR_INIT,
-        ),
-        activation_fn=SiTUGLU.Config(beta=4.0, linear_beta=25.0),
+) -> KimiFeedForward.Config:
+    return KimiFeedForward.Config(
+        w1=_linear(dim, hidden_dim),
+        w2=_linear(hidden_dim, dim),
+        w3=_linear(dim, hidden_dim),
+        beta=4.0,
+        linear_beta=25.0,
     )
 
 
@@ -170,11 +161,7 @@ def _mla_config(
             num_heads * (qk_nope_head_dim + v_head_dim),
         ),
         gate=_linear(dim, num_heads * v_head_dim),
-        wo=RowParallelLinear.Config(
-            in_features=num_heads * v_head_dim,
-            out_features=dim,
-            param_init=_LINEAR_INIT,
-        ),
+        wo=_linear(num_heads * v_head_dim, dim),
         inner_attention=inner_attention,
     )
 
@@ -221,11 +208,7 @@ def _kda_config(
             eps=1e-5,
             param_init=_NORM_INIT,
         ),
-        output_proj=RowParallelLinear.Config(
-            in_features=projection_dim,
-            out_features=dim,
-            param_init=_LINEAR_INIT,
-        ),
+        output_proj=_linear(projection_dim, dim),
         param_init={
             "A_log": _a_log_init,
             "dt_bias": nn.init.zeros_,
@@ -237,7 +220,6 @@ def _latent_moe_config(
     *,
     dim: int,
     latent_dim: int,
-    enable_sp: bool,
     expert_hidden_dim: int,
     num_experts: int,
     top_k: int,
@@ -246,49 +228,47 @@ def _latent_moe_config(
 ) -> KimiLatentMoE.Config:
     return KimiLatentMoE.Config(
         num_experts=num_experts,
-        router=QuantileBalancedTopKRouter.Config(
+        router=TokenChoiceTopKRouter.Config(
             num_experts=num_experts,
             top_k=top_k,
-            gate=RouterGateLinear.Config(
-                in_features=dim,
-                out_features=num_experts,
-                bias=False,
-                param_init=_LINEAR_INIT,
-            ),
-            score_func=Sigmoid.Config(),
+            gate=_linear(dim, num_experts),
+            score_func="sigmoid",
             route_norm=True,
             route_scale=1.0,
-            num_bins=1000,
         ),
         routed_down=_linear(dim, latent_dim),
-        routed_experts=replace(
-            make_routed_experts_config(
+        routed_experts=RoutedExperts.Config(
+            inner_experts=KimiGroupedExperts.Config(
                 dim=latent_dim,
                 hidden_dim=expert_hidden_dim,
                 num_experts=num_experts,
-                top_k=top_k,
+                beta=4.0,
+                linear_beta=25.0,
                 param_init={
                     "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
                     "w2_EDF": partial(nn.init.trunc_normal_, std=0.02),
                     "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
                 },
-                comm_backend=moe_comm_backend,
             ),
-            activation_fn=SiTUGLU.Config(beta=4.0, linear_beta=25.0),
+            # core's dispatcher factory: standard / deepep / hybridep /
+            # minimal_async_ep per spec, as deepseek_v3; falls back to local
+            # dispatch when the ep mesh is None.
+            token_dispatcher=make_token_dispatcher_config(
+                num_experts=num_experts,
+                top_k=top_k,
+                comm_backend=moe_comm_backend,
+                # The routed experts consume the LATENT stream, so the
+                # dispatcher buffers size by latent_dim, not model dim.
+                hidden_dim=latent_dim,
+            ),
         ),
         routed_norm=_norm(latent_dim),
         routed_up=_linear(latent_dim, dim),
-        shared_experts=replace(
-            make_shared_expert_ffn_config(
-                dim=dim,
-                hidden_dim=num_shared_experts * expert_hidden_dim,
-                enable_sp=enable_sp,
-                w1_param_init=_LINEAR_INIT,
-                w2w3_param_init=_LINEAR_INIT,
-            ),
-            activation_fn=SiTUGLU.Config(beta=4.0, linear_beta=25.0),
+        shared_experts=_feed_forward_config(
+            dim=dim,
+            hidden_dim=num_shared_experts * expert_hidden_dim,
         ),
-        load_balance_coeff=None,
+        load_balance_coeff=1e-3,
     )
 
 
@@ -327,8 +307,16 @@ def _vision_encoder_config(
             proj=_linear(qkv_dim, dim),
         ),
         mlp=VisionMLP.Config(
-            fc1=_linear(dim, hidden_dim, param_init=_fan_in_linear_init(dim)),
-            fc2=_linear(hidden_dim, dim, param_init=_fan_in_linear_init(hidden_dim)),
+            fc1=_linear(
+                dim,
+                hidden_dim,
+                param_init=_fan_in_linear_init(dim),
+            ),
+            fc2=_linear(
+                hidden_dim,
+                dim,
+                param_init=_fan_in_linear_init(hidden_dim),
+            ),
             act_fn=GELU.Config(approximate="tanh"),
         ),
     )
@@ -370,9 +358,7 @@ def _vision_encoder_config(
 
 def _kimi_k3_config(
     *,
-    max_context_length: int,
     dim: int,
-    enable_sp: bool,
     vocab_size: int,
     num_layers: int,
     full_attention_layers: set[int],
@@ -443,7 +429,6 @@ def _kimi_k3_config(
                     else _latent_moe_config(
                         dim=dim,
                         latent_dim=latent_dim,
-                        enable_sp=enable_sp,
                         expert_hidden_dim=expert_hidden_dim,
                         num_experts=num_experts,
                         top_k=top_k,
@@ -461,7 +446,6 @@ def _kimi_k3_config(
         )
 
     return KimiK3Model.Config(
-        max_context_length=max_context_length,
         dim=dim,
         vocab_size=vocab_size,
         tok_embeddings=Embedding.Config(
@@ -482,44 +466,43 @@ def _kimi_k3_config(
     )
 
 
+def kimi_k3_full_attention_layers(num_layers: int) -> set[int]:
+    """Every fourth layer and the last: the (3 KDA + 1 MLA) pattern."""
+    return {i for i in range(num_layers) if i % 4 == 3} | {num_layers - 1}
+
+
 def _debugmodel(
-    attn_backend: str,
-    moe_comm_backend: str,
-    *,
-    enable_sp: bool,
-    seq_len: int,
+    attn_backend: str, moe_comm_backend: str, *, num_layers: int
 ) -> KimiK3Model.Config:
-    dim = 256
+    dim = 1024
     return _kimi_k3_config(
-        max_context_length=seq_len,
         dim=dim,
-        enable_sp=enable_sp,
         moe_comm_backend=moe_comm_backend,
-        vocab_size=2048,
-        num_layers=17,
-        full_attention_layers={3, 7, 11, 15, 16},
-        attn_res_block_size=4,
-        num_heads=4,
-        q_lora_rank=128,
-        kv_lora_rank=64,
+        vocab_size=163840,
+        num_layers=num_layers,
+        full_attention_layers=kimi_k3_full_attention_layers(num_layers),
+        attn_res_block_size=12,
+        num_heads=16,
+        q_lora_rank=512,
+        kv_lora_rank=256,
         qk_nope_head_dim=64,
         qk_rope_head_dim=32,
         v_head_dim=64,
         kda_head_dim=128,
         conv_kernel_size=4,
-        dense_hidden_dim=512,
-        latent_dim=128,
-        expert_hidden_dim=128,
-        num_experts=8,
-        top_k=2,
+        dense_hidden_dim=4096,
+        latent_dim=512,
+        expert_hidden_dim=384,
+        num_experts=32,
+        top_k=4,
         num_shared_experts=2,
         vision_encoder=_vision_encoder_config(
             text_dim=dim,
-            dim=256,
-            qkv_dim=512,
-            hidden_dim=512,
-            num_layers=2,
-            num_heads=4,
+            dim=512,
+            qkv_dim=768,
+            hidden_dim=2048,
+            num_layers=8,
+            num_heads=6,
             init_pos_emb_height=32,
             init_pos_emb_width=32,
         ),
@@ -527,22 +510,14 @@ def _debugmodel(
     )
 
 
-def _kimi_k3(
-    attn_backend: str,
-    moe_comm_backend: str,
-    *,
-    enable_sp: bool,
-    seq_len: int,
-) -> KimiK3Model.Config:
+def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
-        max_context_length=seq_len,
         dim=dim,
-        enable_sp=enable_sp,
         moe_comm_backend=moe_comm_backend,
         vocab_size=163840,
         num_layers=93,
-        full_attention_layers=set(range(3, 92, 4)) | {92},
+        full_attention_layers=kimi_k3_full_attention_layers(93),
         attn_res_block_size=12,
         num_heads=96,
         q_lora_rank=1536,
@@ -573,7 +548,10 @@ def _kimi_k3(
 
 
 kimi_k3_configs = {
-    "debugmodel": (_debugmodel, 16384),
+    # 33 layers: two blocks of 12 and the 93-layer model's partial block of 9
+    # (93 = 7 x 12 + 9); 35 units with the embedding and the head, which no
+    # pipeline shape divides, so every split is uneven the way the real one is.
+    "debugmodel": (partial(_debugmodel, num_layers=33), 16384),
     "Kimi-K3": (_kimi_k3, 262144),
 }
 
@@ -584,9 +562,10 @@ def model_registry(
     converters: list[ModelConfigConverter.Config] | None = None,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
     seq_len: int | None = None,
-) -> KimiK3Model.Config:
+) -> ModelSpec:
+    # The KDA / MLA layers build their own RoPE, so seq_len is not a builder
+    # argument here -- it only reports the context length on the ModelSpec.
     get_config, max_context_len = kimi_k3_configs[flavor]
     context_len = seq_len or max_context_len
     if context_len > max_context_len:
@@ -594,14 +573,18 @@ def model_registry(
             f"Requested seq_len {context_len} exceeds max context length "
             f"{max_context_len} for flavor {flavor}"
         )
-    config = get_config(
-        attn_backend=attn_backend,
-        enable_sp=enable_sp,
-        moe_comm_backend=moe_comm_backend,
-        seq_len=context_len,
-    )
+    config = get_config(attn_backend=attn_backend, moe_comm_backend=moe_comm_backend)
     if converters is not None:
-        validate_converter_compatibility(converters)
+        validate_converter_order(converters)
         for converter in converters:
             config = converter.build().convert(config)
-    return config
+    return ModelSpec(
+        name="kimi_k3",
+        flavor=flavor,
+        model=config,
+        max_context_length=context_len,
+        parallelize_fn=parallelize_kimi_k3,
+        pipelining_fn=pipeline_kimi_k3,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
+        state_dict_adapter=KimiK3StateDictAdapter,
+    )

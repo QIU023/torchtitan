@@ -6,11 +6,18 @@
 
 import unittest
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import spmd_types as spmd
 import torch
 import torch.nn as nn
+from expecttest import assert_expected_inline
 from spmd_types import SpmdType
+from torch.distributed.tensor import distribute_tensor, Shard
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorTestBase,
+    with_comms,
+)
 
 from torchtitan.distributed.parallel_dims import MeshAxisName, ParallelDims
 from torchtitan.models.common.linear import Linear
@@ -349,12 +356,37 @@ class TestConfigBuildPropagatesParamInit(unittest.TestCase):
         self.assertTrue(torch.all(m.linear.weight == 1))
 
 
-class TestModuleRedistribution(unittest.TestCase):
+class TestModuleRedistributionDTensor(DTensorTestBase):
     class WeightModule(Module):
         def __init__(self, shape: tuple[int, ...], layout: SpmdType):
             super().__init__()
             self.weight = nn.Parameter(torch.empty(shape))
             self._sharding_config = ShardingConfig(state_shardings={"weight": layout})
+
+    @property
+    def world_size(self):
+        return 2
+
+    def _parallel_dims(self):
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=self.world_size,
+            pp=1,
+            ep=1,
+            world_size=self.world_size,
+            spmd_backend="partial_dtensor",
+        )
+        with patch(
+            "torchtitan.distributed.parallel_dims.device_type", self.device_type
+        ):
+            parallel_dims.build_mesh()
+        return parallel_dims
+
+    class Identity(Module):
+        def forward(self, x):
+            return x
 
     def test_rejects_uneven_tp_parameter_sharding(self):
         module = self.WeightModule(
@@ -372,14 +404,14 @@ class TestModuleRedistribution(unittest.TestCase):
             pp=1,
             ep=1,
             world_size=2,
-            enable_sequence_parallel=False,
+            spmd_backend="spmd_types",
         )
 
         with self.assertRaisesRegex(
             ValueError,
             r"WeightModule\.weight.*tensor dimension 1.*mesh axis tp with size 2",
         ):
-            module._parallelize(parallel_dims)
+            module.parallelize(parallel_dims)
 
     def test_rejects_uneven_ep_parameter_sharding(self):
         module = self.WeightModule(
@@ -394,18 +426,49 @@ class TestModuleRedistribution(unittest.TestCase):
             pp=1,
             ep=2,
             world_size=2,
-            enable_sequence_parallel=False,
+            spmd_backend="spmd_types",
         )
 
         with self.assertRaisesRegex(
             ValueError,
             r"WeightModule\.weight.*tensor dimension 0.*mesh axis ep with size 2",
         ):
-            module._parallelize(parallel_dims)
+            module.parallelize(parallel_dims)
+
+    @with_comms
+    def test_dtensor_must_match_declared_src_shardings(self):
+        parallel_dims = self._parallel_dims()
+        mesh = parallel_dims.get_mesh("tp")
+        module = self.Identity()
+        module._sharding_config = ShardingConfig()
+        module._sharding_config.in_src_shardings = {
+            "x": SpmdType({MeshAxisName.TP: spmd.R})
+        }
+        module._sharding_config.out_src_shardings = SpmdType({MeshAxisName.TP: spmd.R})
+        module._cache_pos_arg_names()
+        x = distribute_tensor(
+            torch.randn(4, 4, device=self.device_type),
+            mesh,
+            (Shard(0),),
+        )
+
+        with self.assertRaises(ValueError) as cm:
+            module._redistribute_inputs(parallel_dims, (x,), {})
+        assert_expected_inline(
+            str(cm.exception),
+            """Identity.x: input DTensor has placements (Shard(dim=0),), but in_src_shardings expects (Replicate(),).""",
+        )
+
+        with self.assertRaises(ValueError) as cm:
+            module._redistribute_outputs(parallel_dims, x)
+        assert_expected_inline(
+            str(cm.exception),
+            """Identity: output DTensor has placements (Shard(dim=0),), but out_src_shardings expects (Replicate(),).""",
+        )
 
 
-class TestParallelizeModuleProtocol(unittest.TestCase):
-    """Tests for protocol validation during Module._parallelize."""
+class TestVerifyModuleProtocol(unittest.TestCase):
+    """Tests for BaseModel.verify_module_protocol."""
 
     def test_passes_for_all_module(self):
         """No error when all submodules are Module instances."""
@@ -425,14 +488,11 @@ class TestParallelizeModuleProtocol(unittest.TestCase):
                 linear_config = Linear.Config(in_features=4, out_features=4)
                 self.linear = linear_config.build()
 
-            def _apply_fsdp(self, **kwargs):
-                pass
-
         model = GoodModel()
-        model._parallelize(None)
+        model.verify_module_protocol()  # should not raise
 
     def test_default_raises_for_plain_nn_module(self):
-        """A plain stateful nn.Module is rejected during parallelization."""
+        """Default verify_module_protocol raises when plain nn.Module child exists."""
         from torchtitan.protocols.model import BaseModel
 
         class BadModel(BaseModel):
@@ -448,15 +508,12 @@ class TestParallelizeModuleProtocol(unittest.TestCase):
                 super().__init__()
                 self.plain = nn.Linear(4, 4)
 
-            def _apply_fsdp(self, **kwargs):
-                pass
-
         model = BadModel()
         with self.assertRaises(RuntimeError):
-            model._parallelize(None)
+            model.verify_module_protocol()
 
-    def test_stateless_plain_module_is_allowed(self):
-        """Stateless PyTorch modules do not need the TorchTitan protocol."""
+    def test_override_skips_verification(self):
+        """Subclass can override verify_module_protocol to skip verification."""
         from torchtitan.protocols.model import BaseModel
 
         class ThirdPartyModel(BaseModel):
@@ -470,38 +527,13 @@ class TestParallelizeModuleProtocol(unittest.TestCase):
 
             def __init__(self):
                 super().__init__()
-                self.plain = nn.ReLU()
+                self.plain = nn.Linear(4, 4)  # third-party module
 
-            def _apply_fsdp(self, **kwargs):
-                pass
-
-        model = ThirdPartyModel()
-        model._parallelize(None)
-
-    def test_explicitly_exempt_stateful_child_is_allowed(self):
-        """A protocol module may own an opaque third-party implementation."""
-        from torchtitan.protocols.model import BaseModel
-
-        class ThirdPartyModel(BaseModel):
-            _module_protocol_exempt_children = frozenset({"plain"})
-
-            @dataclass(kw_only=True, slots=True)
-            class Config(BaseModel.Config):
-                def update_from_config(self, *, config, **kwargs):
-                    pass
-
-                def get_nparams_and_flops(self, model, seq_len):
-                    return (0, 0)
-
-            def __init__(self):
-                super().__init__()
-                self.plain = nn.Linear(4, 4)
-
-            def _apply_fsdp(self, **kwargs):
-                pass
+            def verify_module_protocol(self) -> None:
+                pass  # skip for third-party internals
 
         model = ThirdPartyModel()
-        model._parallelize(None)
+        model.verify_module_protocol()  # should not raise
 
 
 if __name__ == "__main__":
