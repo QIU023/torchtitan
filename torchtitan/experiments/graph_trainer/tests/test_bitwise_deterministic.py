@@ -26,13 +26,10 @@ from tests.utils import hash_gradient, hash_model
 from torch.nn.attention.flex_attention import flex_attention
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.config import DebugConfig, TrainingConfig
-from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.graph_trainer.common_utils import (
-    annotate_graph_trainer_model,
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.configs import (
@@ -42,22 +39,25 @@ from torchtitan.experiments.graph_trainer.configs import (
 from torchtitan.experiments.graph_trainer.deepseek_v3 import (
     model_registry as dsv3_model_registry,
 )
+from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize import (
+    annotate_deepseekv3,
+)
 from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
     maybe_apply_ep_overlap_eager_chunking,
 )
 from torchtitan.experiments.graph_trainer.llama3 import (
     model_registry as llama3_model_registry,
 )
+from torchtitan.experiments.graph_trainer.llama3.parallelize import annotate_llama
 from torchtitan.experiments.graph_trainer.qwen3 import (
     model_registry as qwen3_model_registry,
 )
+from torchtitan.experiments.graph_trainer.qwen3.parallelize import annotate_qwen3
 from torchtitan.experiments.graph_trainer.tests._trainer_test_utils import (
     build_minimal_trainer,
-    single_device_parallel_dims,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
-from torchtitan.models.common.attention import FlexInnerAttention
-from torchtitan.models.common.aux_loss import AuxLoss
+from torchtitan.models.common.attention import FlexAttention
 from torchtitan.tools.utils import has_cuda_capability
 from torchtitan.trainer import Trainer
 
@@ -105,57 +105,49 @@ class BitwiseDeterministicBase(unittest.TestCase):
     """
 
     model_registry: Callable
-    model_registry_kwargs: dict[str, object] = {}
     annotate_model: Callable
     model_flavor: str
     # The unsuffixed subclasses use SDPA (a test-only backend that exercises the
     # backend-agnostic graph machinery — precompile serialization, codegen,
-    # determinism — without FlexInnerAttention's unpicklable, non-tensor BlockMask).
+    # determinism — without FlexAttention's unpicklable, non-tensor BlockMask).
     # The *FlexAttn subclasses override this to "flex".
     attn_backend: str = "sdpa"
 
     def setUp(self):
-        self.parallel_dims = self.enterContext(single_device_parallel_dims())
-
-        # Disable max_autotune for FlexInnerAttention to ensure bitwise-identical
+        # Disable max_autotune for FlexAttention to ensure bitwise-identical
         # results between eager (torch.compile) and traced (regional_inductor)
         # paths. max_autotune causes kernel config divergence between the two.
-        self._orig_inductor_configs = FlexInnerAttention.inductor_configs
-        self._orig_compiled_flex_attn = FlexInnerAttention._compiled_flex_attn
-        FlexInnerAttention.inductor_configs = {
+        self._orig_inductor_configs = FlexAttention.inductor_configs
+        self._orig_compiled_flex_attn = FlexAttention._compiled_flex_attn
+        FlexAttention.inductor_configs = {
             **self._orig_inductor_configs,
             "max_autotune": False,
             "coordinate_descent_tuning": False,
         }
-        FlexInnerAttention._compiled_flex_attn = torch.compile(
+        FlexAttention._compiled_flex_attn = torch.compile(
             flex_attention,
-            options=FlexInnerAttention.inductor_configs,
+            options=FlexAttention.inductor_configs,
         )
 
         _set_deterministic()
-        self.model_config = self.model_registry(
-            self.model_flavor,
-            attn_backend=self.attn_backend,
-            **self.model_registry_kwargs,
+        model_spec = self.model_registry(
+            self.model_flavor, attn_backend=self.attn_backend
         )
+        self.model_config = model_spec.model
         # Match Trainer.__init__: model configs consume runtime settings before
         # build. DSv3 uses the synced RoPE length to decide YaRN scaling.
         runtime_config = Trainer.Config(
-            model=self.model_config,
+            model_spec=model_spec,
             training=TrainingConfig(
                 num_tokens_per_microbatch_per_dp_rank=NUM_TOKENS,
                 max_context_length=SEQ_LEN,
                 steps=NUM_STEPS,
             ),
             parallelism=ParallelismConfig(),
-            checkpointer=CheckpointManager.Config(initial_load_model_only=False),
+            checkpoint=CheckpointManager.Config(initial_load_model_only=False),
             debug=DebugConfig(seed=SEED, deterministic=True),
         )
         self.model_config.update_from_config(config=runtime_config)
-        # Auxiliary losses normalize by the step's global valid-token count,
-        # which the trainer sets before the first forward; this test plays that
-        # role so the DeepSeek-v3 flavors' aux loss can run.
-        AuxLoss.set_step_denominator(torch.tensor(NUM_TOKENS))
         vocab_size = self.model_config.vocab_size
         with torch.device("meta"):
             model = self.model_config.build()
@@ -169,18 +161,16 @@ class BitwiseDeterministicBase(unittest.TestCase):
         self.positions = torch.arange(SEQ_LEN, device="cuda").repeat(BATCH_SIZE)
 
     def tearDown(self):
-        FlexInnerAttention.inductor_configs = self._orig_inductor_configs
-        FlexInnerAttention._compiled_flex_attn = self._orig_compiled_flex_attn
+        FlexAttention.inductor_configs = self._orig_inductor_configs
+        FlexAttention._compiled_flex_attn = self._orig_compiled_flex_attn
 
     def _get_extra_kwargs(self, model: nn.Module) -> dict[str, object]:
         """Build extra_kwargs matching what the model's preprocess_inputs produces.
 
-        For FlexInnerAttention models, this generates the BlockMask attention
+        For FlexAttention models, this generates the BlockMask attention
         masks. For SDPA models, returns an empty dict.
         """
-        from torchtitan.models.common.attention import (
-            FlexInnerAttention as FlexAttnModule,
-        )
+        from torchtitan.models.common.attention import FlexAttention as FlexAttnModule
         from torchtitan.models.common.decoder import Decoder
 
         if not isinstance(self.model_config, Decoder.Config):
@@ -227,23 +217,15 @@ class BitwiseDeterministicBase(unittest.TestCase):
             compile_disable_passes=compile_disable_passes,
             compile_numerics_changing_optim=numerics_changing_optim,
             tokenizer=HuggingFaceTokenizer(tokenizer_path=_TOKENIZER_PATH),
-            parallel_dims=self.parallel_dims,
         )
         global_valid_tokens = torch.tensor(NUM_TOKENS, dtype=torch.float, device="cuda")
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
         for _ in range(NUM_STEPS):
             optimizer.zero_grad()
-            loss = trainer.engine.forward_backward_microbatch(
-                microbatch_group=[
-                    TokenizedTrainingMicrobatch(
-                        input=self.inputs,
-                        positions=self.positions,
-                        labels=self.labels,
-                        padding_mask=torch.zeros_like(self.labels, dtype=torch.bool),
-                        num_valid_tokens=self.labels.numel(),
-                    )
-                ],
+            loss = trainer.forward_backward_step(
+                input_dict={"input": self.inputs, "positions": self.positions},
+                labels=self.labels,
                 global_valid_tokens=global_valid_tokens,
             )
             optimizer.step()
@@ -260,7 +242,6 @@ class BitwiseDeterministicBase(unittest.TestCase):
         the loaded artifact — identical to what happens during
         torchrun training with --compile.precompile_artifact_dir.
         """
-        from torchtitan.experiments.graph_trainer.graph_builder import make_fwd_bwd_step
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
             minimal_fx_tracer,
             run_traced,
@@ -271,11 +252,11 @@ class BitwiseDeterministicBase(unittest.TestCase):
             construct_default_graph_passes,
         )
         from torchtitan.experiments.graph_trainer.precompile import (
-            flatten_runtime_inputs,
             precompile_fx_trace_load,
             precompile_fx_trace_save,
         )
         from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
+        from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
 
         self.annotate_model(model)
         loss_fn = CrossEntropyLoss.Config().build()
@@ -300,8 +281,11 @@ class BitwiseDeterministicBase(unittest.TestCase):
         # before saving, so compiled Triton kernels are baked in
         if enable_passes:
             config = SimpleNamespace(
-                model=self.model_config,
-                compile=GraphTrainerCompileConfig(),
+                model_spec=SimpleNamespace(model=self.model_config),
+                compile=GraphTrainerCompileConfig(
+                    enable=True,
+                    mode="aot_fx_trace",
+                ),
                 parallelism=SimpleNamespace(
                     pipeline_parallel_degree=1,
                     fsdp_reshard_after_forward="default",
@@ -319,22 +303,15 @@ class BitwiseDeterministicBase(unittest.TestCase):
             storage = DiskStorageAdapter(tmpdir)
             precompile_fx_trace_save(traced_result, storage)
 
-            example_inputs = flatten_runtime_inputs(
-                model,
-                (self.inputs, self.labels, global_valid_tokens, extra_kwargs),
-                {},
-            )
-            loaded_result = precompile_fx_trace_load(
-                storage,
-                expected_fingerprint="",
-                example_inputs=example_inputs,
-            )
+            loaded_result = precompile_fx_trace_load(storage, expected_fingerprint="")
 
-        # Step 4: Apply load-time passes (CUDA graph)
+        # Step 4: Apply load-time passes (cudagraph)
         if enable_passes:
             load_config = SimpleNamespace(
-                model=self.model_config,
+                model_spec=SimpleNamespace(model=self.model_config),
                 compile=GraphTrainerCompileConfig(
+                    enable=True,
+                    mode="aot_fx_trace",
                     precompile_artifact_dir="precompiled",
                 ),
             )
@@ -392,7 +369,7 @@ class TestLlama3BitwiseDeterministic(BitwiseDeterministicBase):
 
     model_registry = staticmethod(llama3_model_registry)
     model_flavor = "debugmodel"
-    annotate_model = staticmethod(annotate_graph_trainer_model)
+    annotate_model = staticmethod(annotate_llama)
 
     @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
@@ -429,10 +406,10 @@ class TestLlama3BitwiseDeterministic(BitwiseDeterministicBase):
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
         if self.attn_backend == "flex":
-            # FlexInnerAttention's BlockMask mask_mod closures are Python code objects
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
             # that pickle.dumps cannot serialize. The SDPA subclasses cover this
             # path (SDPA carries no such object).
-            self.skipTest("FlexInnerAttention graphs contain unpicklable code objects")
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
@@ -458,9 +435,8 @@ class TestDSv3BitwiseDeterministic(BitwiseDeterministicBase):
     """Bitwise determinism tests for DeepSeek-v3 debug model."""
 
     model_registry = staticmethod(dsv3_model_registry)
-    model_registry_kwargs = {"enable_sp": True}
     model_flavor = "debugmodel"
-    annotate_model = staticmethod(annotate_graph_trainer_model)
+    annotate_model = staticmethod(annotate_deepseekv3)
 
     @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
@@ -494,10 +470,10 @@ class TestDSv3BitwiseDeterministic(BitwiseDeterministicBase):
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
         if self.attn_backend == "flex":
-            # FlexInnerAttention's BlockMask mask_mod closures are Python code objects
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
             # that pickle.dumps cannot serialize. The SDPA subclasses cover this
             # path (SDPA carries no such object).
-            self.skipTest("FlexInnerAttention graphs contain unpicklable code objects")
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
@@ -520,16 +496,16 @@ class TestDSv3BitwiseDeterministic(BitwiseDeterministicBase):
 
 
 class TestLlama3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
-    """Bitwise determinism tests for Llama3 with FlexInnerAttention (debugmodel).
+    """Bitwise determinism tests for Llama3 with FlexAttention (debugmodel).
 
-    aot_fx_trace compiles FlexInnerAttention HOPs via regional_inductor into fused
+    aot_fx_trace compiles FlexAttention HOPs via regional_inductor into fused
     Triton kernels and produces bitwise identical results to eager.
     """
 
     model_registry = staticmethod(llama3_model_registry)
     model_flavor = "debugmodel"
     attn_backend = "flex"
-    annotate_model = staticmethod(annotate_graph_trainer_model)
+    annotate_model = staticmethod(annotate_llama)
 
     @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
@@ -562,10 +538,10 @@ class TestLlama3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
         if self.attn_backend == "flex":
-            # FlexInnerAttention's BlockMask mask_mod closures are Python code objects
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
             # that pickle.dumps cannot serialize. The SDPA subclasses cover this
             # path (SDPA carries no such object).
-            self.skipTest("FlexInnerAttention graphs contain unpicklable code objects")
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
@@ -588,22 +564,22 @@ class TestLlama3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
 
 
 class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
-    """Bitwise determinism tests for DSv3 with FlexInnerAttention (debugmodel).
+    """Bitwise determinism tests for DSv3 with FlexAttention (debugmodel).
 
-    aot_fx_trace compiles FlexInnerAttention HOPs via regional_inductor into fused
+    aot_fx_trace compiles FlexAttention HOPs via regional_inductor into fused
     Triton kernels and produces bitwise identical results to eager.
     """
 
     model_registry = staticmethod(dsv3_model_registry)
-    model_registry_kwargs = {"enable_sp": True}
     model_flavor = "debugmodel"
     attn_backend = "flex"
-    annotate_model = staticmethod(annotate_graph_trainer_model)
+    annotate_model = staticmethod(annotate_deepseekv3)
 
     def _wrap_ep_chunk_eager_baseline(self, model: nn.Module) -> None:
         maybe_apply_ep_overlap_eager_chunking(
             model,
             GraphTrainerCompileConfig(
+                enable=True,
                 ep_overlap=EpOverlapConfig(
                     enabled=True,
                     strategy="eager",
@@ -635,7 +611,7 @@ class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
             """86f1656c38fa1e23d6b29955889bd5c4ad0c363f9755e2c4ea8dee142cacfcfe""",
         )
 
-    # TODO: FlexInnerAttention compilation exceeds resource limits on pre-Hopper GPUs.
+    # TODO: FlexAttention compilation exceeds resource limits on pre-Hopper GPUs.
     # Revisit when GraphTrainer addresses peak memory during compilation.
     @unittest.skipUnless(
         has_cuda_capability(9, 0),
@@ -650,16 +626,16 @@ class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
         if self.attn_backend == "flex":
-            # FlexInnerAttention's BlockMask mask_mod closures are Python code objects
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
             # that pickle.dumps cannot serialize. The SDPA subclasses cover this
             # path (SDPA carries no such object).
-            self.skipTest("FlexInnerAttention graphs contain unpicklable code objects")
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
         self._assert_runs_match(run_traced, run_precompile, "trace vs precompile: ")
 
-    # TODO: FlexInnerAttention compilation exceeds resource limits on pre-Hopper GPUs.
+    # TODO: FlexAttention compilation exceeds resource limits on pre-Hopper GPUs.
     @unittest.skipUnless(
         has_cuda_capability(9, 0),
         "flex_attention compilation exceeds resource limits on pre-Hopper GPUs",
@@ -684,7 +660,7 @@ class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
         "flex_attention compilation exceeds resource limits on pre-Hopper GPUs",
     )
     def test_ep_chunk_matches_eager_chunking_bitwise(self):
-        """Fast single-GPU prerequisite for FlexInnerAttention EP chunking numerics.
+        """Fast single-GPU prerequisite for FlexAttention EP chunking numerics.
 
         This validates chunking logic, pass composability, and eager-chunked vs.
         graph-chunked numerics with and without the post-schedule concretization
@@ -697,7 +673,7 @@ class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
 
         run_eager = self._run_steps(eager_model, Trainer)
         graph_model = copy.deepcopy(self.model)
-        # The eager FlexInnerAttention baseline compiles with concrete dims.
+        # The eager FlexAttention baseline compiles with concrete dims.
         # Reset Dynamo before tracing the graph-chunked production path,
         # which starts symbolic and then concretizes before Inductor.
         torch._dynamo.reset()
@@ -722,7 +698,7 @@ class TestQwen3MoEBitwiseDeterministic(BitwiseDeterministicBase):
 
     model_registry = staticmethod(qwen3_model_registry)
     model_flavor = "debugmodel_moe"
-    annotate_model = staticmethod(annotate_graph_trainer_model)
+    annotate_model = staticmethod(annotate_qwen3)
 
     @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
@@ -756,10 +732,10 @@ class TestQwen3MoEBitwiseDeterministic(BitwiseDeterministicBase):
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
         if self.attn_backend == "flex":
-            # FlexInnerAttention's BlockMask mask_mod closures are Python code objects
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
             # that pickle.dumps cannot serialize. The SDPA subclasses cover this
             # path (SDPA carries no such object).
-            self.skipTest("FlexInnerAttention graphs contain unpicklable code objects")
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
@@ -782,16 +758,16 @@ class TestQwen3MoEBitwiseDeterministic(BitwiseDeterministicBase):
 
 
 class TestQwen3MoEFlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
-    """Bitwise determinism tests for Qwen3 MoE with FlexInnerAttention.
+    """Bitwise determinism tests for Qwen3 MoE with FlexAttention.
 
-    aot_fx_trace compiles FlexInnerAttention HOPs via regional_inductor into fused
+    aot_fx_trace compiles FlexAttention HOPs via regional_inductor into fused
     Triton kernels and produces bitwise identical results to eager.
     """
 
     model_registry = staticmethod(qwen3_model_registry)
     model_flavor = "debugmodel_moe"
     attn_backend = "flex"
-    annotate_model = staticmethod(annotate_graph_trainer_model)
+    annotate_model = staticmethod(annotate_qwen3)
 
     @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
@@ -824,10 +800,10 @@ class TestQwen3MoEFlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
         if self.attn_backend == "flex":
-            # FlexInnerAttention's BlockMask mask_mod closures are Python code objects
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
             # that pickle.dumps cannot serialize. The SDPA subclasses cover this
             # path (SDPA carries no such object).
-            self.skipTest("FlexInnerAttention graphs contain unpicklable code objects")
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 

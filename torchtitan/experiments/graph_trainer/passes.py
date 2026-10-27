@@ -10,17 +10,14 @@ Compiler passes for graph_trainer training.
 This module provides pass orchestration: building the pass list, applying passes
 in order, and the pass registries.  Individual passes live in dedicated modules:
 
-- ``memory_policy.py`` - SAC and min-cut policy tagging and dispatch
-- ``decompositions.py`` — standalone graph decomposition
+- ``memory_policy.py`` — SAC tagging and memory policy dispatch
 - ``inductor_passes.py`` — regional and full Inductor compilation
-- ``CUDA graph.py`` — CUDA graph wrapping and kernel annotations
+- ``cudagraph.py`` — cudagraph wrapping and kernel annotations
 - ``fsdp_passes.py`` — FSDP bucketing and resharding
 - ``remove_noop_passes.py`` — mandatory gradient-marker cleanup plus graph
   cleanup bundled as ``canonicalize_graph_pass`` (detach, identity view/slice,
   back-to-back transpose, view→reshape normalization)
 - ``performance_passes.py`` — opt-in numerics-changing optimizations
-- ``subgraph_regions.py`` — region annotation, invoke_subgraph outlining, and
-  shared region prologue extraction
 - ``selective_activation_remat.py`` — activation rematerialization
 - ``cpu_offload.py`` — CPU offload insertion
 - ``custom_codegen.py`` — custom code generation for profiling/debugging
@@ -29,14 +26,12 @@ in order, and the pass registries.  Individual passes live in dedicated modules:
 from __future__ import annotations
 
 import functools
-import logging
 import time
 import warnings
 from collections.abc import Callable
 
 import torch
 
-from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     MOE_BLOCK_FQN,
@@ -44,8 +39,8 @@ from torchtitan.experiments.graph_trainer.configs import (
 )
 
 from torchtitan.experiments.graph_trainer.cpu_offload import apply_cpu_offload_pass
-from torchtitan.experiments.graph_trainer.cuda_graph import (
-    cuda_graph_pass,
+from torchtitan.experiments.graph_trainer.cudagraph import (
+    cudagraph_pass,
     insert_kernel_annotations_pass,
 )
 from torchtitan.experiments.graph_trainer.debug_utils import (
@@ -73,7 +68,6 @@ from torchtitan.experiments.graph_trainer.fsdp_passes import (
     deduplicate_fsdp_unshard_chains_pass,
     get_fsdp_param_module_order,
     get_transformer_block_bucket_counts,
-    get_transformer_block_layer_ids,
     joint_transformer_block_bucketing_reordering_pass,
     reassign_collective_pgs_pass,
     schedule_fsdp_comms_to_dense_regions_pass,
@@ -95,9 +89,7 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
-
-logger = logging.getLogger(__name__)
-
+from torchtitan.tools.logging import logger
 
 c10d = torch.ops._c10d_functional
 
@@ -147,27 +139,22 @@ def _tensor_parallel_degree(config, parallel_dims=None) -> int:
     return int(getattr(config.parallelism, "tensor_parallel_degree", 1))
 
 
-def construct_mandatory_graph_passes() -> list[Callable]:
-    """Return correctness passes that run even when optional passes are disabled."""
-    return [remove_parameter_gradient_markers_pass]
-
-
 def compile_time_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
     *,
-    use_cuda_graph: bool = False,
+    use_cudagraph: bool = False,
     parallel_dims=None,
     include_inductor: bool = True,
     include_mandatory_normalization: bool = True,
 ) -> list[Callable]:
-    """Cleanup, FlexInnerAttention annotation, and regional_inductor passes.
+    """Cleanup, FlexAttention annotation, and regional_inductor passes.
 
     If precompile is enabled, these are applied before serialization so
     that compiled Triton kernels are baked into the artifact. Otherwise
     they run at trace time via ``construct_default_graph_passes``.
 
-    CUDA graph is excluded because it needs to re-capture the graph into
+    cudagraph is excluded because it needs to re-capture the graph into
     an in-memory CUDA graph at runtime.
 
     ``reassign_collective_pgs_pass`` runs just before bucketing to place
@@ -188,12 +175,12 @@ def compile_time_passes(
         get_default_transformer_block_buckets,
     )
 
-    n_layers = len(config.model.layers)
+    n_layers = len(config.model_spec.model.layers)
     loss_config = getattr(config, "loss", None)
     uses_chunked_loss = isinstance(loss_config, ChunkedLossWrapper.Config)
     moe_layer_ids = frozenset(
         i
-        for i, layer_cfg in enumerate(config.model.layers)
+        for i, layer_cfg in enumerate(config.model_spec.model.layers)
         if getattr(layer_cfg, "moe", None) is not None
     )
     ep_overlap_enabled = config.compile.ep_overlap.enabled
@@ -213,7 +200,7 @@ def compile_time_passes(
         split_moe_expert_buckets=efsdp_degree > 1,
     )
 
-    passes = construct_mandatory_graph_passes()
+    passes: list[Callable] = [remove_parameter_gradient_markers_pass]
     if include_mandatory_normalization:
         passes.extend(
             [
@@ -333,10 +320,6 @@ def compile_time_passes(
         enable_fsdp_dense_region_overlap = False
 
     if enable_fsdp_dense_region_overlap:
-        require_backward_all_gathers = get_fsdp_reshard_after_forward_policy(
-            config.parallelism.fsdp_reshard_after_forward,
-            pp_enabled=config.parallelism.pipeline_parallel_degree > 1,
-        )
         # Move FSDP comm launches into neighboring transformer dense regions.
         # This is useful both as an EP-overlap companion and as a standalone
         # FSDP scheduling ablation, so it is controlled by its explicit flag.
@@ -349,11 +332,6 @@ def compile_time_passes(
                     module_bucket_plans,
                     n_layers=n_layers,
                 ),
-                local_layer_ids=get_transformer_block_layer_ids(
-                    traced_result.state_fqns,
-                    n_layers=n_layers,
-                ),
-                require_backward_all_gathers=require_backward_all_gathers,
                 strict=True,
             )
         )
@@ -367,7 +345,7 @@ def compile_time_passes(
     passes.extend(
         final_inductor_compile_passes(
             config.compile,
-            use_cuda_graph=use_cuda_graph,
+            use_cudagraph=use_cudagraph,
         )
     )
     return passes
@@ -376,7 +354,7 @@ def compile_time_passes(
 def final_inductor_compile_passes(
     compile_config: GraphTrainerCompileConfig,
     *,
-    use_cuda_graph: bool = False,
+    use_cudagraph: bool = False,
     boxed_codegen: bool = False,
 ) -> list[Callable]:
     """Return the terminal Inductor passes for a traced graph.
@@ -387,7 +365,7 @@ def final_inductor_compile_passes(
     only depends on compile config; model- and parallelism-aware rewrites stay
     in ``compile_time_passes``.
     """
-    from torchtitan.models.common.attention import FlexInnerAttention
+    from torchtitan.models.common.attention import FlexAttention
 
     passes: list[Callable] = []
     inductor_compilation = compile_config.inductor_compilation
@@ -401,12 +379,12 @@ def final_inductor_compile_passes(
             )
         )
     elif inductor_compilation == "regional":
-        # FlexInnerAttention HOPs must be compiled (via regional_inductor) to
+        # FlexAttention HOPs must be compiled (via regional_inductor) to
         # produce bitwise identical results to the eager Trainer path.
         passes.append(
             functools.partial(
                 annotate_flex_attention_for_regional_inductor_pass,
-                flex_compile_config=FlexInnerAttention.inductor_configs,
+                flex_compile_config=FlexAttention.inductor_configs,
             )
         )
         if compile_config.numerics_changing_optim:
@@ -421,7 +399,7 @@ def final_inductor_compile_passes(
                 boxed_codegen=boxed_codegen,
             )
         )
-        if use_cuda_graph:
+        if use_cudagraph:
             passes.append(insert_kernel_annotations_pass)
     else:
         raise ValueError(
@@ -440,12 +418,12 @@ def construct_default_graph_passes(
     """Build the pass list for the aot_fx_trace path.
 
     When ``precompile_artifact_dir`` is unset, returns the full list: cleanup,
-    FlexInnerAttention annotation, regional_inductor, and CUDA graph.
+    FlexAttention annotation, regional_inductor, and cudagraph.
 
     When ``precompile_artifact_dir`` is set, the artifact has graph
-    transformed during precompile phase, so only CUDA graph is returned.
+    transformed during precompile phase, so only cudagraph is returned.
     """
-    want_cuda_graph = "cuda_graph_pass" not in config.compile.disable_passes
+    want_cudagraph = "cudagraph_pass" not in config.compile.disable_passes
 
     has_precompile_artifact = bool(config.compile.precompile_artifact_dir)
 
@@ -455,16 +433,16 @@ def construct_default_graph_passes(
             compile_time_passes(
                 traced_result,
                 config,
-                use_cuda_graph=want_cuda_graph,
+                use_cudagraph=want_cudagraph,
                 parallel_dims=parallel_dims,
             )
         )
 
-    if want_cuda_graph:
+    if want_cudagraph:
         static_input_indices = list(range(traced_result.num_static_inputs))
         passes.append(
             functools.partial(
-                cuda_graph_pass,
+                cudagraph_pass,
                 static_input_indices=static_input_indices,
                 tensor_input_indices=traced_result.tensor_input_indices,
             )

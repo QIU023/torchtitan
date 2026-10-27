@@ -11,30 +11,27 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.config.transform import (
-    ModelConfigConverter,
-    validate_converter_compatibility,
-)
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
     FeedForward,
     Linear,
-    MoE,
     RMSNorm,
     RoPE,
-    RouterGateLinear,
-    RowParallelLinear,
-    SqrtSoftplus,
 )
 from torchtitan.models.common.config_utils import (
-    fused_gate_up_param_init,
-    fused_grouped_gate_up_param_init,
     make_ffn_config,
     make_routed_experts_config,
-    make_shared_expert_ffn_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
+from torchtitan.models.deepseek_v3.parallelize import (
+    parallelize_deepseekv3 as parallelize_deepseek_v4,
+)
+from torchtitan.models.utils import validate_converter_order
+from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.protocols.model_spec import ModelSpec
 
 from .attention import (
     Attention,
@@ -45,10 +42,12 @@ from .attention import (
 from .compressor import Compressor, Indexer
 from .mhc import HcHead, HcPost, HcPre
 from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
-from .moe import DeepSeekV4Router
+from .moe import DeepSeekV4MoE, DeepSeekV4Router
 from .mtp import MTPBlock
+from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
+    "parallelize_deepseek_v4",
     "DeepSeekV4Model",
     "deepseek_v4_configs",
     "model_registry",
@@ -292,7 +291,7 @@ def _make_v4_attn_config(
             bias=False,
             param_init=_LINEAR_INIT,
         ),
-        wo_b=RowParallelLinear.Config(
+        wo_b=Linear.Config(
             in_features=per_group_out,
             out_features=dim,
             bias=False,
@@ -317,7 +316,6 @@ def _make_v4_moe_config(
     *,
     layer_id: int,
     dim: int,
-    enable_sp: bool,
     moe_inter_dim: int,
     num_experts: int,
     num_shared_experts: int,
@@ -330,18 +328,18 @@ def _make_v4_moe_config(
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
 ):
-    return MoE.Config(
+    return DeepSeekV4MoE.Config(
         num_experts=num_experts,
         router=DeepSeekV4Router.Config(
             num_experts=num_experts,
-            gate=RouterGateLinear.Config(
+            gate=Linear.Config(
                 in_features=dim,
                 out_features=num_experts,
                 bias=False,
                 param_init=_depth_init(layer_id),
             ),
             top_k=top_k,
-            score_func=SqrtSoftplus.Config(),
+            score_func="sqrtsoftplus",
             route_scale=route_scale,
             route_norm=route_norm,
             vocab_size=vocab_size,
@@ -358,10 +356,9 @@ def _make_v4_moe_config(
             non_blocking_capacity_factor=non_blocking_capacity_factor,
         ),
         shared_experts=(
-            make_shared_expert_ffn_config(
+            make_ffn_config(
                 dim=dim,
                 hidden_dim=moe_inter_dim * num_shared_experts,
-                enable_sp=enable_sp,
                 w1_param_init=_LINEAR_INIT,
                 w2w3_param_init=_depth_init(layer_id),
             )
@@ -391,7 +388,6 @@ def _build_v4_layers(
     n_layers: int,
     layer_offset: int = 0,
     dim: int,
-    enable_sp: bool,
     n_heads: int,
     head_dim: int,
     rope_head_dim: int,
@@ -464,7 +460,6 @@ def _build_v4_layers(
             moe_cfg = _make_v4_moe_config(
                 layer_id=actual_layer_id,
                 dim=dim,
-                enable_sp=enable_sp,
                 moe_inter_dim=moe_inter_dim,
                 num_experts=num_experts,
                 num_shared_experts=num_shared_experts,
@@ -552,23 +547,15 @@ def _build_mtp_layers(
         layer_id = n_main_layers + depth
         block_cfg = _make_mtp_inner_block(inner_cfg, rope)
         if block_cfg.moe is not None:
-            router_cfg = block_cfg.moe.router
-            assert isinstance(router_cfg, DeepSeekV4Router.Config)
-            router_cfg.gate.param_init = _depth_init(layer_id)
-            router_cfg.layer_id = layer_id
-            expert_init = _depth_experts_init(layer_id)
-            block_cfg.moe.routed_experts.w13.param_init = (
-                fused_grouped_gate_up_param_init(expert_init)
+            block_cfg.moe.router.gate.param_init = _depth_init(layer_id)
+            block_cfg.moe.router.layer_id = layer_id
+            block_cfg.moe.routed_experts.inner_experts.param_init = _depth_experts_init(
+                layer_id
             )
-            block_cfg.moe.routed_experts.w2.param_init = {
-                "weight": expert_init["w2_EDF"]
-            }
             if block_cfg.moe.shared_experts is not None:
                 depth_init = _depth_init(layer_id)
                 block_cfg.moe.shared_experts.w2.param_init = depth_init
-                block_cfg.moe.shared_experts.w13.param_init = fused_gate_up_param_init(
-                    _LINEAR_INIT, depth_init
-                )
+                block_cfg.moe.shared_experts.w3.param_init = depth_init
         mtp_layers.append(
             MTPBlock.Config(
                 attention=block_cfg.attention,
@@ -624,7 +611,6 @@ def _debugmodel(
     non_blocking_capacity_factor: float | None = None,
     n_mtp_layers: int = 0,
     *,
-    enable_sp: bool,
     seq_len: int,
 ) -> DeepSeekV4Model.Config:
     dim = 256
@@ -675,7 +661,6 @@ def _debugmodel(
     )
 
     layers = _build_v4_layers(
-        enable_sp=enable_sp,
         n_layers=n_layers,
         dim=dim,
         n_heads=n_heads,
@@ -710,7 +695,6 @@ def _debugmodel(
     )
 
     return DeepSeekV4Model.Config(
-        max_context_length=seq_len,
         dim=dim,
         vocab_size=vocab_size,
         norm_eps=norm_eps,
@@ -759,7 +743,6 @@ def _deepseek_v4_flash(
     non_blocking_capacity_factor: float | None = None,
     n_mtp_layers: int = 0,
     *,
-    enable_sp: bool,
     seq_len: int,
 ) -> DeepSeekV4Model.Config:
     dim = 4096
@@ -810,7 +793,6 @@ def _deepseek_v4_flash(
     )
 
     layers = _build_v4_layers(
-        enable_sp=enable_sp,
         n_layers=n_layers,
         dim=dim,
         n_heads=n_heads,
@@ -845,7 +827,6 @@ def _deepseek_v4_flash(
     )
 
     return DeepSeekV4Model.Config(
-        max_context_length=seq_len,
         dim=dim,
         vocab_size=vocab_size,
         norm_eps=norm_eps,
@@ -894,7 +875,6 @@ def _deepseek_v4_pro(
     non_blocking_capacity_factor: float | None = None,
     n_mtp_layers: int = 0,
     *,
-    enable_sp: bool,
     seq_len: int,
 ) -> DeepSeekV4Model.Config:
     dim = 7168
@@ -945,7 +925,6 @@ def _deepseek_v4_pro(
     )
 
     layers = _build_v4_layers(
-        enable_sp=enable_sp,
         n_layers=n_layers,
         dim=dim,
         n_heads=n_heads,
@@ -980,7 +959,6 @@ def _deepseek_v4_pro(
     )
 
     return DeepSeekV4Model.Config(
-        max_context_length=seq_len,
         dim=dim,
         vocab_size=vocab_size,
         norm_eps=norm_eps,
@@ -1034,13 +1012,12 @@ deepseek_v4_configs = {
 def model_registry(
     flavor: str,
     *,
-    enable_sp: bool,
     seq_len: int | None = None,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     n_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> DeepSeekV4Model.Config:
+) -> ModelSpec:
     if flavor not in deepseek_v4_configs:
         raise ValueError(
             f"Unknown deepseek_v4 flavor: {flavor}. "
@@ -1054,14 +1031,22 @@ def model_registry(
             f"{max_context_len} for flavor {flavor}"
         )
     config = get_config(
-        enable_sp=enable_sp,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         n_mtp_layers=n_mtp_layers,
         seq_len=context_len,
     )
     if converters is not None:
-        validate_converter_compatibility(converters)
+        validate_converter_order(converters)
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
-    return config
+    return ModelSpec(
+        name="deepseek_v4",
+        flavor=flavor,
+        model=config,
+        max_context_length=context_len,
+        parallelize_fn=parallelize_deepseek_v4,
+        pipelining_fn=pipeline_llm,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
+        state_dict_adapter=DeepSeekV4StateDictAdapter,
+    )

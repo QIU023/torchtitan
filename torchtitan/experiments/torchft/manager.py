@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import importlib.util
-import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -21,9 +20,7 @@ from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 from torch.distributed.distributed_c10d import ReduceOp
 
 from torchtitan.config import Configurable
-
-logger = logging.getLogger(__name__)
-
+from torchtitan.tools.logging import logger
 
 if importlib.util.find_spec("torchft") is not None:
     import torchft
@@ -151,9 +148,7 @@ class TorchFTManager(Configurable):
 
             def apply_set_all_reduce_hook(m):
                 if isinstance(m, FSDPModule):
-                    param_groups = m._get_fsdp_state()._fsdp_param_groups
-                    for param_group in param_groups:
-                        param_group._all_reduce_hook = all_reduce_hook
+                    m.set_all_reduce_hook(all_reduce_hook)
 
             for model_part in model_parts:
                 model_part.apply(apply_set_all_reduce_hook)

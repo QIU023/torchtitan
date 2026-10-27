@@ -4,20 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from __future__ import annotations
-
 import logging
 import re
-from typing import Any, TYPE_CHECKING
+from typing import Any
+
+logger = logging.getLogger()
 
 from torchtitan.models.common.rope import ComplexRoPE
-from torchtitan.protocols.state_dict_adapter import dtensor_safe, StateDictAdapter
-
-if TYPE_CHECKING:
-    from .model import Llama3Model
-
-
-logger = logging.getLogger(__name__)
+from torchtitan.protocols.state_dict_adapter import StateDictAdapter
+from .model import Llama3Model
 
 
 class Llama3StateDictAdapter(StateDictAdapter):
@@ -48,7 +43,6 @@ class Llama3StateDictAdapter(StateDictAdapter):
         }
 
     # HuggingFace permutation function (exact copy from their conversion script)
-    @dtensor_safe
     def _permute(self, w, n_heads_arg, dim1=None, dim2=None):
         if dim1 is None:
             dim1 = w.shape[0]
@@ -61,7 +55,6 @@ class Llama3StateDictAdapter(StateDictAdapter):
             .clone()
         )
 
-    @dtensor_safe
     def _reverse_permute(self, w, n_heads_arg, dim1=None, dim2=None):
         if dim1 is None:
             dim1 = w.shape[0]
@@ -74,7 +67,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
         )
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        state_dict = self._native_fused_linears_to_hf(state_dict)
+
         # pyrefly: ignore [missing-attribute]
         attn = self.model_config.layers[0].attention
         n_heads = attn.n_heads
@@ -158,4 +151,4 @@ class Llama3StateDictAdapter(StateDictAdapter):
 
             state_dict[new_key] = value
 
-        return self._native_fused_linears_from_hf(state_dict)
+        return state_dict

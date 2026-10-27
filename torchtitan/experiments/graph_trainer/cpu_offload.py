@@ -33,7 +33,6 @@ applies NUMA binding (``AffinityMode.NODE``) on CUDA hardware at init
 (see ``_maybe_apply_numa_binding`` in torchtitan/trainer.py).
 """
 
-import logging
 import operator
 from typing import NamedTuple
 
@@ -51,9 +50,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _is_backward_node,
     _NOT_IN_LAYERS,
 )
-
-logger = logging.getLogger(__name__)
-
+from torchtitan.tools.logging import logger
 
 aten = torch.ops.aten
 

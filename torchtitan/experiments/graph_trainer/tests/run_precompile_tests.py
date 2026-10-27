@@ -19,8 +19,6 @@ Usage:
 """
 
 import argparse
-
-import logging
 import os
 import subprocess
 import tempfile
@@ -28,10 +26,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from torchtitan.observability.logging import init_logger
-
-
-logger = logging.getLogger(__name__)
+from torchtitan.tools.logging import logger
 
 
 @dataclass
@@ -52,28 +47,30 @@ def _build_precompile_tests() -> list[PrecompileTestDefinition]:
     fx_trace_precompile_dir = tempfile.mkdtemp(prefix="fx_trace_precompile_")
     dsv3_fx_trace_precompile_dir = tempfile.mkdtemp(prefix="dsv3_fx_trace_precompile_")
     return [
-        # Uses the SDPA backend: the default FlexInnerAttention backend bakes a
+        # Uses the SDPA backend: the default FlexAttention backend bakes a
         # BlockMask into the precompiled artifact, whose mask_mod closures are
         # Python code objects that pickle.dumps cannot serialize ("TypeError:
         # cannot pickle code objects" in precompile_fx_trace_save). SDPA carries
         # no such object, so it exercises the precompile machinery cleanly.
-        # TODO: re-test on FlexInnerAttention once BlockMask is excluded/rebuilt at
+        # TODO: re-test on FlexAttention once BlockMask is excluded/rebuilt at
         # load time (or becomes picklable).
         PrecompileTestDefinition(
             precompile_command=(
                 "python -m torchtitan.experiments.graph_trainer.precompile_main"
                 " --module graph_trainer.llama3"
                 " --config graph_trainer_llama3_debugmodel_sdpa"
+                " --compile.mode aot_fx_trace"
                 f" --compile.precompile_artifact_dir {fx_trace_precompile_dir}"
-                " --parallelism.data_parallel_shard_degree 2"
-                " --parallelism.tensor_parallel_degree 4"
+                " --parallelism.data_parallel_shard_degree 4"
+                " --parallelism.tensor_parallel_degree 2"
             ),
             override_args=[
                 "--module graph_trainer.llama3",
                 "--config graph_trainer_llama3_debugmodel_sdpa",
+                "--compile.mode aot_fx_trace",
                 f"--compile.precompile_artifact_dir {fx_trace_precompile_dir}",
-                "--parallelism.data_parallel_shard_degree 2",
-                "--parallelism.tensor_parallel_degree 4",
+                "--parallelism.data_parallel_shard_degree 4",
+                "--parallelism.tensor_parallel_degree 2",
             ],
             test_descr="aot_fx_trace llama3 precompile FSDP+TP",
             test_name="aot_fx_trace_llama3_precompile_fsdp_tp",
@@ -88,6 +85,7 @@ def _build_precompile_tests() -> list[PrecompileTestDefinition]:
                 "python -m torchtitan.experiments.graph_trainer.precompile_main"
                 " --module graph_trainer.deepseek_v3"
                 " --config graph_trainer_deepseek_v3_debugmodel"
+                " --compile.mode aot_fx_trace"
                 f" --compile.precompile_artifact_dir {dsv3_fx_trace_precompile_dir}"
                 " --parallelism.data_parallel_shard_degree 4"
                 " --parallelism.tensor_parallel_degree 2"
@@ -96,6 +94,7 @@ def _build_precompile_tests() -> list[PrecompileTestDefinition]:
             override_args=[
                 "--module graph_trainer.deepseek_v3",
                 "--config graph_trainer_deepseek_v3_debugmodel",
+                "--compile.mode aot_fx_trace",
                 f"--compile.precompile_artifact_dir {dsv3_fx_trace_precompile_dir}",
                 "--parallelism.data_parallel_shard_degree 4",
                 "--parallelism.tensor_parallel_degree 2",
@@ -173,7 +172,6 @@ def run_precompile_tests(args):
 
 
 def main():
-    init_logger()
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir")
     parser.add_argument(

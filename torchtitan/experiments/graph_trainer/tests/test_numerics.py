@@ -14,24 +14,14 @@ import tempfile
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
-from unittest.mock import patch
 
-import spmd_types as spmd
 import torch
-import torch.distributed as dist
-import torch.nn as nn
 from torch.distributed._composable.fsdp import fully_shard
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Shard
-from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.common_fsdp import FSDPTest
 
 from torchtitan.components.loss import cross_entropy_loss
 from torchtitan.distributed import ParallelDims
-from torchtitan.experiments.graph_trainer import simple_fsdp
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
-from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
-from torchtitan.models.common.linear import GroupedLinear, Linear
 
 
 STEPS = 20
@@ -237,15 +227,21 @@ LLAMA3_PARALLELISM = (
     "--parallelism.tensor_parallel_degree=2"
     " --parallelism.data_parallel_shard_degree=4"
 )
-DEBUGMODEL_TRAINING_OPTIONS = (
-    f"--training.max_context_length={DEFAULT_DEBUG_MODEL_SEQ_LEN}"
+# Core debug configs default to each flavor's full context length, while the
+# GraphTrainer configs use smaller contexts to keep graph tests tractable.
+DEBUGMODEL_2K_TRAINING_OPTIONS = (
+    "--training.max_context_length=2048"
+    " --training.num_tokens_per_microbatch_per_dp_rank=16384"
+)
+DEBUGMODEL_4K_TRAINING_OPTIONS = (
+    "--training.max_context_length=4096"
     " --training.num_tokens_per_microbatch_per_dp_rank=16384"
 )
 
 
 def _run_llama3_loss_compare(test_options_extra: str = "") -> bool:
     """Run loss_compare for llama3 vs graph_trainer.llama3 with FSDP+TP."""
-    options = f"{LLAMA3_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
+    options = f"{LLAMA3_PARALLELISM} {DEBUGMODEL_2K_TRAINING_OPTIONS}"
     test_options = options
     if test_options_extra:
         test_options += f" {test_options_extra}"
@@ -271,17 +267,20 @@ DSV3_EP_OVERLAP_GRAPH_PARALLELISM = (
     " --parallelism.expert_parallel_degree=2"
 )
 DSV3_EP_OVERLAP_OPTIONS = (
-    "--compile.ep_overlap.enabled"
+    "--compile.mode aot_fx_trace"
+    " --compile.ep_overlap.enabled"
     " --compile.ep_overlap.chunk_dim batch"
     " --compile.ep_overlap.module_fqn layers.*"
 )
 DSV3_EP_OVERLAP_MOE_SEQ_OPTIONS = (
-    "--compile.ep_overlap.enabled"
+    "--compile.mode aot_fx_trace"
+    " --compile.ep_overlap.enabled"
     " --compile.ep_overlap.chunk_dim seq"
     " --compile.ep_overlap.module_fqn layers.*.moe"
 )
 DSV3_EP_OVERLAP_MOE_BATCH_OPTIONS = (
-    "--compile.ep_overlap.enabled"
+    "--compile.mode aot_fx_trace"
+    " --compile.ep_overlap.enabled"
     " --compile.ep_overlap.chunk_dim batch"
     " --compile.ep_overlap.module_fqn layers.*.moe"
 )
@@ -302,7 +301,7 @@ def _run_deepseek_v3_loss_compare(
     baseline_options_extra: str = "",
 ) -> bool:
     """Run loss_compare for deepseek_v3 vs graph_trainer.deepseek_v3."""
-    options = f"{parallelism} {DEBUGMODEL_TRAINING_OPTIONS}"
+    options = f"{parallelism} {DEBUGMODEL_2K_TRAINING_OPTIONS}"
     baseline_options = options
     if baseline_options_extra:
         baseline_options += f" {baseline_options_extra}"
@@ -366,7 +365,7 @@ GRAPH_PP_DSV3_PP_OPTIONS = (
     " --parallelism.expert_parallel_degree=2"
     " --training.num_tokens_per_microbatch_per_dp_rank=2048"
     # Eager PP cannot be the baseline for ZBVZeroBubble or DualPipeV here:
-    # FlexInnerAttention needs torch.compile, and torch.compile is incompatible with
+    # FlexAttention needs torch.compile, and torch.compile is incompatible with
     # those eager PP schedules. Compare GraphPP schedules against eager
     # Interleaved1F1B instead. TorchTitan gradient clipping is applied per
     # local rank, so different PP schedules can produce different clip
@@ -377,7 +376,9 @@ GRAPH_PP_DSV3_PP_OPTIONS = (
 
 
 GRAPH_PP_DSV3_TEST_PARALLELISM = (
-    "--compile.inductor_compilation regional" f" {GRAPH_PP_DSV3_PP_OPTIONS}"
+    "--compile.mode aot_fx_trace"
+    " --compile.inductor_compilation regional"
+    f" {GRAPH_PP_DSV3_PP_OPTIONS}"
 )
 
 
@@ -396,8 +397,8 @@ def _run_graph_pp_deepseek_v3_loss_compare(schedule: str) -> bool:
         " --metrics.save_for_all_ranks"
     )
 
-    baseline_module = "deepseek_v3"
-    baseline_config = "deepseek_v3_debugmodel"
+    baseline_module = "graph_trainer.deepseek_v3"
+    baseline_config = "graph_trainer_deepseek_v3_debugmodel_eager_pp"
     test_module = "graph_trainer.deepseek_v3"
     test_config = "graph_trainer_deepseek_v3_debugmodel"
     baseline_tb_folder = "tb_baseline"
@@ -467,7 +468,7 @@ QWEN3_PARALLELISM = (
 
 def _run_qwen3_loss_compare(test_options_extra: str = "") -> bool:
     """Run loss_compare for qwen3 vs graph_trainer.qwen3 with FSDP+TP."""
-    options = f"{QWEN3_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
+    options = f"{QWEN3_PARALLELISM} {DEBUGMODEL_2K_TRAINING_OPTIONS}"
     test_options = options
     if test_options_extra:
         test_options += f" {test_options_extra}"
@@ -491,7 +492,7 @@ QWEN3_MOE_PARALLELISM = (
 
 def _run_qwen3_moe_loss_compare(test_options_extra: str = "") -> bool:
     """Run loss_compare for qwen3 MoE vs graph_trainer.qwen3 MoE."""
-    options = f"{QWEN3_MOE_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
+    options = f"{QWEN3_MOE_PARALLELISM} {DEBUGMODEL_4K_TRAINING_OPTIONS}"
     test_options = options
     if test_options_extra:
         test_options += f" {test_options_extra}"
@@ -512,19 +513,23 @@ AUTOPARALLEL_LLAMA3_PARALLELISM = (
 
 
 def _run_autoparallel_llama3_loss_compare() -> bool:
-    """Run loss_compare for manual SDPA llama3 vs AutoParallel.
+    """Run loss_compare for eager SDPA llama3 vs graph_trainer AutoParallel.
 
-    AutoParallel is unsupported on the default FlexInnerAttention backend (dynamo
+    AutoParallel is unsupported on the default FlexAttention backend (dynamo
     export flattens the BlockMask), so both sides use the test-only SDPA backend.
+    The eager baseline runs the same SDPA model through GraphTrainer with
+    ``mode=None`` (delegates to the core eager path).
     """
     return run_loss_compare_close(
         baseline_module="graph_trainer.llama3",
-        baseline_config="graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
+        baseline_config="graph_trainer_llama3_debugmodel_sdpa_eager",
         test_module="graph_trainer.llama3",
         test_config="graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
         baseline_options=AUTOPARALLEL_LLAMA3_PARALLELISM,
         test_options=(
-            f"{AUTOPARALLEL_LLAMA3_PARALLELISM} --compile.enable_autoparallel"
+            f"{AUTOPARALLEL_LLAMA3_PARALLELISM}"
+            " --compile.mode aot_fx_trace"
+            " --compile.enable_autoparallel"
         ),
         baseline_ngpus=4,
         test_ngpus=4,
@@ -534,7 +539,7 @@ def _run_autoparallel_llama3_loss_compare() -> bool:
 AUTOPARALLEL_DSV3_PARALLELISM = (
     "--parallelism.data_parallel_shard_degree=4"
     " --parallelism.expert_parallel_degree=2"
-    f" {DEBUGMODEL_TRAINING_OPTIONS}"
+    f" {DEBUGMODEL_2K_TRAINING_OPTIONS}"
 )
 
 
@@ -546,7 +551,11 @@ def _run_autoparallel_deepseek_v3_loss_compare() -> bool:
         test_module="graph_trainer.deepseek_v3",
         test_config="graph_trainer_deepseek_v3_debugmodel",
         baseline_options=AUTOPARALLEL_DSV3_PARALLELISM,
-        test_options=(f"{AUTOPARALLEL_DSV3_PARALLELISM} --compile.enable_autoparallel"),
+        test_options=(
+            f"{AUTOPARALLEL_DSV3_PARALLELISM}"
+            " --compile.mode aot_fx_trace"
+            " --compile.enable_autoparallel"
+        ),
         baseline_ngpus=4,
         test_ngpus=4,
         rtol=5e-4,
@@ -557,7 +566,46 @@ class TestGraphTrainerNumerics(unittest.TestCase):
     """Test numerics equivalence between graph_trainer and FSDP2 eager."""
 
     def test_dense_llama3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(_run_llama3_loss_compare())
+        self.assertTrue(
+            _run_llama3_loss_compare(test_options_extra="--compile.mode aot_fx_trace"),
+        )
+
+    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
+    def test_dense_llama3_jit_vs_eager(self):
+        self.assertTrue(
+            _run_llama3_loss_compare(test_options_extra="--compile.mode jit"),
+        )
+
+    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
+    def test_dense_llama3_auto_bucketing_jit_vs_eager(self):
+        self.assertTrue(
+            _run_llama3_loss_compare(
+                test_options_extra="--compile.mode jit --compile.passes auto_bucketing"
+            ),
+        )
+
+    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
+    def test_dense_llama3_manual_bucketing_jit_vs_eager(self):
+        self.assertTrue(
+            _run_llama3_loss_compare(
+                test_options_extra="--compile.mode jit --compile.passes transformer_block_bucketing"
+            ),
+        )
+
+    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
+    def test_moe_dsv3_jit_vs_eager(self):
+        """Test graph_trainer.deepseek_v3 matches deepseek_v3 (JIT)."""
+        self.assertTrue(
+            _run_deepseek_v3_loss_compare(test_options_extra="--compile.mode jit"),
+        )
+
+    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
+    def test_moe_dsv3_manual_bucketing_jit_vs_eager(self):
+        self.assertTrue(
+            _run_deepseek_v3_loss_compare(
+                test_options_extra="--compile.mode jit --compile.passes transformer_block_bucketing"
+            ),
+        )
 
     @unittest.skip(
         "Disabled: flaky single-rank crash in DSv3 MoE EP all-to-all. Losses "
@@ -567,7 +615,11 @@ class TestGraphTrainerNumerics(unittest.TestCase):
         "diagnosed and fixed."
     )
     def test_moe_dsv3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(_run_deepseek_v3_loss_compare())
+        self.assertTrue(
+            _run_deepseek_v3_loss_compare(
+                test_options_extra="--compile.mode aot_fx_trace"
+            ),
+        )
 
     # TODO(#4342): Remove transformer-level chunking. After the model batch
     # dimension was folded into the token dimension, splitting `layers.*` in
@@ -596,10 +648,16 @@ class TestGraphTrainerNumerics(unittest.TestCase):
                 self.assertTrue(_run_graph_pp_deepseek_v3_loss_compare(schedule))
 
     def test_dense_qwen3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(_run_qwen3_loss_compare())
+        self.assertTrue(
+            _run_qwen3_loss_compare(test_options_extra="--compile.mode aot_fx_trace"),
+        )
 
     def test_moe_qwen3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(_run_qwen3_moe_loss_compare())
+        self.assertTrue(
+            _run_qwen3_moe_loss_compare(
+                test_options_extra="--compile.mode aot_fx_trace"
+            ),
+        )
 
 
 @unittest.skipUnless(
@@ -611,7 +669,7 @@ class TestGraphTrainerAutoParallelNumerics(unittest.TestCase):
 
     # AutoParallel runs on the test-only SDPA backend (Decoder.forward lists
     # positions before attention_masks so input_fn's (tokens, positions) binds
-    # correctly). It is unsupported on the default FlexInnerAttention backend (dynamo
+    # correctly). It is unsupported on the default FlexAttention backend (dynamo
     # export flattens the BlockMask to (Fake)Tensors and flex_attention fails on
     # missing BLOCK_SIZE), so both eager baseline and AutoParallel test use SDPA.
     # TODO: Disabled due to upstream AutoParallel/PyTorch API skew. PyTorch
@@ -631,375 +689,7 @@ class TestGraphTrainerAutoParallelNumerics(unittest.TestCase):
         self.assertTrue(_run_autoparallel_deepseek_v3_loss_compare())
 
 
-# B: batch size, D: input features, O: output features.
-
-
-class _SharedProjection(nn.Module):
-    def __init__(self, num_outputs, *, num_inputs=8, bias, device):
-        super().__init__()
-        self.projection = nn.Linear(
-            num_inputs, num_outputs, bias=bias, device=device, dtype=torch.float64
-        )
-
-    def forward(self, inputs_BD):
-        return sum(self.projection(inputs_BD * scale) for scale in (1, 2, 3, 4))
-
-
 class TestSimpleFSDP(FSDPTest):
-    @staticmethod
-    def _local_shard(tensor, *, tp_rank, dp_rank, shard_dim, mode):
-        local = tensor.chunk(2, dim=0)[tp_rank]
-        if mode != "replicate":
-            chunks = local.chunk(2, dim=shard_dim)
-            local = (
-                chunks[dp_rank]
-                if dp_rank < len(chunks)
-                else local.narrow(shard_dim, 0, 0)
-            )
-        return local.contiguous()
-
-    @staticmethod
-    def _check_layout(actual, expected):
-        assert actual.shape == expected.shape
-        assert actual.stride() == expected.stride()
-        assert len(actual.placements) == len(expected.placements)
-        for placement, expected_placement in zip(
-            actual.placements, expected.placements, strict=True
-        ):
-            assert type(placement) is type(expected_placement)
-            assert placement == expected_placement
-            if isinstance(placement, _StridedShard):
-                assert placement.split_factor == expected_placement.split_factor
-
-    @patch.dict(os.environ, {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
-    def _test_sharding(
-        self,
-        mode="fully_shard",
-        *,
-        num_outputs=10,
-        num_inputs=8,
-        shard_dim=0,
-        meta_init=False,
-        compiled=False,
-        transposed=False,
-    ):
-        required_world_size = 8 if mode == "hybrid_shard" else 4
-        if self.world_size < required_world_size or self.world_size % 4:
-            self.skipTest(
-                f"Requires a multiple of four devices, at least {required_world_size}"
-            )
-        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
-        device = (
-            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
-        )
-        previous_deterministic = torch.are_deterministic_algorithms_enabled()
-        torch.manual_seed(42)
-        torch.use_deterministic_algorithms(True)
-        try:
-            mesh = init_device_mesh(
-                device_type,
-                (self.world_size // 4, 2, 2),
-                mesh_dim_names=("replica", "fsdp", "tp"),
-            )
-            dp_mesh = (
-                mesh["replica", "fsdp"] if mode == "hybrid_shard" else mesh["fsdp"]
-            )
-            tp_mesh = mesh["tp"]
-            tp_rank = tp_mesh.get_local_rank()
-            dp_rank = mesh["fsdp"].get_local_rank()
-            reference = _SharedProjection(
-                num_outputs, num_inputs=num_inputs, bias=shard_dim == 0, device=device
-            )
-            if transposed:
-                reference.projection.weight = nn.Parameter(
-                    reference.projection.weight.detach().t().contiguous().t()
-                )
-            model = (
-                _SharedProjection(
-                    num_outputs,
-                    num_inputs=num_inputs,
-                    bias=shard_dim == 0,
-                    device="meta",
-                )
-                if meta_init
-                else copy.deepcopy(reference)
-            )
-            for name, parameter in model.projection.named_parameters():
-                local_parameter = nn.Parameter(
-                    parameter.detach().chunk(2, dim=0)[tp_rank].clone(),
-                    requires_grad=parameter.requires_grad,
-                )
-                spmd.assert_type(local_parameter, {tp_mesh.get_group(): spmd.S(0)})
-                model.projection.register_parameter(name, local_parameter)
-
-            original_redistribute = simple_fsdp.redistribute_local_tensor
-
-            def check_outer_spec(local, *, current_spec, target_spec):
-                for spec in (current_spec, target_spec):
-                    assert spec.shape == local.shape
-                    assert spec.tensor_meta.stride == local.stride()
-                    assert spec.tensor_meta.dtype == local.dtype
-                return original_redistribute(
-                    local, current_spec=current_spec, target_spec=target_spec
-                )
-
-            with patch.object(
-                simple_fsdp, "redistribute_local_tensor", check_outer_spec
-            ):
-                simple_fsdp.data_parallel(
-                    model,
-                    dp_mesh,
-                    mode,
-                    shard_dim=shard_dim,
-                    non_dp_mesh=tp_mesh,
-                )
-
-            def expected_local(tensor):
-                return self._local_shard(
-                    tensor,
-                    tp_rank=tp_rank,
-                    dp_rank=dp_rank,
-                    shard_dim=shard_dim,
-                    mode=mode,
-                )
-
-            if meta_init:
-                model.to_empty(device=device)
-                assert all(not parameter.is_meta for parameter in model.parameters())
-                with torch.no_grad(), simple_fsdp.disable_active_parametrization():
-                    for parameter, original in zip(
-                        model.parameters(), reference.parameters(), strict=True
-                    ):
-                        parameter.to_local().copy_(expected_local(original))
-
-            compute_weight = model.projection.weight
-            self.assertNotIsInstance(compute_weight, DTensor)
-            self.assertEqual(compute_weight.shape, (num_outputs // 2, num_inputs))
-            for parameter, original in zip(
-                model.parameters(), reference.parameters(), strict=True
-            ):
-                self.assertIsInstance(parameter, DTensor)
-                self.assertEqual(parameter.shape, original.shape)
-                self.assertEqual(parameter.stride(), original.stride())
-            optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
-            reference_optimizer = torch.optim.AdamW(
-                reference.parameters(), lr=0.01, foreach=False
-            )
-            run_model = (
-                torch.compile(model, backend="aot_eager", fullgraph=True)
-                if compiled
-                else model
-            )
-            for _ in range(2):
-                optimizer.zero_grad(set_to_none=True)
-                reference_optimizer.zero_grad(set_to_none=True)
-                for microbatch in range(2):
-                    # Sparse, exactly representable inputs keep the comparison bitwise
-                    # across different GEMM shapes while varying the data across DP ranks.
-                    batch_start = (self.rank // 2 + microbatch) % 4
-                    inputs_BD = torch.eye(
-                        num_inputs, dtype=torch.float64, device=device
-                    )[batch_start : batch_start + 2]
-                    output_BO = run_model(inputs_BD)
-                    expected_BO = reference(inputs_BD)
-                    local_expected_BO = expected_BO.chunk(2, dim=1)[
-                        tp_rank
-                    ].contiguous()
-                    torch.testing.assert_close(
-                        output_BO, local_expected_BO, rtol=0, atol=0
-                    )
-                    loss = output_BO.sum()
-                    torch.testing.assert_close(
-                        loss, local_expected_BO.sum(), rtol=0, atol=0
-                    )
-                    loss.backward()
-                    expected_BO.sum().backward()
-                for parameter, original in zip(
-                    model.parameters(), reference.parameters(), strict=True
-                ):
-                    # NCCL requires contiguous buffers even for transposed parameters.
-                    reference_grad = original.grad.contiguous()
-                    # SimpleFSDP sums gradients across every data-parallel axis.
-                    for axis_name in dp_mesh.mesh_dim_names:
-                        dist.all_reduce(
-                            reference_grad, group=dp_mesh.get_group(axis_name)
-                        )
-                    original.grad.copy_(reference_grad)
-                    self._check_layout(parameter.grad, parameter)
-                    torch.testing.assert_close(
-                        parameter.grad.to_local(),
-                        expected_local(original.grad),
-                        rtol=0,
-                        atol=0,
-                    )
-                optimizer.step()
-                reference_optimizer.step()
-                for parameter, original in zip(
-                    model.parameters(), reference.parameters(), strict=True
-                ):
-                    torch.testing.assert_close(
-                        parameter.to_local(), expected_local(original), rtol=0, atol=0
-                    )
-                    for key in ("exp_avg", "exp_avg_sq"):
-                        state = optimizer.state[parameter][key]
-                        self._check_layout(state, parameter)
-                        torch.testing.assert_close(
-                            state.to_local(),
-                            expected_local(reference_optimizer.state[original][key]),
-                            rtol=0,
-                            atol=0,
-                        )
-        finally:
-            torch.use_deterministic_algorithms(previous_deterministic)
-
-    def test_uneven_fsdp_with_tp(self):
-        self._test_sharding()
-
-    def test_uneven_fsdp_with_ep_tp(self):
-        if self.world_size < 8 or self.world_size % 4:
-            self.skipTest("Requires a multiple of four devices, at least eight")
-        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
-        device = (
-            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
-        )
-        mesh = init_device_mesh(
-            device_type,
-            (self.world_size // 4, 2, 2),
-            mesh_dim_names=("fsdp", "ep", "tp"),
-        )
-        # EP and TP split evenly: 20 -> 10 -> 5. Only the DP split is uneven.
-        weight = torch.arange(160, dtype=torch.float32, device=device).reshape(20, 8)
-        expected_local = (
-            weight.chunk(2, dim=0)[mesh["ep"].get_local_rank()]
-            .chunk(2, dim=0)[mesh["tp"].get_local_rank()]
-            .clone()
-        )
-        model = nn.Linear(8, 20, bias=False, device=device)
-        model.weight = nn.Parameter(expected_local.clone())
-        ep_axis = spmd.MeshAxis.of(mesh["ep"].get_group())
-        tp_axis = spmd.MeshAxis.of(mesh["tp"].get_group())
-        spmd.assert_type(
-            model.weight,
-            {ep_axis: spmd.V, tp_axis: spmd.V},
-            spmd.PartitionSpec((ep_axis, tp_axis), None),
-        )
-        data_parallel(model, mesh["fsdp"], "fully_shard", non_dp_mesh=mesh["ep", "tp"])
-        output = model.weight
-        self.assertNotIsInstance(output, DTensor)
-        torch.testing.assert_close(output, expected_local, rtol=0, atol=0)
-        output.sum().backward()
-        parameter = model._parameters["weight"]
-        self.assertEqual(parameter.shape, weight.shape)
-        self._check_layout(parameter.grad, parameter)
-        torch.testing.assert_close(
-            parameter.grad.to_local(),
-            torch.full_like(parameter.to_local(), mesh["fsdp"].size()),
-            rtol=0,
-            atol=0,
-        )
-
-    def test_uneven_hsdp_with_tp(self):
-        self._test_sharding("hybrid_shard")
-
-    def test_uneven_fsdp_shard_dim_one_with_tp(self):
-        self._test_sharding(num_inputs=7, shard_dim=1)
-
-    def test_replicate_with_tp(self):
-        self._test_sharding("replicate")
-
-    def test_uneven_sharding_transposed_parameter(self):
-        self._test_sharding(transposed=True)
-
-    def test_uneven_sharding_transposed_parameter_compiled(self):
-        self._test_sharding(transposed=True, compiled=True)
-
-    def test_replicate_transposed_parameter(self):
-        self._test_sharding("replicate", transposed=True)
-
-    def test_uneven_sharding_meta_init(self):
-        self._test_sharding(meta_init=True)
-
-    def test_uneven_sharding_compiled(self):
-        self._test_sharding(compiled=True)
-
-    def test_even_fsdp_with_tp(self):
-        self._test_sharding(num_outputs=12)
-
-    def test_empty_fsdp_shard_with_tp(self):
-        self._test_sharding(num_outputs=2)
-
-    def test_stacked_linear_shards_matrix_rows(self):
-        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
-        device = (
-            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
-        )
-        mesh = init_device_mesh(
-            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
-        )
-        model = Linear.Config(
-            in_features=8,
-            out_features=8,
-            num_linears=2,
-            bias=True,
-        ).build()
-        model.to(device)
-
-        data_parallel(model, mesh, "fully_shard")
-
-        weight = model._parameters["weight"]
-        bias = model._parameters["bias"]
-        self.assertIsInstance(weight, DTensor)
-        self.assertIsInstance(bias, DTensor)
-        self.assertEqual(weight.placements, (Shard(1),))
-        self.assertEqual(bias.placements, (Shard(1),))
-
-    def test_stacked_grouped_linear_shards_matrix_rows(self):
-        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
-        device = (
-            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
-        )
-        mesh = init_device_mesh(
-            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
-        )
-        model = GroupedLinear.Config(
-            group_size=4,
-            in_features=8,
-            out_features=8,
-            num_linears=2,
-        ).build()
-        model.to(device)
-
-        data_parallel(model, mesh, "fully_shard")
-
-        weight = model._parameters["weight"]
-        self.assertIsInstance(weight, DTensor)
-        self.assertEqual(weight.placements, (Shard(2),))
-
-    def test_frozen_parameter_remains_frozen(self):
-        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
-        device = (
-            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
-        )
-        mesh = init_device_mesh(
-            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
-        )
-        model = nn.Linear(8, 8, device=device)
-        model.weight.requires_grad_(False)
-        data_parallel(model, mesh, "fully_shard")
-        weight = model._parameters["weight"]
-        bias = model._parameters["bias"]
-        self.assertFalse(weight.requires_grad)
-        self.assertTrue(bias.requires_grad)
-        original_weight = weight.to_local().detach().clone()
-        original_bias = bias.to_local().detach().clone()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
-        model(torch.ones(2, 8, device=device)).sum().backward()
-        self.assertIsNone(weight.grad)
-        self.assertIsNotNone(bias.grad)
-        optimizer.step()
-        self.assertTrue(torch.equal(weight.to_local(), original_weight))
-        self.assertFalse(torch.equal(bias.to_local(), original_bias))
-
     def init_test(self):
         self.optimizer = torch.optim.Adam
         self.loss_fn = cross_entropy_loss
@@ -1008,10 +698,10 @@ class TestSimpleFSDP(FSDPTest):
             self.dp_mesh_dim_names = ["dp_replicate"]
             data_parallel_replicate_degree = self.world_size
         elif self.mode == "fully_shard":
-            self.dp_mesh_dim_names = ["dp_shard"]
+            self.dp_mesh_dim_names = ["fsdp"]
             data_parallel_replicate_degree = 1
         elif self.mode == "hybrid_shard":
-            self.dp_mesh_dim_names = ["dp_replicate", "dp_shard"]
+            self.dp_mesh_dim_names = ["dp_replicate", "fsdp"]
             data_parallel_replicate_degree = self.world_size // 2
         else:
             raise ValueError(f"Unsupported mode {self.mode}")
@@ -1024,7 +714,7 @@ class TestSimpleFSDP(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
-            enable_sequence_parallel=False,
+            spmd_backend="partial_dtensor",
         )
 
     def get_input(self):

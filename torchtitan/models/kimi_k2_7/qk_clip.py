@@ -10,14 +10,13 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch_remat as remat
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.nn.attention.flex_attention import AuxRequest
 
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.distributed import ParallelDims
-from torchtitan.models.common.attention import FlexInnerAttention
+from torchtitan.models.common.attention import FlexAttention
 from torchtitan.models.deepseek_v3.model import Attention
 
 # Shape suffixes:
@@ -25,11 +24,11 @@ from torchtitan.models.deepseek_v3.model import Attention
 # I = input features.
 
 
-class QKClipFlexInnerAttention(FlexInnerAttention):
-    """FlexInnerAttention that records the maximum score for each query head."""
+class QKClipFlexAttention(FlexAttention):
+    """FlexAttention that records the maximum score for each query head."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(FlexInnerAttention.Config):
+    class Config(FlexAttention.Config):
         pass
 
     def __init__(self, config: Config) -> None:
@@ -40,11 +39,10 @@ class QKClipFlexInnerAttention(FlexInnerAttention):
         return AuxRequest(lse=return_lse, max_scores=self.training)
 
     def _process_aux(self, aux: Any) -> None:
-        if self.training and not remat.is_recomputing():
+        if self.training:
             max_scores_1HT = aux.max_scores
             assert max_scores_1HT is not None
-            # Record gradient-accumulation and PP microbatches once, excluding
-            # activation-checkpoint replay.
+            # Record gradient-accumulation and PP microbatches, plus AC recomputation.
             self.max_attention_logits_H.append(max_scores_1HT.amax(dim=(0, 2)).detach())
 
 
@@ -149,7 +147,7 @@ def qk_clip(
         for model_part in model_parts
         for module in model_part.modules()
         if isinstance(module, Attention)
-        and isinstance(module.inner_attention, QKClipFlexInnerAttention)
+        and isinstance(module.inner_attention, QKClipFlexAttention)
     ]
     if not attention_layers:
         return
@@ -201,6 +199,6 @@ def register_qk_clip_hook(
 
 
 __all__ = [
-    "QKClipFlexInnerAttention",
+    "QKClipFlexAttention",
     "register_qk_clip_hook",
 ]

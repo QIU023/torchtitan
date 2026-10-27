@@ -38,12 +38,6 @@ class OverrideDefinitions:
     timeout: int | None = None
     golden_numerics_path: str | None = None
     """Run through loss_compare.py using this mode-specific golden path."""
-    loss_compare_seed_config: Callable[[], Trainer.Config] | None = None
-    """Model-equivalent config for loss_compare.py's single-GPU seed run.
-
-    Use this when the test config applies a parallel transform. The seed run
-    disables parallelism but does not undo the transform.
-    """
     use_real_pg: bool = False
     """Whether the test requires communication semantics from a real PG."""
     configs: Sequence[Callable[[], Trainer.Config]] = ()
@@ -74,7 +68,7 @@ def validate_fake_pg_compatibility(
     """Require explicit real-PG marking for incompatible configurations."""
     incompatibilities = []
 
-    if config.checkpointer is not None or config.create_seed_checkpoint:
+    if config.checkpoint.enable or config.checkpoint.create_seed_checkpoint:
         incompatibilities.append("checkpointing")
     if config.parallelism.pipeline_parallel_degree > 1:
         incompatibilities.append("pipeline parallelism")

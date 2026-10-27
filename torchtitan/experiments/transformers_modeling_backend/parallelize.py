@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 from typing import Any
 
 import torch
@@ -18,8 +17,12 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import Shard
 
-from torchtitan.config import CompileConfig, TrainingConfig
-from torchtitan.config.parallelism import FSDPSymmMemScope, ParallelismConfig
+from torchtitan.config import (
+    CompileConfig,
+    ParallelismConfig,
+    TORCH_DTYPE_MAP,
+    TrainingConfig,
+)
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
@@ -27,10 +30,10 @@ from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
     enable_fsdp_symm_mem,
     get_fsdp_reshard_after_forward_policy,
+    resolve_fsdp_mesh,
+    resolve_sparse_fsdp_mesh,
 )
-
-
-logger = logging.getLogger(__name__)
+from torchtitan.tools.logging import logger
 
 
 def _wrap_flex_kernel_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
@@ -44,10 +47,10 @@ def _wrap_flex_kernel_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
     keys -- the BlockMask is Q-sharded / KV-full to match.
 
     This is the explicit-collective analogue of Titan's ``flex_cp_allgather``
-    path: the kernel runs nested inside the attention module's local SPMD region
+    path: the kernel runs nested inside the attention module's local_map region
     where the CP mesh dim is no longer visible to a declarative redistribute, so
     the gather is done here on local tensors. Called before ``model.parallelize``
-    so the wrap is captured inside the local SPMD wrapper.
+    so the wrap is captured inside the local_map wrapping.
     """
     import torch.distributed as dist
     from torch.distributed.tensor.experimental._context_parallel._attention import (
@@ -87,7 +90,7 @@ def parallelize_hf_transformers(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig | None,
+    compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
@@ -97,11 +100,18 @@ def parallelize_hf_transformers(
     1. Build and swap Titan MoE modules (sets _sharding_config on MoE tree)
     2. Convert all remaining HF nn.Modules to Module protocol via __class__ swap
     3. Set ShardingConfig on every module based on its role
-    4. Single model._parallelize(parallel_dims) call -- shards states, wraps forward
+    4. Single model.parallelize(parallel_dims) call — shards states, wraps forward
     5. Apply AC, compile, FSDP as usual
     """
+    if parallel_dims.spmd_backend != "spmd_types":
+        raise ValueError(
+            "The Transformers modeling backend only supports "
+            "parallelism.spmd_backend='spmd_types'; "
+            f"got '{parallel_dims.spmd_backend}'."
+        )
+
     # Flex attention supports FSDP, TP, CP, and PP (in any combination). Under CP
-    # the flex kernel's local SPMD boundary redistributes
+    # the flex kernel's local_map redistributes
     # k/v from seq-sharded to CP-Replicate (all-gather); see _attach_flex_kernel
     # in hf_sharding.py. The CP-sharded BlockMask is built and sharded on its Q
     # axis upstream (trainer, ptrr balancer). Note: the ptrr balancer requires
@@ -159,17 +169,17 @@ def parallelize_hf_transformers(
     )
 
     # 3b. Under CP, wrap each flex kernel forward to all-gather k/v across
-    # the CP axis (on the seq dim). Must run before model._parallelize so the
-    # wrap is captured inside the local SPMD region and operates on the local
+    # the CP axis (on the seq dim). Must run before model.parallelize so the
+    # wrap is captured inside the local_map region and operates on the local
     # (already TP-head-sharded, CP-seq-sharded) tensors.
     if parallel_dims.cp_enabled:
         _wrap_flex_kernel_cp(model, parallel_dims.get_mesh("cp"))
 
     # 4. Single parallelize call -- handles TP, EP, MoE, everything
-    model._parallelize(parallel_dims)
+    model.parallelize(parallel_dims)
 
     model_compile_enabled = (
-        compile_config is not None and "model" in compile_config.components
+        compile_config.enable and "model" in compile_config.components
     )
 
     if ac_config is not None:
@@ -186,10 +196,22 @@ def parallelize_hf_transformers(
             parallel_dims=parallel_dims,
         )
 
-    model._apply_fsdp(
-        parallel_dims=parallel_dims,
-        training=training,
-        parallelism=parallelism,
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+
+    apply_fsdp(
+        model,
+        dp_mesh,
+        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        pp_enabled=parallel_dims.pp_enabled,
+        cpu_offload=training.enable_cpu_offload,
+        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        ep_degree=parallel_dims.ep,
+        dp_mod_ep_mesh=edp_mesh,
+        dp_mesh_dims=dp_mesh_dims,
+        edp_mesh_dims=edp_mesh_dims,
     )
 
     if training.enable_cpu_offload:
@@ -220,7 +242,7 @@ def apply_fsdp(
     dp_mesh_dims: DataParallelMeshDims | None = None,
     edp_mesh_dims: DataParallelMeshDims | None = None,
     gradient_divide_factor: int | None = None,
-    symm_mem_scope: FSDPSymmMemScope = None,
+    enable_symm_mem: bool = False,
 ):
     """Apply data parallelism (via FSDP2) to the model.
 
@@ -289,14 +311,17 @@ def apply_fsdp(
 
             assert dp_mod_ep_mesh is not None
             moe_module = getattr(transformer_block, "mlp", None)
-            routed_experts = moe_module.routed_experts
-            w13_params = set(routed_experts.w13.parameters())
-            w2_params = set(routed_experts.w2.parameters())
-            expert_params = w13_params | w2_params
-            num_experts = routed_experts.w13.group_size
+            # Post-#3859 the grouped experts live under routed_experts.inner_experts
+            # (with the token_dispatcher as a sibling under routed_experts).
+            experts = moe_module.routed_experts.inner_experts
+            expert_params = set(experts.parameters())
+            num_experts = experts.num_experts
 
             efsdp_ep_size = dp_mod_ep_mesh["efsdp"].size() * ep_degree
-            shard_expert_dim = efsdp_ep_size <= num_experts
+            if efsdp_ep_size > num_experts:
+                expert_shard_placement = Shard(1)
+            else:
+                expert_shard_placement = Shard(0)
 
             edp_mesh_info = _get_mesh_info(dp_mod_ep_mesh, edp_mesh_dims)
             dp_mesh_info = _get_mesh_info(dp_mesh, dp_mesh_dims)
@@ -306,19 +331,13 @@ def apply_fsdp(
             def _shard_placement_fn(
                 param: nn.Parameter,
                 _expert_params: set = expert_params,
-                _w13_params: set = w13_params,
-                _shard_expert_dim: bool = shard_expert_dim,
+                _expert_placement: Shard = expert_shard_placement,
                 _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
                 _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
             ) -> ShardPlacementResult:
                 if param in _expert_params:
-                    placement = (
-                        Shard(0)
-                        if _shard_expert_dim
-                        else Shard(2 if param in _w13_params else 1)
-                    )
                     return ShardPlacementResult(
-                        placement=placement, mesh_info=_edp_mesh_info
+                        placement=_expert_placement, mesh_info=_edp_mesh_info
                     )
                 return ShardPlacementResult(placement=Shard(0), mesh_info=_dp_mesh_info)
 
@@ -347,7 +366,8 @@ def apply_fsdp(
 
     fully_shard(model, **fsdp_config)
 
-    enable_fsdp_symm_mem(model, symm_mem_scope)
+    if enable_symm_mem:
+        enable_fsdp_symm_mem(model)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

@@ -6,23 +6,18 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import queue
 import threading
-from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict_saver import _stateful_to_state_dict
-from torch.distributed.checkpoint.stateful import Stateful
 from torch_checkpointing.barriers import TCPStoreBarrierConfig
-from torch_checkpointing.checkpoint_layout import LayoutInfo, SafetensorsSerialization
 from torch_checkpointing.checkpoint_manager import (
     CheckpointManager as BackendCheckpointManager,
 )
@@ -36,28 +31,22 @@ from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.distributed_metadata import (
     METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
 )
-from torch_checkpointing.hf.consolidation import consolidate_hf_safetensors_checkpoint
-from torch_checkpointing.logging_utils import checkpoint_logging_context, EventLogger
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.staging import CheckpointStagerConfig
 from torch_checkpointing.storage.base_storage import Storage, StorageConfig
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torchtitan.components.data.loader import BaseDataLoader
-from torchtitan.components.optimizer import (  # noqa: N811
-    EMA as EMAContainer,
-    LRSchedulersContainer,
-    OptimizersContainer,
-)
+from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools import filesystem
+from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
 from .base import (
     BaseCheckpointManager,
     DATALOADER,
-    EMA,
     LR_SCHEDULER,
     MODEL,
     ModelWrapper,
@@ -65,19 +54,9 @@ from .base import (
     purge_thread,
 )
 
-logger = logging.getLogger(__name__)
-
-
 DEFAULT_TORCH_CHECKPOINTING_BARRIER_TCPSTORE_PORT = 43001
 _DEFAULT_BARRIER_INIT_TIMEOUT_SEC = 60
 _DEFAULT_BARRIER_TIMEOUT_SEC = 600
-
-# Index the HF consolidation writes at the root of a final export; the
-# backend names it after the checkpoint item it consolidated.
-_HF_INDEX_FILE_NAME = f"{MODEL}.safetensors.index.json"
-
-# Logger the backend emits its checkpoint events and metrics on.
-CHECKPOINTING_LOGGER_NAME = "torch_checkpointing"
 
 
 class _BackendCheckpointStorage:
@@ -93,7 +72,7 @@ class _BackendCheckpointStorage:
 
     ``Path`` would mangle a remote URI -- it collapses the double slash in
     ``gs://bucket/x`` -- but every path arriving here is joined off
-    ``checkpointer.folder`` or ``checkpointer.initial_load_path``, and the manager
+    ``checkpoint.folder`` or ``checkpoint.initial_load_path``, and the manager
     rejects a remote value for either at construction. So there is nothing left
     to guard against by the time a path reaches this class.
     """
@@ -115,28 +94,6 @@ class _BackendCheckpointStorage:
         self._storage.rmdir(Path(path))
 
 
-def _init_subprocess_logging(
-    structured_logger_init_fn: Callable[[], None],
-    init_fn: Callable[..., None] | None,
-    init_args: tuple[Any, ...],
-) -> None:
-    """Re-establish structured logging inside the async save subprocess.
-
-    The subprocess does not inherit the parent's logging handlers, so its
-    checkpoint records would otherwise be lost.
-    """
-    if init_fn is not None:
-        init_fn(*init_args)
-
-    structured_logger_init_fn()
-
-    backend_logger = logging.getLogger(CHECKPOINTING_LOGGER_NAME)
-    if backend_logger.level == logging.NOTSET and not backend_logger.isEnabledFor(
-        logging.INFO
-    ):
-        backend_logger.setLevel(logging.INFO)
-
-
 def _item_specs() -> dict[str, ItemSpec]:
     resharder = DefaultResharder()
     return {
@@ -146,11 +103,6 @@ def _item_specs() -> dict[str, ItemSpec]:
             required=False,
         ),
         OPTIMIZER: ItemSpec(
-            requires_copy=True,
-            resharder=resharder,
-            required=False,
-        ),
-        EMA: ItemSpec(
             requires_copy=True,
             resharder=resharder,
             required=False,
@@ -193,28 +145,12 @@ def _default_backend_config(
     save_config: CheckpointSaverConfig,
     *,
     storage_config: StorageConfig | None = None,
-    items: dict[str, ItemSpec] | None = None,
-    subprocess_init_fn: Callable[..., None] | None = None,
-    subprocess_init_args: tuple[Any, ...] = (),
-    pre_finalize_callback: Callable[[str, EventLogger], None] | None = None,
 ) -> BackendCheckpointManager.Config:
-    if isinstance(save_config, AsyncCheckpointSaverConfig):
-        structured_logger_init_fn = sl.get_structured_logger_subprocess_init_fn()
-        if structured_logger_init_fn is not None:
-            subprocess_init_args = (
-                structured_logger_init_fn,
-                subprocess_init_fn,
-                subprocess_init_args,
-            )
-            subprocess_init_fn = _init_subprocess_logging
     return BackendCheckpointManager.Config(
-        items=_item_specs() if items is None else items,
+        items=_item_specs(),
         default=ItemSpec(requires_copy=False),
         save=save_config,
         storage_config=storage_config,
-        subprocess_init_fn=subprocess_init_fn,
-        subprocess_init_args=subprocess_init_args,
-        pre_finalize_callback=pre_finalize_callback,
     )
 
 
@@ -231,7 +167,12 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseCheckpointManager.Config):
-        pass
+        def __post_init__(self) -> None:
+            BaseCheckpointManager.Config.__post_init__(self)
+            if self.last_save_in_hf:
+                raise ValueError(
+                    "TorchCheckpointingManager does not support last_save_in_hf yet."
+                )
 
     def __init__(
         self,
@@ -241,12 +182,14 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         model_parts: list[nn.Module],
         optimizers: OptimizersContainer,
         lr_schedulers: LRSchedulersContainer,
-        ema: EMAContainer | None,
         states: dict[str, Any],
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
         storage_config: StorageConfig | None = None,
     ) -> None:
+        self.enable = config.enable
+        if not self.enable:
+            return
         self.save_future: Future[Any] | None = None
         self.purge_thread: threading.Thread | None = None
 
@@ -255,8 +198,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # probe when retention is off, so it would otherwise reach the backend
         # and be mangled by Path() rather than failing.
         for label, candidate in (
-            ("checkpointer.folder", self.folder),
-            ("checkpointer.initial_load_path", config.initial_load_path),
+            ("checkpoint.folder", self.folder),
+            ("checkpoint.initial_load_path", config.initial_load_path),
         ):
             if candidate and filesystem.is_remote(candidate):
                 raise ValueError(
@@ -274,8 +217,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 LR_SCHEDULER: lr_schedulers,
             }
         )
-        if ema is not None:
-            self.states[EMA] = ema
 
         self.load_only = config.load_only
         self.exclude_from_loading = config.exclude_from_loading
@@ -311,7 +252,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         self.sd_adapter = sd_adapter
         if self.last_save_in_hf and self.sd_adapter is None:
             raise ValueError(
-                "checkpointer.last_save_in_hf is True, but sd_adapter is not provided."
+                "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
             )
 
         self._manager = self._manager_config.build()
@@ -336,44 +277,14 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         if hasattr(self, "_manager"):
             self.close()
 
-    def _load_checkpoint(
-        self,
-        states: dict[str, Any],
-        checkpoint_id: str,
-        *,
-        from_hf: bool,
-        from_quantized: bool,
-    ) -> None:
-        if from_hf:
-            raise ValueError(
-                "TorchCheckpointingManager does not yet support loading "
-                "Hugging Face checkpoints."
-            )
-        if not self._is_valid_checkpoint(checkpoint_id):
-            raise ValueError(
-                f"Checkpoint {checkpoint_id!r} is not a native "
-                "torch_checkpointing checkpointer."
-            )
-        # strict: the backend defaults to skipping anything the checkpoint does
-        # not carry, which would silently leave parameters at their initialized
-        # values and resume from a model that is not the one that was saved.
-        # exclude_from_loading is applied by _states_to_load, so anything still
-        # in `states` here is genuinely required.
-        state_dict = _stateful_to_state_dict(states)
-        loaded = self._manager.load(
-            checkpoint_id,
-            into=state_dict,
-            strict=True,
+    # Load routing lands in a later change.
+    def _load(self, step: int = -1) -> bool:
+        raise NotImplementedError(
+            "TorchCheckpointingManager does not implement load() yet."
         )
-        for key, target in states.items():
-            if isinstance(target, Stateful):
-                target.load_state_dict(state_dict[key])
-            elif loaded[key] is not target:
-                raise TypeError(
-                    f"Cannot restore non-Stateful checkpoint state {key!r} of type "
-                    f"{type(target).__name__}"
-                )
 
+    @sl.log_trace_span("checkpoint_save")
+    @torch.no_grad()
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         should_save = self._should_save(curr_step, last_step)
         # Prewarm on a step we are not saving, so the first real save does not
@@ -385,10 +296,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             return False
 
         sl.add_step_tag("checkpoint_save")
-        # The backend stamps its own events from this context and carries it
-        # into the async save subprocess, so without it every forwarded backend
-        # metric reports step=None.
-        checkpoint_logging_context.update(step=curr_step)
         self.maybe_wait_for_saving()
         # Always preserve the current step's published and staging directories.
         self._purge_stale_checkpoints(
@@ -409,33 +316,9 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         return True
 
-    def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
-        """Whether automatic loading may select ``checkpoint_dir``.
-
-        Unlike ``_is_valid_checkpoint``, this excludes final Hugging Face exports.
-        Hugging Face checkpoint loading has not landed in torch_checkpointing yet,
-        so automatic loading cannot select those exports.
-        """
+    def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
         return self._storage.isfile(
             filesystem.join(checkpoint_dir, TORCH_CHECKPOINTING_METADATA_FILE_NAME)
-        )
-
-    def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
-        # Either published layout counts as valid:
-        #
-        #   step-3/                     step-5/  (final HF export)
-        #   ├── metadata.pkl            ├── model.safetensors.index.json
-        #   ├── model_0.pt              ├── model-00001-of-00002.safetensors
-        #   ├── model_1.pt              ├── model-00002-of-00002.safetensors
-        #   ├── optimizer_0.pt          └── sharded/
-        #   └── optimizer_1.pt              ├── metadata.pkl
-        #                                   ├── model_0.safetensors
-        #                                   └── model_1.safetensors
-        #
-        # Without the HF shape, a finished export looks abandoned and
-        # retention deletes it on the next run.
-        return self._is_resumable_checkpoint(checkpoint_dir) or self._storage.isfile(
-            filesystem.join(checkpoint_dir, _HF_INDEX_FILE_NAME)
         )
 
     def _maybe_wait_for_staging(self) -> None:
@@ -489,62 +372,14 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         # The final save must land before the process exits, so retire the async
         # manager and write synchronously through a fresh one.
-        checkpoint_id = self._create_checkpoint_id(curr_step)
         self._manager.close()
-        storage_config = self._manager_config.storage_config
-        input_checkpoint_id = checkpoint_id
-        item_specs: dict[str, ItemSpec] | None = None
-        pre_finalize_callback: Callable[[str, EventLogger], None] | None = None
-        if self.last_save_in_hf:
-            assert self.sd_adapter is not None
-            states = {MODEL: self.sd_adapter.to_hf(states[MODEL])}
-            # Ranks write safetensors shards into a nested directory; the
-            # pre-finalize callback consolidates them up into checkpoint_id, so
-            # the published checkpoint is HF-layout rather than sharded.
-            input_checkpoint_id = filesystem.join(checkpoint_id, "sharded")
-            item_specs = _item_specs()
-            model_spec = item_specs[MODEL]
-            item_specs[MODEL] = ItemSpec(
-                requires_copy=model_spec.requires_copy,
-                layout=LayoutInfo(
-                    f"{MODEL}_{{rank}}.safetensors",
-                    SafetensorsSerialization(),
-                ),
-                resharder=model_spec.resharder,
-                required=model_spec.required,
-            )
-            fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
-            hf_storage_config = storage_config or LocalFileSystemStorageConfig(
-                use_direct_io=False
-            )
-
-            # The backend invokes the callback after each rank finishes writing
-            # but before the write barrier and the atomic rename of the
-            # temp dir to its final path, passing the directory the shards
-            # were actually written to. Consolidation repacks the per-rank
-            # shards into HF-layout files in the checkpoint directory.
-            def pre_finalize_callback(staged: str, _event_logger) -> None:  # noqa: F811
-                # Need all ranks to finish writing before any rank starts consolidating
-                if dist.is_initialized():
-                    dist.barrier()
-                consolidate_hf_safetensors_checkpoint(
-                    staged,
-                    output_dir=checkpoint_id,
-                    item_key=MODEL,
-                    fqn_to_index_mapping=fqn_to_index_mapping,
-                    storage_config=hf_storage_config,
-                )
-
-        manager_config = _default_backend_config(
+        manager = _default_backend_config(
             _sync_save_config(),
-            storage_config=storage_config,
-            items=item_specs,
-            pre_finalize_callback=pre_finalize_callback,
-        )
-        manager = manager_config.build()
+            storage_config=self._manager_config.storage_config,
+        ).build()
         try:
             manager.save(
-                input_checkpoint_id,
+                self._create_checkpoint_id(curr_step),
                 _stateful_to_state_dict(states),
             )
         finally:
@@ -552,4 +387,4 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         GarbageCollection.collect("GC collection invoked by checkpointer.")
 
     def _should_prewarm(self) -> bool:
-        return not self._prewarmed and not self.load_only
+        return self.enable and not self._prewarmed and not self.load_only

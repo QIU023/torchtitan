@@ -15,14 +15,12 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
-from torchtitan.config import CompileConfig, DebugConfig, TrainingConfig
-from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import ChatProcessor, DATASETS
-from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
-from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.observability.profiler import Profiler
+from torchtitan.tools.profiler import Profiler
 from torchtitan.trainer import Trainer
 from . import model_registry
 from .tokenizer import HFBackendTokenizer
@@ -35,15 +33,15 @@ class TransformersBackendConfig(Trainer.Config):
 
 
 def transformers_modeling_backend_debugmodel(
-    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+    seq_len: int = 2048,
 ) -> TransformersBackendConfig:
-    model_config = model_registry("debugmodel", seq_len=seq_len)
+    model_spec = model_registry("debugmodel", seq_len=seq_len)
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
         debug=DebugConfig(print_config=True),
-        model=model_config,
+        model_spec=model_spec,
         profiler=Profiler.Config(profile_freq=5),
         optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -64,28 +62,23 @@ def transformers_modeling_backend_debugmodel(
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
         ),
-        checkpointer=None,
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
         activation_checkpoint=SelectiveAC.Config(),
     )
 
 
-def transformers_modeling_backend_debugmodel_compile(
-    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
-) -> TransformersBackendConfig:
-    config = transformers_modeling_backend_debugmodel(seq_len=seq_len)
-    config.compile = CompileConfig()
-    return config
-
-
 def transformers_modeling_backend_debugmodel_moe(
-    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+    seq_len: int = 2048,
 ) -> TransformersBackendConfig:
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-30B-A3B",
         debug=DebugConfig(print_config=True),
-        model=model_registry("debugmodel_moe", seq_len=seq_len),
+        model_spec=model_registry("debugmodel_moe", seq_len=seq_len),
         profiler=Profiler.Config(profile_freq=5),
         optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -106,17 +99,12 @@ def transformers_modeling_backend_debugmodel_moe(
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
         ),
-        checkpointer=None,
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
         activation_checkpoint=SelectiveAC.Config(),
     )
-
-
-def transformers_modeling_backend_debugmodel_moe_compile(
-    seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
-) -> TransformersBackendConfig:
-    config = transformers_modeling_backend_debugmodel_moe(seq_len=seq_len)
-    config.compile = CompileConfig()
-    return config
 
 
 def transformers_modeling_backend_full_moe(
@@ -125,7 +113,7 @@ def transformers_modeling_backend_full_moe(
     return TransformersBackendConfig(
         hf_model="Qwen/Qwen3-30B-A3B",
         debug=DebugConfig(print_config=True),
-        model=model_registry("full_moe", seq_len=seq_len),
+        model_spec=model_registry("full_moe", seq_len=seq_len),
         profiler=Profiler.Config(profile_freq=5),
         optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -146,7 +134,10 @@ def transformers_modeling_backend_full_moe(
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
         ),
-        checkpointer=None,
+        checkpoint=CheckpointManager.Config(
+            interval=500,
+            last_save_model_only=False,
+        ),
         activation_checkpoint=SelectiveAC.Config(),
     )
 
@@ -154,12 +145,12 @@ def transformers_modeling_backend_full_moe(
 def transformers_modeling_backend_full(
     seq_len: int = 2048,
 ) -> TransformersBackendConfig:
-    model_config = model_registry("full", seq_len=seq_len)
+    model_spec = model_registry("full", seq_len=seq_len)
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
         debug=DebugConfig(print_config=True),
-        model=model_config,
+        model_spec=model_spec,
         profiler=Profiler.Config(profile_freq=5),
         optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -180,7 +171,10 @@ def transformers_modeling_backend_full(
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
         ),
-        checkpointer=None,
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
         activation_checkpoint=SelectiveAC.Config(),
     )
 
@@ -200,7 +194,7 @@ def transformers_modeling_backend_sft_full(
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/qwen3_0.6b",
         hf_model="Qwen/Qwen3-0.6B",
-        model=model_registry("sft_full", seq_len=seq_len),
+        model_spec=model_registry("sft_full", seq_len=seq_len),
         tokenizer=HFBackendTokenizer.Config(),
         optimizer=default_adamw(lr=2e-5),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -233,7 +227,8 @@ def transformers_modeling_backend_sft_full(
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
         ),
-        checkpointer=CheckpointManager.Config(
+        checkpoint=CheckpointManager.Config(
+            enable=True,
             initial_load_in_hf=True,
             initial_load_model_only=True,
             interval=10,
@@ -258,7 +253,7 @@ def transformers_modeling_backend_sft_debugmodel(
         loss=CrossEntropyLoss.Config(),
         hf_assets_path="./tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
-        model=model_registry("sft_debugmodel", seq_len=seq_len),
+        model_spec=model_registry("sft_debugmodel", seq_len=seq_len),
         tokenizer=HFBackendTokenizer.Config(),
         optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -295,6 +290,9 @@ def transformers_modeling_backend_sft_debugmodel(
         parallelism=ParallelismConfig(
             pipeline_parallel_schedule="1F1B",
         ),
-        checkpointer=None,
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
         activation_checkpoint=SelectiveAC.Config(),
     )

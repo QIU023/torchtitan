@@ -24,7 +24,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 )
 
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 def _privatize_custom_meta(node: fx.Node) -> None:
@@ -297,7 +297,7 @@ def selective_activation_remat_pass(
         for n in sorted(bwd_reload_chain, key=order.__getitem__):
             target.prepend(n)
             moved_offload[n] = target
-            logger.debug("moved %s before %s", n.name, target.name)
+            log.debug("moved %s before %s", n.name, target.name)
 
     def remat_input(x: object) -> object:
         """Arg-transform: redirect must_recompute originals to their dups, and
@@ -368,7 +368,7 @@ def selective_activation_remat_pass(
         dup.name = fwd_node.name + "_recomputed"
         dup.meta["autograd_backward"] = True
         recomputed_nodes[fwd_node] = dup
-        logger.debug(
+        log.debug(
             "Recomputing %s before backward node %s", fwd_node.name, bwd_target.name
         )
 
@@ -393,7 +393,7 @@ def selective_activation_remat_pass(
     # originals' user lists for erase in the same pass.
     for orig in reversed(list(recomputed_nodes)):
         if not orig.users:
-            logger.debug(
+            log.debug(
                 "erased %s, in replace of %s",
                 orig.name,
                 recomputed_nodes[orig].name,

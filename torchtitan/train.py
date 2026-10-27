@@ -4,19 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 import os
-from typing import cast
 
 import torch
 
 from torchtitan.config import ConfigManager
 from torchtitan.observability import structured_logger as sl
-from torchtitan.observability.logging import init_logger
+from torchtitan.tools.logging import init_logger, logger
 from torchtitan.trainer import Trainer
-
-
-logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -31,12 +26,14 @@ def main() -> None:
     )
 
     config_manager = ConfigManager()
-    config = cast(Trainer.Config, config_manager.parse_args())
+    config = config_manager.parse_args()
 
     # NOTE: internal meta tooling relies on source="training".
     sl.init_structured_logger(
         source="training",
+        # pyrefly: ignore [missing-attribute]
         output_dir=config.dump_folder,
+        # pyrefly: ignore [missing-attribute]
         enable=config.debug.enable_structured_logging,
     )
     sl.log_trace_instant("structured_logger_started")
@@ -44,16 +41,18 @@ def main() -> None:
     trainer: Trainer | None = None
 
     try:
-        trainer = config.build()
+        trainer = config.build()  # pyrefly: ignore [missing-attribute]
 
-        if config.create_seed_checkpoint:
+        if (
+            config.checkpoint.create_seed_checkpoint  # pyrefly: ignore[missing-attribute]
+        ):
             assert (
                 int(os.environ["WORLD_SIZE"]) == 1
             ), "Must create seed checkpoint using a single device, to disable sharding."
             assert (
-                config.checkpointer is not None
-            ), "Must configure checkpointer when creating a seed checkpoint."
-            trainer.engine.save_checkpoint(last_step=True)
+                config.checkpoint.enable  # pyrefly: ignore [missing-attribute]
+            ), "Must enable checkpointing when creating a seed checkpoint."
+            trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:
             trainer.train()

@@ -21,19 +21,25 @@ from torchtitan.components.optimizer import (
     default_adamw,
     register_moe_load_balancing_hook,
 )
-from torchtitan.experiments.transformers_modeling_backend.state_dict_adapter import (
-    hf_to_titan_moe_state_dict,
-    titan_to_hf_moe_state_dict,
-)
 from torchtitan.models.common.moe import MoE
 
 
-def _expert_weights(routed_experts):
-    """Return the gate, down, and up expert-weight views."""
+def _expert_weights(experts):
+    """Return (w1, w2, w3) expert params by their dynamically-discovered names.
+
+    GroupedExperts param names carry dimension suffixes (e.g. ``w1_EFD``), so
+    resolve the canonical (gate, down, up) roles via the same helper the
+    production state-dict adapter uses instead of hardcoding ``w1``/``w2``/``w3``.
+    """
+    from torchtitan.experiments.transformers_modeling_backend.state_dict_adapter import (
+        _expert_names,
+    )
+
+    gate_name, down_name, up_name = _expert_names()
     return (
-        routed_experts.w13.weight[:, 0],
-        routed_experts.w2.weight,
-        routed_experts.w13.weight[:, 1],
+        getattr(experts, gate_name),
+        getattr(experts, down_name),
+        getattr(experts, up_name),
     )
 
 
@@ -44,31 +50,10 @@ def _moe_buffer(moe, prefix):
     ``tokens_per_expert_E``, ``expert_bias_E``), so match by prefix instead of
     hardcoding the exact name.
     """
-    for name, buf in moe.named_buffers():
-        leaf_name = name.rsplit(".", 1)[-1]
-        if leaf_name == prefix or leaf_name.startswith(prefix + "_"):
+    for name, buf in moe.named_buffers(recurse=False):
+        if name == prefix or name.startswith(prefix + "_"):
             return buf
     raise AttributeError(f"{type(moe).__name__} has no buffer matching '{prefix}*'")
-
-
-def test_moe_state_dict_roundtrip_uses_native_w13():
-    """Transformer-backend conversion keeps W13 native inside TorchTitan."""
-    gate_up_EGD = torch.arange(4 * 2 * 8 * 4).reshape(4, 16, 4)
-    down_EDF = torch.arange(4 * 4 * 8).reshape(4, 4, 8)
-    hf_state = {
-        "layers.0.moe.experts.gate_up_proj": gate_up_EGD,
-        "layers.0.moe.experts.down_proj": down_EDF,
-    }
-
-    titan_state = hf_to_titan_moe_state_dict(hf_state)
-
-    expert_prefix = "layers.0.moe.routed_experts"
-    assert titan_state[f"{expert_prefix}.w13.weight"].shape == (4, 2, 8, 4)
-    assert titan_state[f"{expert_prefix}.w2.weight"] is down_EDF
-    restored = titan_to_hf_moe_state_dict(titan_state)
-    assert restored.keys() == hf_state.keys()
-    for key in hf_state:
-        torch.testing.assert_close(restored[key], hf_state[key], rtol=0, atol=0)
 
 
 try:
@@ -187,6 +172,7 @@ def _prepare_layers(model):
 class _FakeParallelDims:
     """Minimal ParallelDims stub for tests that don't use full distributed setup."""
 
+    spmd_backend = "spmd_types"
     tp_enabled = False
     ep_enabled = False
     tp = 1
@@ -322,23 +308,6 @@ class TestPrepareNativeMoeConfigs(unittest.TestCase):
 class TestNativeMoeBuildAndSwap(unittest.TestCase):
     """Test building and swapping Titan MoE modules (single device, no parallelism)."""
 
-    def test_rejects_tensor_parallel_without_expert_parallel(self):
-        from torchtitan.experiments.transformers_modeling_backend.moe_replacement import (
-            build_and_swap_native_moe,
-        )
-
-        parallel_dims = _FakeParallelDims(tp_enabled=True, ep_enabled=False)
-        parallel_dims.tp = 2
-
-        with self.assertRaisesRegex(
-            ValueError,
-            r"expert_parallel_degree \(1\).*tensor_parallel_degree \(2\)",
-        ):
-            build_and_swap_native_moe(
-                torch.nn.Module(),
-                parallel_dims,
-            )
-
     def test_build_produces_native_moe(self):
         """Building from MoE.Config produces a Titan MoE with correct shapes."""
         model, config = _create_tiny_qwen3moe_model(num_hidden_layers=1)
@@ -360,7 +329,7 @@ class TestNativeMoeBuildAndSwap(unittest.TestCase):
             native_moe = moe_config.build()
 
         self.assertIsInstance(native_moe, MoE)
-        w1, w2, w3 = _expert_weights(native_moe.routed_experts)
+        w1, w2, w3 = _expert_weights(native_moe.routed_experts.inner_experts)
         self.assertEqual(w1.shape, (4, 32, 64))
         self.assertEqual(w2.shape, (4, 64, 32))
         self.assertEqual(w3.shape, (4, 32, 64))
@@ -387,14 +356,16 @@ class TestNativeMoeBuildAndSwap(unittest.TestCase):
             native_moe = moe_config.build()
 
         self.assertTrue(
-            _expert_weights(native_moe.routed_experts)[0].device.type == "meta"
+            _expert_weights(native_moe.routed_experts.inner_experts)[0].device.type
+            == "meta"
         )
 
         native_moe.to_empty(device=torch.device("cpu"))
         native_moe.init_states(buffer_device=torch.device("cpu"))
 
         self.assertTrue(
-            _expert_weights(native_moe.routed_experts)[0].device.type == "cpu"
+            _expert_weights(native_moe.routed_experts.inner_experts)[0].device.type
+            == "cpu"
         )
         self.assertTrue(native_moe.router.gate.weight.device.type == "cpu")
         self.assertTrue(
@@ -458,8 +429,10 @@ class TestNativeMoeBuildAndSwap(unittest.TestCase):
         output.sum().backward()
 
         self.assertIsNotNone(x.grad)
-        self.assertIsNotNone(native_moe.routed_experts.w13.weight.grad)
-        self.assertIsNotNone(native_moe.routed_experts.w2.weight.grad)
+        w1, w2, w3 = _expert_weights(native_moe.routed_experts.inner_experts)
+        self.assertIsNotNone(w1.grad)
+        self.assertIsNotNone(w2.grad)
+        self.assertIsNotNone(w3.grad)
 
 
 # ---------------------------------------------------------------------------

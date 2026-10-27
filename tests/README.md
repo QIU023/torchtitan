@@ -27,30 +27,21 @@ This directory contains tests for the torchtitan project, including unit tests a
 Use Fake PG as much as possible on pull requests for fast, broad functional
 coverage. Every enabled test runs before landing: tests compatible with Fake PG
 use one physical GPU, while tests marked `use_real_pg=True` use eight physical
-GPUs. The same complete set of tests runs with Real PG after the PR is merged
-into `main`. Scheduled runs also execute the complete suite with Real PG.
+GPUs. Scheduled and post-merge runs execute the complete suite with Real PG.
 
 #### Cadence
 
-- 1 GPU Fake PG cadence: ready, non-draft pull requests, whether they target
-  `main` directly or belong to a ghstack stack.
-  - The `.github/labeler.yml` file automatically applies the
-    `ciflow/fake-pg` label, and PyTorch Probot manages a
-    `ciflow/fake-pg/*` tag that points to the PR head SHA. This allows stacked
-    PRs to run independently of their base branch. The tag starts both the
-    Fake-PG suite and the Real-PG required subset. Reusable workflow callers
-    run only Fake PG by default.
-  - Tests that cannot run with Fake PG (`use_real_pg=True`) run with Real PG in
-    the separate `required subset - features` and `required subset - models`
-    jobs triggered by the same tag.
-- 8 GPU Real PG cadence:
-  - Pushes and merges to `main` run both full-suite jobs with Real PG.
-  - Six-hour schedules and manual dispatches also run both full-suite jobs with
-    Real PG.
-  - Opt-in trigger during the PR stage: adding the `ciflow/real-pg` pull request
-    label creates a `ciflow/real-pg/*` tag and runs separate
-    `full suite - features` and `full suite - models` jobs with Real PG.
-- H100 cadence: opt-in pull requests carrying the `ciflow/h100.8` label.
+- 1 GPU Fake PG cadence: pull requests on open, update, reopen, or
+  ready-for-review. Reusable workflow callers run Fake PG by default.
+- 8 GPU Real PG cadence: every pull request event above runs tests marked
+  `use_real_pg=True` in separate `required subset - features` and
+  `required subset - models` jobs. Adding the `ciflow/8gpu` pull request label
+  creates a `ciflow/8gpu/*` tag and runs separate `full suite - features` and
+  `full suite - models` jobs with Real PG. Pushes and merges to `main`,
+  six-hour schedules, and manual dispatches also run both full-suite jobs with
+  Real PG. Reusable workflow callers can explicitly request
+  `execution_mode: real_pg`, as the ROCm workflow does.
+- 8 GPU H100 cadence: opt-in pull requests carrying the `ciflow/h100.8` label.
   The lane always uses Real PG; updates and reopened events rerun it while the
   label remains attached.
 - B200 cadence: opt-in pull requests carrying the `ciflow/b200` label and
@@ -74,7 +65,7 @@ and uses its fixed initialization path.
 
 - A10G cases run on one physical GPU with Fake PG for pull requests and eight
   physical A10Gs with Real PG after merge, on schedule, or when triggered by
-  the `ciflow/real-pg` label. Their golden paths can use `{execution_mode}` to
+  the `ciflow/8gpu` label. Their golden paths can use `{execution_mode}` to
   select the `fake_pg/` or `real_pg/` directory.
   Shared numerical cases use the same configuration in both modes.
 - Fake-PG goldens guard PyTorch FakeProcessGroup's deterministic synthetic
@@ -90,30 +81,22 @@ and uses its fixed initialization path.
 - Qwen3.5 MoE FSDP 4 x TP 2, EP 4 does not have a numerical golden. Its A10G
   Real-PG results are not bitwise deterministic, so the case provides
   end-to-end coverage only.
-- DeepSeek V4 FSDP 2 x TP 2, EP 2 is end-to-end coverage only and does
-  not have a numerical golden. It runs on a real PG only (`use_real_pg=True`):
-  under Fake PG its sequence-parallel collectives return activations that alias
-  their inputs, corrupting a saved-for-backward tensor and exploding grad_norm
-  at step 1. The same config trains cleanly on a real 4-GPU PG.
 
 | A10G model | Topology (Fake-PG and Real-PG) |
 | --- | --- |
 | Llama 3 | FSDP 2 x TP 2 x CP 2 |
 | Llama 3 SFT | FSDP 2 |
 | DeepSeek V3 | FSDP 8, EP 8 |
-| DeepSeek V4 | FSDP 2 x TP 2, EP 2 (Real-PG only) |
 | GPT-OSS | FSDP 4 x TP 2, EP 4 |
 | Qwen3 | FSDP 2 x TP 2 x CP 2, EP 8 |
 | Muse Glimmer text | FSDP 8 |
 | Qwen3.5 MoE multimodal | FSDP 4 x TP 2, EP 4 |
-| Kimi K2.5 DistMuon | FSDP 8, EP 8 |
 
-Kimi K2.5 DistMuon FSDP+EP and Kimi K2.7 DistMuon PP+FSDP+EP both run on A10G.
-The K2.5 multimodal backward uses bicubic upsampling, whose CUDA backward has no
-deterministic implementation, so the FSDP+EP case does not carry a numerical
-golden. For manual comparisons, `loss_compare.py` can create the model-only seed
-checkpoint with a model-equivalent AdamW config while the measured run continues
-to use DistMuon.
+Kimi K2.5 continues to run as an FSDP 8, EP 8 integration case. Its multimodal
+backward uses bicubic upsampling, whose CUDA backward has no deterministic
+implementation, so the case does not carry a numerical golden. For manual
+comparisons, `loss_compare.py` can create the model-only seed checkpoint with a
+model-equivalent AdamW config while the measured run continues to use DistMuon.
 
 Additional A10G Real-PG-only cases exercise CP and pipeline communication:
 
@@ -122,7 +105,6 @@ Additional A10G Real-PG-only cases exercise CP and pipeline communication:
 | DeepSeek V3 | FSDP 2 x CP 2 x PP 2, EP 4, Interleaved1F1B |
 | Llama 3 | FSDP 2 x TP 2 x PP 2, 1F1B |
 | GPT-OSS | FSDP 2 x CP 2 x PP 2, EP 4, Interleaved1F1B |
-| Kimi K2.7 DistMuon | FSDP 2 x PP 2, EP 2, Interleaved1F1B |
 
 On pull requests, the Fake-PG lane and the `real_pg_required` Real-PG scope
 partition the enabled A10G tests without overlap. Post-merge and scheduled

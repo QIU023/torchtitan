@@ -419,11 +419,7 @@ def allow_fx_graph_extraction_of_side_effectful_ops(exclude_vals: set[object]):
         torch.fx.node._side_effectful_functions.update(original_val)
 
 
-def overlap_fw_bw_sub_actions(
-    action: _Action,
-    *,
-    backward_computation_types: tuple[Any, ...] = (FULL_BACKWARD,),
-) -> tuple[_Action, _Action]:
+def overlap_fw_bw_sub_actions(action: _Action) -> tuple[_Action, _Action]:
     """Validate an ``OVERLAP_F_B`` action and return ``(fw_action, bw_action)``."""
 
     if action.sub_actions is None or len(action.sub_actions) != 2:
@@ -434,12 +430,11 @@ def overlap_fw_bw_sub_actions(
     if bw_action.computation_type == BACKWARD_INPUT:
         raise NotImplementedError(
             "GraphPP OVERLAP_F_B with BACKWARD_INPUT is not implemented. "
-            "Current multiplexed graphs support FORWARD plus full backward only."
+            "Current multiplexed graphs support FORWARD + FULL_BACKWARD only."
         )
-    if bw_action.computation_type not in backward_computation_types:
+    if bw_action.computation_type != FULL_BACKWARD:
         raise ValueError(
-            "GraphPP OVERLAP_F_B second sub-action must be a full backward: "
-            f"{action}"
+            "GraphPP OVERLAP_F_B second sub-action must be FULL_BACKWARD: " f"{action}"
         )
     return fw_action, bw_action
 

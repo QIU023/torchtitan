@@ -35,23 +35,21 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     and ``lr=0`` so parameters are untouched, then restores ``lr``. Adam's
     counters and moments are reset after their tensors are materialized.
 
-    No-op if every trainable parameter already has state. Existing gradients
-    and optimizer state are preserved.
+    No-op if state already exists or any gradient is set, so it is safe to call
+    repeatedly and never disturbs an in-progress training step.
     """
-    params = [
-        param for param_group in optim.param_groups for param in param_group["params"]
-    ]
-    params_to_initialize = [
-        param for param in params if param.requires_grad and not optim.state.get(param)
-    ]
-    if not params_to_initialize:
+    if optim.state:
         return
 
-    saved_grads = [param.grad for param in params]
-    for param in params:
-        param.grad = None
-    for param in params_to_initialize:
-        param.grad = torch.zeros_like(param)
+    for param_group in optim.param_groups:
+        for param in param_group["params"]:
+            if param.grad is not None:
+                return
+
+    for param_group in optim.param_groups:
+        for param in param_group["params"]:
+            if param.requires_grad:
+                param.grad = torch.zeros_like(param)
 
     # Some optimizers update parameters regardless of gradients due to lr, so set
     # lr to zero before stepping to keep parameters unchanged.
@@ -70,8 +68,7 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     # its step counter (and coupled weight decay can update its moments). Reset
     # the materialized state so the first real update remains Adam step 1.
     if isinstance(optim, (torch.optim.Adam, torch.optim.AdamW)):
-        for param in params_to_initialize:
-            state = optim.state[param]
+        for state in optim.state.values():
             state["step"].zero_()
             state["exp_avg"].zero_()
             state["exp_avg_sq"].zero_()
@@ -81,8 +78,7 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     for param_group in optim.param_groups:
         if "lr" in param_group:
             param_group["lr"] = saved_lrs.pop(0)
-    for param, grad in zip(params, saved_grads):
-        param.grad = grad
+    optim.zero_grad(set_to_none=True)
 
 
 def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:

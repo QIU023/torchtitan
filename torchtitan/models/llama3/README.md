@@ -30,8 +30,7 @@ Other recipes include `llama3_70b` and `llama3_405b`. See
 
 ## Supported Parallelisms
 
-Coverage below matches [`sharding.py`](./sharding.py),
-`BaseModel.parallelize()`, and the Llama 3 jobs in
+Coverage below matches `parallelize.py` and the Llama 3 jobs in
 `tests/integration_tests/features.py` (plus Float8 jobs in
 `tests/integration_tests/h100.py`).
 
@@ -40,7 +39,7 @@ Coverage below matches [`sharding.py`](./sharding.py),
 | FSDP / HSDP | Default data-parallel path |
 | Tensor Parallel (TP) | Including sequence parallel; async TP is exercised on H100 |
 | Context Parallel (CP) | Composes with FSDP, HSDP, DDP, and TP |
-| Pipeline Parallel (PP) | 1F1B, Interleaved1F1B, and GPipe. Zero-bubble / split-backward PP tests are disabled in `tests/integration_tests/features.py` because FlexInnerAttention `BlockMask` is not a Tensor |
+| Pipeline Parallel (PP) | 1F1B, Interleaved1F1B, and GPipe. Zero-bubble / split-backward PP tests are disabled in `tests/integration_tests/features.py` because FlexAttention `BlockMask` is not a Tensor |
 | DDP | Including DDP+CP |
 | Activation checkpointing | Selective and full |
 | `torch.compile` | 1D and multi-dimensional jobs |

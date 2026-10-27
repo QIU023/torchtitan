@@ -2,7 +2,7 @@
 
 This enables HF transformers models to be trained with `4D parallelism + torch.compile`
 
-This backend uses the TorchTitan SPMD type system.
+This backend requires `--parallelism.spmd_backend spmd_types`.
 
 ## Quick start
 
@@ -16,7 +16,7 @@ This backend uses the TorchTitan SPMD type system.
 --config transformers_modeling_backend_debugmodel
 ...
 ```
-- Train: `LOG_RANK=7 MODEL=transformers_modeling_backend CONFIG=transformers_modeling_backend_debugmodel_compile ./run_train.sh`
+- Train: `LOG_RANK=7 MODEL=transformers_modeling_backend CONFIG=transformers_modeling_backend_debugmodel ./run_train.sh --compile.enable`
     - Make sure you have created the tokenizers beforehand
 <img width="1334" height="453" alt="image" src="https://github.com/user-attachments/assets/da459448-027b-4af9-8176-6a3e433a272c" />
 
@@ -48,7 +48,7 @@ This backend uses the TorchTitan SPMD type system.
 
 ### Attention
 
-Attention runs on **FlexInnerAttention**. `attn_mask_type` selects the flex mask:
+Attention runs on **FlexAttention**. `attn_mask_type` selects the flex mask:
 `causal` (plain causal) or `block_causal` (causal + same-document, for packed /
 SFT sequences).
 

@@ -6,21 +6,35 @@
 
 from dataclasses import fields
 
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.experiments.graph_trainer.graph_pp.pipeline import graph_pipeline_llm
 from torchtitan.models.deepseek_v3 import deepseekv3_configs
+from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
+from torchtitan.protocols.model_spec import ModelSpec
 
 from ..common_utils import build_decoder_config_for_backend
 from .model import GraphTrainerDeepSeekV3Model
+from .parallelize import parallelize_deepseekv3
+
+
+def _parallelize_fn(model, *, compile_config, **kwargs):
+    if compile_config.enable_autoparallel:
+        from .parallelize_autoparallel import parallelize_autoparallel_deepseekv3
+
+        return parallelize_autoparallel_deepseekv3(
+            model, compile_config=compile_config, **kwargs
+        )
+    return parallelize_deepseekv3(model, compile_config=compile_config, **kwargs)
 
 
 def model_registry(
     flavor: str,
     *,
-    enable_sp: bool,
     seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
-) -> GraphTrainerDeepSeekV3Model.Config:
+) -> ModelSpec:
     get_config, max_context_len = deepseekv3_configs[flavor]
     context_len = seq_len or max_context_len
     if context_len > max_context_len:
@@ -31,7 +45,6 @@ def model_registry(
     base = build_decoder_config_for_backend(
         get_config,
         attn_backend,
-        enable_sp=enable_sp,
         seq_len=context_len,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
@@ -39,4 +52,13 @@ def model_registry(
     config = GraphTrainerDeepSeekV3Model.Config(
         **{f.name: getattr(base, f.name) for f in fields(base)}
     )
-    return config
+    return ModelSpec(
+        name="graph_trainer/deepseek_v3",
+        flavor=flavor,
+        model=config,
+        max_context_length=context_len,
+        parallelize_fn=_parallelize_fn,
+        pipelining_fn=graph_pipeline_llm,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
+        state_dict_adapter=DeepSeekV3StateDictAdapter,
+    )

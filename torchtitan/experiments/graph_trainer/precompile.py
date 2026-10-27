@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import logging
 import os
 import pickle
 from dataclasses import dataclass
-from typing import Any, NewType, TYPE_CHECKING
+from typing import NewType, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torchtitan.distributed import ParallelDims
@@ -21,37 +20,15 @@ if TYPE_CHECKING:
 import torch
 import torch.utils._pytree as pytree
 from torch.distributed.device_mesh import DeviceMesh
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-    _unwrap_subclasses,
-    extract_train_state,
     SubclassLayout,
     TracedResult,
 )
 from torchtitan.experiments.graph_trainer.storage import StorageAdapter
-
-
-logger = logging.getLogger(__name__)
-
+from torchtitan.tools.logging import logger
 
 ConfigFingerprint = NewType("ConfigFingerprint", str)
-
-
-def flatten_runtime_inputs(
-    module: torch.nn.Module,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    precompile_meshes: list[DeviceMesh] | None = None,
-) -> tuple[Any, ...]:
-    """Flatten live model state, meshes, and call inputs for a precompiled graph."""
-    model_state, optim_state = extract_train_state(module)
-    state_flat, _ = pytree.tree_flatten({"model": model_state, "optim": optim_state})
-    user_inputs_flat, _ = pytree.tree_flatten((args, kwargs))
-    flat_inputs, _ = _unwrap_subclasses(
-        [*state_flat, *(precompile_meshes or []), *user_inputs_flat]
-    )
-    return tuple(flat_inputs)
 
 
 def get_spmd_precompile_meshes(parallel_dims: ParallelDims) -> list[DeviceMesh]:
@@ -95,6 +72,8 @@ def compute_config_fingerprint(
         if not f.name.startswith("_"):
             h.update(f"parallel:{f.name}:{getattr(parallel_dims, f.name)}\n".encode())
 
+    h.update(f"compile:mode:{compile_config.mode}\n".encode())
+    h.update(f"compile:backend:{compile_config.backend}\n".encode())
     h.update(f"compile:passes:{list(compile_config.passes)}\n".encode())
     h.update(f"compile:memory_policy:{compile_config.memory_policy}\n".encode())
     h.update(
@@ -210,14 +189,11 @@ class PrecompiledFxTraceArtifact:
     output_spec: pytree.TreeSpec
     tensor_input_indices: list[int]
     # user_inputs_spec is intentionally omitted: it can contain
-    # FlexInnerAttention _MaskModWrapper objects that are not picklable,
+    # FlexAttention _MaskModWrapper objects that are not picklable,
     # and the mask_mod is already compiled into standalone Inductor
     # HOPs (AOTCompiledArtifact) baked into serialized_gm. The spec
     # is only used for optional runtime validation in run_traced().
     config_fingerprint: ConfigFingerprint = ConfigFingerprint("")
-    # Retained separately because user_inputs_spec is not serialized.
-    num_optimizer_state_inputs: int = 0
-    num_runtime_mesh_inputs: int = 0
 
     @classmethod
     def from_traced_result(
@@ -233,12 +209,6 @@ class PrecompiledFxTraceArtifact:
         (e.g. the embedding vocab offset from
         _runtime_compute_coordinate_on_dim).
         """
-        if traced_result.graph_state.mappings:
-            raise ValueError(
-                "Precompiled FX artifacts do not yet support trainer-owned "
-                "gradient state"
-            )
-
         from torch.fx._graph_pickler import GraphPickler, Options
 
         from torchtitan.experiments.graph_trainer.inductor_passes import (
@@ -263,11 +233,9 @@ class PrecompiledFxTraceArtifact:
             output_spec=traced_result.output_spec,
             tensor_input_indices=traced_result.tensor_input_indices,
             config_fingerprint=config_fingerprint or ConfigFingerprint(""),
-            num_optimizer_state_inputs=traced_result.num_optimizer_state_inputs,
-            num_runtime_mesh_inputs=traced_result.num_runtime_mesh_inputs,
         )
 
-    def to_traced_result(self, example_inputs: tuple[Any, ...]) -> TracedResult:
+    def to_traced_result(self) -> TracedResult:
         """Deserialize back into a TracedResult.
 
         Registers CooR custom ops, then deserializes the GraphModule
@@ -282,7 +250,7 @@ class PrecompiledFxTraceArtifact:
 
         fake_mode = FakeTensorMode(
             allow_non_fake_inputs=True,
-            shape_env=ShapeEnv(),
+            shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
         )
         gm = GraphPickler.loads(self.serialized_gm, fake_mode)
         gm.recompile()
@@ -293,7 +261,7 @@ class PrecompiledFxTraceArtifact:
 
         return TracedResult(
             gm=gm,
-            example_inputs=example_inputs,
+            example_inputs=(),
             num_flat_inputs=self.num_flat_inputs,
             input_subclass_layouts=self.input_subclass_layouts,
             user_inputs_spec=dummy_spec,
@@ -302,8 +270,6 @@ class PrecompiledFxTraceArtifact:
             output_subclass_layouts=self.output_subclass_layouts,
             output_spec=self.output_spec,
             state_fqns=self.state_fqns,
-            num_optimizer_state_inputs=self.num_optimizer_state_inputs,
-            num_runtime_mesh_inputs=self.num_runtime_mesh_inputs,
         )
 
 
@@ -337,7 +303,6 @@ def precompile_fx_trace_save(
 def precompile_fx_trace_load(
     storage: StorageAdapter,
     expected_fingerprint: ConfigFingerprint,
-    example_inputs: tuple[Any, ...],
 ) -> TracedResult:
     """Load a precompiled aot_fx_trace artifact.
 
@@ -362,4 +327,4 @@ def precompile_fx_trace_load(
         f"fingerprint={artifact.config_fingerprint}"
     )
 
-    return artifact.to_traced_result(example_inputs)
+    return artifact.to_traced_result()

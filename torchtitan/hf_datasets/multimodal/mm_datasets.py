@@ -61,10 +61,8 @@ Workflow overview::
                      special_tokens: dict[str, int]}, labels
 """
 
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from typing import Annotated, Any
 
 import grain.python as grain
@@ -81,11 +79,10 @@ from torchtitan.components.data.sources import HuggingFaceStreamingSource
 from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import MultiModalTokenizer
+
+from torchtitan.tools.logging import logger
 from .utils.image import calculate_vision_tokens, process_image, resize_to_pixel_budget
 from .utils.text import insert_vision_placeholders
-
-
-logger = logging.getLogger(__name__)
 
 
 def _process_mm_sample(
@@ -158,7 +155,9 @@ def _process_mm_sample(
                     width=processed_img.shape[2],
                     patch_size=patch_size,
                     spatial_merge_size=spatial_merge_size,
-                    temporal_patch_size=temporal_patch_size,
+                    # TODO(data-mm-temporal-patches): Unify image/video token counting;
+                    # the configured temporal patch size is unused by this image path.
+                    temporal_patch_size=1,
                 )
                 processed_images.append(processed_img)
                 num_image_tokens.append(num_tokens)
@@ -256,12 +255,8 @@ def _process_cc12_wd_sample(
     text = sample.get("txt", "")
     image = sample.get("jpg", None)
 
-    if image is None:
-        texts: list[str | None] = [text]
-        images: list[bytes | None] = [None]
-    else:
-        texts = [None, text]
-        images = [image, None]
+    texts = [None, text]
+    images = [image, None]
 
     return _process_mm_sample(
         texts=texts,
@@ -412,9 +407,9 @@ class MMSamplePackingConfig:
         dataset = grain.experimental.FirstFitPackIterDataset(
             dataset,
             length_struct={
-                "input_ids": context.num_tokens_per_microbatch,
-                "labels": context.num_tokens_per_microbatch,
-                "positions": context.num_tokens_per_microbatch,
+                "input_ids": context.num_tokens_per_batch,
+                "labels": context.num_tokens_per_batch,
+                "positions": context.num_tokens_per_batch,
             },
             padding_struct={
                 # pyrefly: ignore [missing-attribute]
@@ -432,12 +427,7 @@ class MMSamplePackingConfig:
             seed=dataset_iteration_policy.seed,
             shuffle_bins=dataset_iteration_policy.shuffle,
         )
-        return dataset.map(
-            partial(
-                _packing_output_to_mm_sample,
-                max_context_length=context.max_context_length,
-            )
-        )
+        return dataset.map(_packing_output_to_mm_sample)
 
 
 def _mm_sample_to_packing_input(sample: dict[str, Any]) -> dict[str, Any]:
@@ -453,22 +443,12 @@ def _mm_sample_to_packing_input(sample: dict[str, Any]) -> dict[str, Any]:
 
 def _packing_output_to_mm_sample(
     packing_output: dict[str, Any],
-    *,
-    max_context_length: int,
 ) -> dict[str, Any]:
     """Restore Torch token fields and flatten per-document media lists."""
-    padding_mask = np.asarray(packing_output["input_ids_segment_ids"]) == 0
-    positions = np.asarray(packing_output["positions"]).copy()
-    if np.any(padding_mask):
-        first_padding_token = int(np.flatnonzero(padding_mask)[0])
-        positions[first_padding_token:] = (
-            np.arange(len(positions) - first_padding_token) % max_context_length
-        )
     return {
         "input_ids": torch.from_numpy(packing_output["input_ids"]),
         "labels": torch.from_numpy(packing_output["labels"]),
-        "positions": torch.from_numpy(positions),
-        "padding_mask": torch.from_numpy(padding_mask),
+        "positions": torch.from_numpy(packing_output["positions"]),
         "pixel_values": [
             image
             for document_images in packing_output["pixel_values"]

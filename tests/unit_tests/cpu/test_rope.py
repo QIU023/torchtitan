@@ -14,7 +14,7 @@ from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
     GQAttention,
     QKVLinear,
-    VarlenInnerAttention,
+    VarlenAttention,
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import (
@@ -277,9 +277,7 @@ class TestYaRNScaling(unittest.TestCase):
         from torchtitan.models.deepseek_v3.model import Attention
 
         build_config, max_context_length = deepseekv3_configs["debugmodel"]
-        model_config = build_config(
-            "flex", "standard", enable_sp=True, seq_len=max_context_length
-        )
+        model_config = build_config("flex", "standard", seq_len=max_context_length)
         attention_config = model_config.layers[0].attention
         assert isinstance(attention_config, Attention.Config)
         attention_config.rope = dataclasses.replace(
@@ -308,12 +306,11 @@ class TestPerLayerRoPECache(unittest.TestCase):
             dim=dim,
             qkv_linear=QKVLinear.Config(
                 head_dim=head_dim,
-                n_heads=2,
-                n_kv_heads=2,
-                wqkv=Linear.Config(in_features=dim, out_features=3 * dim),
+                wq=Linear.Config(in_features=dim, out_features=dim),
+                wkv=Linear.Config(in_features=dim, out_features=dim),
             ),
             wo=Linear.Config(in_features=dim, out_features=dim),
-            inner_attention=VarlenInnerAttention.Config(),
+            inner_attention=VarlenAttention.Config(),
             rope=ComplexRoPE.Config(dim=head_dim, max_context_length=16),
         ).build()
 
