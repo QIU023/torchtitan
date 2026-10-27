@@ -17,7 +17,6 @@ import torch
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining._utils import flatten_args
 from torch.distributed.pipelining.schedules import _batch_p2p, _ComputationType
-from torch.distributed.pipelining.stage import _make_tensor_from_meta
 
 from .cache import PPRankLocalCache
 from .layout import BlockLayoutTables
@@ -194,33 +193,6 @@ class AttnResPipelineStage(PipelineStage):
         mine = [s for s, r in layout.stage_to_rank.items() if r == self.group_rank]
         return self.stage_index == max(mine)
 
-    def _setup_forward_recv_info(
-        self, num_microbatches: int, has_backward: bool
-    ) -> None:
-        super()._setup_forward_recv_info(num_microbatches, has_backward)
-        if self.is_first:
-            return
-        for chunk_id in range(num_microbatches):
-            for info in self.args_recv_info[chunk_id]:
-                if info.buffer is not None:
-                    info.buffer = info.buffer.new_empty(0)
-
-    def _setup_backward_recv_info(self, num_microbatches: int) -> None:
-        super()._setup_backward_recv_info(num_microbatches)
-        if self.is_last:
-            return
-        for mb_index in range(num_microbatches):
-            for info in self.grad_recv_info[mb_index]:
-                if info.buffer is not None:
-                    info.buffer = info.buffer.new_empty(0)
-
-    def get_fwd_recv_ops(self, fwd_chunk_id: int):
-        if not self.is_first:
-            for info in self.args_recv_info[fwd_chunk_id]:
-                if info.tensor_meta is not None:
-                    info.buffer = _make_tensor_from_meta(info.tensor_meta, self.device)
-        return super().get_fwd_recv_ops(fwd_chunk_id)
-
     def get_fwd_send_ops(self, fwd_chunk_id: int):
         ops = super().get_fwd_send_ops(fwd_chunk_id)
         if self._wait_sends_at_backward and self.has_backward and ops:
@@ -237,13 +209,6 @@ class AttnResPipelineStage(PipelineStage):
         ):
             return []
         return ops
-
-    def get_bwd_recv_ops(self, bwd_chunk_id: int):
-        if self.has_backward and not self.is_last:
-            for info in self.grad_recv_info[bwd_chunk_id]:
-                if info.buffer is not None and info.tensor_meta is not None:
-                    info.buffer = _make_tensor_from_meta(info.tensor_meta, self.device)
-        return super().get_bwd_recv_ops(bwd_chunk_id)
 
     def _assemble(
         self, mb: int, hidden_TD: torch.Tensor, delta_TND: torch.Tensor
@@ -294,9 +259,6 @@ class AttnResPipelineStage(PipelineStage):
             order_in: list[int] = []
         else:
             hidden_TD, delta_TND = self._retrieve_recv_activations(fwd_chunk_id)
-            for info in self.args_recv_info[fwd_chunk_id]:
-                if info.buffer is not None:
-                    info.buffer = info.buffer.new_empty(0)
             stack_TND = self._assemble(fwd_chunk_id, hidden_TD, delta_TND)
             composite_args = (hidden_TD, stack_TND)
             order_in = self._order[fwd_chunk_id]
@@ -329,9 +291,6 @@ class AttnResPipelineStage(PipelineStage):
         grads = super()._retrieve_recv_grads(bwd_chunk_id)
         if self.is_last:
             return grads
-        for info in self.grad_recv_info[bwd_chunk_id]:
-            if info.buffer is not None:
-                info.buffer = info.buffer.new_empty(0)
         layout = self.layout()
         grad_hidden, grad_delta = grads
         mine = set(layout.commits_at(self.stage_index))
