@@ -211,9 +211,12 @@ class RemoteBackend:
         session = f"{host}:{self._engine.get_rpc_port()}"
         # The TCP transport serves host memory only; RDMA and NVLink serve device memory directly.
         on_device = protocol in ("rdma", "nvlink_intra") and device.type == "cuda"
+        pool_on_device = on_device or (
+            os.environ.get("K3_TEST_TCP_DEVICE_POOL") == "1" and device.type == "cuda"
+        )
 
-        def buffer(nbytes: int) -> torch.Tensor:
-            if on_device:
+        def buffer(nbytes: int, pool: bool = False) -> torch.Tensor:
+            if on_device or (pool and pool_on_device):
                 return torch.empty(nbytes, dtype=torch.uint8, device=device)
             return torch.empty(
                 nbytes, dtype=torch.uint8, pin_memory=device.type == "cuda"
@@ -223,16 +226,43 @@ class RemoteBackend:
             return sorted(src for src, dst in dests.items() if dst == dest)
 
         pool_base = 0
+        pool_session = session
         self._pool: torch.Tensor | None = None
+        self._holder = None
         if rank in dests.values():
             pool_bytes = sum(spans[src] for src in sources_of(rank))
-            self._pool = buffer(pool_bytes)
-            pool_base = self._pool.data_ptr()
-            _check(
-                self._engine.register_memory(pool_base, pool_bytes), "register_memory"
-            )
+            if os.environ.get("K3_TEST_TCP_POOL_PROCESS") == "1" and device.type == "cuda":
+                import subprocess
+                import sys
+
+                index = device.index if device.index is not None else torch.cuda.current_device()
+                self._holder = subprocess.Popen(
+                    [sys.executable, os.environ["K3_TEST_POOL_HOLDER"], str(index),
+                     str(pool_bytes), protocol, device_names],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                )
+                ready = self._holder.stdout.readline().split()
+                if len(ready) != 3 or ready[0] != "READY":
+                    raise RuntimeError(f"pool holder of rank {rank} failed: {ready}")
+                pool_session, pool_base = ready[1], int(ready[2])
+                print(
+                    f"[K3_TEST_TCP_POOL_PROCESS] rank {rank} protocol {protocol} pool "
+                    f"{pool_bytes / 2**30:.3f} GiB on cuda:{index} held by pid {self._holder.pid}",
+                    flush=True,
+                )
+            else:
+                self._pool = buffer(pool_bytes, pool=True)
+                print(
+                    f"[K3_TEST_TCP_DEVICE_POOL] rank {rank} protocol {protocol} pool "
+                    f"{pool_bytes / 2**30:.3f} GiB on {self._pool.device}",
+                    flush=True,
+                )
+                pool_base = self._pool.data_ptr()
+                _check(
+                    self._engine.register_memory(pool_base, pool_bytes), "register_memory"
+                )
         book: list[tuple[str, int] | None] = [None] * dist.get_world_size(group)
-        dist.all_gather_object(book, (session, pool_base), group=group)
+        dist.all_gather_object(book, (pool_session, pool_base), group=group)
         self.parks = rank in dests
         self._staging: torch.Tensor | None = None
         if self.parks:
