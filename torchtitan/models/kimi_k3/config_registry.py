@@ -94,3 +94,10 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel_ac_reuse() -> Trainer.Config:
+    """LOCAL, not committed: the debug model with ac_reuse_attention on."""
+    config = kimi_k3_debugmodel()
+    config.model_spec.model.ac_reuse_attention = True
+    return config
