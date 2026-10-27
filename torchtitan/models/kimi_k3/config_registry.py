@@ -94,3 +94,19 @@ def kimi_k3_debugmodel(
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel_ppnaive() -> Trainer.Config:
+    """Local probe alias, uncommitted: the whole-stack pipeline transport."""
+    import functools
+
+    from .parallelize import pipeline_kimi_k3
+
+    from . import model_registry
+
+    config = kimi_k3_debugmodel()
+    config.model_spec = model_registry("debugmodel_33_layers")
+    config.model_spec.pipelining_fn = functools.partial(
+        pipeline_kimi_k3, attn_res_cache=False
+    )
+    return config
