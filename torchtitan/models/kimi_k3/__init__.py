@@ -550,6 +550,48 @@ def _debugmodel(
     )
 
 
+# PROBE ONLY (not committed): the 12-layer debug model with the RELEASED MLA head dims (128 / 64 / 128), the
+# only ones vLLM's MLA prefill backends accept, kv_lora_rank 512 (its fused MLA kv-cache kernel asserts
+# [Tp, 512]), and the tree's own KDA (head_dim 128): the verl cells' model.
+def _rl_debugmodel(
+    attn_backend: str, moe_comm_backend: str, *, num_layers: int
+) -> KimiK3Model.Config:
+    dim = 1024
+    return _kimi_k3_config(
+        dim=dim,
+        moe_comm_backend=moe_comm_backend,
+        vocab_size=163840,
+        num_layers=num_layers,
+        full_attention_layers=kimi_k3_full_attention_layers(num_layers),
+        attn_res_block_size=12,
+        num_heads=16,
+        q_lora_rank=512,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        kda_head_dim=128,
+        conv_kernel_size=4,
+        dense_hidden_dim=4096,
+        latent_dim=512,
+        expert_hidden_dim=384,
+        num_experts=32,
+        top_k=4,
+        num_shared_experts=2,
+        vision_encoder=_vision_encoder_config(
+            text_dim=dim,
+            dim=512,
+            qkv_dim=768,
+            hidden_dim=2048,
+            num_layers=8,
+            num_heads=6,
+            init_pos_emb_height=32,
+            init_pos_emb_width=32,
+        ),
+        attn_backend=attn_backend,
+    )
+
+
 def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
@@ -593,6 +635,8 @@ kimi_k3_configs = {
     # pipeline shape divides, so every split is uneven the way the real one is.
     "debugmodel": (partial(_debugmodel, num_layers=33), 16384),
     "Kimi-K3": (_kimi_k3, 262144),
+    # PROBE ONLY (not committed): a 12-layer debug model for the verl cells (rollout on 16 GB cards).
+    "rl": (partial(_rl_debugmodel, num_layers=12), 16384),
 }
 
 
