@@ -582,6 +582,8 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
+    if __import__("os").environ.get("GN_FP32") == "1":  # LOCAL PROBE HACK (not committed): norm in float32
+        grads = [g.float() for g in grads]
     total_norm = torch.nn.utils.get_total_norm(
         grads, norm_type, error_if_nonfinite, foreach
     )
