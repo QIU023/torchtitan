@@ -896,6 +896,58 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 local_valid_tokens += input_dict.pop("num_valid_tokens")
                 microbatches.append(input_dict)
             microbatch_groups.append(microbatches)
+        # LOCAL PROBE HACK (not committed): accumulation order only, with a log
+        # of the order actually applied so a null result can be told apart from
+        # an inert hook. Each group's forward and backward is unchanged.
+        _mb_order = os.environ.get("MB_ORDER")
+        _mb_rev = os.environ.get("MB_REVERSE") == "1"
+        _perm = list(range(len(microbatch_groups)))
+        if _mb_order:
+            _perm = [int(i) for i in _mb_order.split(",")]
+            assert sorted(_perm) == list(range(len(microbatch_groups)))
+        elif _mb_rev:
+            _perm = _perm[::-1]
+        if os.environ.get("MB_LOG") and self.step <= 1:
+            import torch.distributed as _d
+
+            if not _d.is_initialized() or _d.get_rank() == 0:
+                _ids = []
+                for _g in microbatch_groups:
+                    _d0 = _g[0]
+                    _t = None
+                    if isinstance(_d0, dict):
+                        for _k in ("input_ids", "tokens", "input"):
+                            if isinstance(_d0.get(_k), torch.Tensor):
+                                _t = _d0[_k]
+                                break
+                        if _t is None:
+                            for _v in _d0.values():
+                                if isinstance(_v, torch.Tensor) and _v.numel():
+                                    _t = _v
+                                    break
+                    _ids.append(
+                        [str(sorted(_d0.keys())) if isinstance(_d0, dict) else "?"]
+                        if _t is None
+                        else [int(_t.reshape(-1)[0]), float(_t.float().sum())]
+                    )
+                with open(os.environ["MB_LOG"], "a") as _f:
+                    _f.write(
+                        f"step={self.step} groups={len(microbatch_groups)} "
+                        f"perm={_perm} first_token_per_group_before={_ids} "
+                        f"after={[_ids[i] for i in _perm]}\n"
+                    )
+        if _perm != list(range(len(microbatch_groups))):
+            microbatch_groups = [microbatch_groups[i] for i in _perm]
+            # Unconditional, so a null result can never be mistaken for an
+            # inert hook: if this line is absent, no reordering happened.
+            import sys as _sys
+
+            print(
+                f"MB_REORDER_APPLIED step={self.step} perm={_perm} "
+                f"groups={len(microbatch_groups)}",
+                file=_sys.stderr,
+                flush=True,
+            )
         sl.log_trace_scalar({"local_valid_tokens": local_valid_tokens})
 
         # Keep the global token count on device so loss normalization does not
@@ -1062,6 +1114,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             **lr_metrics,
             **collect_aux_loss_metrics(parallel_dims),
         }
+        _s1 = os.environ.get("STEP1_DUMP")
+        if _s1 and self.step == 1:  # LOCAL PROBE HACK (not committed)
+            import torch.distributed as _d
+
+            if not _d.is_initialized() or _d.get_rank() == 0:
+                with open(_s1, "w") as _f:
+                    _f.write(
+                        f"loss={float(global_avg_loss)!r}\n"
+                        f"grad_norm={float(grad_norm.item())!r}\n"
+                    )
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
