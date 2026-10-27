@@ -525,7 +525,8 @@ def init_distributed(
 
     # Directed physical PP edges need independent, preinitialized communicator
     # FIFOs so eager execution and CUDA graph replay use deterministic ordering.
-    dist_config.pipeline_per_edge_p2p = pipeline_parallel_degree > 1
+    if hasattr(dist_config, "pipeline_per_edge_p2p"):  # LOCAL SHIM: old torch
+        dist_config.pipeline_per_edge_p2p = pipeline_parallel_degree > 1
 
     # disable autograd multithreading, to enable TLS DeviceMesh stack for spmd_types backend.
     # this is needed for AC functionality; multi-threaded autograd means BWD threads performing recompute,
