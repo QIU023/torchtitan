@@ -37,7 +37,7 @@ from .float8 import (  # noqa: F401, E402
     Float8Linear,
     Float8LinearConverter,
 )
-from .mxfp8 import (  # noqa: F401, E402
+from .mx import (  # noqa: F401, E402
     MXFP8GroupedExpertsConverter,
     MXFP8Linear,
     MXFP8LinearConverter,
