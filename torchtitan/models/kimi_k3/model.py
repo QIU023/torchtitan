@@ -196,7 +196,27 @@ class KimiMLAAttention(BaseAttention):
         return k_THK, v_THV
 
 
-def _apply_attention_residual(
+def _apply_attention_residual(  # LOCAL PROBE HACK (not committed): the old always-on wrapper
+    partial_block_TD, block_residual_TND, projection, norm
+):
+    import torch.utils.checkpoint
+
+    if torch.is_grad_enabled() and (
+        (partial_block_TD is not None and partial_block_TD.requires_grad)
+        or block_residual_TND.requires_grad
+    ):
+        return torch.utils.checkpoint.checkpoint(
+            _attention_residual_math,
+            partial_block_TD,
+            block_residual_TND,
+            projection,
+            norm,
+            use_reentrant=False,
+        )
+    return _attention_residual_math(partial_block_TD, block_residual_TND, projection, norm)
+
+
+def _attention_residual_math(
     partial_block_TD: torch.Tensor | None,
     block_residual_TND: torch.Tensor,
     projection: Linear,
