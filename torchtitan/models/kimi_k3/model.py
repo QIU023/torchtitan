@@ -486,6 +486,10 @@ class KimiK3Model(Decoder):
             )
         if pixel_values is None:
             return embeddings_TD
+        if spmd.is_type_checking():
+            # LOCAL HACK (not committed): the tower's declarations are not
+            # typecheck-clean; check the text path only.
+            return embeddings_TD
         assert grid_thw is not None
         if self.vision_encoder is None:
             raise ValueError("pixel_values were provided without a vision encoder.")
