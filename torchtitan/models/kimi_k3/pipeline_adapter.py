@@ -596,6 +596,14 @@ class CrossStageCacheAdapter(nn.Module):
 
     def forward(self, *args, **kwargs):
         """Dispatch to delta-P2P, shape inference, or naive passthrough."""
+        import os as _os
+        if _os.environ.get("KIMI_ARGS_PROBE") == "1":
+            shapes = [
+                f"{tuple(a.shape)}/{a.dtype}/grad={a.requires_grad}"
+                if isinstance(a, torch.Tensor) else type(a).__name__
+                for a in args
+            ]
+            print(f"[argsprobe stage={self.stage_id}] n={len(args)} {shapes} kwargs={list(kwargs)}", flush=True)
         # ``PipelineStage._shape_inference`` invokes ``self.submod(...)``
         # directly, bypassing the ``forward_one_chunk`` patch that stashes
         # the mb index. Route to the shape-inference helper in that case.
@@ -839,6 +847,15 @@ class CrossStageCacheAdapter(nn.Module):
                     f"{self.stage_id} but it's neither cached nor committed."
                 )
 
+        import os as _os
+        if _os.environ.get("KIMI_ARGS_PROBE") == "1":
+            print(
+                f"[sendprobe stage={self.stage_id}] out_indices={out_indices} "
+                f"pieces={[tuple(p.shape) for p in send_pieces]} "
+                f"new={[tuple(b.shape) for b in attached_new_blocks]} "
+                f"cache={[tuple(b.shape) for b in self._cache.get_blocks(mb)]}",
+                flush=True,
+            )
         out_blocks_tensor = (
             torch.stack(send_pieces, dim=1)
             if send_pieces
