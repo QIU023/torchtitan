@@ -79,9 +79,8 @@ def _microbatches(seq_len: int, degrees: dict[str, int]) -> int:
     if explicit:
         return int(explicit)
     data_parallel = degrees["dp"] * degrees["dpr"]
-    count = max(1, round(_TOKENS_PER_STEP / (seq_len * data_parallel)))
     pp = degrees["pp"]
-    return max(pp, round(count / pp) * pp)
+    return pp * max(1, round(_TOKENS_PER_STEP / (seq_len * data_parallel * pp)))
 
 
 def _parallelism(degrees: dict[str, int], microbatches: int) -> ParallelismConfig:
