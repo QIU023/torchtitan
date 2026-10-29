@@ -774,9 +774,113 @@ def _kimi_k3(
     )
 
 
+def _downscale(
+    *,
+    dim: int,
+    num_heads: int,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    expert_hidden_dim: int,
+    latent_dim: int,
+    dense_hidden_dim: int,
+) -> Callable[..., KimiK3Model.Config]:
+    """Kimi K3's 29-layer, 128-expert top-16 family for 2 nodes x 8 GPUs."""
+
+    def build(
+        attn_backend: str,
+        *,
+        seq_len: int,
+        parallelism: ParallelismConfig,
+    ) -> KimiK3Model.Config:
+        return _kimi_k3_config(
+            max_context_length=seq_len,
+            dim=dim,
+            vocab_size=163840,
+            num_layers=29,
+            full_attention_layers=set(range(3, 28, 4)) | {28},
+            attn_res_block_size=4,
+            num_heads=num_heads,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            kda_head_dim=128,
+            conv_kernel_size=4,
+            dense_hidden_dim=dense_hidden_dim,
+            latent_dim=latent_dim,
+            expert_hidden_dim=expert_hidden_dim,
+            num_experts=128,
+            top_k=16,
+            num_shared_experts=2,
+            vision_encoder=_vision_encoder_config(
+                text_dim=dim,
+                dim=256,
+                qkv_dim=512,
+                hidden_dim=512,
+                num_layers=2,
+                num_heads=4,
+                init_pos_emb_height=32,
+                init_pos_emb_width=32,
+            ),
+            attn_backend=attn_backend,
+            parallelism=parallelism,
+        )
+
+    return build
+
+
 MODEL_FLAVORS = {
     "debugmodel": (_debugmodel, 16384),
     "Kimi-K3": (_kimi_k3, 262144),
+    "k3_16x80g": (
+        _downscale(
+            dim=2304,
+            num_heads=32,
+            q_lora_rank=512,
+            kv_lora_rank=192,
+            expert_hidden_dim=960,
+            latent_dim=1152,
+            dense_hidden_dim=10880,
+        ),
+        131072,
+    ),
+    "k3_16x80g_small": (
+        _downscale(
+            dim=2048,
+            num_heads=24,
+            q_lora_rank=448,
+            kv_lora_rank=128,
+            expert_hidden_dim=896,
+            latent_dim=1024,
+            dense_hidden_dim=9600,
+        ),
+        131072,
+    ),
+    "k3_16x141g": (
+        _downscale(
+            dim=3584,
+            num_heads=48,
+            q_lora_rank=768,
+            kv_lora_rank=256,
+            expert_hidden_dim=1536,
+            latent_dim=1792,
+            dense_hidden_dim=16896,
+        ),
+        131072,
+    ),
+    "k3_16x141g_small": (
+        _downscale(
+            dim=3328,
+            num_heads=48,
+            q_lora_rank=704,
+            kv_lora_rank=256,
+            expert_hidden_dim=1408,
+            latent_dim=1664,
+            dense_hidden_dim=15744,
+        ),
+        131072,
+    ),
 }
 
 

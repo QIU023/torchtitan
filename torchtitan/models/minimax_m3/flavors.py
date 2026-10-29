@@ -559,11 +559,38 @@ def _m3_1_flash(**kwargs) -> MiniMaxM3Model.Config:
     )
 
 
+def _downscale(*, dim: int, n_layers: int) -> Callable[..., MiniMaxM3Model.Config]:
+    """MiniMax M3's ratios at width ``dim``, with the debug vision tower."""
+    sizes = dict(
+        _M3_SIZES,
+        dim=dim,
+        n_layers=n_layers,
+        n_heads=dim // 96,
+        dense_hidden_dim=2 * dim,
+        moe_hidden_dim=dim // 2,
+        vision_dim=_DEBUG_SIZES["vision_dim"],
+        vision_layers=_DEBUG_SIZES["vision_layers"],
+        vision_heads=_DEBUG_SIZES["vision_heads"],
+        vision_ffn_dim=_DEBUG_SIZES["vision_ffn_dim"],
+    )
+
+    def build(**kwargs) -> MiniMaxM3Model.Config:
+        return _minimax_m3_config(
+            **sizes, rope_theta=5_000_000.0, first_sparse_layer=3, **kwargs
+        )
+
+    return build
+
+
 MODEL_FLAVORS = {
     "debugmodel": (_debugmodel, 8192),
     "debugmodel_flash": (_debugmodel_flash, 8192),
     "M3": (_m3, 1048576),
     "M3.1-Flash": (_m3_1_flash, 1048576),
+    "m3_16x80g": (_downscale(dim=2304, n_layers=16), 131072),
+    "m3_16x80g_small": (_downscale(dim=1920, n_layers=16), 131072),
+    "m3_16x141g": (_downscale(dim=3072, n_layers=20), 131072),
+    "m3_16x141g_small": (_downscale(dim=2688, n_layers=20), 131072),
 }
 
 
