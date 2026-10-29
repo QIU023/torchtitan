@@ -62,6 +62,8 @@ class KDAKernel(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         lower_bound: float = -5.0
+        # The fused bounded gate is a CuTeDSL kernel that needs compute capability 9.0.
+        gate_impl: str = "fused"
 
         def __post_init__(self):
             if not -5.0 <= self.lower_bound < 0.0:
@@ -69,12 +71,18 @@ class KDAKernel(Module):
                     "KDA lower_bound must be in the safe range [-5, 0), "
                     f"got {self.lower_bound}."
                 )
+            if self.gate_impl not in ("fused", "reference"):
+                raise ValueError(
+                    "KDA gate_impl must be 'fused' or 'reference', "
+                    f"got {self.gate_impl!r}."
+                )
 
     def __init__(self, config: Config):
         # Every attn_gym export this module calls; keep the list in sync.
         require_attn_gym(chunk_kda, bound_gate, l2norm)
         super().__init__()
         self.lower_bound = config.lower_bound
+        self.gate_impl = config.gate_impl
 
     def forward(
         self,
@@ -128,7 +136,7 @@ class KDAKernel(Module):
             A_log_H.float(),
             dt_bias_HK.float(),
             lower_bound=self.lower_bound,
-            impl="fused",
+            impl=self.gate_impl,
         )
         autotune = not torch.are_deterministic_algorithms_enabled()
         return (
