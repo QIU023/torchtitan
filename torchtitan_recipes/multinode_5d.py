@@ -28,6 +28,9 @@ Launch with ``-m torchtitan.train --module torchtitan_recipes.multinode_5d
 - ``MN_SEED_CKPT``: model-only checkpoint to load; ``seed`` writes one to
   ``MN_SEED_OUT``.
 - ``MN_PROFILE``: profile every that many steps; ``MN_DETERMINISTIC=1``.
+- ``MN_MEMSNAP``: memory snapshot every that many steps and on OOM, on each
+  node's local rank 0 (``MN_MEMSNAP_ALL=1``: every rank).
+- ``MN_TB=1``: TensorBoard metrics.
 """
 
 import dataclasses
@@ -258,6 +261,12 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
     if os.environ.get("MN_PROFILE"):
         config.profiler.enable_profiling = True
         config.profiler.profile_freq = int(os.environ["MN_PROFILE"])
+    if os.environ.get("MN_MEMSNAP") and (
+        _env("MN_MEMSNAP_ALL", "0") == "1" or _env("LOCAL_RANK", "0") == "0"
+    ):
+        config.profiler.enable_memory_snapshot = True
+        config.profiler.memory_snapshot_freq = int(os.environ["MN_MEMSNAP"])
+    config.metrics.enable_tensorboard = _env("MN_TB", "0") == "1"
     config.checkpointer = None
     if os.environ.get("MN_SEED_CKPT"):
         config.checkpointer = CheckpointManager.Config(
