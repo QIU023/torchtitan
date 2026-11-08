@@ -31,6 +31,8 @@ Launch with ``-m torchtitan.train --module torchtitan_recipes.multinode_5d
 - ``MN_MEMSNAP``: memory snapshot every that many steps and on OOM, on each
   node's local rank 0 (``MN_MEMSNAP_ALL=1``: every rank).
 - ``MN_TB=1``: TensorBoard metrics.
+- ``MN_COMPILE=0``: the model's local compile regions run eagerly and flex
+  attention compiles without autotuning (flex cannot run eagerly at length).
 """
 
 import dataclasses
@@ -210,6 +212,22 @@ def _set_kda_gate(config: Trainer.Config, impl: str) -> int:
     return count
 
 
+def _without_autotune() -> None:
+    import torch
+    from torch.nn.attention.flex_attention import flex_attention
+
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    FlexInnerAttention.inductor_configs["max_autotune"] = False
+    FlexInnerAttention.inductor_configs["coordinate_descent_tuning"] = False
+    FlexInnerAttention._compiled_flex_attn = torch.compile(
+        flex_attention,
+        fullgraph=True,
+        options=FlexInnerAttention.inductor_configs,
+        recompile_limit=16,
+    )
+
+
 def _build(degrees: dict[str, int]) -> Trainer.Config:
     model = _env("MN_MODEL", "k3")
     flavor = _env("MN_FLAVOR", f"{model}_16x80g")
@@ -220,6 +238,9 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
 
     config = _scaffold(model)
     model_config = _model_config(model, flavor, seq_len, parallelism)
+    if _env("MN_COMPILE", "1") == "0":
+        _without_autotune()
+        model_config.local_compile_regions = []
     config.model = model_config
     config.parallelism = parallelism
     config.loss = ChunkedLossWrapper.Config(
