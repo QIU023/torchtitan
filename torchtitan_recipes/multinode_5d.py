@@ -33,9 +33,15 @@ Launch with ``-m torchtitan.train --module torchtitan_recipes.multinode_5d
 - ``MN_TB=1``: TensorBoard metrics.
 - ``MN_COMPILE=0``: the model's local compile regions run eagerly and flex
   attention compiles without autotuning (flex cannot run eagerly at length).
+- ``MN_VPP``: virtual stages per PP rank under ``Interleaved1F1B``, lowered to
+  the largest count the layer count can split evenly into.
+- ``MN_NCCL_TIMEOUT``: NCCL timeout in seconds after the first step (at least
+  120 while a memory snapshot or a trace is dumped); ``MN_NCCL_INIT_TIMEOUT``
+  for initialization and the first step.
 """
 
 import dataclasses
+import math
 import os
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -228,6 +234,24 @@ def _without_autotune() -> None:
     )
 
 
+def _vpp(parallelism: ParallelismConfig, model_config, pp: int) -> int:
+    want = int(_env("MN_VPP", "1"))
+    if pp == 1 or want < 2:
+        return 1
+    units = (
+        len(model_config.layers)
+        + parallelism.pipeline_parallel_first_stage_less_layers
+        + parallelism.pipeline_parallel_last_stage_less_layers
+    )
+    for v in range(want, 1, -1):
+        per_stage = math.ceil(units / (pp * v))
+        if math.ceil(units / per_stage) == pp * v:
+            parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+            parallelism.pipeline_parallel_layers_per_stage = per_stage
+            return v
+    return 1
+
+
 def _build(degrees: dict[str, int]) -> Trainer.Config:
     model = _env("MN_MODEL", "k3")
     flavor = _env("MN_FLAVOR", f"{model}_16x80g")
@@ -241,6 +265,7 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
     if _env("MN_COMPILE", "1") == "0":
         _without_autotune()
         model_config.local_compile_regions = []
+    vpp = _vpp(parallelism, model_config, degrees["pp"])
     config.model = model_config
     config.parallelism = parallelism
     config.loss = ChunkedLossWrapper.Config(
@@ -288,6 +313,13 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
         config.profiler.enable_memory_snapshot = True
         config.profiler.memory_snapshot_freq = int(os.environ["MN_MEMSNAP"])
     config.metrics.enable_tensorboard = _env("MN_TB", "0") == "1"
+    if os.environ.get("MN_NCCL_TIMEOUT"):
+        # A rank dumping a memory snapshot or a trace stalls its peers longer than a short timeout allows.
+        dumps = os.environ.get("MN_MEMSNAP") or os.environ.get("MN_PROFILE")
+        timeout = int(os.environ["MN_NCCL_TIMEOUT"])
+        config.comm.train_timeout_seconds = max(timeout, 120) if dumps else timeout
+    if os.environ.get("MN_NCCL_INIT_TIMEOUT"):
+        config.comm.init_timeout_seconds = int(os.environ["MN_NCCL_INIT_TIMEOUT"])
     config.checkpointer = None
     if os.environ.get("MN_SEED_CKPT"):
         config.checkpointer = CheckpointManager.Config(
@@ -307,7 +339,10 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
         print(
             f"[multinode_5d] model={model} flavor={flavor} cell={degrees} "
             f"seq={seq_len} microbatches={microbatches} tokens/step={tokens} "
-            f"schedule={_env('MN_SCHEDULE', '1F1B')} cp={_env('MN_CP', 'allgather')} "
+            f"schedule={parallelism.pipeline_parallel_schedule if degrees['pp'] > 1 else '-'} vpp={vpp} "
+            f"layers_per_stage={parallelism.pipeline_parallel_layers_per_stage} "
+            f"nccl_timeout={config.comm.init_timeout_seconds}/{config.comm.train_timeout_seconds}s "
+            f"compile={_env('MN_COMPILE', '1')} cp={_env('MN_CP', 'allgather')} "
             f"fsdp_keep={_env('MN_FSDP_KEEP', '0')} gate={gate} kda_kernels={kernels} "
             f"dataset={_env('MN_DATASET', 'c4')} dtype={training.dtype}",
             flush=True,
