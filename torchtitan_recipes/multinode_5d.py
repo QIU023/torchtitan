@@ -10,7 +10,8 @@ Launch with ``-m torchtitan.train --module torchtitan_recipes.multinode_5d
 --config cell``; environment variables select the cell:
 
 - ``MN_MODEL``: ``k3`` (default) or ``m3``.
-- ``MN_FLAVOR``: a flavor of that model, default ``k3_16x80g`` / ``m3_16x80g``.
+- ``MN_FLAVOR``: a flavor of that model, default ``k3_16x80g`` / ``m3_16x80g``;
+  ``k3_32x*`` and ``k3_64x*`` are the K3 downscales for 32 and 64 GPUs.
 - ``MN_CELL``: degrees such as ``pp=2,dp=2,cp=2,tp=2,ep=8``; missing keys are 1,
   ``dpr`` is the HSDP replicate degree.
 - ``MN_SEQ``: tokens per sequence, also the micro-batch per data-parallel rank.
