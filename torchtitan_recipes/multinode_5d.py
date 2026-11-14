@@ -28,7 +28,11 @@ Launch with ``-m torchtitan.train --module torchtitan_recipes.multinode_5d
   (3e-4), ``MN_DTYPE`` (``float32``), ``MN_ATTN`` (M3 full-attention backend).
 - ``MN_SEED_CKPT``: model-only checkpoint to load; ``seed`` writes one to
   ``MN_SEED_OUT``.
-- ``MN_PROFILE``: profile every that many steps; ``MN_DETERMINISTIC=1``.
+- ``MN_PROFILE``: profile every that many steps; ``MN_PROFILE_SHAPES=1`` also
+  records operator input shapes; ``MN_DETERMINISTIC=1``.
+- ``MN_CKPT_STEP``: save a full checkpoint at that step (and the model at the
+  last) to ``MN_CKPT_DIR``, resuming from it when the folder holds one;
+  ``MN_CKPT_ASYNC``: ``disabled`` (default), ``async`` or ``async_with_pinned_mem``.
 - ``MN_MEMSNAP``: memory snapshot every that many steps and on OOM, on each
   node's local rank 0 (``MN_MEMSNAP_ALL=1``: every rank).
 - ``MN_TB=1``: TensorBoard metrics.
@@ -308,6 +312,7 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
     if os.environ.get("MN_PROFILE"):
         config.profiler.enable_profiling = True
         config.profiler.profile_freq = int(os.environ["MN_PROFILE"])
+        config.profiler.record_shapes = _env("MN_PROFILE_SHAPES", "0") == "1"
     if os.environ.get("MN_MEMSNAP") and (
         _env("MN_MEMSNAP_ALL", "0") == "1" or _env("LOCAL_RANK", "0") == "0"
     ):
@@ -322,6 +327,13 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
     if os.environ.get("MN_NCCL_INIT_TIMEOUT"):
         config.comm.init_timeout_seconds = int(os.environ["MN_NCCL_INIT_TIMEOUT"])
     config.checkpointer = None
+    if os.environ.get("MN_CKPT_STEP"):
+        config.checkpointer = CheckpointManager.Config(
+            folder=_env("MN_CKPT_DIR", "checkpoint"),
+            interval=int(os.environ["MN_CKPT_STEP"]),
+            keep_latest_k=1,
+            async_mode=_env("MN_CKPT_ASYNC", "disabled"),
+        )
     if os.environ.get("MN_SEED_CKPT"):
         config.checkpointer = CheckpointManager.Config(
             interval=10**9,

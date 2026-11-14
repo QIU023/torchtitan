@@ -299,6 +299,9 @@ class Profiler(Configurable):
         This is used to configure torch.profiler.schedule.
         """
 
+        record_shapes: bool = True
+        """Whether the trace records the input shapes of every operator."""
+
         profiler_active: int = 1
         """
         The steps profiler is active for.
@@ -565,7 +568,7 @@ class Profiler(Configurable):
                 wait=wait, warmup=warmup, active=active, **additional_params
             ),
             on_trace_ready=trace_handler,
-            record_shapes=True,
+            record_shapes=cfg.record_shapes,
             with_stack=with_stack,
         )
         torch_profiler.__enter__()
