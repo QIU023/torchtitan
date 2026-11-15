@@ -28,6 +28,10 @@ Launch with ``-m torchtitan.train --module torchtitan_recipes.multinode_5d
   (3e-4), ``MN_DTYPE`` (``float32``), ``MN_ATTN`` (M3 full-attention backend).
 - ``MN_SEED_CKPT``: model-only checkpoint to load; ``seed`` writes one to
   ``MN_SEED_OUT``.
+- ``MN_EP_BACKEND``: ``standard`` (default, all-to-all on the EP group),
+  ``hybridep`` or ``deepep`` (DeepEP's libraries, built by the kit's
+  ext_build.sh); ``MN_EP_CAPACITY`` makes HybridEP non-blocking with that
+  capacity factor.
 - ``MN_PROFILE``: profile every that many steps; ``MN_PROFILE_SHAPES=1`` also
   records operator input shapes; ``MN_DETERMINISTIC=1``.
 - ``MN_MEMSNAP``: memory snapshot every that many steps and on OOM, on each
@@ -192,6 +196,28 @@ def _apply_context_parallel(config: Trainer.Config, model: str) -> Trainer.Confi
     )
 
 
+def _apply_ep_backend(config: Trainer.Config, backend: str, seq_len: int, degrees: dict[str, int]) -> Trainer.Config:
+    from torchtitan.config.transform import apply_transforms, TokenDispatcherTransform
+    from torchtitan.models.common.moe.token_dispatcher import DeepEPTokenDispatcher, HybridEPTokenDispatcher
+
+    dispatchers = {"hybridep": HybridEPTokenDispatcher, "deepep": DeepEPTokenDispatcher}
+    if backend not in dispatchers:
+        raise ValueError(f"MN_EP_BACKEND must be standard, hybridep or deepep, got {backend!r}")
+    kwargs = {}
+    if backend == "hybridep" and os.environ.get("MN_EP_CAPACITY"):
+        kwargs["non_blocking_capacity_factor"] = float(os.environ["MN_EP_CAPACITY"])
+    return apply_transforms(
+        config,
+        [
+            TokenDispatcherTransform(
+                dispatcher=dispatchers[backend],
+                num_max_tokens_per_rank=seq_len // (degrees["cp"] * degrees["tp"]),
+                kwargs=kwargs,
+            )
+        ],
+    )
+
+
 def _set_kda_gate(config: Trainer.Config, impl: str) -> int:
     from torchtitan.models.common.attention.kda import KDAKernel
 
@@ -337,6 +363,9 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
     kernels = _set_kda_gate(config, gate) if model == "k3" else 0
     if model == "k3" and kernels == 0:
         raise RuntimeError("No KDAKernel config found to set the gate on.")
+    ep_backend = _env("MN_EP_BACKEND", "standard")
+    if ep_backend != "standard":
+        config = _apply_ep_backend(config, ep_backend, seq_len, degrees)
 
     if os.environ.get("RANK", "0") == "0":
         print(
@@ -346,7 +375,7 @@ def _build(degrees: dict[str, int]) -> Trainer.Config:
             f"layers_per_stage={parallelism.pipeline_parallel_layers_per_stage} "
             f"nccl_timeout={config.comm.init_timeout_seconds}/{config.comm.train_timeout_seconds}s "
             f"compile={_env('MN_COMPILE', '1')} cp={_env('MN_CP', 'allgather')} "
-            f"fsdp_keep={_env('MN_FSDP_KEEP', '0')} gate={gate} kda_kernels={kernels} "
+            f"fsdp_keep={_env('MN_FSDP_KEEP', '0')} gate={gate} kda_kernels={kernels} ep_backend={ep_backend} "
             f"dataset={_env('MN_DATASET', 'c4')} dtype={training.dtype}",
             flush=True,
         )
