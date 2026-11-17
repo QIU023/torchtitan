@@ -860,6 +860,15 @@ _WIDTH_141G = dict(
     latent_dim=1792,
     dense_hidden_dim=16896,
 )
+_WIDTH_270G = dict(
+    dim=5120,
+    num_heads=64,
+    q_lora_rank=1024,
+    kv_lora_rank=384,
+    expert_hidden_dim=2048,
+    latent_dim=2560,
+    dense_hidden_dim=24064,
+)
 _WIDTH_141G_SMALL = dict(
     dim=3328,
     num_heads=48,
@@ -877,10 +886,11 @@ MODEL_FLAVORS = {
     "k3_16x80g_small": (_downscale(**_WIDTH_80G_SMALL), 131072),
     "k3_16x141g": (_downscale(**_WIDTH_141G), 131072),
     "k3_16x141g_small": (_downscale(**_WIDTH_141G_SMALL), 131072),
+    "k3_16x270g": (_downscale(**_WIDTH_270G), 131072),
 }
 # 32 and 64 GPUs keep the per-GPU parameter budget of the 16-GPU flavors: deeper (K3's own 93 layers and blocks of
 # 12 at 64), or the same depth with two or four times the experts.
-for _mem, _width in (("80g", _WIDTH_80G), ("141g", _WIDTH_141G)):
+for _mem, _width in (("80g", _WIDTH_80G), ("141g", _WIDTH_141G), ("270g", _WIDTH_270G)):
     MODEL_FLAVORS[f"k3_32x{_mem}"] = (_downscale(**_width, num_layers=61, attn_res_block_size=8), 131072)
     MODEL_FLAVORS[f"k3_32x{_mem}_e256"] = (_downscale(**_width, num_experts=256), 131072)
     MODEL_FLAVORS[f"k3_64x{_mem}"] = (_downscale(**_width, num_layers=93, attn_res_block_size=12), 131072)
